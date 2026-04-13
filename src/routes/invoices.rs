@@ -1,4 +1,4 @@
-use actix_web::{web, HttpResponse};
+use actix_web::{HttpResponse, web};
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::json;
@@ -27,12 +27,13 @@ use crate::{
 /// Builds the auth section of the PHP CLI payload.
 /// For FIEL: converts DER → PEM inside `work_dir` and returns paths.
 /// For CIEC: returns RFC + password directly.
-async fn build_auth_payload(
-    auth: Auth,
-    work_dir: &TempDir,
-) -> Result<serde_json::Value, AppError> {
+async fn build_auth_payload(auth: Auth, work_dir: &TempDir) -> Result<serde_json::Value, AppError> {
     match auth {
-        Auth::Fiel { certificate, private_key, password } => {
+        Auth::Fiel {
+            certificate,
+            private_key,
+            password,
+        } => {
             let (cert_pem, key_pem) =
                 fiel::der_to_pem(&certificate, &private_key, &password, work_dir.path())
                     .await
@@ -45,14 +46,16 @@ async fn build_auth_payload(
                 "password":      ""   // key was already decrypted by openssl pkcs8
             }))
         }
-        Auth::Ciec { rfc, password, captcha_api_key } => {
-            Ok(json!({
-                "type":             "ciec",
-                "rfc":              rfc,
-                "password":         password,
-                "captcha_api_key":  captcha_api_key
-            }))
-        }
+        Auth::Ciec {
+            rfc,
+            password,
+            captcha_api_key,
+        } => Ok(json!({
+            "type":             "ciec",
+            "rfc":              rfc,
+            "password":         password,
+            "captcha_api_key":  captcha_api_key
+        })),
     }
 }
 
@@ -84,9 +87,9 @@ pub async fn list_invoices(
     if let Some(uuids) = body.uuids {
         params["uuids"] = json!(uuids);
     } else {
-        let from = body
-            .period_from
-            .ok_or_else(|| AppError::bad_request("period_from is required when uuids is not set"))?;
+        let from = body.period_from.ok_or_else(|| {
+            AppError::bad_request("period_from is required when uuids is not set")
+        })?;
         let to = body
             .period_to
             .ok_or_else(|| AppError::bad_request("period_to is required when uuids is not set"))?;
@@ -161,9 +164,7 @@ pub async fn download_invoices(
         let path = files[0]["path"]
             .as_str()
             .ok_or_else(|| AppError::internal("Missing path in CLI response"))?;
-        let filename = files[0]["filename"]
-            .as_str()
-            .unwrap_or("invoice");
+        let filename = files[0]["filename"].as_str().unwrap_or("invoice");
 
         let content = tokio::fs::read(path)
             .await
@@ -171,7 +172,10 @@ pub async fn download_invoices(
 
         return Ok(HttpResponse::Ok()
             .content_type(resource_type.mime_type())
-            .insert_header(("Content-Disposition", format!("attachment; filename=\"{filename}\"")))
+            .insert_header((
+                "Content-Disposition",
+                format!("attachment; filename=\"{filename}\""),
+            ))
             .body(content));
     }
 
@@ -182,16 +186,14 @@ pub async fn download_invoices(
             let mut buf = Vec::new();
             let cursor = std::io::Cursor::new(&mut buf);
             let mut zip = zip::ZipWriter::new(cursor);
-            let options = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
             for file in &files {
                 let path = file["path"]
                     .as_str()
                     .ok_or_else(|| AppError::internal("Missing path in CLI response"))?;
-                let filename = file["filename"]
-                    .as_str()
-                    .unwrap_or("invoice");
+                let filename = file["filename"].as_str().unwrap_or("invoice");
 
                 let content = std::fs::read(path)
                     .map_err(|e| AppError::internal(format!("Could not read file {path}: {e}")))?;
@@ -202,7 +204,8 @@ pub async fn download_invoices(
                     .map_err(|e| AppError::internal(e.to_string()))?;
             }
 
-            zip.finish().map_err(|e| AppError::internal(e.to_string()))?;
+            zip.finish()
+                .map_err(|e| AppError::internal(e.to_string()))?;
             Ok(buf)
         }
     })
@@ -211,7 +214,10 @@ pub async fn download_invoices(
 
     Ok(HttpResponse::Ok()
         .content_type("application/zip")
-        .insert_header(("Content-Disposition", "attachment; filename=\"invoices.zip\""))
+        .insert_header((
+            "Content-Disposition",
+            "attachment; filename=\"invoices.zip\"",
+        ))
         .body(zip_bytes))
 }
 
@@ -251,8 +257,8 @@ pub async fn download_stream(
         }
     });
 
-    let mut input_bytes = serde_json::to_vec(&payload)
-        .map_err(|e| AppError::internal(e.to_string()))?;
+    let mut input_bytes =
+        serde_json::to_vec(&payload).map_err(|e| AppError::internal(e.to_string()))?;
     input_bytes.push(b'\n');
 
     let mut child = tokio::process::Command::new(&cfg.php_bin)
@@ -437,8 +443,8 @@ pub async fn list_stream(
         }
     });
 
-    let mut input_bytes = serde_json::to_vec(&payload)
-        .map_err(|e| AppError::internal(e.to_string()))?;
+    let mut input_bytes =
+        serde_json::to_vec(&payload).map_err(|e| AppError::internal(e.to_string()))?;
     input_bytes.push(b'\n'); // PHP uses fgets() which reads until newline
 
     // Spawn the PHP CLI

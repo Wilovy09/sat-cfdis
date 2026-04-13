@@ -6,7 +6,7 @@ mod services;
 mod state;
 
 use actix_files::Files;
-use actix_web::{middleware, web, App, HttpServer};
+use actix_web::{App, HttpServer, middleware, web};
 use tera::Tera;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -26,8 +26,8 @@ async fn main() -> std::io::Result<()> {
     let bind_addr = format!("{}:{}", cfg.host, cfg.port);
 
     // Tera templates — path relative to CWD (run from repo root)
-    let templates_glob = std::env::var("TEMPLATES_DIR")
-        .unwrap_or_else(|_| "templates/**/*".to_string());
+    let templates_glob =
+        std::env::var("TEMPLATES_DIR").unwrap_or_else(|_| "templates/**/*".to_string());
     let tera = Tera::new(&templates_glob).unwrap_or_else(|e| {
         panic!("Failed to load Tera templates from '{templates_glob}': {e}");
     });
@@ -40,8 +40,8 @@ async fn main() -> std::io::Result<()> {
         "Starting pulso-backend"
     );
 
-    let cfg_data      = web::Data::new(cfg);
-    let tera_data     = web::Data::new(tera);
+    let cfg_data = web::Data::new(cfg);
+    let tera_data = web::Data::new(tera);
     let captcha_map: web::Data<CaptchaMap> =
         web::Data::new(CaptchaMap::new(std::collections::HashMap::new()));
 
@@ -57,16 +57,19 @@ async fn main() -> std::io::Result<()> {
             // Health check
             .route("/health", web::get().to(invoices::health))
             // Web UI
-            .route("/",         web::get().to(web_routes::index))
+            .route("/", web::get().to(web_routes::index))
             .route("/web/list", web::post().to(web_routes::list_web))
             // JSON API
             .service(
                 web::scope("/api/v1/invoices")
-                    .route("/list",              web::post().to(invoices::list_invoices))
-                    .route("/list/stream",       web::post().to(invoices::list_stream))
-                    .route("/captcha/solve",     web::post().to(invoices::solve_captcha))
-                    .route("/download",          web::post().to(invoices::download_invoices))
-                    .route("/download/stream",   web::post().to(invoices::download_stream)),
+                    .route("/list", web::post().to(invoices::list_invoices))
+                    .route("/list/stream", web::post().to(invoices::list_stream))
+                    .route("/captcha/solve", web::post().to(invoices::solve_captcha))
+                    .route("/download", web::post().to(invoices::download_invoices))
+                    .route(
+                        "/download/stream",
+                        web::post().to(invoices::download_stream),
+                    ),
             )
     })
     .bind(&bind_addr)?

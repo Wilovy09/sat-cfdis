@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
@@ -9,14 +9,14 @@ use tokio::process::Command;
 /// Sends a JSON payload to the process's stdin and parses the JSON from stdout.
 /// Any output on stderr is captured and returned as an error on non-zero exit.
 pub struct PhpCli {
-    php_bin:      String,
+    php_bin: String,
     php_cli_path: String,
 }
 
 impl PhpCli {
     pub fn new(php_bin: impl Into<String>, php_cli_path: impl Into<String>) -> Self {
         Self {
-            php_bin:      php_bin.into(),
+            php_bin: php_bin.into(),
             php_cli_path: php_cli_path.into(),
         }
     }

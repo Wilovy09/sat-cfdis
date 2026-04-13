@@ -1,6 +1,6 @@
 use actix_multipart::Multipart;
-use actix_web::{web, HttpResponse};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use actix_web::{HttpResponse, web};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::TryStreamExt as _;
 use serde_json::json;
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ async fn parse_multipart(mut payload: Multipart) -> Result<HashMap<String, Vec<u
     {
         let name = match field.name() {
             Some(n) => n.to_string(),
-            None    => continue,   // skip nameless fields
+            None => continue, // skip nameless fields
         };
         let mut data: Vec<u8> = Vec::new();
         while let Some(chunk) = field
@@ -80,9 +80,9 @@ pub async fn list_web(
 ) -> Result<HttpResponse, AppError> {
     let fields = parse_multipart(payload).await?;
 
-    let auth_type    = get_str(&fields, "auth_type");
-    let period_from  = get_str(&fields, "period_from");
-    let period_to    = get_str(&fields, "period_to");
+    let auth_type = get_str(&fields, "auth_type");
+    let period_from = get_str(&fields, "period_from");
+    let period_to = get_str(&fields, "period_to");
     let download_type = get_str(&fields, "download_type");
 
     if period_from.is_empty() || period_to.is_empty() {
@@ -96,8 +96,8 @@ pub async fn list_web(
     let (auth_payload, creds_for_js) = match auth_type.as_str() {
         "fiel" => {
             let cert_bytes = fields.get("cert_file").cloned().unwrap_or_default();
-            let key_bytes  = fields.get("key_file").cloned().unwrap_or_default();
-            let password   = get_str(&fields, "fiel_password");
+            let key_bytes = fields.get("key_file").cloned().unwrap_or_default();
+            let password = get_str(&fields, "fiel_password");
 
             if cert_bytes.is_empty() {
                 return render_error(&tmpl, "Sube el certificado (.cer).");
@@ -107,7 +107,7 @@ pub async fn list_web(
             }
 
             let cert_b64 = STANDARD.encode(&cert_bytes);
-            let key_b64  = STANDARD.encode(&key_bytes);
+            let key_b64 = STANDARD.encode(&key_bytes);
 
             let (cert_pem, key_pem) =
                 crate::services::fiel::der_to_pem(&cert_b64, &key_b64, &password, work_dir.path())
@@ -133,14 +133,14 @@ pub async fn list_web(
         }
 
         "ciec" => {
-            let rfc      = get_str(&fields, "rfc");
+            let rfc = get_str(&fields, "rfc");
             let password = get_str(&fields, "ciec_password");
 
             if rfc.is_empty() || password.is_empty() {
                 return render_error(&tmpl, "RFC y contraseña CIEC son obligatorios.");
             }
 
-            let auth  = json!({"type": "ciec", "rfc": rfc, "password": password});
+            let auth = json!({"type": "ciec", "rfc": rfc, "password": password});
             let creds = json!({"type": "ciec", "rfc": rfc, "password": password});
             (auth, creds)
         }
@@ -158,17 +158,17 @@ pub async fn list_web(
         }
     });
 
-    let cli    = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path);
+    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path);
     let result = cli.run(&cli_payload).await?;
 
     let invoices = result["invoices"].as_array().cloned().unwrap_or_default();
-    let total    = result["total"].as_u64().unwrap_or(invoices.len() as u64);
+    let total = result["total"].as_u64().unwrap_or(invoices.len() as u64);
 
     let mut ctx = tera::Context::new();
-    ctx.insert("invoices",      &invoices);
-    ctx.insert("total",         &total);
-    ctx.insert("period_from",   &period_from);
-    ctx.insert("period_to",     &period_to);
+    ctx.insert("invoices", &invoices);
+    ctx.insert("total", &total);
+    ctx.insert("period_from", &period_from);
+    ctx.insert("period_to", &period_to);
     ctx.insert("download_type", &download_type);
     // Embed credentials as JSON string so app.js can read window.__CREDS__
     ctx.insert(

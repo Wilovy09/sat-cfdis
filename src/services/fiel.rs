@@ -1,5 +1,5 @@
-use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -15,14 +15,18 @@ pub async fn der_to_pem(
     work_dir: &Path,
 ) -> Result<(PathBuf, PathBuf)> {
     // Decode base64 → raw DER bytes
-    let cert_der = STANDARD.decode(cert_b64).context("Invalid base64 in certificate")?;
-    let key_der  = STANDARD.decode(key_b64).context("Invalid base64 in private_key")?;
+    let cert_der = STANDARD
+        .decode(cert_b64)
+        .context("Invalid base64 in certificate")?;
+    let key_der = STANDARD
+        .decode(key_b64)
+        .context("Invalid base64 in private_key")?;
 
     // Write DER files
     let cert_der_path = work_dir.join("cert.cer");
-    let key_der_path  = work_dir.join("key.key");
+    let key_der_path = work_dir.join("key.key");
     let cert_pem_path = work_dir.join("cert.pem");
-    let key_pem_path  = work_dir.join("key.pem");
+    let key_pem_path = work_dir.join("key.pem");
 
     tokio::fs::write(&cert_der_path, &cert_der)
         .await

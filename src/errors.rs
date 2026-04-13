@@ -12,11 +12,17 @@ pub struct AppError {
 
 impl AppError {
     pub fn bad_request(msg: impl Into<String>) -> Self {
-        Self { message: msg.into(), status: 400 }
+        Self {
+            message: msg.into(),
+            status: 400,
+        }
     }
 
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self { message: msg.into(), status: 500 }
+        Self {
+            message: msg.into(),
+            status: 500,
+        }
     }
 }
 

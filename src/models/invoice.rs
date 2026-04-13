@@ -1,5 +1,5 @@
-use serde::Deserialize;
 use super::auth::Auth;
+use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -16,8 +16,8 @@ pub enum DownloadType {
 impl DownloadType {
     pub fn as_str(&self) -> &'static str {
         match self {
-            DownloadType::Emitidos   => "emitidos",
-            DownloadType::Recibidos  => "recibidos",
+            DownloadType::Emitidos => "emitidos",
+            DownloadType::Recibidos => "recibidos",
         }
     }
 }
@@ -44,7 +44,6 @@ impl ResourceType {
             ResourceType::Pdf => "application/pdf",
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -75,4 +74,3 @@ pub struct DownloadRequest {
     #[serde(default)]
     pub resource_type: ResourceType,
 }
-
