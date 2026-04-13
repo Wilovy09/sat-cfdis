@@ -1,0 +1,34 @@
+{
+    "name": "adquiere/cfdi-cli",
+    "description": "CLI wrapper for phpcfdi/cfdi-sat-scraper, used by the Rust API",
+    "type": "project",
+    "require": {
+        "php": ">=8.2",
+        "phpcfdi/cfdi-sat-scraper": "@dev",
+        "phpcfdi/image-captcha-resolver-boxfactura-ai": "^0.2.0"
+    },
+    "repositories": [
+        {
+            "type": "path",
+            "url": "../libs/cfdi-sat-scraper",
+            "options": {
+                "symlink": false
+            }
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "Adquiere\\CfdiCli\\": "src/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "preferred-install": {
+            "*": "dist"
+        },
+        "allow-plugins": {
+            "php-http/discovery": false
+        }
+    },
+    "bin": ["bin/cfdi-scraper"]
+}

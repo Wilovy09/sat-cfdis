@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}Pulso SAT{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+
+  <header class="app-header">
+    <div class="container header-inner">
+      <a href="/" class="logo">
+        <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="32" height="32" rx="8" fill="#4f46e5"/>
+          <path d="M8 10h16M8 16h10M8 22h13" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/>
+          <circle cx="24" cy="22" r="4" fill="#10b981"/>
+          <path d="M22 22l1.5 1.5L26 20" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>Pulso <strong>SAT</strong></span>
+      </a>
+      <nav class="header-nav">
+        <a href="/" class="nav-link {% block nav_inicio %}{% endblock %}">Consulta</a>
+        <a href="/health" class="nav-link" target="_blank">API</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="page-main">
+    <div class="container">
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+
+  <footer class="app-footer">
+    <div class="container">
+      <span>Pulso SAT &mdash; Descarga de CFDI</span>
+      <span class="footer-note">Los datos se procesan en tu servidor. Nunca se almacenan credenciales.</span>
+    </div>
+  </footer>
+
+  <script src="/static/app.js?v=5"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

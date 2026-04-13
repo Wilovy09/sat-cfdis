@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Error — Pulso SAT{% endblock %}
+
+{% block content %}
+<div class="error-page">
+  <div class="error-icon">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="64" height="64"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+  </div>
+  <h2>Ocurrió un error</h2>
+  <p class="error-message">{{ message }}</p>
+  <a href="/" class="btn btn-primary">
+    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+    Volver al inicio
+  </a>
+</div>
+{% endblock %}

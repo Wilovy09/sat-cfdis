@@ -1,0 +1,394 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+require_once __DIR__ . '/../vendor/autoload.php';
+
+use GuzzleHttp\Client as GuzzleClient;
+use PhpCfdi\CfdiSatScraper\Filters\DownloadType;
+use PhpCfdi\CfdiSatScraper\Filters\Options\StatesVoucherOption;
+use PhpCfdi\CfdiSatScraper\QueryByFilters;
+use PhpCfdi\CfdiSatScraper\ResourceType;
+use PhpCfdi\CfdiSatScraper\SatHttpGateway;
+use PhpCfdi\CfdiSatScraper\SatScraper;
+use PhpCfdi\CfdiSatScraper\Sessions\Ciec\CiecSessionManager;
+use PhpCfdi\CfdiSatScraper\Sessions\Fiel\FielSessionManager;
+use PhpCfdi\Credentials\Credential;
+use PhpCfdi\ImageCaptchaResolver\CaptchaAnswer;
+use PhpCfdi\ImageCaptchaResolver\CaptchaAnswerInterface;
+use PhpCfdi\ImageCaptchaResolver\CaptchaImageInterface;
+use PhpCfdi\ImageCaptchaResolver\CaptchaResolverInterface;
+
+/**
+ * Captcha resolver that asks the user via browser.
+ *
+ * Writes a JSON event to stdout so Rust forwards it to the browser as SSE.
+ * Then reads the user's answer from stdin (written by Rust after the browser POSTs it).
+ */
+final class UserCaptchaResolver implements CaptchaResolverInterface
+{
+    public function resolve(CaptchaImageInterface $image): CaptchaAnswerInterface
+    {
+        // Emit captcha event — Rust picks this up and sends it as SSE to the browser.
+        echo json_encode([
+            '__captcha__'  => true,
+            'image_base64' => $image->asBase64(),
+            'mime'         => $image->getMimeType(),
+        ], JSON_UNESCAPED_UNICODE) . "\n";
+        flush();
+
+        // Block until Rust writes the user's answer to our stdin.
+        $answer = trim((string) fgets(STDIN));
+
+        if ($answer === '') {
+            throw new \PhpCfdi\ImageCaptchaResolver\UnableToResolveCaptchaException($this, $image);
+        }
+
+        return new CaptchaAnswer($answer);
+    }
+}
+
+/**
+ * Selects the best available captcha resolver.
+ *
+ * Priority:
+ *  1. BOXFACTURA_CONFIG_PATH is set and points to a valid YAML config
+ *     → uses BoxFactura AI (local ONNX model, fully automatic, no user interaction)
+ *  2. Fallback → UserCaptchaResolver (shows image in the browser, user types the answer)
+ */
+function createCaptchaResolver(): CaptchaResolverInterface
+{
+    $configPath = getenv('BOXFACTURA_CONFIG_PATH');
+
+    if (
+        $configPath
+        && file_exists($configPath)
+        && class_exists(\PhpCfdi\ImageCaptchaResolver\BoxFacturaAI\BoxFacturaAIResolver::class)
+    ) {
+        return \PhpCfdi\ImageCaptchaResolver\BoxFacturaAI\BoxFacturaAIResolver::createFromConfigs($configPath);
+    }
+
+    return new UserCaptchaResolver();
+}
+
+/**
+ * Builds the SSL verify value for Guzzle.
+ *
+ * Priority:
+ *  1. VERIFY_SSL=false  → disables certificate verification (dev only)
+ *  2. CURL_CA_BUNDLE    → explicit path to a PEM bundle
+ *  3. openssl.cafile    → PHP ini (set by Homebrew/system)
+ *  4. /etc/ssl/cert.pem → macOS system bundle
+ *  5. true              → let cURL decide (works on most Linux EC2s)
+ */
+function resolveGuzzleVerify(): string|bool
+{
+    if (strtolower((string) getenv('VERIFY_SSL')) === 'false') {
+        return false;
+    }
+    if ($bundle = getenv('CURL_CA_BUNDLE')) {
+        return $bundle;
+    }
+    if ($bundle = ini_get('curl.cainfo') ?: ini_get('openssl.cafile')) {
+        return $bundle;
+    }
+    foreach (['/etc/ssl/cert.pem', '/etc/ssl/certs/ca-certificates.crt'] as $path) {
+        if (file_exists($path)) {
+            return $path;
+        }
+    }
+    return true;
+}
+
+/**
+ * Creates a SatScraper with a Guzzle client configured for the SAT portal.
+ *
+ * The SAT uses a 1024-bit Diffie-Hellman key which OpenSSL 3.x rejects by
+ * default (SECLEVEL=2 requires >=2048-bit DH).  We lower to SECLEVEL=1 via
+ * the cipher list so cURL will complete the TLS handshake.
+ * This is safe: we are connecting to a known government endpoint and the
+ * weakness is on the SAT's server, not in our code.
+ */
+function makeScraper(\PhpCfdi\CfdiSatScraper\Sessions\SessionManager $sessionManager): SatScraper
+{
+    $guzzle = new GuzzleClient([
+        'verify' => resolveGuzzleVerify(),
+        'curl'   => [
+            // Accept the SAT's legacy 1024-bit DH key (OpenSSL 3.x SECLEVEL=1).
+            CURLOPT_SSL_CIPHER_LIST => 'DEFAULT@SECLEVEL=1',
+        ],
+    ]);
+    $gateway = new SatHttpGateway($guzzle);
+    return new SatScraper($sessionManager, $gateway);
+}
+
+/**
+ * Writes a JSON error to stderr and exits with a non-zero code.
+ */
+function outputError(string $message, int $code = 1): never
+{
+    fwrite(STDERR, json_encode(['error' => $message], JSON_UNESCAPED_UNICODE) . PHP_EOL);
+    exit($code);
+}
+
+/**
+ * Writes a JSON result to stdout and exits cleanly.
+ */
+function outputJson(mixed $data): never
+{
+    echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+    exit(0);
+}
+
+// --------------------------------------------------------------------------
+// Disable output buffering globally so captcha events (and SSE lines) are
+// flushed to Rust immediately, regardless of which command is running.
+while (ob_get_level()) { ob_end_clean(); }
+ini_set('output_buffering', 'Off');
+ini_set('implicit_flush', '1');
+
+// --------------------------------------------------------------------------
+// Read JSON input from stdin (one line — stdin stays open for captcha answers)
+// --------------------------------------------------------------------------
+$rawInput = fgets(STDIN);
+if ($rawInput === false || trim($rawInput) === '') {
+    outputError('No input received on stdin');
+}
+
+$input = json_decode($rawInput, true);
+if (!is_array($input)) {
+    outputError('Invalid JSON input: ' . json_last_error_msg());
+}
+
+$command = $input['command'] ?? null;
+$auth    = $input['auth'] ?? null;
+$params  = $input['params'] ?? [];
+
+if (!$command) {
+    outputError('Missing required field: command');
+}
+if (!$auth) {
+    outputError('Missing required field: auth');
+}
+
+// --------------------------------------------------------------------------
+// Build session manager
+// --------------------------------------------------------------------------
+$authType = $auth['type'] ?? '';
+
+$scraper = match($authType) {
+    'fiel' => (static function () use ($auth): SatScraper {
+        foreach (['cert_pem_path', 'key_pem_path'] as $field) {
+            if (empty($auth[$field])) {
+                outputError("Missing FIEL field: $field");
+            }
+            if (!file_exists($auth[$field])) {
+                outputError("File not found: {$auth[$field]}");
+            }
+        }
+
+        $certContent = file_get_contents($auth['cert_pem_path']);
+        $keyContent  = file_get_contents($auth['key_pem_path']);
+
+        if ($certContent === false || $keyContent === false) {
+            outputError('Could not read FIEL certificate or key file');
+        }
+
+        // Key was already decrypted by openssl pkcs8 in Rust, so passphrase is empty.
+        $credential = Credential::create($certContent, $keyContent, '');
+        return makeScraper(FielSessionManager::create($credential));
+    })(),
+
+    'ciec' => (static function () use ($auth): SatScraper {
+        foreach (['rfc', 'password'] as $field) {
+            if (empty($auth[$field])) {
+                outputError("Missing CIEC field: $field");
+            }
+        }
+        // createCaptchaResolver() picks BoxFactura AI if BOXFACTURA_CONFIG_PATH is set,
+        // otherwise falls back to the interactive browser captcha (UserCaptchaResolver).
+        $resolver = createCaptchaResolver();
+        return makeScraper(CiecSessionManager::create($auth['rfc'], $auth['password'], $resolver));
+    })(),
+
+    default => outputError("Unknown auth type: '$authType'. Use 'fiel' or 'ciec'"),
+};
+
+// --------------------------------------------------------------------------
+// Helper: build DownloadType from string
+// --------------------------------------------------------------------------
+function resolveDownloadType(string $type): DownloadType
+{
+    return match(strtolower($type)) {
+        'recibidos', 'received' => DownloadType::recibidos(),
+        default                 => DownloadType::emitidos(),
+    };
+}
+
+// --------------------------------------------------------------------------
+// Helper: build ResourceType from string
+// --------------------------------------------------------------------------
+function resolveResourceType(string $type): ResourceType
+{
+    return match(strtolower($type)) {
+        'pdf'   => ResourceType::pdf(),
+        default => ResourceType::xml(),
+    };
+}
+
+// --------------------------------------------------------------------------
+// Execute command
+// --------------------------------------------------------------------------
+switch ($command) {
+
+    // ----------------------------------------------------------------------
+    // list: query invoices by period or by UUID list
+    // ----------------------------------------------------------------------
+    case 'list':
+        $downloadType = resolveDownloadType($params['download_type'] ?? 'emitidos');
+
+        if (!empty($params['uuids'])) {
+            // List by specific UUIDs
+            $list = $scraper->listByUuids((array) $params['uuids'], $downloadType);
+        } else {
+            // List by date period
+            if (empty($params['period_from']) || empty($params['period_to'])) {
+                outputError("'list' command requires 'period_from' and 'period_to' in params");
+            }
+
+            try {
+                $from = new DateTimeImmutable($params['period_from']);
+                $to   = new DateTimeImmutable($params['period_to']);
+            } catch (Throwable $e) {
+                outputError('Invalid date format: ' . $e->getMessage());
+            }
+
+            $query = new QueryByFilters($from, $to);
+            $query->setDownloadType($downloadType);
+
+            if (!empty($params['state'])) {
+                $query->setStateVoucher(match(strtolower($params['state'])) {
+                    'vigentes', 'active'    => StatesVoucherOption::vigentes(),
+                    'cancelados', 'canceled' => StatesVoucherOption::cancelados(),
+                    default                 => StatesVoucherOption::todos(),
+                });
+            }
+
+            $list = $scraper->listByPeriod($query);
+        }
+
+        $invoices = [];
+        foreach ($list as $metadata) {
+            $invoices[] = $metadata->getData();
+        }
+
+        outputJson([
+            'command'  => 'list',
+            'total'    => count($invoices),
+            'invoices' => $invoices,
+        ]);
+
+    // ----------------------------------------------------------------------
+    // list-stream: emit one JSON line per invoice as it is found, day by day.
+    // Last line: {"__done__":true,"total":N}
+    // Rust reads this as SSE and forwards to the browser in real time.
+    // ----------------------------------------------------------------------
+    case 'list-stream':
+        if (empty($params['period_from']) || empty($params['period_to'])) {
+            outputError("'list-stream' requires 'period_from' and 'period_to' in params");
+        }
+
+        try {
+            $streamFrom = new DateTimeImmutable($params['period_from']);
+            $streamTo   = new DateTimeImmutable($params['period_to']);
+        } catch (Throwable $e) {
+            outputError('Invalid date format: ' . $e->getMessage());
+        }
+
+        $streamDownloadType = resolveDownloadType($params['download_type'] ?? 'emitidos');
+
+        // Disable output buffering so each echo reaches the pipe immediately.
+        while (ob_get_level()) { ob_end_clean(); }
+        ini_set('output_buffering', 'Off');
+        ini_set('implicit_flush', '1');
+
+        $streamTotal   = 0;
+        $streamCurrent = $streamFrom;
+
+        while ($streamCurrent->format('Y-m-d') <= $streamTo->format('Y-m-d')) {
+            $dayStart = $streamCurrent->setTime(0, 0, 0);
+            $dayEnd   = $streamCurrent->setTime(23, 59, 59);
+
+            $dayQuery = new QueryByFilters($dayStart, $dayEnd);
+            $dayQuery->setDownloadType($streamDownloadType);
+
+            try {
+                $dayList = $scraper->listByDateTime($dayQuery);
+                foreach ($dayList as $metadata) {
+                    echo json_encode($metadata->getData(), JSON_UNESCAPED_UNICODE) . "\n";
+                    flush();
+                    $streamTotal++;
+                }
+            } catch (Throwable $dayError) {
+                // Log the error but keep going — one bad day should not stop the whole query.
+                fwrite(STDERR, 'Day error ' . $streamCurrent->format('Y-m-d') . ': ' . $dayError->getMessage() . "\n");
+            }
+
+            $streamCurrent = $streamCurrent->modify('+1 day');
+        }
+
+        echo json_encode(['__done__' => true, 'total' => $streamTotal]) . "\n";
+        flush();
+        exit(0);
+
+    // ----------------------------------------------------------------------
+    // download: fetch XML or PDF files for given UUIDs
+    // ----------------------------------------------------------------------
+    case 'download':
+        if (empty($params['uuids'])) {
+            outputError("'download' command requires 'uuids' in params");
+        }
+        if (empty($params['output_dir'])) {
+            outputError("'download' command requires 'output_dir' in params");
+        }
+
+        $uuids        = (array) $params['uuids'];
+        $outputDir    = rtrim($params['output_dir'], '/');
+        $downloadType = resolveDownloadType($params['download_type'] ?? 'emitidos');
+        $resourceType = resolveResourceType($params['resource_type'] ?? 'xml');
+
+        if (!is_dir($outputDir) && !mkdir($outputDir, 0755, true)) {
+            outputError("Could not create output directory: $outputDir");
+        }
+
+        // Retrieve metadata for the requested UUIDs
+        $list = $scraper->listByUuids($uuids, $downloadType);
+
+        if (count($list) === 0) {
+            outputError('No invoices found for the given UUIDs');
+        }
+
+        // Download files to the output directory
+        $scraper->resourceDownloader($resourceType, $list)
+            ->saveTo($outputDir);
+
+        // Collect info about downloaded files
+        $files = [];
+        foreach (glob($outputDir . '/*') as $filePath) {
+            $files[] = [
+                'path'     => $filePath,
+                'filename' => basename($filePath),
+                'size'     => filesize($filePath),
+            ];
+        }
+
+        outputJson([
+            'command'    => 'download',
+            'output_dir' => $outputDir,
+            'files'      => $files,
+        ]);
+
+    default:
+        outputError("Unknown command: '$command'. Use 'list' or 'download'");
+}

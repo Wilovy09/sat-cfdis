@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}{{ total }} facturas — Pulso SAT{% endblock %}
+
+{% block content %}
+
+<!-- Credentials stored for JS download requests -->
+<script>window.__CREDS__ = {{ creds_json | safe }};</script>
+<script>window.__DOWNLOAD_TYPE__ = "{{ download_type }}";</script>
+
+<!-- ── Summary bar ──────────────────────────────────────── -->
+<div class="summary-bar">
+  <div class="summary-stat">
+    <span class="summary-num">{{ total }}</span>
+    <span class="summary-label">facturas encontradas</span>
+  </div>
+  <div class="summary-stat">
+    <span class="summary-num">{{ period_from }}</span>
+    <span class="summary-label">–</span>
+    <span class="summary-num">{{ period_to }}</span>
+  </div>
+  <div class="summary-stat">
+    <span class="badge badge-indigo">{{ download_type | capitalize }}</span>
+  </div>
+  <a href="/" class="btn btn-ghost btn-sm">
+    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg>
+    Nueva consulta
+  </a>
+</div>
+
+{% if total == 0 %}
+<div class="empty-state">
+  <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" stroke-width="1.2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+  <p>No se encontraron facturas en el período seleccionado.</p>
+  <a href="/" class="btn btn-primary">Hacer otra consulta</a>
+</div>
+
+{% else %}
+
+<!-- ── Search / filter ─────────────────────────────────── -->
+<div class="table-toolbar">
+  <div class="search-box">
+    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+    <input type="search" id="tableSearch" placeholder="Buscar UUID, RFC, nombre, importe…" />
+  </div>
+  <div class="toolbar-actions">
+    <button class="btn btn-ghost btn-sm" id="selectAllBtn">Seleccionar todo</button>
+    <button class="btn btn-secondary btn-sm" id="downloadSelectedBtn" disabled>
+      <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Descargar seleccionados (XML)
+    </button>
+  </div>
+</div>
+
+<!-- ── Table ───────────────────────────────────────────── -->
+<div class="table-wrap">
+  <table class="invoice-table" id="invoiceTable">
+    <thead>
+      <tr>
+        <th class="col-check"><input type="checkbox" id="checkAll" /></th>
+        <th class="sortable" data-col="0">Folio UUID</th>
+        <th class="sortable" data-col="1">RFC Emisor</th>
+        <th class="sortable" data-col="2">Nombre Emisor</th>
+        <th class="sortable" data-col="3">RFC Receptor</th>
+        <th class="sortable" data-col="4">Fecha Emisión</th>
+        <th class="sortable num" data-col="5">Total</th>
+        <th>Estado</th>
+        <th>Descargar</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for inv in invoices %}
+      <tr>
+        <td class="col-check"><input type="checkbox" class="row-check" data-uuid="{{ inv.uuid }}" /></td>
+        <td>
+          <span class="uuid-cell" title="{{ inv.uuid }}" data-copy="{{ inv.uuid }}">
+            {{ inv.uuid | truncate(length=13, end="…") }}
+            <svg class="copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+          </span>
+        </td>
+        <td><code class="rfc">{{ inv.rfcEmisor }}</code></td>
+        <td class="nombre">{{ inv.nombreEmisor }}</td>
+        <td><code class="rfc">{{ inv.rfcReceptor }}</code></td>
+        <td class="fecha">{{ inv.fechaEmision }}</td>
+        <td class="num">
+          {% if inv.total %}
+            ${{ inv.total | float | round(precision=2) }}
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if inv.estadoComprobante == "Vigente" or inv.estadoComprobante == "vigente" %}
+            <span class="badge badge-green">Vigente</span>
+          {% elif inv.estadoComprobante == "Cancelado" or inv.estadoComprobante == "cancelado" %}
+            <span class="badge badge-red">Cancelado</span>
+          {% else %}
+            <span class="badge badge-gray">{{ inv.estadoComprobante }}</span>
+          {% endif %}
+        </td>
+        <td class="col-actions">
+          <button class="btn-icon" title="Descargar XML" data-dl-uuid="{{ inv.uuid }}" data-dl-type="xml">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            XML
+          </button>
+          <button class="btn-icon btn-icon-pdf" title="Descargar PDF" data-dl-uuid="{{ inv.uuid }}" data-dl-type="pdf">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            PDF
+          </button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- ── Download toast ─────────────────────────────────── -->
+<div id="dlToast" class="toast hidden">
+  <div class="toast-inner">
+    <span class="toast-spinner"></span>
+    <span id="dlToastMsg">Descargando…</span>
+  </div>
+</div>
+
+{% endif %}
+{% endblock %}
