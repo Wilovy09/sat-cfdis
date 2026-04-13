@@ -1,3 +1,7 @@
 [submodule "libs/cfdi-sat-scraper"]
 	path = libs/cfdi-sat-scraper
 	url = https://github.com/phpcfdi/cfdi-sat-scraper.git
+
+[submodule "libs/sat-captcha-ai-model"]
+	path = libs/sat-captcha-ai-model
+	url = git@github.com:BoxFactura/sat-captcha-ai-model.git
