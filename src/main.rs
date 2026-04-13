@@ -21,6 +21,7 @@ async fn main() -> std::io::Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
 
+    dotenvy::dotenv().ok();
     let cfg = Config::from_env();
     let bind_addr = format!("{}:{}", cfg.host, cfg.port);
 
