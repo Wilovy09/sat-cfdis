@@ -1,0 +1,3 @@
+[submodule "libs/cfdi-sat-scraper"]
+	path = libs/cfdi-sat-scraper
+	url = https://github.com/phpcfdi/cfdi-sat-scraper.git
