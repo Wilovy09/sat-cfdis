@@ -278,15 +278,20 @@ switch ($command) {
             $list = $scraper->listByPeriod($query);
         }
 
-        $invoices = [];
+        $invoices    = [];
+        $typeCounts  = [];
         foreach ($list as $metadata) {
-            $invoices[] = $metadata->getData();
+            $data = $metadata->getData();
+            $tipo = $data['efectoComprobante'] ?? 'Desconocido';
+            $typeCounts[$tipo] = ($typeCounts[$tipo] ?? 0) + 1;
+            $invoices[] = $data;
         }
 
         outputJson([
-            'command'  => 'list',
-            'total'    => count($invoices),
-            'invoices' => $invoices,
+            'command'      => 'list',
+            'total'        => count($invoices),
+            'type_counts'  => $typeCounts,
+            'invoices'     => $invoices,
         ]);
 
     // ----------------------------------------------------------------------
@@ -313,8 +318,9 @@ switch ($command) {
         ini_set('output_buffering', 'Off');
         ini_set('implicit_flush', '1');
 
-        $streamTotal   = 0;
-        $streamCurrent = $streamFrom;
+        $streamTotal      = 0;
+        $streamTypeCounts = [];
+        $streamCurrent    = $streamFrom;
 
         while ($streamCurrent->format('Y-m-d') <= $streamTo->format('Y-m-d')) {
             $dayStart = $streamCurrent->setTime(0, 0, 0);
@@ -326,7 +332,10 @@ switch ($command) {
             try {
                 $dayList = $scraper->listByDateTime($dayQuery);
                 foreach ($dayList as $metadata) {
-                    echo json_encode($metadata->getData(), JSON_UNESCAPED_UNICODE) . "\n";
+                    $data = $metadata->getData();
+                    $tipo = $data['efectoComprobante'] ?? 'Desconocido';
+                    $streamTypeCounts[$tipo] = ($streamTypeCounts[$tipo] ?? 0) + 1;
+                    echo json_encode($data, JSON_UNESCAPED_UNICODE) . "\n";
                     flush();
                     $streamTotal++;
                 }
@@ -338,7 +347,7 @@ switch ($command) {
             $streamCurrent = $streamCurrent->modify('+1 day');
         }
 
-        echo json_encode(['__done__' => true, 'total' => $streamTotal]) . "\n";
+        echo json_encode(['__done__' => true, 'total' => $streamTotal, 'type_counts' => $streamTypeCounts]) . "\n";
         flush();
         exit(0);
 
@@ -369,6 +378,14 @@ switch ($command) {
             outputError('No invoices found for the given UUIDs');
         }
 
+        // Count by CFDI type using portal metadata
+        $typeCounts = [];
+        foreach ($list as $metadata) {
+            $data = $metadata->getData();
+            $tipo = $data['efectoComprobante'] ?? 'Desconocido';
+            $typeCounts[$tipo] = ($typeCounts[$tipo] ?? 0) + 1;
+        }
+
         // Download files to the output directory
         $scraper->resourceDownloader($resourceType, $list)
             ->saveTo($outputDir);
@@ -384,9 +401,10 @@ switch ($command) {
         }
 
         outputJson([
-            'command'    => 'download',
-            'output_dir' => $outputDir,
-            'files'      => $files,
+            'command'     => 'download',
+            'output_dir'  => $outputDir,
+            'type_counts' => $typeCounts,
+            'files'       => $files,
         ]);
 
     default:

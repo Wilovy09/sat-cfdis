@@ -69,10 +69,12 @@
 
       <!-- CIEC panel -->
       <div class="tab-panel hidden" id="panel-ciec">
+        {% if not captcha_enabled %}
         <div class="ciec-notice">
           <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-          CIEC requiere resolución de captcha. Asegúrate de configurar <code>BOXFACTURA_API_KEY</code>.
+          CIEC requiere resolución de captcha. Asegúrate de configurar <code>BOXFACTURA_CONFIG_PATH</code>.
         </div>
+        {% endif %}
         <div class="form-row" style="margin-top:1rem">
           <div class="form-group">
             <label for="rfc">RFC</label>
@@ -175,6 +177,7 @@
           <th>RFC Receptor</th>
           <th>Fecha Emisión</th>
           <th class="num">Total</th>
+          <th>Tipo</th>
           <th>Estado</th>
           <th>Descargar</th>
         </tr>

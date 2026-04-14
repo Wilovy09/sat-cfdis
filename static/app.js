@@ -291,6 +291,16 @@ function statusBadge(state) {
   return `<span class="badge badge-gray">${state || '—'}</span>`;
 }
 
+function typeBadge(tipo) {
+  const t = (tipo || '').toLowerCase();
+  if (t === 'ingreso')  return `<span class="badge badge-indigo">Ingreso</span>`;
+  if (t === 'egreso')   return `<span class="badge badge-amber">Egreso</span>`;
+  if (t === 'nómina' || t === 'nomina') return `<span class="badge badge-purple">Nómina</span>`;
+  if (t === 'pago')     return `<span class="badge badge-teal">Pago</span>`;
+  if (t === 'traslado') return `<span class="badge badge-gray">Traslado</span>`;
+  return tipo ? `<span class="badge badge-gray">${tipo}</span>` : '—';
+}
+
 function appendInvoiceRow(inv) {
   if (!streamTableBody) return;
   streamTotal++;
@@ -315,6 +325,7 @@ function appendInvoiceRow(inv) {
     <td><code class="rfc">${inv.rfcReceptor || '—'}</code></td>
     <td class="fecha">${inv.fechaEmision || '—'}</td>
     <td class="num">${total}</td>
+    <td>${typeBadge(inv.efectoComprobante)}</td>
     <td>${statusBadge(inv.estadoComprobante)}</td>
     <td class="col-actions">
       <button class="btn-icon" data-dl-uuid="${uuid}" data-dl-type="xml" title="Descargar XML">

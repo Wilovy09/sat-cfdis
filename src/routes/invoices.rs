@@ -159,6 +159,12 @@ pub async fn download_invoices(
         return Err(AppError::internal("No files were downloaded"));
     }
 
+    // Serialize type counts from PHP CLI for the response header
+    let type_counts_header = cli_result["type_counts"]
+        .as_object()
+        .map(|m| serde_json::to_string(m).unwrap_or_default())
+        .unwrap_or_default();
+
     // --- Single file: return it directly ---
     if files.len() == 1 {
         let path = files[0]["path"]
@@ -170,13 +176,16 @@ pub async fn download_invoices(
             .await
             .map_err(|e| AppError::internal(format!("Could not read downloaded file: {e}")))?;
 
-        return Ok(HttpResponse::Ok()
-            .content_type(resource_type.mime_type())
-            .insert_header((
-                "Content-Disposition",
-                format!("attachment; filename=\"{filename}\""),
-            ))
-            .body(content));
+        let mut response = HttpResponse::Ok();
+        response.content_type(resource_type.mime_type());
+        response.insert_header((
+            "Content-Disposition",
+            format!("attachment; filename=\"{filename}\""),
+        ));
+        if !type_counts_header.is_empty() {
+            response.insert_header(("X-Invoice-Type-Counts", type_counts_header));
+        }
+        return Ok(response.body(content));
     }
 
     // --- Multiple files: bundle as ZIP ---
@@ -212,13 +221,16 @@ pub async fn download_invoices(
     .await
     .map_err(|e| AppError::internal(e.to_string()))??;
 
-    Ok(HttpResponse::Ok()
-        .content_type("application/zip")
-        .insert_header((
-            "Content-Disposition",
-            "attachment; filename=\"invoices.zip\"",
-        ))
-        .body(zip_bytes))
+    let mut response = HttpResponse::Ok();
+    response.content_type("application/zip");
+    response.insert_header((
+        "Content-Disposition",
+        "attachment; filename=\"invoices.zip\"",
+    ));
+    if !type_counts_header.is_empty() {
+        response.insert_header(("X-Invoice-Type-Counts", type_counts_header));
+    }
+    Ok(response.body(zip_bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +394,8 @@ pub async fn download_stream(
         })
         .await;
 
+        let type_counts = result.get("type_counts").cloned().unwrap_or(serde_json::Value::Null);
+
         match packed {
             Ok(Ok((bytes, filename, content_type))) => {
                 use base64::Engine as _;
@@ -391,6 +405,7 @@ pub async fn download_stream(
                     "filename":     filename,
                     "content_type": content_type,
                     "data_b64":     b64,
+                    "type_counts":  type_counts,
                 });
                 yield Ok(Bytes::from(format!("data: {evt}\n\n")));
             }

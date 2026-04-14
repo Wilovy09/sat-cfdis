@@ -63,6 +63,7 @@
         <th class="sortable" data-col="3">RFC Receptor</th>
         <th class="sortable" data-col="4">Fecha Emisión</th>
         <th class="sortable num" data-col="5">Total</th>
+        <th>Tipo</th>
         <th>Estado</th>
         <th>Descargar</th>
       </tr>
@@ -85,6 +86,22 @@
           {% if inv.total %}
             ${{ inv.total | float | round(precision=2) }}
           {% else %}—{% endif %}
+        </td>
+        <td>
+          {% set tipo = inv.efectoComprobante | lower %}
+          {% if tipo == "ingreso" %}
+            <span class="badge badge-indigo">Ingreso</span>
+          {% elif tipo == "egreso" %}
+            <span class="badge badge-amber">Egreso</span>
+          {% elif tipo == "nómina" or tipo == "nomina" %}
+            <span class="badge badge-purple">Nómina</span>
+          {% elif tipo == "pago" %}
+            <span class="badge badge-teal">Pago</span>
+          {% elif tipo == "traslado" %}
+            <span class="badge badge-gray">Traslado</span>
+          {% else %}
+            <span class="badge badge-gray">{{ inv.efectoComprobante }}</span>
+          {% endif %}
         </td>
         <td>
           {% if inv.estadoComprobante == "Vigente" or inv.estadoComprobante == "vigente" %}

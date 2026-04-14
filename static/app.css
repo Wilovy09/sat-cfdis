@@ -471,6 +471,9 @@ select { -webkit-appearance: none; appearance: none; padding-right: 2rem; }
 .badge-red    { background: var(--danger-light);   color: #991b1b; }
 .badge-gray   { background: var(--bg);             color: var(--text-muted); border: 1px solid var(--border); }
 .badge-indigo { background: var(--indigo-light);   color: var(--primary); }
+.badge-amber  { background: #fef3c7; color: #92400e; }
+.badge-purple { background: #ede9fe; color: #5b21b6; }
+.badge-teal   { background: #ccfbf1; color: #0f766e; }
 
 /* ─── Download buttons ───────────────────────────────────────────────────── */
 .col-actions { white-space: nowrap; }

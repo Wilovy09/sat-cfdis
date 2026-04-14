@@ -8,6 +8,8 @@ pub struct Config {
     pub php_bin: String,
     /// Absolute path to `php-cli/bin/cfdi-scraper`
     pub php_cli_path: String,
+    /// Whether BOXFACTURA_CONFIG_PATH is set (enables CIEC captcha support)
+    pub captcha_enabled: bool,
 }
 
 impl Config {
@@ -23,6 +25,7 @@ impl Config {
                 // Relative to the working directory where the binary runs
                 "./php-cli/bin/cfdi-scraper".to_string()
             }),
+            captcha_enabled: env::var("BOXFACTURA_CONFIG_PATH").is_ok(),
         }
     }
 }
