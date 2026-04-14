@@ -83,25 +83,23 @@
         <td><code class="rfc">{{ inv.rfcReceptor }}</code></td>
         <td class="fecha">{{ inv.fechaEmision }}</td>
         <td class="num">
-          {% if inv.total %}
-            ${{ inv.total | float | round(precision=2) }}
-          {% else %}—{% endif %}
+          {% if inv.total %}{{ inv.total }}{% else %}—{% endif %}
         </td>
         <td>
-          {% set tipo = inv.efectoComprobante | lower %}
-          {% if tipo == "ingreso" %}
+          {% set tipo = inv.efectoComprobante | lower | trim %}
+          {% if tipo == "ingreso" or tipo == "i" %}
             <span class="badge badge-indigo">Ingreso</span>
-          {% elif tipo == "egreso" %}
+          {% elif tipo == "egreso" or tipo == "e" %}
             <span class="badge badge-amber">Egreso</span>
-          {% elif tipo == "nómina" or tipo == "nomina" %}
+          {% elif tipo == "nómina" or tipo == "nomina" or tipo == "n" %}
             <span class="badge badge-purple">Nómina</span>
-          {% elif tipo == "pago" %}
+          {% elif tipo == "pago" or tipo == "p" %}
             <span class="badge badge-teal">Pago</span>
-          {% elif tipo == "traslado" %}
+          {% elif tipo == "traslado" or tipo == "t" %}
             <span class="badge badge-gray">Traslado</span>
-          {% else %}
+          {% elif tipo != "" %}
             <span class="badge badge-gray">{{ inv.efectoComprobante }}</span>
-          {% endif %}
+          {% else %}—{% endif %}
         </td>
         <td>
           {% if inv.estadoComprobante == "Vigente" or inv.estadoComprobante == "vigente" %}

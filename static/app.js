@@ -292,13 +292,13 @@ function statusBadge(state) {
 }
 
 function typeBadge(tipo) {
-  const t = (tipo || '').toLowerCase();
-  if (t === 'ingreso')  return `<span class="badge badge-indigo">Ingreso</span>`;
-  if (t === 'egreso')   return `<span class="badge badge-amber">Egreso</span>`;
-  if (t === 'nómina' || t === 'nomina') return `<span class="badge badge-purple">Nómina</span>`;
-  if (t === 'pago')     return `<span class="badge badge-teal">Pago</span>`;
-  if (t === 'traslado') return `<span class="badge badge-gray">Traslado</span>`;
-  return tipo ? `<span class="badge badge-gray">${tipo}</span>` : '—';
+  const t = (tipo || '').trim().toLowerCase();
+  if (t === 'ingreso'  || t === 'i') return `<span class="badge badge-indigo">Ingreso</span>`;
+  if (t === 'egreso'   || t === 'e') return `<span class="badge badge-amber">Egreso</span>`;
+  if (t === 'nómina'   || t === 'nomina' || t === 'n') return `<span class="badge badge-purple">Nómina</span>`;
+  if (t === 'pago'     || t === 'p') return `<span class="badge badge-teal">Pago</span>`;
+  if (t === 'traslado' || t === 't') return `<span class="badge badge-gray">Traslado</span>`;
+  return t ? `<span class="badge badge-gray">${tipo}</span>` : '—';
 }
 
 function appendInvoiceRow(inv) {
@@ -308,7 +308,7 @@ function appendInvoiceRow(inv) {
 
   const uuid    = inv.uuid || '';
   const short   = uuid.length > 13 ? uuid.slice(0, 13) + '…' : uuid;
-  const total   = inv.total ? '$' + parseFloat(inv.total).toLocaleString('es-MX', { minimumFractionDigits: 2 }) : '—';
+  const total   = inv.total || '—';
 
   const tr = document.createElement('tr');
   tr.classList.add('row-new');
