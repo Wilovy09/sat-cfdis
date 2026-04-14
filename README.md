@@ -217,6 +217,63 @@ SSE es unidireccional (servidor → cliente), más simple que WebSockets y sufic
 
 ---
 
+## Despliegue en EC2 (Ubuntu 24.04)
+
+### Requisitos
+
+| Componente | Versión mínima |
+|---|---|
+| PHP CLI | 8.3 |
+| Extensiones PHP | `curl`, `gd`, `mbstring`, `zip`, `xml`, `ffi` |
+| openssl CLI | cualquiera |
+| Rust | 1.75+ |
+
+### Script de preparación
+
+El repositorio incluye `prepare_ec2.sh` que instala todo lo necesario de una vez:
+
+```bash
+bash prepare_ec2.sh                        # usa /arena/sat-cfdis por defecto
+bash prepare_ec2.sh /ruta/al/proyecto      # o pasa tu propia ruta
+```
+
+El script:
+1. Instala PHP 8.3 con todas las extensiones necesarias y openssl
+2. Habilita FFI en php.ini (requerido por el modelo ONNX de captchas)
+3. Descarga la librería nativa de ONNX Runtime para Linux
+4. Instala Rust si no está instalado
+5. Compila el binario de Rust en modo release
+
+### Variables de entorno (`.env`)
+
+Crea un archivo `.env` en la raíz del proyecto ajustando las rutas:
+
+```env
+HOST=0.0.0.0
+PORT=8080
+PHP_BIN=php
+PHP_CLI_PATH=/arena/sat-cfdis/php-cli/bin/cfdi-scraper
+TEMPLATES_DIR=/arena/sat-cfdis/templates/**/*
+BOXFACTURA_CONFIG_PATH=/arena/sat-cfdis/libs/sat-captcha-ai-model/model/configs.yaml
+```
+
+> `BOXFACTURA_CONFIG_PATH` activa la resolución automática de captchas con el modelo ONNX local.
+> Si no se configura, el captcha se mostrará al usuario para resolverlo manualmente.
+
+### Arrancar el servidor
+
+```bash
+./target/release/pulso-backend
+```
+
+O con nohup para que sobreviva al cierre de sesión:
+
+```bash
+nohup ./target/release/pulso-backend &
+```
+
+---
+
 ## Resumen del flujo completo (CIEC con captcha)
 
 ```
