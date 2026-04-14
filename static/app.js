@@ -102,6 +102,7 @@ function fileToBase64(file) {
 let activeReader   = null;   // current ReadableStreamDefaultReader
 let streamTotal    = 0;
 let streamDlType   = 'emitidos';
+const streamTypeCounts = { ingreso: 0, egreso: 0, nomina: 0, pago: 0, traslado: 0 };
 window.__captchaSessionId = null;   // session ID of the pending captcha challenge
 
 /* ── Grab DOM references ──────────────────────────────────────────────── */
@@ -130,10 +131,12 @@ queryForm?.addEventListener('submit', async e => {
 
   // Reset UI
   streamTotal = 0;
+  Object.keys(streamTypeCounts).forEach(k => streamTypeCounts[k] = 0);
   if (streamTableBody) streamTableBody.innerHTML = '';
   if (streamError)     { streamError.textContent = ''; streamError.classList.add('hidden'); }
   if (streamSection)   streamSection.classList.add('hidden');
   if (streamCheckAll)  streamCheckAll.checked = false;
+  updateTypeCounters();
   updateBulkBtn();
 
   // Loading state
@@ -301,6 +304,21 @@ function typeBadge(tipo) {
   return t ? `<span class="badge badge-gray">${tipo}</span>` : '—';
 }
 
+function formatTotal(val) {
+  if (val == null || val === '') return '—';
+  const n = parseFloat(String(val).replace(/[$,\s]/g, ''));
+  if (isNaN(n)) return '—';
+  return '$' + n.toLocaleString('es-MX', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function updateTypeCounters() {
+  const types = ['ingreso', 'egreso', 'nomina', 'pago', 'traslado'];
+  types.forEach(t => {
+    const el = document.getElementById('counter-' + t);
+    if (el) el.textContent = streamTypeCounts[t];
+  });
+}
+
 function appendInvoiceRow(inv) {
   if (!streamTableBody) return;
   streamTotal++;
@@ -308,7 +326,16 @@ function appendInvoiceRow(inv) {
 
   const uuid    = inv.uuid || '';
   const short   = uuid.length > 13 ? uuid.slice(0, 13) + '…' : uuid;
-  const total   = inv.total || '—';
+  const total   = formatTotal(inv.total);
+
+  // Update type counter
+  const tipo = (inv.efectoComprobante || '').trim().toLowerCase();
+  if      (tipo === 'ingreso'  || tipo === 'i') streamTypeCounts.ingreso++;
+  else if (tipo === 'egreso'   || tipo === 'e') streamTypeCounts.egreso++;
+  else if (tipo === 'nómina'   || tipo === 'nomina' || tipo === 'n') streamTypeCounts.nomina++;
+  else if (tipo === 'pago'     || tipo === 'p') streamTypeCounts.pago++;
+  else if (tipo === 'traslado' || tipo === 't') streamTypeCounts.traslado++;
+  updateTypeCounters();
 
   const tr = document.createElement('tr');
   tr.classList.add('row-new');

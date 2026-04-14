@@ -367,6 +367,8 @@ select { -webkit-appearance: none; appearance: none; padding-right: 2rem; }
 .summary-num  { font-size: 1.1rem; font-weight: 700; color: var(--text); }
 .summary-label { font-size: .8rem; color: var(--text-muted); }
 .summary-bar .btn { margin-left: auto; }
+.type-counters { display: flex; align-items: center; flex-wrap: wrap; gap: .4rem; }
+.type-counters .badge strong { font-weight: 700; margin-left: .2rem; }
 
 /* ─── Table toolbar ──────────────────────────────────────────────────────── */
 .table-toolbar {
