@@ -5,3 +5,7 @@
 [submodule "libs/sat-captcha-ai-model"]
 	path = libs/sat-captcha-ai-model
 	url = git@github.com:BoxFactura/sat-captcha-ai-model.git
+
+[submodule "libs/sat-ws-descarga-masiva"]
+	path = libs/sat-ws-descarga-masiva
+	url = https://github.com/phpcfdi/sat-ws-descarga-masiva

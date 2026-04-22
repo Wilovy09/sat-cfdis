@@ -5,12 +5,20 @@
     "require": {
         "php": ">=8.2",
         "phpcfdi/cfdi-sat-scraper": "@dev",
+        "phpcfdi/sat-ws-descarga-masiva": "@dev",
         "phpcfdi/image-captcha-resolver-boxfactura-ai": "^0.2.0"
     },
     "repositories": [
         {
             "type": "path",
             "url": "../libs/cfdi-sat-scraper",
+            "options": {
+                "symlink": false
+            }
+        },
+        {
+            "type": "path",
+            "url": "../libs/sat-ws-descarga-masiva",
             "options": {
                 "symlink": false
             }

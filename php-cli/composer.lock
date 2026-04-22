@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "ddd2746bee70bd784bfc4b4c4021bea0",
+    "content-hash": "71564aff874c671585d94c287c7adfd1",
     "packages": [
         {
             "name": "ankane/onnxruntime",
@@ -621,7 +621,7 @@
             "dist": {
                 "type": "path",
                 "url": "../libs/cfdi-sat-scraper",
-                "reference": "6967a87603544330ed43bbcbba975d559b90265b"
+                "reference": "d935d004fd935d3fd39d4c2d270528a4644caee0"
             },
             "require": {
                 "eclipxe/enum": "^0.2.0",
@@ -886,6 +886,154 @@
                 "source": "https://github.com/phpcfdi/image-captcha-resolver-boxfactura-ai"
             },
             "time": "2025-09-13T21:09:22+00:00"
+        },
+        {
+            "name": "phpcfdi/rfc",
+            "version": "v1.2.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/phpcfdi/rfc.git",
+                "reference": "1040a47d453fcdd6c9e91654c874f5629c5ccd36"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/phpcfdi/rfc/zipball/1040a47d453fcdd6c9e91654c874f5629c5ccd36",
+                "reference": "1040a47d453fcdd6c9e91654c874f5629c5ccd36",
+                "shasum": ""
+            },
+            "require": {
+                "ext-json": "*",
+                "ext-mbstring": "*",
+                "php": ">=8.1"
+            },
+            "require-dev": {
+                "fakerphp/faker": "^1.13",
+                "phpunit/phpunit": "^10.5.45"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "PhpCfdi\\Rfc\\": "src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Carlos C Soto",
+                    "email": "eclipxe13@gmail.com",
+                    "homepage": "https://eclipxe.com.mx/"
+                }
+            ],
+            "description": "PHP library to deal with Mexican RFC",
+            "homepage": "https://github.com/phpcfdi/rfc",
+            "keywords": [
+                "mexico",
+                "sat"
+            ],
+            "support": {
+                "issues": "https://github.com/phpcfdi/rfc/issues",
+                "source": "https://github.com/phpcfdi/rfc"
+            },
+            "time": "2025-04-12T20:09:29+00:00"
+        },
+        {
+            "name": "phpcfdi/sat-ws-descarga-masiva",
+            "version": "dev-main",
+            "dist": {
+                "type": "path",
+                "url": "../libs/sat-ws-descarga-masiva",
+                "reference": "777e00a838c7465d19c4791f690e0b80ee705f81"
+            },
+            "require": {
+                "eclipxe/enum": "^0.2.0",
+                "eclipxe/micro-catalog": "^0.1.2",
+                "ext-dom": "*",
+                "ext-json": "*",
+                "ext-libxml": "*",
+                "ext-mbstring": "*",
+                "ext-openssl": "*",
+                "ext-zip": "*",
+                "php": ">=8.1",
+                "phpcfdi/credentials": "^1.3",
+                "phpcfdi/rfc": "^1.2"
+            },
+            "require-dev": {
+                "guzzlehttp/guzzle": "^7.2.0",
+                "phpunit/phpunit": "^10.5.45",
+                "robrichards/xmlseclibs": "^3.1.0"
+            },
+            "suggest": {
+                "guzzlehttp/guzzle": "To use GuzzleWebClient implementation"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "PhpCfdi\\SatWsDescargaMasiva\\": "src/"
+                }
+            },
+            "autoload-dev": {
+                "psr-4": {
+                    "PhpCfdi\\SatWsDescargaMasiva\\Tests\\": "tests/"
+                }
+            },
+            "scripts": {
+                "dev:build": [
+                    "@dev:fix-style",
+                    "@dev:test"
+                ],
+                "dev:check-style": [
+                    "@php tools/composer-normalize normalize --dry-run",
+                    "@php tools/php-cs-fixer fix --dry-run --verbose",
+                    "@php tools/phpcs --colors -sp"
+                ],
+                "dev:coverage": [
+                    "@php -dzend_extension=xdebug.so -dxdebug.mode=coverage vendor/bin/phpunit --coverage-html build/coverage/html/"
+                ],
+                "dev:fix-style": [
+                    "@php tools/composer-normalize normalize",
+                    "@php tools/php-cs-fixer fix --verbose",
+                    "@php tools/phpcbf --colors -sp"
+                ],
+                "dev:test": [
+                    "@dev:check-style",
+                    "@php vendor/bin/phpunit --testdox --stop-on-failure",
+                    "@php tools/phpstan analyse --no-interaction --no-progress"
+                ]
+            },
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Cesar Aguilera",
+                    "email": "cesargnu29@gmail.com"
+                },
+                {
+                    "name": "Carlos C Soto",
+                    "email": "eclipxe13@gmail.com"
+                }
+            ],
+            "description": "Librería para usar el servicio web del SAT de Descarga Masiva",
+            "homepage": "https://github.com/phpcfdi/sat-ws-descarga-masiva",
+            "keywords": [
+                "cfdi",
+                "descarga",
+                "download",
+                "sat",
+                "webservice"
+            ],
+            "support": {
+                "issues": "https://github.com/phpcfdi/sat-ws-descarga-masiva/issues",
+                "chat": "https://discord.gg/aFGYXvX",
+                "source": "https://github.com/phpcfdi/sat-ws-descarga-masiva"
+            },
+            "transport-options": {
+                "symlink": false,
+                "relative": true
+            }
         },
         {
             "name": "psr/http-client",
@@ -1630,7 +1778,8 @@
     "aliases": [],
     "minimum-stability": "stable",
     "stability-flags": {
-        "phpcfdi/cfdi-sat-scraper": 20
+        "phpcfdi/cfdi-sat-scraper": 20,
+        "phpcfdi/sat-ws-descarga-masiva": 20
     },
     "prefer-stable": false,
     "prefer-lowest": false,

@@ -24,6 +24,13 @@ impl AppError {
             status: 500,
         }
     }
+
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+            status: 404,
+        }
+    }
 }
 
 impl fmt::Display for AppError {
@@ -37,6 +44,7 @@ impl ResponseError for AppError {
         let body = json!({ "error": self.message });
         match self.status {
             400 => HttpResponse::BadRequest().json(body),
+            404 => HttpResponse::NotFound().json(body),
             _ => HttpResponse::InternalServerError().json(body),
         }
     }

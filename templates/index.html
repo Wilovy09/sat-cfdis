@@ -102,25 +102,37 @@
       Período de consulta
     </div>
     <div class="card-body">
-      <div class="form-row">
+
+      <div class="period-grid">
+
         <div class="form-group">
-          <label for="period_from">Desde</label>
-          <input type="date" name="period_from" id="period_from" required />
+          <label>Años <span class="period-hint" id="yearHint"></span></label>
+          <div class="pill-grid" id="yearPills"></div>
         </div>
+
         <div class="form-group">
-          <label for="period_to">Hasta</label>
-          <input type="date" name="period_to" id="period_to" required />
+          <label>Meses <span class="period-hint" id="monthHint"></span></label>
+          <div class="pill-grid" id="monthPills"></div>
         </div>
+
         <div class="form-group">
           <label for="download_type">Tipo de factura</label>
           <div class="select-wrapper">
             <select name="download_type" id="download_type">
               <option value="emitidos">Emitidas</option>
               <option value="recibidos">Recibidas</option>
+              <option value="ambas">Ambas</option>
             </select>
           </div>
         </div>
+
       </div>
+
+      <!-- Hidden inputs consumed by form submit & JS -->
+      <input type="hidden" name="period_from" id="period_from" />
+      <input type="hidden" name="period_to"   id="period_to"   />
+      <p class="period-summary" id="periodSummary"></p>
+
     </div>
   </div>
 
@@ -154,6 +166,7 @@
     <span id="streamBadge" class="badge badge-indigo">
       <span class="stream-dot"></span> Consultando…
     </span>
+    <span id="cacheBadge" class="badge badge-gray hidden"></span>
     <button class="btn btn-ghost btn-sm" id="streamCancelBtn" style="margin-left:auto">
       Cancelar
     </button>

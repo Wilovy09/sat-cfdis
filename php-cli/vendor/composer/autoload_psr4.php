@@ -14,6 +14,8 @@ return array(
     'Symfony\\Component\\CssSelector\\' => array($vendorDir . '/symfony/css-selector'),
     'Psr\\Http\\Message\\' => array($vendorDir . '/psr/http-factory/src', $vendorDir . '/psr/http-message/src'),
     'Psr\\Http\\Client\\' => array($vendorDir . '/psr/http-client/src'),
+    'PhpCfdi\\SatWsDescargaMasiva\\' => array($vendorDir . '/phpcfdi/sat-ws-descarga-masiva/src'),
+    'PhpCfdi\\Rfc\\' => array($vendorDir . '/phpcfdi/rfc/src'),
     'PhpCfdi\\ImageCaptchaResolver\\BoxFacturaAI\\' => array($vendorDir . '/phpcfdi/image-captcha-resolver-boxfactura-ai/src'),
     'PhpCfdi\\ImageCaptchaResolver\\' => array($vendorDir . '/phpcfdi/image-captcha-resolver/src'),
     'PhpCfdi\\Credentials\\' => array($vendorDir . '/phpcfdi/credentials/src'),

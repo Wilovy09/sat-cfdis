@@ -6,6 +6,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/../vendor/autoload.php';
 
 use GuzzleHttp\Client as GuzzleClient;
+use GuzzleHttp\Cookie\CookieJar;
 use PhpCfdi\CfdiSatScraper\Filters\DownloadType;
 use PhpCfdi\CfdiSatScraper\Filters\Options\StatesVoucherOption;
 use PhpCfdi\CfdiSatScraper\QueryByFilters;
@@ -19,6 +20,16 @@ use PhpCfdi\ImageCaptchaResolver\CaptchaAnswer;
 use PhpCfdi\ImageCaptchaResolver\CaptchaAnswerInterface;
 use PhpCfdi\ImageCaptchaResolver\CaptchaImageInterface;
 use PhpCfdi\ImageCaptchaResolver\CaptchaResolverInterface;
+use PhpCfdi\SatWsDescargaMasiva\PackageReader\CfdiPackageReader;
+use PhpCfdi\SatWsDescargaMasiva\RequestBuilder\FielRequestBuilder\Fiel;
+use PhpCfdi\SatWsDescargaMasiva\RequestBuilder\FielRequestBuilder\FielRequestBuilder;
+use PhpCfdi\SatWsDescargaMasiva\Service;
+use PhpCfdi\SatWsDescargaMasiva\Services\Query\QueryParameters;
+use PhpCfdi\SatWsDescargaMasiva\Shared\DateTimePeriod;
+use PhpCfdi\SatWsDescargaMasiva\Shared\DownloadType as WsDownloadType;
+use PhpCfdi\SatWsDescargaMasiva\Shared\RequestType;
+use PhpCfdi\SatWsDescargaMasiva\Shared\StatusRequest;
+use PhpCfdi\SatWsDescargaMasiva\WebClient\GuzzleWebClient;
 
 /**
  * Captcha resolver that asks the user via browser.
@@ -110,8 +121,10 @@ function resolveGuzzleVerify(): string|bool
  * This is safe: we are connecting to a known government endpoint and the
  * weakness is on the SAT's server, not in our code.
  */
-function makeScraper(\PhpCfdi\CfdiSatScraper\Sessions\SessionManager $sessionManager): SatScraper
-{
+function makeScraper(
+    \PhpCfdi\CfdiSatScraper\Sessions\SessionManager $sessionManager,
+): SatScraper {
+    $cookieJar = new CookieJar();
     $guzzle = new GuzzleClient([
         'verify' => resolveGuzzleVerify(),
         'curl'   => [
@@ -119,7 +132,7 @@ function makeScraper(\PhpCfdi\CfdiSatScraper\Sessions\SessionManager $sessionMan
             CURLOPT_SSL_CIPHER_LIST => 'DEFAULT@SECLEVEL=1',
         ],
     ]);
-    $gateway = new SatHttpGateway($guzzle);
+    $gateway = new SatHttpGateway($guzzle, $cookieJar);
     return new SatScraper($sessionManager, $gateway);
 }
 
@@ -175,7 +188,7 @@ if (!$auth) {
 // --------------------------------------------------------------------------
 // Build session manager
 // --------------------------------------------------------------------------
-$authType = $auth['type'] ?? '';
+$authType    = $auth['type'] ?? '';
 
 $scraper = match($authType) {
     'fiel' => (static function () use ($auth): SatScraper {
@@ -206,8 +219,6 @@ $scraper = match($authType) {
                 outputError("Missing CIEC field: $field");
             }
         }
-        // createCaptchaResolver() picks BoxFactura AI if BOXFACTURA_CONFIG_PATH is set,
-        // otherwise falls back to the interactive browser captcha (UserCaptchaResolver).
         $resolver = createCaptchaResolver();
         return makeScraper(CiecSessionManager::create($auth['rfc'], $auth['password'], $resolver));
     })(),
@@ -311,7 +322,22 @@ switch ($command) {
             outputError('Invalid date format: ' . $e->getMessage());
         }
 
-        $streamDownloadType = resolveDownloadType($params['download_type'] ?? 'emitidos');
+        // "ambas" runs both emitidos + recibidos in the same PHP process so that
+        // CIEC only authenticates once — two rapid logins for the same RFC cause
+        // the SAT to reset the second connection.
+        $rawDlType = strtolower($params['download_type'] ?? 'emitidos');
+        $streamDownloadTypes = $rawDlType === 'ambas'
+            ? [DownloadType::emitidos(), DownloadType::recibidos()]
+            : [resolveDownloadType($rawDlType)];
+
+        // When true, each found invoice is immediately downloaded and its XML
+        // content sent back as a __xml_ready__ event so Rust can save it to storage.
+        $streamAutoXml       = !empty($params['auto_download_xml']);
+        // Temp dir for per-invoice XML files (cleaned up as we go).
+        $streamXmlTmpDir     = sys_get_temp_dir() . '/pulso_xml_' . getmypid();
+        if ($streamAutoXml) {
+            @mkdir($streamXmlTmpDir, 0700, true);
+        }
 
         // Disable output buffering so each echo reaches the pipe immediately.
         while (ob_get_level()) { ob_end_clean(); }
@@ -320,9 +346,21 @@ switch ($command) {
 
         $streamTotal      = 0;
         $streamTypeCounts = [];
-        $streamCurrent    = $streamFrom;
+
+        foreach ($streamDownloadTypes as $streamDownloadType) {
+        // Emit a separator so the browser knows which direction we are querying.
+        $dlTypeLabel = ($streamDownloadType === DownloadType::recibidos()) ? 'recibidos' : 'emitidos';
+        echo json_encode(['__dl_type__' => $dlTypeLabel], JSON_UNESCAPED_UNICODE) . "\n";
+        flush();
+
+        $streamCurrent = $streamFrom;
 
         while ($streamCurrent->format('Y-m-d') <= $streamTo->format('Y-m-d')) {
+            // Keepalive: emit a heartbeat so nginx/proxy doesn't close the SSE
+            // connection while we wait for the SAT to respond on this day.
+            echo json_encode(['__keepalive__' => true], JSON_UNESCAPED_UNICODE) . "\n";
+            flush();
+
             $dayStart = $streamCurrent->setTime(0, 0, 0);
             $dayEnd   = $streamCurrent->setTime(23, 59, 59);
 
@@ -333,18 +371,82 @@ switch ($command) {
                 $dayList = $scraper->listByDateTime($dayQuery);
                 foreach ($dayList as $metadata) {
                     $data = $metadata->getData();
+                    $uuid = strtolower($data['uuid'] ?? '');
                     $tipo = $data['efectoComprobante'] ?? 'Desconocido';
                     $streamTypeCounts[$tipo] = ($streamTypeCounts[$tipo] ?? 0) + 1;
+                    $data['_dl_type'] = $dlTypeLabel; // emitidos | recibidos
                     echo json_encode($data, JSON_UNESCAPED_UNICODE) . "\n";
                     flush();
                     $streamTotal++;
+
+                    // Auto-download XML immediately after finding the invoice.
+                    // Errors are non-fatal — listing continues regardless.
+                    if ($streamAutoXml && $uuid !== '') {
+                        try {
+                            $singleList = new \PhpCfdi\CfdiSatScraper\MetadataList(
+                                [$metadata->uuid() => $metadata]
+                            );
+                            $scraper->resourceDownloader(ResourceType::xml(), $singleList)
+                                ->saveTo($streamXmlTmpDir);
+                            $xmlPath = $streamXmlTmpDir . '/' . $uuid . '.xml';
+                            if (file_exists($xmlPath)) {
+                                $xmlBytes = file_get_contents($xmlPath);
+                                echo json_encode([
+                                    '__xml_ready__' => true,
+                                    'uuid'          => $uuid,
+                                    'xml_b64'       => base64_encode($xmlBytes),
+                                ], JSON_UNESCAPED_UNICODE) . "\n";
+                                flush();
+                                unlink($xmlPath); // free disk space immediately
+                            }
+                        } catch (Throwable $xmlErr) {
+                            fwrite(STDERR, 'XML auto-download error ' . $uuid . ': ' . $xmlErr->getMessage() . "\n");
+                        }
+                    }
                 }
             } catch (Throwable $dayError) {
-                // Log the error but keep going — one bad day should not stop the whole query.
-                fwrite(STDERR, 'Day error ' . $streamCurrent->format('Y-m-d') . ': ' . $dayError->getMessage() . "\n");
+                $errMsg = $dayError->getMessage();
+                // Build full cause chain for logging
+                $causeChain = $errMsg;
+                $cause = $dayError->getPrevious();
+                while ($cause !== null) {
+                    $causeChain .= ' | caused by: ' . $cause->getMessage();
+                    $cause = $cause->getPrevious();
+                }
+                // Detect SAT session / download limit errors and stop gracefully.
+                // The Rust layer saves the job and resumes after 24.5 h.
+                if (
+                    str_contains($errMsg, '429') ||
+                    str_contains($errMsg, 'Too Many') ||
+                    str_contains($errMsg, 'bloqueado') ||
+                    str_contains($errMsg, 'demasiadas') ||
+                    str_contains($errMsg, 'limite') ||
+                    str_contains($errMsg, 'limit') ||
+                    str_contains($errMsg, 'No tiene acceso') ||
+                    str_contains($errMsg, 'SatAuthenticationException') ||
+                    ($dayError instanceof \PhpCfdi\CfdiSatScraper\Exceptions\SatException)
+                ) {
+                    fwrite(STDERR, 'SAT limit/auth error: ' . $causeChain . "\n");
+                    echo json_encode([
+                        '__limit_reached__' => true,
+                        'date'   => $streamCurrent->format('Y-m-d'),
+                        'reason' => $causeChain,
+                    ], JSON_UNESCAPED_UNICODE) . "\n";
+                    flush();
+                    exit(0);
+                }
+                // Non-limit day error — log and continue.
+                fwrite(STDERR, 'Day error ' . $streamCurrent->format('Y-m-d') . ': ' . $causeChain . "\n");
             }
 
             $streamCurrent = $streamCurrent->modify('+1 day');
+        }
+        } // end foreach $streamDownloadTypes
+
+        // Cleanup temp dir (should already be empty, but just in case)
+        if ($streamAutoXml && is_dir($streamXmlTmpDir)) {
+            @array_map('unlink', glob($streamXmlTmpDir . '/*'));
+            @rmdir($streamXmlTmpDir);
         }
 
         echo json_encode(['__done__' => true, 'total' => $streamTotal, 'type_counts' => $streamTypeCounts]) . "\n";
@@ -387,8 +489,29 @@ switch ($command) {
         }
 
         // Download files to the output directory
-        $scraper->resourceDownloader($resourceType, $list)
-            ->saveTo($outputDir);
+        try {
+            $scraper->resourceDownloader($resourceType, $list)
+                ->saveTo($outputDir);
+        } catch (Throwable $dlError) {
+            $errMsg = $dlError->getMessage();
+            if (
+                str_contains($errMsg, '429') ||
+                str_contains($errMsg, 'Too Many') ||
+                str_contains($errMsg, 'bloqueado') ||
+                str_contains($errMsg, 'demasiadas') ||
+                str_contains($errMsg, 'limite') ||
+                str_contains($errMsg, 'limit') ||
+                str_contains($errMsg, 'No tiene acceso') ||
+                ($dlError instanceof \PhpCfdi\CfdiSatScraper\Exceptions\SatException)
+            ) {
+                outputJson([
+                    '__limit_reached__' => true,
+                    'reason' => $errMsg,
+                    'files'  => [], // partial — whatever was saved before the error
+                ]);
+            }
+            outputError('Download failed: ' . $errMsg);
+        }
 
         // Collect info about downloaded files
         $files = [];
@@ -407,6 +530,222 @@ switch ($command) {
             'files'       => $files,
         ]);
 
+    // ----------------------------------------------------------------------
+    // descarga-masiva: use the SAT bulk download web service (FIEL only).
+    //
+    // Flow:
+    //   1. Build Service with FielRequestBuilder + GuzzleWebClient
+    //   2. query()  → get requestId; emit __progress__ queued
+    //   3. poll verify() every 5 s until Finished/Failure/Rejected/Expired
+    //      emit __progress__ on each poll
+    //   4. For each packageId → download() → CfdiPackageReader → save XMLs
+    //      emit __progress__ on each downloaded package
+    //   5. Final outputJson with summary
+    //
+    // Params:
+    //   period_from, period_to  (ISO-8601 date strings)
+    //   download_type           (emitidos|recibidos)
+    //   output_dir              (directory where XMLs are written)
+    // ----------------------------------------------------------------------
+    case 'descarga-masiva':
+        if ($authType !== 'fiel') {
+            outputError("'descarga-masiva' only supports FIEL authentication");
+        }
+        if (empty($params['period_from']) || empty($params['period_to'])) {
+            outputError("'descarga-masiva' requires 'period_from' and 'period_to' in params");
+        }
+        if (empty($params['output_dir'])) {
+            outputError("'descarga-masiva' requires 'output_dir' in params");
+        }
+
+        $dmOutputDir = rtrim($params['output_dir'], '/');
+        if (!is_dir($dmOutputDir) && !mkdir($dmOutputDir, 0755, true)) {
+            outputError("Could not create output directory: $dmOutputDir");
+        }
+
+        // Read FIEL credentials (already validated above when building $scraper)
+        $dmCertContent = file_get_contents($auth['cert_pem_path']);
+        $dmKeyContent  = file_get_contents($auth['key_pem_path']);
+        if ($dmCertContent === false || $dmKeyContent === false) {
+            outputError('Could not read FIEL certificate or key file');
+        }
+
+        // Build the sat-ws-descarga-masiva Service
+        $dmFiel    = Fiel::create($dmCertContent, $dmKeyContent, '');
+        if (!$dmFiel->isValid()) {
+            outputError('FIEL credential is not valid or not a FIEL certificate');
+        }
+        $dmBuilder = new FielRequestBuilder($dmFiel);
+        $dmGuzzle  = new GuzzleClient([
+            'verify' => resolveGuzzleVerify(),
+            'curl'   => [CURLOPT_SSL_CIPHER_LIST => 'DEFAULT@SECLEVEL=1'],
+        ]);
+        $dmWebClient = new GuzzleWebClient($dmGuzzle);
+        $dmService   = new Service($dmBuilder, $dmWebClient);
+
+        // Build monthly chunks from period_from → period_to
+        // The SAT bulk download API works best with ≤1 month per request.
+        $dmDownloadTypeWs = strtolower($params['download_type'] ?? 'emitidos') === 'recibidos'
+            ? WsDownloadType::received()
+            : WsDownloadType::issued();
+
+        try {
+            $dmRangeStart = new DateTimeImmutable($params['period_from']);
+            $dmRangeEnd   = new DateTimeImmutable($params['period_to']);
+        } catch (Throwable $e) {
+            outputError('Invalid date format: ' . $e->getMessage());
+        }
+
+        // Build list of (start, end) pairs, one per calendar month in the range
+        $dmChunks = [];
+        $dmCursor = $dmRangeStart->setTime(0, 0, 0);
+        while ($dmCursor <= $dmRangeEnd) {
+            $dmMonthEnd = new DateTimeImmutable(
+                $dmCursor->format('Y-m-') . $dmCursor->format('t') . ' 23:59:59'
+            );
+            $dmChunkEnd = $dmMonthEnd < $dmRangeEnd ? $dmMonthEnd : $dmRangeEnd->setTime(23, 59, 59);
+            $dmChunks[] = [$dmCursor, $dmChunkEnd];
+            // Advance to the first day of the next month
+            $dmCursor = (new DateTimeImmutable($dmCursor->format('Y-m-01')))->modify('+1 month');
+        }
+
+        $dmTotalFiles    = 0;
+        $dmFiles         = [];
+        $dmTotalChunks   = count($dmChunks);
+
+        foreach ($dmChunks as $dmChunkIdx => [$dmChunkStart, $dmChunkEnd]) {
+            $dmMonthLabel = $dmChunkStart->format('Y-m');
+
+            echo json_encode([
+                '__progress__' => true,
+                'stage'        => 'month_start',
+                'month'        => $dmMonthLabel,
+                'chunk'        => $dmChunkIdx + 1,
+                'total_chunks' => $dmTotalChunks,
+            ], JSON_UNESCAPED_UNICODE) . "\n";
+            flush();
+
+            // ── Step 1: Query ──────────────────────────────────────────────
+            try {
+                $dmPeriod = DateTimePeriod::createFromValues($dmChunkStart, $dmChunkEnd);
+            } catch (Throwable $e) {
+                fwrite(STDERR, 'Invalid period for ' . $dmMonthLabel . ': ' . $e->getMessage() . "\n");
+                continue;
+            }
+
+            $dmQueryParams = QueryParameters::create(
+                period: $dmPeriod,
+                downloadType: $dmDownloadTypeWs,
+                requestType: RequestType::cfdi(),
+            );
+
+            $dmQueryResult = $dmService->query($dmQueryParams);
+            if (!$dmQueryResult->getStatus()->isAccepted()) {
+                fwrite(STDERR, 'SAT rejected query for ' . $dmMonthLabel . ': ' . $dmQueryResult->getStatus()->getMessage() . "\n");
+                continue;
+            }
+            $dmRequestId = $dmQueryResult->getRequestId();
+
+            echo json_encode([
+                '__progress__' => true,
+                'stage'        => 'queued',
+                'month'        => $dmMonthLabel,
+                'request_id'   => $dmRequestId,
+            ], JSON_UNESCAPED_UNICODE) . "\n";
+            flush();
+
+            // ── Step 2: Poll verify ────────────────────────────────────────
+            $dmPackageIds = [];
+            $dmMaxPolls   = 120; // up to 10 min per month (5 s × 120)
+            $dmSuccess    = false;
+            for ($dmPoll = 0; $dmPoll < $dmMaxPolls; $dmPoll++) {
+                sleep(5);
+
+                $dmVerifyResult = $dmService->verify($dmRequestId);
+                $dmStatusReq    = $dmVerifyResult->getStatusRequest();
+
+                echo json_encode([
+                    '__progress__' => true,
+                    'stage'        => 'verifying',
+                    'month'        => $dmMonthLabel,
+                    'request_id'   => $dmRequestId,
+                    'status'       => $dmStatusReq->getMessage(),
+                    'cfdis'        => $dmVerifyResult->getNumberCfdis(),
+                    'packages'     => $dmVerifyResult->countPackages(),
+                ], JSON_UNESCAPED_UNICODE) . "\n";
+                flush();
+
+                if ($dmStatusReq->isFinished()) {
+                    $dmPackageIds = $dmVerifyResult->getPackagesIds();
+                    $dmSuccess    = true;
+                    break;
+                }
+                if ($dmStatusReq->isFailure() || $dmStatusReq->isRejected() || $dmStatusReq->isExpired()) {
+                    fwrite(STDERR, 'Bulk request failed for ' . $dmMonthLabel . ': ' . $dmStatusReq->getMessage() . "\n");
+                    break;
+                }
+            }
+
+            if (!$dmSuccess) {
+                fwrite(STDERR, 'Timed out or failed for ' . $dmMonthLabel . " (request_id: $dmRequestId)\n");
+                continue;
+            }
+
+            // ── Step 3: Download packages ──────────────────────────────────
+            foreach ($dmPackageIds as $dmPkgIdx => $dmPkgId) {
+                echo json_encode([
+                    '__progress__' => true,
+                    'stage'        => 'downloading',
+                    'month'        => $dmMonthLabel,
+                    'request_id'   => $dmRequestId,
+                    'package'      => $dmPkgIdx + 1,
+                    'total_pkgs'   => count($dmPackageIds),
+                ], JSON_UNESCAPED_UNICODE) . "\n";
+                flush();
+
+                $dmDownloadResult = $dmService->download($dmPkgId);
+                if (!$dmDownloadResult->getStatus()->isAccepted()) {
+                    fwrite(STDERR, 'Package download failed (' . $dmPkgId . '): ' . $dmDownloadResult->getStatus()->getMessage() . "\n");
+                    continue;
+                }
+
+                $dmTmpZip = tempnam(sys_get_temp_dir(), 'sat_pkg_') . '.zip';
+                file_put_contents($dmTmpZip, $dmDownloadResult->getPackageContent());
+
+                try {
+                    $dmReader = CfdiPackageReader::createFromFile($dmTmpZip);
+                    foreach ($dmReader as $dmUuid => $dmXmlContent) {
+                        $dmFilePath = $dmOutputDir . '/' . strtolower($dmUuid) . '.xml';
+                        file_put_contents($dmFilePath, $dmXmlContent);
+                        $dmFiles[] = [
+                            'uuid'     => strtolower($dmUuid),
+                            'path'     => $dmFilePath,
+                            'filename' => basename($dmFilePath),
+                            'size'     => strlen($dmXmlContent),
+                        ];
+                        $dmTotalFiles++;
+                    }
+                } finally {
+                    @unlink($dmTmpZip);
+                }
+            }
+
+            echo json_encode([
+                '__progress__' => true,
+                'stage'        => 'month_done',
+                'month'        => $dmMonthLabel,
+                'month_total'  => $dmTotalFiles,
+            ], JSON_UNESCAPED_UNICODE) . "\n";
+            flush();
+        }
+
+        outputJson([
+            'command'     => 'descarga-masiva',
+            'request_id'  => $dmRequestId ?? null,
+            'total'       => $dmTotalFiles,
+            'files'       => $dmFiles,
+        ]);
+
     default:
-        outputError("Unknown command: '$command'. Use 'list' or 'download'");
+        outputError("Unknown command: '$command'. Use 'list', 'list-stream', 'download', or 'descarga-masiva'");
 }

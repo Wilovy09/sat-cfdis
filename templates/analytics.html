@@ -1,0 +1,465 @@
+{% extends "base.html" %}
+{% block title %}Analytics — Pulso SAT{% endblock %}
+{% block nav_analytics %}active{% endblock %}
+
+{% block content %}
+
+<!-- ══ Filter bar ═══════════════════════════════════════════════════════════ -->
+<div class="card an-filter-card">
+  <div class="an-filters">
+    <div class="form-group an-filter-rfc">
+      <label for="an-rfc">RFC</label>
+      <input type="text" id="an-rfc" placeholder="XAXX010101000"
+             maxlength="13" autocomplete="off" style="text-transform:uppercase" />
+    </div>
+    <div class="form-group">
+      <label for="an-from">Desde</label>
+      <input type="month" id="an-from" />
+    </div>
+    <div class="form-group">
+      <label for="an-to">Hasta</label>
+      <input type="month" id="an-to" />
+    </div>
+    <div class="form-group">
+      <label for="an-dltype">Tipo</label>
+      <div class="select-wrapper">
+        <select id="an-dltype">
+          <option value="emitidos">Emitidas</option>
+          <option value="recibidos">Recibidas</option>
+          <option value="ambos">Ambas</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group an-filter-btn">
+      <label>&nbsp;</label>
+      <button class="btn btn-primary" id="an-load-btn">
+        <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <span id="an-load-label">Cargar</span>
+        <span class="btn-spinner hidden" id="an-load-spinner"></span>
+      </button>
+    </div>
+  </div>
+  <div id="an-error" class="stream-error hidden" style="margin-top:.75rem"></div>
+</div>
+
+<!-- ══ Empty state ══════════════════════════════════════════════════════════ -->
+<div id="an-empty" class="an-empty">
+  <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="var(--text-subtle)" stroke-width="1.2">
+    <path d="M18 20V10M12 20V4M6 20v-6"/>
+  </svg>
+  <p>Ingresa un RFC y el período para ver el análisis financiero.</p>
+</div>
+
+<!-- ══ Dashboard ════════════════════════════════════════════════════════════ -->
+<div id="an-dashboard" class="hidden">
+
+  <!-- KPI bar -->
+  <div class="an-kpi-bar" id="an-kpis">
+    <div class="an-kpi" id="kpi-total">
+      <span class="an-kpi-label">Total MXN</span>
+      <span class="an-kpi-value" id="kv-total">—</span>
+    </div>
+    <div class="an-kpi" id="kpi-count">
+      <span class="an-kpi-label">Facturas</span>
+      <span class="an-kpi-value" id="kv-count">—</span>
+    </div>
+    <div class="an-kpi" id="kpi-avg">
+      <span class="an-kpi-label">Promedio mensual</span>
+      <span class="an-kpi-value" id="kv-avg">—</span>
+    </div>
+    <div class="an-kpi" id="kpi-ltm">
+      <span class="an-kpi-label">LTM</span>
+      <span class="an-kpi-value" id="kv-ltm">—</span>
+    </div>
+    <div class="an-kpi" id="kpi-yoy">
+      <span class="an-kpi-label">Crecimiento YoY</span>
+      <span class="an-kpi-value" id="kv-yoy">—</span>
+    </div>
+  </div>
+
+  <!-- Module tabs -->
+  <div class="tab-bar" id="an-tabs" style="margin: 1.5rem 0 0">
+    <button class="tab-btn active" data-tab="resumen">Resumen</button>
+    <button class="tab-btn" data-tab="contrapartes">Contrapartes</button>
+    <button class="tab-btn" data-tab="recurrencia">Recurrencia</button>
+    <button class="tab-btn" data-tab="retencion">Retención</button>
+    <button class="tab-btn" data-tab="geografia">Geografía</button>
+    <button class="tab-btn" data-tab="conceptos">Conceptos</button>
+    <button class="tab-btn" data-tab="fiscal">Fiscal</button>
+    <button class="tab-btn" data-tab="pagos">Pagos</button>
+    <button class="tab-btn" data-tab="cashflow">Flujo de Caja</button>
+    <button class="tab-btn" data-tab="nomina">Nómina</button>
+    <button class="tab-btn" data-tab="normalizacion">Normalización</button>
+  </div>
+
+  <!-- ── Resumen ── -->
+  <div class="an-tab-panel" id="tab-resumen">
+    <div class="an-grid-2">
+      <div class="card an-card">
+        <div class="card-header">Ingresos netos por mes</div>
+        <div class="card-body"><canvas id="chart-monthly"></canvas></div>
+      </div>
+      <div class="card an-card">
+        <div class="card-header">Comparativa anual</div>
+        <div class="card-body"><canvas id="chart-yearly"></canvas></div>
+      </div>
+    </div>
+    <div class="card an-card" style="margin-top:1rem">
+      <div class="card-header">Por tipo de comprobante</div>
+      <div class="card-body">
+        <table class="invoice-table" id="tbl-tipo">
+          <thead><tr><th>Tipo</th><th class="num">Total MXN</th><th class="num">Facturas</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Contrapartes ── -->
+  <div class="an-tab-panel hidden" id="tab-contrapartes">
+    <div class="an-kpi-bar" id="cp-kpis" style="margin-bottom:1rem">
+      <div class="an-kpi"><span class="an-kpi-label">Contrapartes únicas</span><span class="an-kpi-value" id="kv-cp-count">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">HHI Concentración</span><span class="an-kpi-value" id="kv-cp-hhi">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">Top 10 del total</span><span class="an-kpi-value" id="kv-cp-top10">—</span></div>
+    </div>
+    <div class="card an-card" style="margin-bottom:1rem">
+      <div class="card-header">Top 20 por monto</div>
+      <div class="card-body"><canvas id="chart-cp-top"></canvas></div>
+    </div>
+    <div class="card an-card">
+      <div class="card-header">Tabla de contrapartes</div>
+      <div class="card-body table-wrap">
+        <table class="invoice-table" id="tbl-cp">
+          <thead><tr><th>RFC</th><th>Nombre</th><th class="num">Total MXN</th><th class="num">Facturas</th><th class="num">Promedio</th><th class="num">Meses activo</th><th class="num">% del total</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Recurrencia ── -->
+  <div class="an-tab-panel hidden" id="tab-recurrencia">
+    <div class="an-kpi-bar" style="margin-bottom:1rem">
+      <div class="an-kpi"><span class="an-kpi-label">% Recurrentes (≥3m)</span><span class="an-kpi-value" id="kv-rec-pct">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">% Únicos (1 vez)</span><span class="an-kpi-value" id="kv-rec-one">—</span></div>
+    </div>
+    <div class="an-grid-2">
+      <div class="card an-card">
+        <div class="card-header">Distribución por frecuencia</div>
+        <div class="card-body"><canvas id="chart-rec-freq"></canvas></div>
+      </div>
+      <div class="card an-card">
+        <div class="card-header">Top contrapartes recurrentes</div>
+        <div class="card-body table-wrap">
+          <table class="invoice-table" id="tbl-rec">
+            <thead><tr><th>RFC</th><th>Nombre</th><th class="num">Meses</th><th class="num">Total MXN</th><th class="num">Consistencia</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Retención ── -->
+  <div class="an-tab-panel hidden" id="tab-retencion">
+    <div class="an-kpi-bar" style="margin-bottom:1rem">
+      <div class="an-kpi"><span class="an-kpi-label">Retención global</span><span class="an-kpi-value" id="kv-ret-pct">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">Vida promedio</span><span class="an-kpi-value" id="kv-ret-life">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">Churned (últ. 3m)</span><span class="an-kpi-value" id="kv-ret-churn">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">Nuevos (últ. 3m)</span><span class="an-kpi-value" id="kv-ret-new">—</span></div>
+    </div>
+    <div class="card an-card">
+      <div class="card-header">Tabla de cohortes</div>
+      <div class="card-body">
+        <div id="cohort-table-wrap" class="cohort-wrap"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Geografía ── -->
+  <div class="an-tab-panel hidden" id="tab-geografia">
+    <div class="an-grid-2">
+      <div class="card an-card">
+        <div class="card-header">Por estado</div>
+        <div class="card-body"><canvas id="chart-geo-state"></canvas></div>
+      </div>
+      <div class="card an-card">
+        <div class="card-header">Desglose por estado</div>
+        <div class="card-body table-wrap">
+          <table class="invoice-table" id="tbl-geo">
+            <thead><tr><th>Estado</th><th class="num">Total MXN</th><th class="num">Facturas</th><th class="num">%</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Conceptos ── -->
+  <div class="an-tab-panel hidden" id="tab-conceptos">
+    <div class="card an-card" style="margin-bottom:1rem">
+      <div class="card-header">Top productos / servicios por monto</div>
+      <div class="card-body"><canvas id="chart-concepts"></canvas></div>
+    </div>
+    <div class="card an-card">
+      <div class="card-header">Por clave SAT</div>
+      <div class="card-body table-wrap">
+        <table class="invoice-table" id="tbl-concepts">
+          <thead><tr><th>Clave</th><th>Descripción más frecuente</th><th class="num">Total</th><th class="num">Facturas</th><th class="num">%</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Fiscal ── -->
+  <div class="an-tab-panel hidden" id="tab-fiscal">
+    <div class="an-kpi-bar" style="margin-bottom:1rem">
+      <div class="an-kpi"><span class="an-kpi-label">IVA traslado</span><span class="an-kpi-value" id="kv-iva-tras">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">IVA retenido</span><span class="an-kpi-value" id="kv-iva-ret">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">IVA neto</span><span class="an-kpi-value" id="kv-iva-neto">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">ISR retenido</span><span class="an-kpi-value" id="kv-isr">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">Tasa IVA efectiva</span><span class="an-kpi-value" id="kv-tax-rate">—</span></div>
+    </div>
+    <div class="an-grid-2">
+      <div class="card an-card">
+        <div class="card-header">Desglose fiscal por mes</div>
+        <div class="card-body"><canvas id="chart-fiscal-month"></canvas></div>
+      </div>
+      <div class="card an-card">
+        <div class="card-header">Por moneda</div>
+        <div class="card-body table-wrap">
+          <table class="invoice-table" id="tbl-currency">
+            <thead><tr><th>Moneda</th><th class="num">Facturas</th><th class="num">Original</th><th class="num">MXN</th><th class="num">TC prom.</th><th class="num">%</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="card an-card" style="margin-top:1rem">
+      <div class="card-header">Resumen fiscal</div>
+      <div class="card-body">
+        <div id="fiscal-summary-wrap"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Pagos ── -->
+  <div class="an-tab-panel hidden" id="tab-pagos">
+    <div class="an-kpi-bar" style="margin-bottom:1rem">
+      <div class="an-kpi"><span class="an-kpi-label">Facturado</span><span class="an-kpi-value" id="kv-pag-inv">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">Cobrado</span><span class="an-kpi-value" id="kv-pag-paid">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">Pendiente</span><span class="an-kpi-value" id="kv-pag-out">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">Tasa de cobranza</span><span class="an-kpi-value" id="kv-pag-rate">—</span></div>
+    </div>
+    <div class="an-grid-2">
+      <div class="card an-card">
+        <div class="card-header">Por forma de pago</div>
+        <div class="card-body"><canvas id="chart-forma-pago"></canvas></div>
+      </div>
+      <div class="card an-card">
+        <div class="card-header">PUE vs PPD</div>
+        <div class="card-body"><canvas id="chart-metodo-pago"></canvas></div>
+      </div>
+    </div>
+    <div class="card an-card" style="margin-top:1rem">
+      <div class="card-header">Facturas PPD pendientes de cobro</div>
+      <div class="card-body table-wrap">
+        <table class="invoice-table" id="tbl-outstanding">
+          <thead><tr><th>UUID</th><th>Contraparte</th><th>Fecha</th><th class="num">Total</th><th class="num">Cobrado</th><th class="num">Pendiente</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Cashflow ── -->
+  <div class="an-tab-panel hidden" id="tab-cashflow">
+    <div class="an-kpi-bar" style="margin-bottom:1rem">
+      <div class="an-kpi"><span class="an-kpi-label">Posición acumulada</span><span class="an-kpi-value" id="kv-cf-pos">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">PUE (inmediato)</span><span class="an-kpi-value" id="kv-cf-pue">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">PPD facturado</span><span class="an-kpi-value" id="kv-cf-ppd">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">PPD pendiente</span><span class="an-kpi-value" id="kv-cf-ppd-out">—</span></div>
+    </div>
+    <div class="card an-card" style="margin-bottom:1rem">
+      <div class="card-header">Posición de caja acumulada</div>
+      <div class="card-body"><canvas id="chart-cf-cumulative"></canvas></div>
+    </div>
+    <div class="an-grid-2">
+      <div class="card an-card">
+        <div class="card-header">Ingresos vs egresos por mes</div>
+        <div class="card-body"><canvas id="chart-cf-monthly"></canvas></div>
+      </div>
+      <div class="card an-card">
+        <div class="card-header">Por forma de pago (complementos)</div>
+        <div class="card-body"><canvas id="chart-cf-forma"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Nómina ── -->
+  <div class="an-tab-panel hidden" id="tab-nomina">
+    <div class="an-kpi-bar" style="margin-bottom:1rem">
+      <div class="an-kpi"><span class="an-kpi-label">Total pagado</span><span class="an-kpi-value" id="kv-nom-total">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">Empleados únicos</span><span class="an-kpi-value" id="kv-nom-emp">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">Promedio por empleado</span><span class="an-kpi-value" id="kv-nom-avg">—</span></div>
+      <div class="an-kpi"><span class="an-kpi-label">SDI promedio</span><span class="an-kpi-value" id="kv-nom-sdi">—</span></div>
+    </div>
+    <div class="an-grid-2">
+      <div class="card an-card">
+        <div class="card-header">Headcount por mes</div>
+        <div class="card-body"><canvas id="chart-nom-hc"></canvas></div>
+      </div>
+      <div class="card an-card">
+        <div class="card-header">Gasto mensual de nómina</div>
+        <div class="card-body"><canvas id="chart-nom-monthly"></canvas></div>
+      </div>
+    </div>
+    <div class="an-grid-2" style="margin-top:1rem">
+      <div class="card an-card">
+        <div class="card-header">Por tipo de percepción</div>
+        <div class="card-body table-wrap">
+          <table class="invoice-table" id="tbl-nom-perc">
+            <thead><tr><th>Tipo</th><th>Concepto</th><th class="num">Gravado</th><th class="num">Exento</th><th class="num">Total</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card an-card">
+        <div class="card-header">Por tipo de deducción</div>
+        <div class="card-body table-wrap">
+          <table class="invoice-table" id="tbl-nom-ded">
+            <thead><tr><th>Tipo</th><th>Concepto</th><th class="num">Total</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="card an-card" style="margin-top:1rem">
+      <div class="card-header">Empleados</div>
+      <div class="card-body table-wrap">
+        <table class="invoice-table" id="tbl-empleados">
+          <thead><tr><th>RFC</th><th>Nombre</th><th>Depto.</th><th>Puesto</th><th class="num">Total MXN</th><th class="num">SDI prom.</th><th class="num">Meses</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Normalización ── -->
+  <div class="an-tab-panel hidden" id="tab-normalizacion">
+    <div class="an-grid-2">
+      <!-- Counterparty rules -->
+      <div class="card an-card">
+        <div class="card-header">
+          Reglas de contrapartes
+          <button class="btn btn-ghost btn-sm" id="norm-refresh-btn" style="margin-left:auto">
+            <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 4v6h6M23 20v-6h-6"/><path d="M20.49 9A9 9 0 105.64 5.64L1 10M23 14l-4.64 4.36A9 9 0 013.51 15"/></svg>
+            Refrescar
+          </button>
+        </div>
+        <div class="card-body">
+          <form id="norm-form" class="an-norm-form">
+            <div class="form-row">
+              <div class="form-group">
+                <label>RFC contraparte</label>
+                <input type="text" id="norm-src-rfc" placeholder="RFC (opcional)" />
+              </div>
+              <div class="form-group">
+                <label>Nombre contraparte</label>
+                <input type="text" id="norm-src-name" placeholder="Nombre (opcional)" />
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Tipo</label>
+                <div class="select-wrapper">
+                  <select id="norm-dl-type">
+                    <option value="emitidos">Emitidos</option>
+                    <option value="recibidos">Recibidos</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Acción</label>
+                <div class="select-wrapper">
+                  <select id="norm-action">
+                    <option value="group">Agrupar</option>
+                    <option value="exclude">Excluir</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-group" id="norm-group-name-wrap">
+                <label>Nombre del grupo</label>
+                <input type="text" id="norm-group-name" placeholder="Nombre agrupado" />
+              </div>
+            </div>
+            <button type="submit" class="btn btn-primary btn-sm">Agregar regla</button>
+          </form>
+          <div id="norm-rules-list" class="an-rules-list" style="margin-top:1rem"></div>
+        </div>
+      </div>
+
+      <!-- Payroll rules -->
+      <div class="card an-card">
+        <div class="card-header">Reglas de nómina</div>
+        <div class="card-body">
+          <form id="payroll-norm-form" class="an-norm-form">
+            <div class="form-row">
+              <div class="form-group">
+                <label>RFC empleado</label>
+                <input type="text" id="pnorm-emp-rfc" placeholder="RFC (opcional)" />
+              </div>
+              <div class="form-group">
+                <label>Nombre empleado</label>
+                <input type="text" id="pnorm-emp-name" placeholder="Nombre (opcional)" />
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Familia</label>
+                <div class="select-wrapper">
+                  <select id="pnorm-family">
+                    <option value="exclude_employee">Excluir empleado</option>
+                    <option value="scale_employee_pct">Escalar %</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-group" id="pnorm-pct-wrap" style="display:none">
+                <label>% ajuste</label>
+                <input type="number" id="pnorm-pct" placeholder="Ej: 80" min="0" max="200" />
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Desde (YYYY-MM)</label>
+                <input type="month" id="pnorm-from" />
+              </div>
+              <div class="form-group">
+                <label>Hasta (YYYY-MM)</label>
+                <input type="month" id="pnorm-to" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Notas</label>
+              <input type="text" id="pnorm-notes" placeholder="Comentario opcional" />
+            </div>
+            <button type="submit" class="btn btn-primary btn-sm">Agregar regla</button>
+          </form>
+          <div id="payroll-norm-rules-list" class="an-rules-list" style="margin-top:1rem"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /an-dashboard -->
+
+{% endblock %}
+
+{% block scripts %}
+<!-- Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="/static/analytics.js?v=2"></script>
+{% endblock %}

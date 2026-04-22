@@ -59,7 +59,20 @@ fn render_error(tmpl: &Tera, message: &str) -> Result<HttpResponse, AppError> {
 // GET /
 // ---------------------------------------------------------------------------
 
-pub async fn index(tmpl: web::Data<Tera>, cfg: web::Data<Config>) -> Result<HttpResponse, AppError> {
+pub async fn analytics_page(tmpl: web::Data<Tera>) -> Result<HttpResponse, AppError> {
+    let ctx = tera::Context::new();
+    let html = tmpl
+        .render("analytics.html", &ctx)
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(html))
+}
+
+pub async fn index(
+    tmpl: web::Data<Tera>,
+    cfg: web::Data<Config>,
+) -> Result<HttpResponse, AppError> {
     let mut ctx = tera::Context::new();
     ctx.insert("captcha_enabled", &cfg.captcha_enabled);
     let html = tmpl

@@ -23,3 +23,26 @@ futures-util = "0.3"
 async-stream = "0.3"
 uuid = { version = "1", features = ["v4"] }
 dotenvy = "0.15"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+sqlx = { version = "0.8", features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "uuid",
+    "time",
+    "migrate",
+] }
+aes-gcm = "0.10"
+rand = "0.8"
+hex = "0.4"
+quick-xml = { version = "0.37", features = ["async-tokio"] }
+actix-cors = "0.7"
+reqwest = { version = "0.12", features = [
+    "json",
+    "rustls-tls",
+    "charset",
+    "http2",
+    "system-proxy",
+], default-features = false }
+utoipa = { version = "5" }
+utoipa-scalar = { version = "0.3", features = ["actix-web"] }
