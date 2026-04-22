@@ -81,6 +81,9 @@ pub async fn insert_taxes(
     taxes: &[ParsedTax],
 ) -> Result<(), sqlx::Error> {
     for t in taxes {
+        if t.tasa.is_none() {
+            continue;
+        }
         sqlx::query(
             r#"
             INSERT INTO pulso.cfdi_taxes
