@@ -223,9 +223,10 @@ pub async fn upsert_invoice(
     uuid: &str,
     metadata: &str,
 ) -> Result<(), sqlx::Error> {
+    let uuid_upper = uuid.to_uppercase();
     sqlx::query(r#"INSERT INTO pulso.job_invoices (job_id, uuid, metadata) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"#)
         .bind(job_id)
-        .bind(uuid)
+        .bind(&uuid_upper)
         .bind(metadata)
         .execute(pool)
         .await?;
@@ -279,6 +280,38 @@ pub async fn set_running(pool: &PgPool, job_id: &str) -> Result<(), sqlx::Error>
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Insert a new job with status 'queued' (will be picked up by the background worker).
+pub async fn insert_queued(
+    pool: &PgPool,
+    rfc: &str,
+    auth_type: &str,
+    auth_enc: &str,
+    dl_type: &str,
+    period_from: &str,
+    period_to: &str,
+) -> Result<String, sqlx::Error> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_utc();
+    sqlx::query(
+        r#"INSERT INTO pulso.sync_jobs
+           (id, job_type, rfc, auth_type, auth_enc, dl_type,
+            period_from, period_to, found, status, created_at, updated_at)
+           VALUES ($1, 'list', $2, $3, $4, $5, $6, $7, 0, 'queued', $8, $9)"#,
+    )
+    .bind(&id)
+    .bind(rfc)
+    .bind(auth_type)
+    .bind(auth_enc)
+    .bind(dl_type)
+    .bind(period_from)
+    .bind(period_to)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(id)
 }
 
 /// Paginated invoice results for a job.

@@ -306,7 +306,7 @@ pub async fn find_pending_etl(
         r#"
         SELECT ji.uuid, ji.metadata
         FROM pulso.job_invoices ji
-        LEFT JOIN pulso.cfdis c ON c.uuid = ji.uuid
+        LEFT JOIN pulso.cfdis c ON UPPER(c.uuid) = UPPER(ji.uuid)
         WHERE ji.job_id = $1 AND c.uuid IS NULL
         "#,
     )
@@ -330,7 +330,7 @@ pub async fn jobs_needing_etl(pool: &PgPool) -> Result<Vec<String>, sqlx::Error>
         r#"
         SELECT DISTINCT ji.job_id
         FROM pulso.job_invoices ji
-        LEFT JOIN pulso.cfdis c ON c.uuid = ji.uuid
+        LEFT JOIN pulso.cfdis c ON UPPER(c.uuid) = UPPER(ji.uuid)
         WHERE c.uuid IS NULL
         "#,
     )

@@ -90,9 +90,11 @@ async fn process_invoice(
         return;
     };
 
-    // Ensure UUID matches (in case metadata had different casing)
+    // Always normalize UUID to uppercase to match job_invoices
     if cfdi.uuid.is_empty() {
         cfdi.uuid = uuid.to_uppercase();
+    } else {
+        cfdi.uuid = cfdi.uuid.to_uppercase();
     }
 
     // Insert header

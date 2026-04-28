@@ -250,7 +250,7 @@ pub fn parse(
                     }
                     ("TimbreFiscalDigital", Ctx::Complemento) => {
                         if let Some(uuid) = attr(e, b"UUID") {
-                            cfdi.uuid = uuid;
+                            cfdi.uuid = uuid.to_uppercase();
                         }
                     }
                     // Payment complement (pago10 or pago20 namespace)
