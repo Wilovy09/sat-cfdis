@@ -53,12 +53,14 @@ impl AnalyticsParams {
     ),
     responses((status = 200, description = "Resumen financiero"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_summary(
     path: web::Path<String>,
     query: web::Query<AnalyticsParams>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let p = summary::SummaryParams {
         dl_type: query.dl_type(),
         from: query.from(),
@@ -87,12 +89,14 @@ pub async fn get_summary(
     ),
     responses((status = 200, description = "Top contrapartes"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_counterparties(
     path: web::Path<String>,
     query: web::Query<AnalyticsParams>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let result = counterparties::get(
         &pool,
         &rfc,
@@ -122,12 +126,14 @@ pub async fn get_counterparties(
     ),
     responses((status = 200, description = "Análisis de recurrencia"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_recurrence(
     path: web::Path<String>,
     query: web::Query<AnalyticsParams>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let result = recurrence::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -150,12 +156,14 @@ pub async fn get_recurrence(
     ),
     responses((status = 200, description = "Análisis de retención de clientes"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_retention(
     path: web::Path<String>,
     query: web::Query<AnalyticsParams>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let result = retention::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -178,12 +186,14 @@ pub async fn get_retention(
     ),
     responses((status = 200, description = "Distribución geográfica"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_geography(
     path: web::Path<String>,
     query: web::Query<AnalyticsParams>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let result = geography::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -206,12 +216,14 @@ pub async fn get_geography(
     ),
     responses((status = 200, description = "Conceptos más frecuentes"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_concepts(
     path: web::Path<String>,
     query: web::Query<AnalyticsParams>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let result = concepts::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -234,12 +246,14 @@ pub async fn get_concepts(
     ),
     responses((status = 200, description = "Análisis fiscal"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_fiscal(
     path: web::Path<String>,
     query: web::Query<AnalyticsParams>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let result = fiscal::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -262,12 +276,14 @@ pub async fn get_fiscal(
     ),
     responses((status = 200, description = "Análisis de pagos"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_payments(
     path: web::Path<String>,
     query: web::Query<AnalyticsParams>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let result = payments::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -290,12 +306,14 @@ pub async fn get_payments(
     ),
     responses((status = 200, description = "Flujo de caja"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_cashflow(
     path: web::Path<String>,
     query: web::Query<AnalyticsParams>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let result = cashflow::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -317,12 +335,14 @@ pub async fn get_cashflow(
     ),
     responses((status = 200, description = "Análisis de nómina"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_payroll(
     path: web::Path<String>,
     query: web::Query<AnalyticsParams>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let result = payroll::get(&pool, &rfc, &query.from(), &query.to())
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -346,11 +366,13 @@ pub async fn get_payroll(
     params(("rfc" = String, Path, description = "RFC del contribuyente")),
     responses((status = 200, description = "Reglas de normalización"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn list_normalization(
     path: web::Path<String>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let rules = normalization::list_rules(&pool, &rfc)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -368,12 +390,14 @@ pub async fn list_normalization(
         (status = 400, description = "Datos inválidos"),
     )
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn create_normalization(
     path: web::Path<String>,
     pool: web::Data<DbPool>,
     body: web::Json<normalization::CreateRuleRequest>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let rule = normalization::create_rule(&pool, &rfc, &body)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -393,11 +417,14 @@ pub async fn create_normalization(
         (status = 404, description = "Regla no encontrada"),
     )
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty, rule_id = tracing::field::Empty))]
 pub async fn delete_normalization(
     path: web::Path<(String, String)>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let (rfc, id) = path.into_inner();
+    tracing::Span::current().record("rfc", &rfc.to_uppercase().as_str());
+    tracing::Span::current().record("rule_id", &id.as_str());
     let deleted = normalization::delete_rule(&pool, &id, &rfc.to_uppercase())
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -415,11 +442,13 @@ pub async fn delete_normalization(
     params(("rfc" = String, Path, description = "RFC del contribuyente")),
     responses((status = 200, description = "Reglas de nómina"))
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn list_payroll_normalization(
     path: web::Path<String>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let rules = normalization::list_payroll_rules(&pool, &rfc)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -437,12 +466,14 @@ pub async fn list_payroll_normalization(
         (status = 400, description = "Datos inválidos"),
     )
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn create_payroll_normalization(
     path: web::Path<String>,
     pool: web::Data<DbPool>,
     body: web::Json<normalization::CreatePayrollRuleRequest>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
     let rule = normalization::create_payroll_rule(&pool, &rfc, &body)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -462,11 +493,14 @@ pub async fn create_payroll_normalization(
         (status = 404, description = "Regla no encontrada"),
     )
 )]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty, rule_id = tracing::field::Empty))]
 pub async fn delete_payroll_normalization(
     path: web::Path<(String, String)>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let (rfc, id) = path.into_inner();
+    tracing::Span::current().record("rfc", &rfc.to_uppercase().as_str());
+    tracing::Span::current().record("rule_id", &id.as_str());
     let deleted = normalization::delete_payroll_rule(&pool, &id, &rfc.to_uppercase())
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;

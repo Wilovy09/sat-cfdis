@@ -117,6 +117,7 @@ pub struct XmlContentRequest {
         (status = 400, description = "Parámetros inválidos"),
     )
 )]
+#[tracing::instrument(skip_all, fields(uuid = tracing::field::Empty))]
 pub async fn xml_content(
     cfg: web::Data<Config>,
     s3_client: web::Data<aws_sdk_s3::Client>,
@@ -124,6 +125,7 @@ pub async fn xml_content(
 ) -> Result<HttpResponse, AppError> {
     let body = body.into_inner();
     let uuid = body.uuid.to_lowercase();
+    tracing::Span::current().record("uuid", &uuid.as_str());
 
     // Parse year/month/day from fecha "YYYY-MM-DD"
     let (year, month, day) = parse_fecha_ymd(&body.fecha);
@@ -402,6 +404,7 @@ pub async fn health() -> HttpResponse {
         (status = 400, description = "Credenciales inválidas"),
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn list_invoices(
     cfg: web::Data<Config>,
     body: web::Json<ListRequest>,
@@ -457,6 +460,7 @@ pub async fn list_invoices(
         (status = 400, description = "Credenciales o UUIDs inválidos"),
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn download_invoices(
     cfg: web::Data<Config>,
     body: web::Json<DownloadRequest>,
@@ -1234,6 +1238,7 @@ pub struct SolveCaptchaBody {
     pub answer: String,
 }
 
+#[tracing::instrument(skip_all, fields(session_id = %body.session_id))]
 pub async fn solve_captcha(
     captcha_map: web::Data<CaptchaMap>,
     body: web::Json<SolveCaptchaBody>,

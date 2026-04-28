@@ -25,10 +25,12 @@ pub type DbPool = crate::db::DbPool;
         (status = 200, description = "Lista de jobs"),
     )
 )]
+#[tracing::instrument(skip_all)]
 pub async fn list_jobs(pool: web::Data<DbPool>) -> Result<HttpResponse, AppError> {
     let jobs = jobs::list_all(pool.get_ref())
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
+    tracing::debug!(count = jobs.len(), "list_jobs");
     Ok(HttpResponse::Ok().json(json!({ "jobs": jobs })))
 }
 
@@ -46,6 +48,7 @@ pub async fn list_jobs(pool: web::Data<DbPool>) -> Result<HttpResponse, AppError
         (status = 404, description = "Job no encontrado"),
     )
 )]
+#[tracing::instrument(skip(pool), fields(id = %path))]
 pub async fn get_job(
     pool: web::Data<DbPool>,
     path: web::Path<String>,
@@ -90,6 +93,7 @@ fn default_limit() -> i64 {
         (status = 404, description = "Job no encontrado"),
     )
 )]
+#[tracing::instrument(skip(pool, query), fields(id = %path))]
 pub async fn get_job_results(
     pool: web::Data<DbPool>,
     path: web::Path<String>,
@@ -142,6 +146,7 @@ pub async fn get_job_results(
         (status = 404, description = "Job no encontrado"),
     )
 )]
+#[tracing::instrument(skip(pool), fields(id = %path))]
 pub async fn cancel_job(
     pool: web::Data<DbPool>,
     path: web::Path<String>,
@@ -174,5 +179,6 @@ pub async fn cancel_job(
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
 
+    tracing::info!(id = %id, "Job cancelled");
     Ok(HttpResponse::Ok().json(json!({ "cancelled": id })))
 }
