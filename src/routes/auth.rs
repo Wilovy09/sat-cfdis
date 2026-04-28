@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::config::Config;
+use crate::db::DbPool;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RegisterDto {
@@ -25,6 +26,34 @@ struct ErrorBody {
     error: String,
 }
 
+/// Decode JWT payload and return the `sub` claim without signature verification.
+fn jwt_sub(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    json.get("id").or_else(|| json.get("sub"))?.as_str().map(|s| s.to_string())
+}
+
+/// After a successful Adquiere auth response, enrich the JSON body with
+/// `pulso_complete_profile` queried from our local DB.
+async fn enrich_with_profile(
+    pool: &DbPool,
+    mut body: serde_json::Value,
+) -> serde_json::Value {
+    if let Some(token) = body.get("access_token").and_then(|t| t.as_str()) {
+        if let Some(user_id) = jwt_sub(token) {
+            let complete = crate::db::users::get_profile_complete(pool, &user_id)
+                .await
+                .unwrap_or(false);
+            body["pulso_complete_profile"] = serde_json::Value::Bool(complete);
+        }
+    }
+    body
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/auth/register",
@@ -36,7 +65,13 @@ struct ErrorBody {
         (status = 502, description = "Error al conectar con Adquiere API"),
     )
 )]
-pub async fn register(cfg: web::Data<Config>, body: web::Json<RegisterDto>) -> HttpResponse {
+#[tracing::instrument(skip_all, fields(email = %body.email))]
+pub async fn register(
+    cfg: web::Data<Config>,
+    pool: web::Data<DbPool>,
+    body: web::Json<RegisterDto>,
+) -> HttpResponse {
+    tracing::info!("Register attempt");
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
         Err(e) => {
@@ -75,7 +110,16 @@ pub async fn register(cfg: web::Data<Config>, body: web::Json<RegisterDto>) -> H
         .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
 
     match resp.json::<serde_json::Value>().await {
-        Ok(json) => HttpResponse::build(status).json(json),
+        Ok(json) => {
+            if status.is_success() {
+                tracing::info!(status = %status.as_u16(), "Register successful");
+                let enriched = enrich_with_profile(&pool, json).await;
+                HttpResponse::build(status).json(enriched)
+            } else {
+                tracing::warn!(status = %status.as_u16(), "Register rejected by upstream");
+                HttpResponse::build(status).json(json)
+            }
+        }
         Err(_) => HttpResponse::build(status).finish(),
     }
 }
@@ -91,7 +135,13 @@ pub async fn register(cfg: web::Data<Config>, body: web::Json<RegisterDto>) -> H
         (status = 502, description = "Error al conectar con Adquiere API"),
     )
 )]
-pub async fn login(cfg: web::Data<Config>, body: web::Json<LoginDto>) -> HttpResponse {
+#[tracing::instrument(skip_all, fields(email = %body.email))]
+pub async fn login(
+    cfg: web::Data<Config>,
+    pool: web::Data<DbPool>,
+    body: web::Json<LoginDto>,
+) -> HttpResponse {
+    tracing::info!("Login attempt");
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
         Err(e) => {
@@ -121,7 +171,16 @@ pub async fn login(cfg: web::Data<Config>, body: web::Json<LoginDto>) -> HttpRes
         .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
 
     match resp.json::<serde_json::Value>().await {
-        Ok(json) => HttpResponse::build(status).json(json),
+        Ok(json) => {
+            if status.is_success() {
+                tracing::info!(status = %status.as_u16(), "Login successful");
+                let enriched = enrich_with_profile(&pool, json).await;
+                HttpResponse::build(status).json(enriched)
+            } else {
+                tracing::warn!(status = %status.as_u16(), "Login rejected by upstream");
+                HttpResponse::build(status).json(json)
+            }
+        }
         Err(_) => HttpResponse::build(status).finish(),
     }
 }
