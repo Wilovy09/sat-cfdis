@@ -9,7 +9,8 @@ mod state;
 
 use actix_cors::Cors;
 use actix_files::Files;
-use actix_web::{App, HttpServer, http, middleware, web};
+use actix_web::{App, HttpServer, web};
+use tracing_actix_web::TracingLogger;
 use aws_sdk_s3::Client as S3Client;
 use std::sync::Arc;
 use tera::Tera;
@@ -22,7 +23,7 @@ use config::Config;
 use db::DbPool;
 use routes::{
     analytics as analytics_routes, auth as auth_routes, invoices, queue as queue_routes,
-    web as web_routes,
+    users as users_routes, web as web_routes,
 };
 use services::etl;
 use state::CaptchaMap;
@@ -38,16 +39,27 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(WORKER_POLL_SECS)).await;
 
+        // Collect both queued (new) and paused_limit (SAT limit hit) jobs
+        let queued = match db::jobs::find_queued(&pool).await {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                tracing::error!("Worker: DB error finding queued jobs: {e}");
+                vec![]
+            }
+        };
+
         let resumable = match db::jobs::find_resumable(&pool).await {
             Ok(jobs) => jobs,
             Err(e) => {
                 tracing::error!("Worker: DB error finding resumable jobs: {e}");
-                continue;
+                vec![]
             }
         };
 
-        for job in resumable {
-            tracing::info!(job_id = %job.id, rfc = %job.rfc, "Resuming paused job");
+        for job in queued.into_iter().chain(resumable) {
+            let label = if job.status == "queued" { "Starting queued job" } else { "Resuming paused job" };
+            tracing::info!(job_id = %job.id, rfc = %job.rfc, "{label}");
+
             if let Err(e) = db::jobs::set_running(&pool, &job.id).await {
                 tracing::error!(job_id = %job.id, "Worker: could not set running: {e}");
                 continue;
@@ -72,14 +84,13 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                 }
             };
 
-            // Determine start date: day after cursor_date, or period_from
+            // Queued jobs start from period_from; paused jobs resume from day after cursor
             let resume_from = match &job.cursor_date {
                 Some(d) => next_day(d),
                 None => job.period_from.clone(),
             };
 
             if resume_from > job.period_to {
-                // Already done
                 let _ = db::jobs::complete(
                     &pool,
                     &job.id,
@@ -220,6 +231,20 @@ async fn run_worker_chunk(
         let _ = stdin.write_all(&input_bytes).await;
     }
 
+    // Drain stderr so it never blocks and errors are visible in traces
+    if let Some(stderr) = child.stderr.take() {
+        let job_id_err = job_id.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt as _;
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !line.is_empty() {
+                    tracing::error!(job_id = %job_id_err, php_stderr = %line, "PHP worker stderr");
+                }
+            }
+        });
+    }
+
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
@@ -250,7 +275,7 @@ async fn run_worker_chunk(
             continue;
         }
 
-        // Auto-downloaded XML — save to storage directly from the worker
+        // Auto-downloaded XML — save to storage and count as found invoice
         if data
             .get("__xml_ready__")
             .and_then(|v| v.as_bool())
@@ -260,7 +285,9 @@ async fn run_worker_chunk(
             let xml_b64 = data["xml_b64"].as_str().unwrap_or("").to_string();
             let s3_ref = s3.clone();
             let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+            let uuid_for_upload = uuid_str.clone();
             tokio::spawn(async move {
+                let uuid_str = uuid_for_upload;
                 use base64::Engine as _;
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&xml_b64) {
                     let should_upload = cfg!(debug_assertions) || !bucket.is_empty();
@@ -274,6 +301,26 @@ async fn run_worker_chunk(
                     }
                 }
             });
+
+            // Count this CFDI and persist metadata (strip xml_b64 to keep DB lean)
+            if !uuid_str.is_empty() {
+                let mut meta = data.clone();
+                if let Some(obj) = meta.as_object_mut() {
+                    obj.remove("xml_b64");
+                    obj.remove("__xml_ready__");
+                }
+                let meta_str = serde_json::to_string(&meta).unwrap_or_default();
+                let _ = db::jobs::upsert_invoice(&pool, &job_id, &uuid_str, &meta_str).await;
+                found += 1;
+
+                if let Some(fecha) = data["fecha"].as_str().or(data["Fecha"].as_str()) {
+                    let day = &fecha[..10.min(fecha.len())];
+                    cursor = format!("{day} 00:00:00");
+                }
+                if found % 50 == 0 {
+                    let _ = db::jobs::update_found(&pool, &job_id, found, &cursor).await;
+                }
+            }
             continue;
         }
 
@@ -314,7 +361,15 @@ async fn run_worker_chunk(
         }
     }
 
-    let _ = child.wait().await;
+    match child.wait().await {
+        Ok(status) if !status.success() => {
+            tracing::error!(job_id = %job_id, exit_code = ?status.code(), "PHP worker exited with error");
+        }
+        Err(e) => {
+            tracing::error!(job_id = %job_id, "PHP worker wait failed: {e}");
+        }
+        _ => {}
+    }
 
     if limit_hit {
         let resume_at = db::jobs::utc_offset(24 * 3600 + 1800); // +24.5 h
@@ -406,11 +461,7 @@ async fn main() -> std::io::Result<()> {
         let cors = Cors::default()
             .allow_any_origin()
             .allowed_methods(vec!["GET", "POST", "DELETE", "OPTIONS"])
-            .allowed_headers(vec![
-                http::header::CONTENT_TYPE,
-                http::header::AUTHORIZATION,
-                http::header::ACCEPT,
-            ])
+            .allow_any_header()
             .max_age(3600);
 
         App::new()
@@ -421,7 +472,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(pool_data.clone())
             .app_data(web::JsonConfig::default().limit(10 * 1024 * 1024))
             .wrap(cors)
-            .wrap(middleware::Logger::default())
+            .wrap(TracingLogger::default())
             // Docs
             .service(
                 Scalar::with_url("/docs", api_docs::ApiDoc::openapi())
@@ -437,6 +488,19 @@ async fn main() -> std::io::Result<()> {
                 web::post().to(auth_routes::register),
             )
             .route("/api/v1/auth/login", web::post().to(auth_routes::login))
+            // Users
+            .route(
+                "/api/v1/users/complete-profile",
+                web::post().to(users_routes::complete_profile),
+            )
+            .route(
+                "/api/v1/users/trigger-sync",
+                web::post().to(users_routes::trigger_sync),
+            )
+            .route(
+                "/api/v1/users/sync-status",
+                web::get().to(users_routes::sync_status),
+            )
             // Web UI
             .route("/", web::get().to(web_routes::index))
             .route("/analytics", web::get().to(web_routes::analytics_page))
