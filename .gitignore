@@ -2,3 +2,5 @@
 *.env
 /invoices**.DS_Store
 /invoices
+.pulso_queue_key
+*.py
