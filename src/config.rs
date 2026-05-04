@@ -16,6 +16,8 @@ pub struct Config {
     pub pg_password: String,
     pub pg_database: String,
     pub pg_cert_path: String,
+    /// Optional residential proxy for PHP CLI SAT requests (e.g. http://user:pass@host:port)
+    pub https_proxy: Option<String>,
 }
 
 impl Config {
@@ -43,6 +45,7 @@ impl Config {
             pg_database: env::var("POSTGRES_DATABASE").unwrap_or_else(|_| "adquiere".to_string()),
             pg_cert_path: env::var("POSTGRES_CERT_PATH")
                 .unwrap_or_else(|_| "/arena/certs/rds-ca-bundle.pem".to_string()),
+            https_proxy: env::var("HTTPS_PROXY").ok(),
         }
     }
 }

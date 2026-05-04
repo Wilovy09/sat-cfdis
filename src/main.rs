@@ -308,13 +308,15 @@ async fn run_worker_chunk(
     };
     input_bytes.push(b'\n');
 
-    let mut child = match tokio::process::Command::new(&cfg.php_bin)
-        .arg(&cfg.php_cli_path)
+    let mut cmd = tokio::process::Command::new(&cfg.php_bin);
+    cmd.arg(&cfg.php_cli_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    if let Some(ref proxy) = cfg.https_proxy {
+        cmd.env("HTTPS_PROXY", proxy).env("https_proxy", proxy);
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             let _ = db::jobs::fail(&pool, &job_id, &e.to_string()).await;

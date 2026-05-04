@@ -276,6 +276,7 @@ async fn build_auth_payload(auth: Auth, work_dir: &TempDir) -> Result<serde_json
 async fn run_php_chunk(
     php_bin: String,
     php_cli_path: String,
+    https_proxy: Option<String>,
     auth_payload: serde_json::Value,
     chunk_from: String,
     chunk_to: String,
@@ -301,13 +302,15 @@ async fn run_php_chunk(
     };
     input_bytes.push(b'\n');
 
-    let mut child = match tokio::process::Command::new(&php_bin)
-        .arg(&php_cli_path)
+    let mut cmd = tokio::process::Command::new(&php_bin);
+    cmd.arg(&php_cli_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    if let Some(ref proxy) = https_proxy {
+        cmd.env("HTTPS_PROXY", proxy).env("https_proxy", proxy);
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -843,6 +846,7 @@ pub async fn list_stream(
 
     let php_bin = cfg.php_bin.clone();
     let php_cli_path = cfg.php_cli_path.clone();
+    let https_proxy_ls = cfg.https_proxy.clone();
     let pool_ls = pool.into_inner();
     let s3_ls = s3_client.into_inner();
     let s3_bucket_ls = cfg.s3_bucket.clone().unwrap_or_default();
@@ -863,6 +867,7 @@ pub async fn list_stream(
         let handle = tokio::spawn(run_php_chunk(
             php_bin,
             php_cli_path,
+            https_proxy_ls,
             auth_payload,
             period_from.clone(),
             period_to.clone(),
