@@ -69,14 +69,14 @@ pub async fn get(
         SELECT
             t.impuesto,
             t.tipo_factor,
-            t.tasa,
+            t.tasa::float8,
             t.is_retenido,
-            SUM(COALESCE(t.base, 0))   AS base_sum,
-            SUM(COALESCE(t.importe, 0)) AS importe_sum
+            SUM(COALESCE(t.base, 0)::float8)   AS base_sum,
+            SUM(COALESCE(t.importe, 0)::float8) AS importe_sum
         FROM pulso.cfdi_taxes t
         JOIN pulso.cfdis c ON c.uuid = t.uuid
         WHERE c.{owner_col} = $1
-          AND c.{dl_filter}
+          AND {dl_filter}
           AND c.tipo_comprobante NOT IN ('P','N')
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
@@ -161,9 +161,9 @@ pub async fn get(
         SELECT
             COALESCE(moneda, 'MXN')     AS moneda,
             COUNT(*)                    AS cnt,
-            SUM(COALESCE(total, 0))     AS total_orig,
-            SUM(COALESCE(total_mxn, 0)) AS total_mxn_sum,
-            AVG(COALESCE(tipo_cambio, 1.0)) AS avg_tc
+            SUM(COALESCE(total, 0)::float8)     AS total_orig,
+            SUM(COALESCE(total_mxn, 0)::float8)::float8 AS total_mxn_sum,
+            AVG(COALESCE(tipo_cambio, 1.0)::float8) AS avg_tc
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
@@ -211,15 +211,15 @@ pub async fn get(
         &format!(r#"
         SELECT
             c.year, c.month,
-            SUM(COALESCE(c.subtotal, 0))     AS subtotal,
-            SUM(COALESCE(c.total_mxn, 0))    AS total_mxn,
-            SUM(CASE WHEN t.impuesto='002' AND t.is_retenido=0 THEN COALESCE(t.importe,0) ELSE 0 END) AS iva_tras,
-            SUM(CASE WHEN t.impuesto='002' AND t.is_retenido=1 THEN COALESCE(t.importe,0) ELSE 0 END) AS iva_ret,
-            SUM(CASE WHEN t.impuesto='001' AND t.is_retenido=1 THEN COALESCE(t.importe,0) ELSE 0 END) AS isr_ret
+            SUM(COALESCE(c.subtotal, 0)::float8)     AS subtotal,
+            SUM(COALESCE(c.total_mxn, 0)::float8)::float8    AS total_mxn,
+            SUM(CASE WHEN t.impuesto='002' AND t.is_retenido=0 THEN COALESCE(t.importe,0)::float8 ELSE 0 END) AS iva_tras,
+            SUM(CASE WHEN t.impuesto='002' AND t.is_retenido=1 THEN COALESCE(t.importe,0)::float8 ELSE 0 END) AS iva_ret,
+            SUM(CASE WHEN t.impuesto='001' AND t.is_retenido=1 THEN COALESCE(t.importe,0)::float8 ELSE 0 END) AS isr_ret
         FROM pulso.cfdis c
         LEFT JOIN pulso.cfdi_taxes t ON t.uuid = c.uuid
         WHERE c.{owner_col} = $1
-          AND c.{dl_filter}
+          AND {dl_filter}
           AND c.tipo_comprobante NOT IN ('P','N')
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))

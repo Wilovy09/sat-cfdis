@@ -44,7 +44,7 @@ pub async fn get(
         r#"
         SELECT
             COALESCE(lugar_expedicion, 'UNKNOWN')    AS cp,
-            SUM(COALESCE(total_mxn,0))               AS total,
+            SUM(COALESCE(total_mxn,0)::float8)::float8               AS total,
             COUNT(*)                                  AS cnt
         FROM pulso.cfdis
         WHERE {owner_col} = $1

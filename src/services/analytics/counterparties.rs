@@ -52,7 +52,7 @@ pub async fn get(
         SELECT
             {cp_col}                                                AS cp_rfc,
             MAX({cp_name_col})                                      AS cp_nombre,
-            SUM(COALESCE(total_mxn,0))                             AS total,
+            SUM(COALESCE(total_mxn,0)::float8)::float8                             AS total,
             COUNT(*)                                               AS cnt,
             MIN(fecha_emision)                                     AS first_inv,
             MAX(fecha_emision)                                     AS last_inv,
@@ -80,7 +80,7 @@ pub async fn get(
     // Total for percentage calc
     let total_row = sqlx::query(&format!(
         r#"
-        SELECT SUM(COALESCE(total_mxn,0)) AS total, COUNT(DISTINCT {cp_col}) AS cp_count
+        SELECT SUM(COALESCE(total_mxn,0)::float8)::float8 AS total, COUNT(DISTINCT {cp_col}) AS cp_count
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}

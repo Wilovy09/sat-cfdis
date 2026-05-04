@@ -52,7 +52,7 @@ pub async fn get(
         FROM pulso.cfdi_concepts cc
         JOIN pulso.cfdis c ON c.uuid = cc.uuid
         WHERE c.{owner_col} = $1
-          AND c.{dl_filter}
+          AND {dl_filter}
           AND c.tipo_comprobante NOT IN ('P','N')
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
@@ -100,7 +100,7 @@ pub async fn get(
         FROM pulso.cfdi_concepts cc
         JOIN pulso.cfdis c ON c.uuid = cc.uuid
         WHERE c.{owner_col} = $1
-          AND c.{dl_filter}
+          AND {dl_filter}
           AND c.tipo_comprobante NOT IN ('P','N')
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))

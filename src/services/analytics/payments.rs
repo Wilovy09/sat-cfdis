@@ -78,7 +78,7 @@ pub async fn get(
     // Invoices in range (PUE = paid upfront, PPD = deferred)
     let inv_total_row = sqlx::query(&format!(
         r#"
-        SELECT SUM(COALESCE(total_mxn,0)) AS total
+        SELECT SUM(COALESCE(total_mxn,0)::float8)::float8 AS total
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
@@ -99,7 +99,7 @@ pub async fn get(
     // Total paid via payment complements linked to these invoices
     let paid_row = sqlx::query(&format!(
         r#"
-        SELECT SUM(COALESCE(pd.imp_pagado, 0)) AS paid
+        SELECT SUM(COALESCE(pd.imp_pagado, 0)::float8) AS paid
         FROM pulso.cfdi_payment_docs pd
         JOIN pulso.cfdis inv ON inv.uuid = pd.invoice_uuid
         JOIN pulso.cfdis pay ON pay.uuid = pd.payment_uuid
@@ -131,7 +131,7 @@ pub async fn get(
         SELECT
             COALESCE(forma_pago, '99')    AS forma,
             COUNT(*)                      AS cnt,
-            SUM(COALESCE(total_mxn,0))    AS total
+            SUM(COALESCE(total_mxn,0)::float8)::float8    AS total
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
@@ -175,7 +175,7 @@ pub async fn get(
         SELECT
             COALESCE(metodo_pago, 'PUE')  AS metodo,
             COUNT(*)                       AS cnt,
-            SUM(COALESCE(total_mxn,0))     AS total
+            SUM(COALESCE(total_mxn,0)::float8)::float8     AS total
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
@@ -215,8 +215,8 @@ pub async fn get(
             inv.{cp_name_col}                        AS cp_nombre,
             inv.fecha_emision,
             inv.total_mxn,
-            COALESCE(SUM(pd.imp_pagado), 0)          AS paid,
-            inv.total_mxn - COALESCE(SUM(pd.imp_pagado), 0) AS outstanding
+            COALESCE(SUM(pd.imp_pagado)::float8, 0)          AS paid,
+            inv.total_mxn - COALESCE(SUM(pd.imp_pagado)::float8, 0) AS outstanding
         FROM pulso.cfdis inv
         LEFT JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
         WHERE inv.{owner_col} = $1
@@ -259,7 +259,7 @@ pub async fn get(
     let timeline_rows = sqlx::query(&format!(
         r#"
         SELECT year, month,
-               SUM(COALESCE(total_mxn,0)) AS invoiced
+               SUM(COALESCE(total_mxn,0)::float8)::float8 AS invoiced
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}

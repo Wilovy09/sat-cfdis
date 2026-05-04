@@ -728,7 +728,8 @@ fn parse_f64_val(v: &serde_json::Value, keys: &[&str]) -> Option<f64> {
             return Some(n);
         }
         if let Some(s) = v[k].as_str() {
-            if let Ok(f) = s.parse::<f64>() {
+            let clean: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+            if let Ok(f) = clean.parse::<f64>() {
                 return Some(f);
             }
         }

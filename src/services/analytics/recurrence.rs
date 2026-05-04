@@ -60,8 +60,8 @@ pub async fn get(
             {cp_col}                                        AS cp_rfc,
             MAX({cp_name_col})                              AS cp_nombre,
             COUNT(DISTINCT year * 100 + month)              AS months_active,
-            SUM(COALESCE(total_mxn,0))                     AS total,
-            SUM(COALESCE(total_mxn,0)) /
+            SUM(COALESCE(total_mxn,0))::float8                     AS total,
+            SUM(COALESCE(total_mxn,0))::float8 /
                 NULLIF(COUNT(DISTINCT year * 100 + month),0) AS avg_monthly
         FROM pulso.cfdis
         WHERE {owner_col} = $1

@@ -75,7 +75,7 @@ pub async fn get(
         r#"
         SELECT {cp_col} AS cp_rfc,
                year * 100 + month AS ym,
-               SUM(COALESCE(total_mxn,0)) AS total
+               SUM(COALESCE(total_mxn,0))::float8 AS total
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}

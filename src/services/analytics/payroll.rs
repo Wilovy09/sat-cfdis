@@ -103,11 +103,11 @@ pub async fn get(
     // Summary
     let summary_row = sqlx::query(r#"
         SELECT
-            SUM(COALESCE(n.total_percepciones,0) - COALESCE(n.total_deducciones,0)) AS total_pagado,
-            SUM(COALESCE(n.total_percepciones,0))                                    AS total_perc,
-            SUM(COALESCE(n.total_deducciones,0))                                     AS total_ded,
+            SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS total_pagado,
+            SUM(COALESCE(n.total_percepciones,0)::float8)                                    AS total_perc,
+            SUM(COALESCE(n.total_deducciones,0)::float8)                                     AS total_ded,
             COUNT(DISTINCT c.rfc_receptor)                                            AS emp_count,
-            AVG(COALESCE(n.salario_diario_integrado,0))                              AS avg_sdi,
+            AVG(COALESCE(n.salario_diario_integrado,0)::float8)                              AS avg_sdi,
             COUNT(*)                                                                  AS payrolls_count
         FROM pulso.cfdi_nomina n
         JOIN pulso.cfdis c ON c.uuid = n.uuid
@@ -143,9 +143,9 @@ pub async fn get(
     let month_rows = sqlx::query(
         r#"
         SELECT c.year, c.month,
-               SUM(COALESCE(n.total_percepciones,0) - COALESCE(n.total_deducciones,0)) AS pagado,
-               SUM(COALESCE(n.total_percepciones,0))  AS perc,
-               SUM(COALESCE(n.total_deducciones,0))   AS ded,
+               SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
+               SUM(COALESCE(n.total_percepciones,0)::float8)  AS perc,
+               SUM(COALESCE(n.total_deducciones,0)::float8)   AS ded,
                COUNT(DISTINCT c.rfc_receptor)          AS emp_count,
                COUNT(*)                               AS payrolls_count
         FROM pulso.cfdi_nomina n
@@ -193,10 +193,10 @@ pub async fn get(
             MAX(n.num_empleado)                         AS num_emp,
             MAX(n.departamento)                         AS dpto,
             MAX(n.puesto)                               AS puesto,
-            SUM(COALESCE(n.total_percepciones,0) - COALESCE(n.total_deducciones,0)) AS pagado,
-            SUM(COALESCE(n.total_percepciones,0))       AS perc,
-            SUM(COALESCE(n.total_deducciones,0))        AS ded,
-            AVG(COALESCE(n.salario_diario_integrado,0)) AS avg_sdi,
+            SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
+            SUM(COALESCE(n.total_percepciones,0)::float8)       AS perc,
+            SUM(COALESCE(n.total_deducciones,0)::float8)        AS ded,
+            AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi,
             COUNT(*)                                    AS payrolls,
             COUNT(DISTINCT c.year * 100 + c.month)      AS months_active,
             MIN(n.fecha_pago)                           AS first_pay,
@@ -243,7 +243,7 @@ pub async fn get(
     let tipo_rows = sqlx::query(
         r#"
         SELECT n.tipo_nomina,
-               SUM(COALESCE(n.total_percepciones,0)) AS total,
+               SUM(COALESCE(n.total_percepciones,0)::float8) AS total,
                COUNT(*) AS cnt
         FROM pulso.cfdi_nomina n
         JOIN pulso.cfdis c ON c.uuid = n.uuid
@@ -289,7 +289,7 @@ pub async fn get(
         r#"
         SELECT d.tipo_deduccion,
                MAX(d.concepto) AS concepto,
-               SUM(COALESCE(d.importe,0)) AS total,
+               SUM(COALESCE(d.importe,0)::float8) AS total,
                COUNT(*) AS cnt
         FROM pulso.cfdi_nomina_deducciones d
         JOIN pulso.cfdi_nomina n ON n.uuid = d.uuid
@@ -324,8 +324,8 @@ pub async fn get(
         r#"
         SELECT p.tipo_percepcion,
                MAX(p.concepto) AS concepto,
-               SUM(COALESCE(p.importe_gravado,0)) AS gravado,
-               SUM(COALESCE(p.importe_exento,0))  AS exento,
+               SUM(COALESCE(p.importe_gravado,0)::float8) AS gravado,
+               SUM(COALESCE(p.importe_exento,0)::float8)  AS exento,
                COUNT(*) AS cnt
         FROM pulso.cfdi_nomina_percepciones p
         JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
@@ -334,7 +334,7 @@ pub async fn get(
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
         GROUP BY p.tipo_percepcion
-        ORDER BY (gravado + exento) DESC
+        ORDER BY SUM(COALESCE(p.importe_gravado,0)::float8) + SUM(COALESCE(p.importe_exento,0)::float8) DESC
     "#,
     )
     .bind(rfc)

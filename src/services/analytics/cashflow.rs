@@ -55,7 +55,7 @@ pub async fn get(
     let invoiced_rows = sqlx::query(&format!(
         r#"
         SELECT year, month, tipo_comprobante,
-               SUM(COALESCE(total_mxn,0)) AS total
+               SUM(COALESCE(total_mxn,0)::float8)::float8 AS total
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
@@ -78,11 +78,11 @@ pub async fn get(
     let pago_rows = sqlx::query(&format!(
         r#"
         SELECT c.year, c.month,
-               SUM(COALESCE(p.monto, 0)) AS total_pagos
+               SUM(COALESCE(p.monto, 0)::float8) AS total_pagos
         FROM pulso.cfdi_payments p
         JOIN pulso.cfdis c ON c.uuid = p.payment_uuid
         WHERE c.{owner_col} = $1
-          AND c.{dl_filter}
+          AND {dl_filter}
           AND c.tipo_comprobante = 'P'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
@@ -132,7 +132,7 @@ pub async fn get(
     // PUE / PPD totals
     let metodo_row = sqlx::query(&format!(
         r#"
-        SELECT metodo_pago, SUM(COALESCE(total_mxn,0)) AS total
+        SELECT metodo_pago, SUM(COALESCE(total_mxn,0)::float8)::float8 AS total
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
@@ -163,7 +163,7 @@ pub async fn get(
     // PPD paid (from payment docs)
     let ppd_paid_row = sqlx::query(&format!(
         r#"
-        SELECT COALESCE(SUM(pd.imp_pagado), 0) AS paid
+        SELECT COALESCE(SUM(pd.imp_pagado)::float8, 0) AS paid
         FROM pulso.cfdi_payment_docs pd
         JOIN pulso.cfdis inv ON inv.uuid = pd.invoice_uuid
         WHERE inv.{owner_col} = $1
@@ -223,11 +223,11 @@ pub async fn get(
     // Payment method breakdown from complementos
     let pm_rows = sqlx::query(&format!(
         r#"
-        SELECT p.forma_pago, COUNT(*) AS cnt, SUM(COALESCE(p.monto,0)) AS total
+        SELECT p.forma_pago, COUNT(*) AS cnt, SUM(COALESCE(p.monto,0)::float8) AS total
         FROM pulso.cfdi_payments p
         JOIN pulso.cfdis c ON c.uuid = p.payment_uuid
         WHERE c.{owner_col} = $1
-          AND c.{dl_filter}
+          AND {dl_filter}
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
         GROUP BY p.forma_pago

@@ -326,7 +326,7 @@ switch ($command) {
         // CIEC only authenticates once — two rapid logins for the same RFC cause
         // the SAT to reset the second connection.
         $rawDlType = strtolower($params['download_type'] ?? 'emitidos');
-        $streamDownloadTypes = $rawDlType === 'ambas'
+        $streamDownloadTypes = ($rawDlType === 'ambas' || $rawDlType === 'ambos')
             ? [DownloadType::emitidos(), DownloadType::recibidos()]
             : [resolveDownloadType($rawDlType)];
 

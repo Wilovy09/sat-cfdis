@@ -60,10 +60,10 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
     let rows = sqlx::query(
         &format!(r#"
         SELECT year, month,
-               SUM(CASE WHEN tipo_comprobante IN ('I','T') THEN COALESCE(total_mxn,0) ELSE 0 END) AS ingreso,
-               SUM(CASE WHEN tipo_comprobante = 'E' THEN COALESCE(total_mxn,0) ELSE 0 END)        AS egreso,
-               SUM(COALESCE(total_mxn,0))  AS total,
-               COUNT(*)                     AS cnt
+               SUM(CASE WHEN tipo_comprobante IN ('I','T') THEN COALESCE(total_mxn,0) ELSE 0 END)::float8 AS ingreso,
+               SUM(CASE WHEN tipo_comprobante = 'E' THEN COALESCE(total_mxn,0) ELSE 0 END)::float8        AS egreso,
+               SUM(COALESCE(total_mxn,0))::float8  AS total,
+               COUNT(*)                              AS cnt
         FROM pulso.cfdis
         WHERE {rfc_col} = $1
           AND {dl_filter}
@@ -125,7 +125,7 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
     // By tipo_comprobante
     let tipo_rows = sqlx::query(&format!(
         r#"
-        SELECT tipo_comprobante, SUM(COALESCE(total_mxn,0)) AS total, COUNT(*) AS cnt
+        SELECT tipo_comprobante, SUM(COALESCE(total_mxn,0))::float8 AS total, COUNT(*) AS cnt
         FROM pulso.cfdis
         WHERE {rfc_col} = $1
           AND {dl_filter}
