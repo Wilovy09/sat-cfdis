@@ -11,6 +11,9 @@ pub enum DownloadType {
     #[default]
     Emitidos,
     Recibidos,
+    Ambos,
+    #[serde(rename = "ambas")]
+    Ambas,
 }
 
 impl DownloadType {
@@ -18,6 +21,7 @@ impl DownloadType {
         match self {
             DownloadType::Emitidos => "emitidos",
             DownloadType::Recibidos => "recibidos",
+            DownloadType::Ambos | DownloadType::Ambas => "ambos",
         }
     }
 }
