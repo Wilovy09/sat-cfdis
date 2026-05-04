@@ -82,6 +82,50 @@ fn days_in_month(y: u32, m: u32) -> u32 {
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/v1/users/profile",
+    tag = "Users",
+    responses(
+        (status = 200, description = "Perfil del usuario"),
+        (status = 401, description = "No autenticado"),
+        (status = 404, description = "Perfil incompleto"),
+    )
+)]
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
+pub async fn get_profile(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".to_string(),
+            });
+        }
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".to_string(),
+            });
+        }
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    match crate::db::users::get_user_credentials(&pool, &user_id).await {
+        Ok(Some((rfc, _, _))) => HttpResponse::Ok().json(serde_json::json!({ "rfc": rfc })),
+        Ok(None) => HttpResponse::NotFound().json(ErrorBody {
+            error: "Perfil no encontrado".to_string(),
+        }),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "get_profile: DB error: {e}");
+            HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".to_string(),
+            })
+        }
+    }
+}
+
+#[utoipa::path(
     post,
     path = "/api/v1/users/complete-profile",
     tag = "Users",
