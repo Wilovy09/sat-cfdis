@@ -272,6 +272,28 @@ pub async fn find_queued(pool: &PgPool) -> Result<Vec<SyncJob>, sqlx::Error> {
     .await
 }
 
+/// True if a non-cancelled/non-failed job already covers this exact period for the RFC.
+pub async fn has_job_for_period(
+    pool: &PgPool,
+    rfc: &str,
+    period_from: &str,
+    period_to: &str,
+) -> Result<bool, sqlx::Error> {
+    let (exists,): (bool,) = sqlx::query_as(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM pulso.sync_jobs
+               WHERE rfc = $1 AND period_from = $2 AND period_to = $3
+               AND status NOT IN ('cancelled', 'failed')
+           )"#,
+    )
+    .bind(rfc)
+    .bind(period_from)
+    .bind(period_to)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
 /// Mark a job as running.
 pub async fn set_running(pool: &PgPool, job_id: &str) -> Result<(), sqlx::Error> {
     sqlx::query(r#"UPDATE pulso.sync_jobs SET status='running', updated_at=$1 WHERE id=$2"#)

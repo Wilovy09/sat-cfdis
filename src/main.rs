@@ -126,6 +126,21 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
     }
 }
 
+fn days_in_month(y: u32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
 /// Returns the next day in ISO-8601 format ("YYYY-MM-DD HH:MM:SS").
 fn next_day(date_str: &str) -> String {
     // Parse YYYY-MM-DD from first 10 chars
@@ -144,21 +159,6 @@ fn next_day(date_str: &str) -> String {
         return date_str.to_string();
     };
 
-    let days_in_month = |yr: u32, mo: u32| -> u32 {
-        match mo {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 => {
-                if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 {
-                    29
-                } else {
-                    28
-                }
-            }
-            _ => 30,
-        }
-    };
-
     let (ny, nm, nd) = if d >= days_in_month(y, m) {
         if m == 12 {
             (y + 1, 1, 1)
@@ -170,6 +170,101 @@ fn next_day(date_str: &str) -> String {
     };
 
     format!("{ny:04}-{nm:02}-{nd:02} 00:00:00")
+}
+
+// ---------------------------------------------------------------------------
+// Monthly auto-sync worker
+// ---------------------------------------------------------------------------
+
+/// How often the monthly worker wakes to check for new complete months (6 h).
+const MONTHLY_POLL_SECS: u64 = 6 * 3600;
+
+/// When a calendar month of the current year finishes, queue a sync job covering
+/// only that month for every registered user whose period hasn't been synced yet.
+async fn monthly_sync_worker(pool: DbPool) {
+    // Short initial delay so the main worker gets a head start on startup.
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+    loop {
+        let now_str = db::jobs::utc_offset(0);
+        let cur_year: u32 = now_str[0..4].parse().unwrap_or(2026);
+        let cur_month: u32 = now_str[5..7].parse().unwrap_or(1);
+
+        // The last fully completed month
+        let (lc_year, lc_month) = if cur_month <= 1 {
+            (cur_year - 1, 12u32)
+        } else {
+            (cur_year, cur_month - 1)
+        };
+
+        let period_from = format!("{lc_year:04}-{lc_month:02}-01 00:00:00");
+        let last_day = days_in_month(lc_year, lc_month);
+        let period_to = format!("{lc_year:04}-{lc_month:02}-{last_day:02} 23:59:59");
+
+        let users = match db::users::get_all_with_credentials(&pool).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::error!("Monthly worker: DB error fetching users: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(MONTHLY_POLL_SECS)).await;
+                continue;
+            }
+        };
+
+        let key = services::crypto::load_key();
+
+        for (rfc, clave_enc) in users {
+            let already_queued = match db::jobs::has_job_for_period(&pool, &rfc, &period_from, &period_to).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(rfc = %rfc, "Monthly worker: period check failed: {e}");
+                    continue;
+                }
+            };
+
+            if already_queued {
+                continue;
+            }
+
+            let clave = match services::crypto::decrypt(&key, &clave_enc) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(rfc = %rfc, "Monthly worker: decrypt failed: {e}");
+                    continue;
+                }
+            };
+
+            let auth_json = serde_json::json!({
+                "type": "ciec",
+                "rfc":  rfc,
+                "password": clave,
+            })
+            .to_string();
+
+            let auth_enc = match services::crypto::encrypt(&key, &auth_json) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!(rfc = %rfc, "Monthly worker: encrypt failed: {e}");
+                    continue;
+                }
+            };
+
+            match db::jobs::insert_queued(&pool, &rfc, "ciec", &auth_enc, "ambos", &period_from, &period_to).await {
+                Ok(job_id) => {
+                    tracing::info!(
+                        rfc = %rfc,
+                        job_id = %job_id,
+                        month = %format!("{lc_year:04}-{lc_month:02}"),
+                        "Monthly auto-sync queued"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(rfc = %rfc, "Monthly worker: insert_queued failed: {e}");
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(MONTHLY_POLL_SECS)).await;
+    }
 }
 
 /// Run one PHP list-stream chunk for a background worker job.
@@ -447,6 +542,9 @@ async fn main() -> std::io::Result<()> {
         let etl_cfg = Arc::new(cfg.clone());
         let etl_s3 = s3_client.clone();
         tokio::spawn(etl::etl_worker(etl_pool, etl_cfg, etl_s3));
+    }
+    {
+        tokio::spawn(monthly_sync_worker(pool.clone()));
     }
 
     // ── HTTP server ─────────────────────────────────────────────────────────

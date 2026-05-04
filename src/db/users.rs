@@ -79,6 +79,15 @@ pub async fn set_initial_sync_job(
     Ok(())
 }
 
+/// Returns (rfc, clave_enc) for every user — used by the monthly sync worker.
+pub async fn get_all_with_credentials(pool: &PgPool) -> Result<Vec<(String, String)>, sqlx::Error> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT rfc, clave FROM pulso.users")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
+}
+
 /// Returns (rfc, initial_sync_job_id) for the given user.
 pub async fn get_user_sync_info(
     pool: &PgPool,
