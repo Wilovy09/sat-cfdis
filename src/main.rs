@@ -590,6 +590,10 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/auth/login", web::post().to(auth_routes::login))
             // Users
             .route(
+                "/api/v1/users/profile",
+                web::get().to(users_routes::get_profile),
+            )
+            .route(
                 "/api/v1/users/complete-profile",
                 web::post().to(users_routes::complete_profile),
             )
