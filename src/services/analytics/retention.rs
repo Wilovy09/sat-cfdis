@@ -1,223 +1,185 @@
-use super::summary::{dl_type_filter, parse_ym, rfc_column};
-/// Retention: cohort analysis — counterparties by their first invoice month.
+use std::collections::{HashMap, HashSet};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
+use super::summary::{dl_type_filter, rfc_column};
 
 #[derive(Debug, Serialize)]
 pub struct RetentionResponse {
-    pub cohorts: Vec<CohortRow>,
-    pub overall_retention_pct: f64,
-    pub avg_lifespan_months: f64,
-    pub churned_last_3m: i64, // counterparties not seen in last 3 months
-    pub new_last_3m: i64,
+    pub years: Vec<RetentionYearRow>,
+    pub top_lost_by_year: Vec<TopLostCp>,
+    pub incomplete_years: Vec<IncompleteYear>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct CohortRow {
-    pub cohort_period: String, // YYYY-MM of first invoice
-    pub cohort_size: i64,
+pub struct RetentionYearRow {
+    pub year: i32,
+    pub total_cp: i64,
+    pub new_cp: Option<i64>,
+    pub retained_cp: Option<i64>,
+    pub lost_cp: Option<i64>,
     pub total_mxn: f64,
-    pub months_retained: Vec<MonthRetained>,
+    pub new_mxn: Option<f64>,
+    pub retained_mxn: Option<f64>,
+    pub lost_mxn: Option<f64>,
+    pub pct_new_mxn: Option<f64>,
+    pub pct_retained_mxn: Option<f64>,
+    pub churn_vs_prev_pct: Option<f64>,
+    pub churn_vs_curr_pct: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct MonthRetained {
-    pub offset: i64, // months since first invoice
-    pub period: String,
-    pub active_count: i64,
-    pub retention_pct: f64,
-    pub total_mxn: f64,
+pub struct TopLostCp {
+    pub year_lost: i32,
+    pub rfc: String,
+    pub nombre: String,
+    pub last_active_mxn: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncompleteYear {
+    pub year: i32,
+    pub months: i32,
 }
 
 pub async fn get(
     pool: &DbPool,
     rfc: &str,
     dl_type: &str,
-    from: &str,
-    to: &str,
 ) -> anyhow::Result<RetentionResponse> {
-    let (from_y, from_m) = parse_ym(from);
-    let (to_y, to_m) = parse_ym(to);
-    let dl_filter = dl_type_filter(dl_type);
     let owner_col = rfc_column(dl_type);
-    let cp_col = if dl_type == "recibidos" {
-        "rfc_emisor"
-    } else {
-        "rfc_receptor"
-    };
+    let dl_filter = dl_type_filter(dl_type);
+    let cp_col = if dl_type == "recibidos" { "rfc_emisor" } else { "rfc_receptor" };
+    let cp_name_col = if dl_type == "recibidos" { "nombre_emisor" } else { "nombre_receptor" };
 
-    // First invoice month per counterparty
-    let first_rows = sqlx::query(&format!(
-        r#"
-        SELECT {cp_col} AS cp_rfc,
-               MIN(year * 100 + month) AS first_ym,
-               MAX(year * 100 + month) AS last_ym
-        FROM pulso.cfdis
-        WHERE {owner_col} = $1
-          AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N')
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY {cp_col}
-        "#
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_all(pool)
-    .await?;
-
-    // Activity by counterparty by month
-    let activity_rows = sqlx::query(&format!(
-        r#"
-        SELECT {cp_col} AS cp_rfc,
-               year * 100 + month AS ym,
-               SUM(COALESCE(total_mxn,0))::float8 AS total
-        FROM pulso.cfdis
-        WHERE {owner_col} = $1
-          AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N')
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY {cp_col}, year, month
-        "#
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_all(pool)
-    .await?;
-
-    // Build activity map: cp_rfc → Vec<(ym, total)>
-    let mut activity: std::collections::HashMap<String, Vec<(i64, f64)>> = Default::default();
-    for r in &activity_rows {
-        let cp: String = r.try_get("cp_rfc").unwrap_or_default();
-        let ym: i64 = r.try_get("ym").unwrap_or(0);
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
-        activity.entry(cp).or_default().push((ym, total));
+    // Q1: distinct months per year (for incomplete detection)
+    let q1 = format!(
+        "SELECT year, COUNT(DISTINCT month)::bigint AS month_count \
+         FROM pulso.cfdis \
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') \
+         GROUP BY year ORDER BY year"
+    );
+    let rows1 = sqlx::query(&q1).bind(rfc).fetch_all(pool).await?;
+    let mut months_per_year: HashMap<i32, i32> = HashMap::new();
+    for r in &rows1 {
+        let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
+        let cnt: i32 = r.try_get::<i64, _>("month_count").unwrap_or(0) as i32;
+        months_per_year.insert(year, cnt);
     }
 
-    let last_ym = to_y * 100 + to_m;
-    let cur_ym = last_ym;
+    // Q2: per (year, cp_rfc) totals
+    let q2 = format!(
+        "SELECT year, {cp_col} AS rfc, MAX({cp_name_col}) AS nombre, \
+                SUM(COALESCE(total_mxn,0)::float8)::float8 AS total_mxn \
+         FROM pulso.cfdis \
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') \
+         GROUP BY year, {cp_col} \
+         ORDER BY year"
+    );
+    let rows2 = sqlx::query(&q2).bind(rfc).fetch_all(pool).await?;
 
-    // Group counterparties by cohort (first month)
-    let mut cohort_map: std::collections::BTreeMap<i64, Vec<String>> = Default::default();
-    let mut lifespans = Vec::new();
-    let mut churned = 0i64;
-    let mut new_last_3m = 0i64;
-
-    for r in &first_rows {
-        let cp: String = r.try_get("cp_rfc").unwrap_or_default();
-        let first: i64 = r.try_get("first_ym").unwrap_or(0);
-        let last: i64 = r.try_get("last_ym").unwrap_or(0);
-
-        cohort_map.entry(first).or_default().push(cp);
-
-        let lifespan = ym_diff(first, last);
-        lifespans.push(lifespan);
-
-        // Churned: last activity > 3 months ago
-        if ym_diff(last, cur_ym) > 3 {
-            churned += 1;
-        }
-
-        // New: first invoice in last 3 months
-        if ym_diff(first, cur_ym) <= 2 {
-            new_last_3m += 1;
-        }
+    // Build: year -> HashMap<rfc, (nombre, total_mxn)>
+    let mut year_clients: HashMap<i32, HashMap<String, (String, f64)>> = HashMap::new();
+    for r in &rows2 {
+        let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
+        let cp_rfc: String = r.try_get("rfc").unwrap_or_default();
+        let nombre: String = r.try_get("nombre").unwrap_or_default();
+        let total_mxn: f64 = r.try_get("total_mxn").unwrap_or(0.0);
+        year_clients.entry(year).or_default().insert(cp_rfc, (nombre, total_mxn));
     }
 
-    let avg_lifespan = if lifespans.is_empty() {
-        0.0
-    } else {
-        lifespans.iter().sum::<i64>() as f64 / lifespans.len() as f64
-    };
+    let mut sorted_years: Vec<i32> = year_clients.keys().copied().collect();
+    sorted_years.sort();
 
-    let total_cps = first_rows.len() as i64;
-    let retained = total_cps - churned;
-    let overall_retention = if total_cps > 0 {
-        retained as f64 / total_cps as f64 * 100.0
-    } else {
-        0.0
-    };
+    // Q3: year totals
+    let q3 = format!(
+        "SELECT year, SUM(COALESCE(total_mxn,0)::float8)::float8 AS total_mxn \
+         FROM pulso.cfdis \
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') \
+         GROUP BY year ORDER BY year"
+    );
+    let rows3 = sqlx::query(&q3).bind(rfc).fetch_all(pool).await?;
+    let mut year_totals: HashMap<i32, f64> = HashMap::new();
+    for r in &rows3 {
+        let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
+        let total: f64 = r.try_get("total_mxn").unwrap_or(0.0);
+        year_totals.insert(year, total);
+    }
 
-    // Build cohort rows (limit to 24 cohorts for display)
-    let mut cohorts = Vec::new();
-    for (cohort_ym, cps) in cohort_map.iter().rev().take(24) {
-        let cohort_period = ym_to_str(*cohort_ym);
-        let cohort_size = cps.len() as i64;
+    // Build retention rows and top lost
+    let mut years: Vec<RetentionYearRow> = Vec::new();
+    let mut top_lost_by_year: Vec<TopLostCp> = Vec::new();
 
-        // For each offset month, count active counterparties
-        let max_offset = ym_diff(*cohort_ym, last_ym).min(12);
-        let mut months_retained = Vec::new();
-        let mut total_cohort_mxn = 0.0f64;
+    for (i, &year) in sorted_years.iter().enumerate() {
+        let curr_clients = year_clients.get(&year).cloned().unwrap_or_default();
+        let total_mxn = year_totals.get(&year).copied().unwrap_or(0.0);
+        let total_cp = curr_clients.len() as i64;
 
-        for offset in 0..=max_offset {
-            let check_ym = add_months(*cohort_ym, offset);
-            let check_period = ym_to_str(check_ym);
-            let mut active_count = 0i64;
-            let mut month_total = 0.0f64;
+        if i == 0 {
+            years.push(RetentionYearRow {
+                year,
+                total_cp,
+                new_cp: None,
+                retained_cp: None,
+                lost_cp: None,
+                total_mxn,
+                new_mxn: None,
+                retained_mxn: None,
+                lost_mxn: None,
+                pct_new_mxn: None,
+                pct_retained_mxn: None,
+                churn_vs_prev_pct: None,
+                churn_vs_curr_pct: None,
+            });
+        } else {
+            let prev_year = sorted_years[i - 1];
+            let prev_clients = year_clients.get(&prev_year).cloned().unwrap_or_default();
+            let prev_total_mxn = year_totals.get(&prev_year).copied().unwrap_or(0.0);
 
-            for cp in cps {
-                if let Some(acts) = activity.get(cp) {
-                    if let Some(&(_, t)) = acts.iter().find(|(ym, _)| *ym == check_ym) {
-                        active_count += 1;
-                        month_total += t;
-                    }
-                }
+            let curr_rfcs: HashSet<&str> = curr_clients.keys().map(|s| s.as_str()).collect();
+            let prev_rfcs: HashSet<&str> = prev_clients.keys().map(|s| s.as_str()).collect();
+
+            let new_rfcs: Vec<&str> = curr_rfcs.difference(&prev_rfcs).copied().collect();
+            let retained_rfcs: Vec<&str> = curr_rfcs.intersection(&prev_rfcs).copied().collect();
+            let lost_rfcs: Vec<&str> = prev_rfcs.difference(&curr_rfcs).copied().collect();
+
+            let new_mxn: f64 = new_rfcs.iter().filter_map(|r| curr_clients.get(*r)).map(|(_, m)| m).sum();
+            let retained_mxn: f64 = retained_rfcs.iter().filter_map(|r| curr_clients.get(*r)).map(|(_, m)| m).sum();
+            let lost_mxn: f64 = lost_rfcs.iter().filter_map(|r| prev_clients.get(*r)).map(|(_, m)| m).sum();
+
+            let new_cp = new_rfcs.len() as i64;
+            let retained_cp = retained_rfcs.len() as i64;
+            let lost_cp = lost_rfcs.len() as i64;
+
+            let pct_new_mxn = if total_mxn > 0.0 { Some(new_mxn / total_mxn * 100.0) } else { None };
+            let pct_retained_mxn = if total_mxn > 0.0 { Some(retained_mxn / total_mxn * 100.0) } else { None };
+            let churn_vs_prev_pct = if prev_total_mxn > 0.0 { Some(lost_mxn / prev_total_mxn * 100.0) } else { None };
+            let churn_vs_curr_pct = if total_mxn > 0.0 { Some(lost_mxn / total_mxn * 100.0) } else { None };
+
+            // Top 5 lost clients for this year (sorted by last active mxn desc)
+            let mut lost_vec: Vec<(String, String, f64)> = lost_rfcs.iter()
+                .filter_map(|r| prev_clients.get(*r).map(|(n, m)| (r.to_string(), n.clone(), *m)))
+                .collect();
+            lost_vec.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            for (cp_rfc, nombre, last_active_mxn) in lost_vec.into_iter().take(5) {
+                top_lost_by_year.push(TopLostCp { year_lost: year, rfc: cp_rfc, nombre, last_active_mxn });
             }
 
-            total_cohort_mxn += month_total;
-            months_retained.push(MonthRetained {
-                offset,
-                period: check_period,
-                active_count,
-                retention_pct: if cohort_size > 0 {
-                    active_count as f64 / cohort_size as f64 * 100.0
-                } else {
-                    0.0
-                },
-                total_mxn: month_total,
+            years.push(RetentionYearRow {
+                year, total_cp,
+                new_cp: Some(new_cp), retained_cp: Some(retained_cp), lost_cp: Some(lost_cp),
+                total_mxn,
+                new_mxn: Some(new_mxn), retained_mxn: Some(retained_mxn), lost_mxn: Some(lost_mxn),
+                pct_new_mxn, pct_retained_mxn, churn_vs_prev_pct, churn_vs_curr_pct,
             });
         }
-
-        cohorts.push(CohortRow {
-            cohort_period,
-            cohort_size,
-            total_mxn: total_cohort_mxn,
-            months_retained,
-        });
     }
 
-    Ok(RetentionResponse {
-        cohorts,
-        overall_retention_pct: overall_retention,
-        avg_lifespan_months: avg_lifespan,
-        churned_last_3m: churned,
-        new_last_3m,
-    })
-}
+    let mut incomplete_years: Vec<IncompleteYear> = months_per_year.iter()
+        .filter(|(_, m)| **m < 12)
+        .map(|(y, m)| IncompleteYear { year: *y, months: *m })
+        .collect();
+    incomplete_years.sort_by_key(|y| y.year);
 
-fn ym_diff(from: i64, to: i64) -> i64 {
-    let fy = from / 100;
-    let fm = from % 100;
-    let ty = to / 100;
-    let tm = to % 100;
-    (ty - fy) * 12 + (tm - fm)
-}
-
-fn add_months(ym: i64, n: i64) -> i64 {
-    let y = ym / 100;
-    let m = ym % 100;
-    let total = y * 12 + m - 1 + n;
-    (total / 12) * 100 + (total % 12) + 1
-}
-
-fn ym_to_str(ym: i64) -> String {
-    format!("{:04}-{:02}", ym / 100, ym % 100)
+    Ok(RetentionResponse { years, top_lost_by_year, incomplete_years })
 }

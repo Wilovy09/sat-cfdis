@@ -643,6 +643,26 @@ async fn main() -> std::io::Result<()> {
                         web::get().to(analytics_routes::get_counterparties),
                     )
                     .route(
+                        "/counterparties/evolution",
+                        web::get().to(analytics_routes::get_counterparties_evolution),
+                    )
+                    .route(
+                        "/counterparties/ltm",
+                        web::get().to(analytics_routes::get_counterparties_ltm),
+                    )
+                    .route(
+                        "/counterparties/payments-detail",
+                        web::get().to(analytics_routes::get_counterparties_payments_detail),
+                    )
+                    .route(
+                        "/counterparties/atypical",
+                        web::get().to(analytics_routes::get_counterparties_atypical),
+                    )
+                    .route(
+                        "/counterparties/{cp_rfc}",
+                        web::get().to(analytics_routes::get_counterparty_individual),
+                    )
+                    .route(
                         "/recurrence",
                         web::get().to(analytics_routes::get_recurrence),
                     )
@@ -653,6 +673,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/payments", web::get().to(analytics_routes::get_payments))
                     .route("/cashflow", web::get().to(analytics_routes::get_cashflow))
                     .route("/payroll", web::get().to(analytics_routes::get_payroll))
+                    .route("/period-comparison", web::get().to(analytics_routes::get_period_comparison))
                     // Normalization rules
                     .route(
                         "/normalization",
@@ -677,7 +698,13 @@ async fn main() -> std::io::Result<()> {
                     .route(
                         "/normalization/payroll/{rule_id}",
                         web::delete().to(analytics_routes::delete_payroll_normalization),
-                    ),
+                    )
+                    .route(
+                        "/normalization/excluded",
+                        web::get().to(analytics_routes::list_excluded_cfdis),
+                    )
+                    .service(web::resource("/normalization/cfdis")
+                        .route(web::get().to(analytics_routes::list_norm_cfdis))),
             )
     })
     .bind(&bind_addr)?

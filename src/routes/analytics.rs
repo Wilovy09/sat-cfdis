@@ -6,7 +6,7 @@ use crate::{
     errors::AppError,
     services::analytics::{
         cashflow, concepts, counterparties, fiscal, geography, normalization, payments, payroll,
-        recurrence, retention, summary,
+        period_comparison, recurrence, retention, summary,
     },
 };
 
@@ -119,22 +119,25 @@ pub async fn get_counterparties(
     path = "/api/v1/analytics/{rfc}/recurrence",
     tag = "Analytics",
     params(
-        ("rfc" = String, Path, description = "RFC del contribuyente"),
-        ("dl_type" = Option<String>, Query, description = "emitidos|recibidos|ambos"),
-        ("from" = Option<String>, Query, description = "YYYY-MM"),
-        ("to" = Option<String>, Query, description = "YYYY-MM"),
+        ("rfc" = String, Path, description = "RFC del propietario"),
+        ("dl_type" = Option<String>, Query, description = "emitidos|recibidos"),
+        ("window_months" = Option<i32>, Query, description = "Meses de ventana (default 24)"),
     ),
-    responses((status = 200, description = "Análisis de recurrencia"))
+    responses((status = 200, description = "Recurrence analysis"))
 )]
-#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_recurrence(
     path: web::Path<String>,
-    query: web::Query<AnalyticsParams>,
+    query: web::Query<std::collections::HashMap<String, String>>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
-    let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
-    let result = recurrence::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
+    let rfc = path.into_inner();
+    let dl_type = query.get("dl_type").map(|s| s.as_str()).unwrap_or("emitidos");
+    let window_months: i32 = query
+        .get("window_months")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24)
+        .clamp(6, 60);
+    let result = recurrence::get(&pool, &rfc, dl_type, window_months)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
@@ -149,22 +152,19 @@ pub async fn get_recurrence(
     path = "/api/v1/analytics/{rfc}/retention",
     tag = "Analytics",
     params(
-        ("rfc" = String, Path, description = "RFC del contribuyente"),
-        ("dl_type" = Option<String>, Query, description = "emitidos|recibidos|ambos"),
-        ("from" = Option<String>, Query, description = "YYYY-MM"),
-        ("to" = Option<String>, Query, description = "YYYY-MM"),
+        ("rfc" = String, Path, description = "RFC del propietario"),
+        ("dl_type" = Option<String>, Query, description = "emitidos|recibidos"),
     ),
-    responses((status = 200, description = "Análisis de retención de clientes"))
+    responses((status = 200, description = "Retention analysis"))
 )]
-#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
 pub async fn get_retention(
     path: web::Path<String>,
-    query: web::Query<AnalyticsParams>,
+    query: web::Query<std::collections::HashMap<String, String>>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
-    let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
-    let result = retention::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
+    let rfc = path.into_inner();
+    let dl_type = query.get("dl_type").map(|s| s.as_str()).unwrap_or("emitidos");
+    let result = retention::get(&pool, &rfc, dl_type)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
@@ -512,6 +512,134 @@ pub async fn delete_payroll_normalization(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/normalization/excluded
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/analytics/{rfc}/normalization/excluded",
+    tag = "Normalization",
+    params(("rfc" = String, Path, description = "RFC del contribuyente")),
+    responses((status = 200, description = "CFDIs excluidos por reglas de normalización"))
+)]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
+pub async fn list_excluded_cfdis(
+    path: web::Path<String>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    let cfdis = normalization::list_excluded_cfdis(&pool, &rfc)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(cfdis))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/normalization/cfdis
+// ---------------------------------------------------------------------------
+
+pub async fn list_norm_cfdis(
+    path: web::Path<String>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    let dl_type = query.dl_type();
+    let from = query.from();
+    let to = query.to();
+    let limit = query.limit();
+    let (from_y, from_m) = crate::services::analytics::summary::parse_ym(&from);
+    let (to_y, to_m) = crate::services::analytics::summary::parse_ym(&to);
+    let rows = normalization::list_cfdis_for_normalization(&pool, &rfc, &dl_type, from_y, from_m, to_y, to_m, limit)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/counterparties/evolution
+// ---------------------------------------------------------------------------
+
+pub async fn get_counterparties_evolution(
+    path: web::Path<String>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    let result = counterparties::get_evolution(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/counterparties/ltm
+// ---------------------------------------------------------------------------
+
+pub async fn get_counterparties_ltm(
+    path: web::Path<String>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    let result = counterparties::get_ltm_comparison(&pool, &rfc, &query.dl_type(), &query.to())
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/counterparties/payments-detail
+// ---------------------------------------------------------------------------
+
+pub async fn get_counterparties_payments_detail(
+    path: web::Path<String>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    let result = counterparties::get_payments_detail(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/counterparties/atypical
+// ---------------------------------------------------------------------------
+
+pub async fn get_counterparties_atypical(
+    path: web::Path<String>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    let result = counterparties::get_atypical(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/counterparties/{cp_rfc}
+// ---------------------------------------------------------------------------
+
+pub async fn get_counterparty_individual(
+    path: web::Path<(String, String)>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let (rfc, cp_rfc) = path.into_inner();
+    let rfc = rfc.to_uppercase();
+    let cp_rfc = cp_rfc.to_uppercase();
+    let result = counterparties::get_individual(&pool, &rfc, &cp_rfc, &query.dl_type(), &query.from(), &query.to())
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -575,4 +703,43 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
         mo += 1;
     }
     (y, mo, rem + 1)
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/period-comparison
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct PeriodComparisonParams {
+    pub dl_type: Option<String>,
+    pub from_month: Option<i32>,
+    pub to_month: Option<i32>,
+    pub years: Option<String>, // comma-separated e.g. "2023,2024,2025,2026"
+    pub limit: Option<i64>,
+}
+
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
+pub async fn get_period_comparison(
+    path: web::Path<String>,
+    query: web::Query<PeriodComparisonParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    let dl_type = query.dl_type.clone().unwrap_or_else(|| "emitidos".into());
+    let from_month = query.from_month.unwrap_or(1).clamp(1, 12);
+    let to_month = query.to_month.unwrap_or(12).clamp(1, 12);
+    let years: Vec<i32> = query
+        .years
+        .as_deref()
+        .unwrap_or("2023,2024,2025,2026")
+        .split(',')
+        .filter_map(|s| s.trim().parse::<i32>().ok())
+        .collect();
+    let limit = query.limit.unwrap_or(10).clamp(1, 50);
+
+    let result = period_comparison::get(&pool, &rfc, &dl_type, from_month, to_month, &years, limit)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
 }
