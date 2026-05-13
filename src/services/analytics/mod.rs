@@ -6,6 +6,7 @@ pub mod geography;
 pub mod normalization;
 pub mod payments;
 pub mod payroll;
+pub mod period_comparison;
 pub mod recurrence;
 pub mod retention;
 pub mod summary;
