@@ -3,6 +3,7 @@ use super::summary::{dl_type_filter, parse_ym, rfc_column};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Serialize)]
 pub struct GeographyResponse {
@@ -17,6 +18,7 @@ pub struct StateRow {
     pub state_name: String,
     pub total_mxn: f64,
     pub invoice_count: i64,
+    pub unique_cp: i64,
     pub pct_of_total: f64,
 }
 
@@ -39,20 +41,22 @@ pub async fn get(
     let (to_y, to_m) = parse_ym(to);
     let dl_filter = dl_type_filter(dl_type);
     let owner_col = rfc_column(dl_type);
+    let cp_col = if dl_type == "recibidos" { "rfc_emisor" } else { "rfc_receptor" };
 
     let rows = sqlx::query(&format!(
         r#"
         SELECT
-            COALESCE(lugar_expedicion, 'UNKNOWN')    AS cp,
-            SUM(COALESCE(total_mxn,0)::float8)::float8               AS total,
-            COUNT(*)                                  AS cnt
+            COALESCE(lugar_expedicion, 'UNKNOWN') AS cp,
+            {cp_col}                              AS counterparty_rfc,
+            SUM(COALESCE(total_mxn,0)::float8)::float8 AS total,
+            COUNT(*)::bigint                      AS cnt
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N')
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY cp
+        GROUP BY cp, {cp_col}
         ORDER BY total DESC
         "#
     ))
@@ -69,12 +73,14 @@ pub async fn get(
         .map(|r| r.try_get::<f64, _>("total").unwrap_or(0.0))
         .sum();
 
-    let mut state_map: std::collections::HashMap<String, (f64, i64)> = Default::default();
+    // state_code → (total_mxn, invoice_count, unique_cp_rfcs)
+    let mut state_map: HashMap<String, (f64, i64, HashSet<String>)> = Default::default();
     let mut by_postal_code = Vec::new();
     let mut unknown_total = 0.0f64;
 
     for r in &rows {
         let cp: String = r.try_get("cp").unwrap_or_default();
+        let counterparty_rfc: String = r.try_get("counterparty_rfc").unwrap_or_default();
         let total: f64 = r.try_get("total").unwrap_or(0.0);
         let cnt: i64 = r.try_get("cnt").unwrap_or(0);
 
@@ -83,15 +89,15 @@ pub async fn get(
             continue;
         }
 
-        let state = postal_to_state(&cp);
-
-        let e = state_map.entry(state.to_string()).or_insert((0.0, 0));
+        let state = postal_to_state(&cp).to_string();
+        let e = state_map.entry(state.clone()).or_insert((0.0, 0, HashSet::new()));
         e.0 += total;
         e.1 += cnt;
+        e.2.insert(counterparty_rfc);
 
         by_postal_code.push(PostalCodeRow {
             postal_code: cp,
-            state_code: state.to_string(),
+            state_code: state,
             total_mxn: total,
             invoice_count: cnt,
         });
@@ -99,7 +105,7 @@ pub async fn get(
 
     let mut by_state: Vec<StateRow> = state_map
         .into_iter()
-        .map(|(code, (total, cnt))| StateRow {
+        .map(|(code, (total, cnt, rfcs))| StateRow {
             state_name: state_name(&code).to_string(),
             pct_of_total: if grand_total > 0.0 {
                 total / grand_total * 100.0
@@ -109,6 +115,7 @@ pub async fn get(
             state_code: code,
             total_mxn: total,
             invoice_count: cnt,
+            unique_cp: rfcs.len() as i64,
         })
         .collect();
     by_state.sort_by(|a, b| b.total_mxn.partial_cmp(&a.total_mxn).unwrap());
