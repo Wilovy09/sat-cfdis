@@ -115,6 +115,13 @@ pub async fn get(
           AND c.tipo_comprobante = 'N'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
     "#)
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
     .fetch_one(pool)
@@ -154,6 +161,13 @@ pub async fn get(
           AND c.tipo_comprobante = 'N'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
         GROUP BY c.year, c.month
         ORDER BY c.year, c.month
     "#,
@@ -207,6 +221,13 @@ pub async fn get(
           AND c.tipo_comprobante = 'N'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
         GROUP BY c.rfc_receptor
         ORDER BY pagado DESC
         LIMIT 100
@@ -250,6 +271,13 @@ pub async fn get(
         WHERE c.rfc_emisor = $1
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
         GROUP BY n.tipo_nomina
     "#,
     )
@@ -297,6 +325,13 @@ pub async fn get(
         WHERE c.rfc_emisor = $1
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
         GROUP BY d.tipo_deduccion
         ORDER BY total DESC
     "#,
@@ -333,6 +368,13 @@ pub async fn get(
         WHERE c.rfc_emisor = $1
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
         GROUP BY p.tipo_percepcion
         ORDER BY SUM(COALESCE(p.importe_gravado,0)::float8) + SUM(COALESCE(p.importe_exento,0)::float8) DESC
     "#,
@@ -370,6 +412,13 @@ pub async fn get(
         WHERE c.rfc_emisor = $1
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
         GROUP BY c.year, c.month
         ORDER BY c.year, c.month
     "#,

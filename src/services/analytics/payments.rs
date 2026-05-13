@@ -226,8 +226,8 @@ pub async fn get(
           AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
           AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
         GROUP BY inv.uuid
-        HAVING outstanding > 1.0
-        ORDER BY outstanding DESC
+        HAVING (inv.total_mxn - COALESCE(SUM(pd.imp_pagado)::float8, 0)) > 1.0
+        ORDER BY (inv.total_mxn - COALESCE(SUM(pd.imp_pagado)::float8, 0)) DESC
         LIMIT 50
         "#
     ))
