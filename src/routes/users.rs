@@ -384,11 +384,8 @@ pub async fn trigger_sync(
         }
     };
 
-    if let Some(ref specific_rfc) = requested_rfc {
-        let _ = crate::db::users::set_initial_sync_job_for_rfc(&pool, &user_id, specific_rfc, &job_id).await;
-    } else {
-        let _ = crate::db::users::set_initial_sync_job(&pool, &user_id, &job_id).await;
-    }
+    // Always update only the specific RFC's row — never overwrite other RFCs' job ids
+    let _ = crate::db::users::set_initial_sync_job_for_rfc(&pool, &user_id, &rfc, &job_id).await;
     tracing::info!(user_id = %user_id, job_id = %job_id, "Sync job triggered manually");
 
     HttpResponse::Ok().json(serde_json::json!({
@@ -697,6 +694,49 @@ pub async fn update_rfc_clave_handler(
             HttpResponse::InternalServerError().json(ErrorBody {
                 error: "Error de base de datos".to_string(),
             })
+        }
+    }
+}
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn delete_rfc_handler(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".to_string() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".to_string() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let rfc = path.into_inner().trim().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+
+    // Prevent deleting the last RFC
+    match crate::db::users::get_user_rfcs(&pool, &user_id).await {
+        Ok(rfcs) if rfcs.len() <= 1 => {
+            return HttpResponse::UnprocessableEntity().json(ErrorBody {
+                error: "No puedes eliminar tu único RFC".to_string(),
+            });
+        }
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "delete_rfc: DB error: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".to_string() });
+        }
+        _ => {}
+    }
+
+    match crate::db::users::delete_user_rfc(&pool, &user_id, &rfc).await {
+        Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Ok(false) => HttpResponse::NotFound().json(ErrorBody { error: "RFC no encontrado".to_string() }),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, rfc = %rfc, "delete_rfc: DB error: {e}");
+            HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".to_string() })
         }
     }
 }
