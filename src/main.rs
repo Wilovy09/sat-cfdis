@@ -560,7 +560,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         let cors = Cors::default()
             .allow_any_origin()
-            .allowed_methods(vec!["GET", "POST", "DELETE", "OPTIONS"])
+            .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
             .allow_any_header()
             .max_age(3600);
 
@@ -604,6 +604,15 @@ async fn main() -> std::io::Result<()> {
             .route(
                 "/api/v1/users/sync-status",
                 web::get().to(users_routes::sync_status),
+            )
+            .service(
+                web::resource("/api/v1/users/rfcs")
+                    .route(web::get().to(users_routes::get_rfcs))
+                    .route(web::post().to(users_routes::add_rfc)),
+            )
+            .service(
+                web::resource("/api/v1/users/rfcs/{rfc}/clave")
+                    .route(web::put().to(users_routes::update_rfc_clave_handler)),
             )
             // Web UI
             .route("/", web::get().to(web_routes::index))
