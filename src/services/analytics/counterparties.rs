@@ -869,8 +869,8 @@ pub async fn get_individual(
                c.year,
                SUM(COALESCE(cc.importe, 0)::float8)::float8 AS yr_amount,
                COUNT(*) AS yr_count
-        FROM pulso.cfdi_conceptos cc
-        JOIN pulso.cfdis c ON c.uuid = cc.cfdi_uuid
+        FROM pulso.cfdi_concepts cc
+        JOIN pulso.cfdis c ON c.uuid = cc.uuid
         WHERE c.{owner_col} = $1 AND c.{dl_filter} AND c.tipo_comprobante NOT IN ('P','N')
           AND c.{cp_col} = $2
           AND (c.year > $3 OR (c.year = $3 AND c.month >= $4))
