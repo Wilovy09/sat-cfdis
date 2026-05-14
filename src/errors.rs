@@ -31,6 +31,20 @@ impl AppError {
             status: 404,
         }
     }
+
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+            status: 401,
+        }
+    }
+
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+            status: 403,
+        }
+    }
 }
 
 impl fmt::Display for AppError {
@@ -44,6 +58,8 @@ impl ResponseError for AppError {
         let body = json!({ "error": self.message });
         match self.status {
             400 => HttpResponse::BadRequest().json(body),
+            401 => HttpResponse::Unauthorized().json(body),
+            403 => HttpResponse::Forbidden().json(body),
             404 => HttpResponse::NotFound().json(body),
             _ => HttpResponse::InternalServerError().json(body),
         }
