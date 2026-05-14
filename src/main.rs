@@ -276,7 +276,7 @@ async fn run_worker_chunk(
     cfg: Arc<Config>,
     s3: Arc<S3Client>,
     job_id: String,
-    _rfc: String,
+    job_rfc: String,
     auth_payload: serde_json::Value,
     _auth_type: String,
     period_from: String,
@@ -483,6 +483,17 @@ async fn run_worker_chunk(
     } else {
         let _ = db::jobs::complete(&pool, &job_id, &period_to, found).await;
         tracing::info!(job_id = %job_id, found = found, "Job completed");
+
+        // Send completion email if SendGrid is configured
+        if let Some(ref api_key) = cfg.sendgrid_api_key {
+            if let Ok(Some(email)) = crate::db::users::get_email_by_rfc(&pool, &job_rfc).await {
+                if let Err(e) = crate::services::email::send_sync_complete(api_key, &cfg.sendgrid_from, &email, &job_rfc, found).await {
+                    tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}");
+                } else {
+                    tracing::info!(job_id = %job_id, "Sent completion email to {email}");
+                }
+            }
+        }
     }
 }
 
@@ -613,6 +624,10 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::resource("/api/v1/users/rfcs/{rfc}/clave")
                     .route(web::put().to(users_routes::update_rfc_clave_handler)),
+            )
+            .service(
+                web::resource("/api/v1/users/rfcs/{rfc}")
+                    .route(web::delete().to(users_routes::delete_rfc_handler)),
             )
             // Web UI
             .route("/", web::get().to(web_routes::index))

@@ -1,5 +1,6 @@
 pub mod analytics;
 pub mod crypto;
+pub mod email;
 pub mod etl;
 pub mod fiel;
 pub mod php_cli;

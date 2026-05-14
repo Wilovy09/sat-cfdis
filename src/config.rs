@@ -18,6 +18,10 @@ pub struct Config {
     pub pg_cert_path: String,
     /// Optional residential proxy for PHP CLI SAT requests (e.g. http://user:pass@host:port)
     pub https_proxy: Option<String>,
+    /// SendGrid API key for transactional email notifications
+    pub sendgrid_api_key: Option<String>,
+    /// Sender address for SendGrid emails (defaults to team@adquiere.co)
+    pub sendgrid_from: String,
 }
 
 impl Config {
@@ -46,6 +50,9 @@ impl Config {
             pg_cert_path: env::var("POSTGRES_CERT_PATH")
                 .unwrap_or_else(|_| "/arena/certs/rds-ca-bundle.pem".to_string()),
             https_proxy: env::var("HTTPS_PROXY").ok(),
+            sendgrid_api_key: env::var("SENDGRID_API_KEY").ok(),
+            sendgrid_from: env::var("SENDGRID_FROM")
+                .unwrap_or_else(|_| "team@adquiere.co".to_string()),
         }
     }
 }
