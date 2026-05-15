@@ -361,9 +361,9 @@ pub async fn list_cfdis_for_normalization(
 ) -> anyhow::Result<Vec<NormCfdiRow>> {
     let rfc_col = rfc_column(dl_type);
     let dl_filter = match dl_type {
-        "recibidos" => "c.dl_type = 'recibidos'",
+        "recibidos" => "c.dl_type IN ('recibidos', 'ambos')",
         "ambos"     => "1=1",
-        _           => "c.dl_type = 'emitidos'",
+        _           => "c.dl_type IN ('emitidos', 'ambos')",
     };
 
     let sql = format!(
