@@ -1,9 +1,9 @@
 /// Normalization rules CRUD: counterparty grouping/exclusion and payroll adjustments.
 use crate::db::DbPool;
+use crate::services::analytics::summary::rfc_column;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use utoipa::ToSchema;
-use crate::services::analytics::summary::rfc_column;
 
 // ---------------------------------------------------------------------------
 // Counterparty normalization
@@ -159,11 +159,12 @@ pub async fn create_rule(
 }
 
 pub async fn delete_rule(pool: &DbPool, id: &str, owner_rfc: &str) -> anyhow::Result<bool> {
-    let result = sqlx::query("DELETE FROM pulso.normalization_rules WHERE id = $1 AND owner_rfc = $2")
-        .bind(id)
-        .bind(owner_rfc)
-        .execute(pool)
-        .await?;
+    let result =
+        sqlx::query("DELETE FROM pulso.normalization_rules WHERE id = $1 AND owner_rfc = $2")
+            .bind(id)
+            .bind(owner_rfc)
+            .execute(pool)
+            .await?;
 
     Ok(result.rows_affected() > 0)
 }
@@ -256,12 +257,13 @@ pub async fn create_payroll_rule(
 }
 
 pub async fn delete_payroll_rule(pool: &DbPool, id: &str, owner_rfc: &str) -> anyhow::Result<bool> {
-    let result =
-        sqlx::query("DELETE FROM pulso.payroll_normalization_rules WHERE id = $1 AND owner_rfc = $2")
-            .bind(id)
-            .bind(owner_rfc)
-            .execute(pool)
-            .await?;
+    let result = sqlx::query(
+        "DELETE FROM pulso.payroll_normalization_rules WHERE id = $1 AND owner_rfc = $2",
+    )
+    .bind(id)
+    .bind(owner_rfc)
+    .execute(pool)
+    .await?;
 
     Ok(result.rows_affected() > 0)
 }
@@ -362,8 +364,8 @@ pub async fn list_cfdis_for_normalization(
     let rfc_col = rfc_column(dl_type);
     let dl_filter = match dl_type {
         "recibidos" => "c.dl_type IN ('recibidos', 'ambos')",
-        "ambos"     => "1=1",
-        _           => "c.dl_type IN ('emitidos', 'ambos')",
+        "ambos" => "1=1",
+        _ => "c.dl_type IN ('emitidos', 'ambos')",
     };
 
     let sql = format!(

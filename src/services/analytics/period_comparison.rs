@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use super::summary::{dl_type_filter, rfc_column};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
-use super::summary::{dl_type_filter, rfc_column};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -87,13 +87,23 @@ pub async fn get(
 ) -> anyhow::Result<PeriodComparisonResponse> {
     let owner_col = rfc_column(dl_type);
     let dl_filter = dl_type_filter(dl_type);
-    let cp_col = if dl_type == "recibidos" { "rfc_emisor" } else { "rfc_receptor" };
-    let cp_name_col = if dl_type == "recibidos" { "nombre_emisor" } else { "nombre_receptor" };
+    let cp_col = if dl_type == "recibidos" {
+        "rfc_emisor"
+    } else {
+        "rfc_receptor"
+    };
+    let cp_name_col = if dl_type == "recibidos" {
+        "nombre_emisor"
+    } else {
+        "nombre_receptor"
+    };
 
     let years_vec: Vec<i32> = years.iter().copied().collect();
 
     // Month abbreviations in Spanish
-    const MONTHS: [&str; 12] = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
+    const MONTHS: [&str; 12] = [
+        "Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic",
+    ];
     let fm_idx = ((from_month - 1).clamp(0, 11)) as usize;
     let tm_idx = ((to_month - 1).clamp(0, 11)) as usize;
     let period_label = format!("{}–{}", MONTHS[fm_idx], MONTHS[tm_idx]);
@@ -261,7 +271,8 @@ pub async fn get(
 
     let mut per_year: Vec<PeriodYearRow> = Vec::new();
     for (i, &year) in sorted_years.iter().enumerate() {
-        let (period_total, cp_count, invoice_count) = period_map.get(&year).copied().unwrap_or((0.0, 0, 0));
+        let (period_total, cp_count, invoice_count) =
+            period_map.get(&year).copied().unwrap_or((0.0, 0, 0));
         let fy_total = fy_map.get(&year).copied().unwrap_or(0.0);
 
         // YoY %: compare with previous year in sorted list
@@ -325,7 +336,10 @@ pub async fn get(
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
         let cp_rfc: String = r.try_get("cp_rfc").unwrap_or_default();
         let total: f64 = r.try_get("total").unwrap_or(0.0);
-        year_cp_totals.entry(year).or_default().insert(cp_rfc, total);
+        year_cp_totals
+            .entry(year)
+            .or_default()
+            .insert(cp_rfc, total);
     }
 
     let mut top_cp_by_year: Vec<CpPeriodRow> = Vec::new();
@@ -338,11 +352,18 @@ pub async fn get(
         let invoice_count: i64 = r.try_get("invoice_count").unwrap_or(0);
 
         let (period_total, _, _) = period_map.get(&year).copied().unwrap_or((0.0, 0, 0));
-        let share_pct = if period_total > 0.0 { total / period_total * 100.0 } else { 0.0 };
+        let share_pct = if period_total > 0.0 {
+            total / period_total * 100.0
+        } else {
+            0.0
+        };
 
         // Status: compare with previous year in sorted list
         let status = {
-            let prev_year_idx = sorted_years.iter().position(|&y| y == year).and_then(|i| i.checked_sub(1));
+            let prev_year_idx = sorted_years
+                .iter()
+                .position(|&y| y == year)
+                .and_then(|i| i.checked_sub(1));
             let status_str = if let Some(pi) = prev_year_idx {
                 let prev_year = sorted_years[pi];
                 let prev_total = year_cp_totals
@@ -468,7 +489,11 @@ pub async fn get(
             .filter(|r| r.status == "Expansión")
             .cloned()
             .collect();
-        top_expansions.sort_by(|a, b| b.delta_mxn.partial_cmp(&a.delta_mxn).unwrap_or(std::cmp::Ordering::Equal));
+        top_expansions.sort_by(|a, b| {
+            b.delta_mxn
+                .partial_cmp(&a.delta_mxn)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         top_expansions.truncate(5);
 
         // top_contractions: Contracción, sorted by delta ASC (most negative), top 5
@@ -477,7 +502,11 @@ pub async fn get(
             .filter(|r| r.status == "Contracción")
             .cloned()
             .collect();
-        top_contractions.sort_by(|a, b| a.delta_mxn.partial_cmp(&b.delta_mxn).unwrap_or(std::cmp::Ordering::Equal));
+        top_contractions.sort_by(|a, b| {
+            a.delta_mxn
+                .partial_cmp(&b.delta_mxn)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         top_contractions.truncate(5);
 
         // new_relevant: Nuevo, sorted by curr_total DESC, top 5
@@ -486,7 +515,11 @@ pub async fn get(
             .filter(|r| r.status == "Nuevo")
             .cloned()
             .collect();
-        new_relevant.sort_by(|a, b| b.current_mxn.partial_cmp(&a.current_mxn).unwrap_or(std::cmp::Ordering::Equal));
+        new_relevant.sort_by(|a, b| {
+            b.current_mxn
+                .partial_cmp(&a.current_mxn)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         new_relevant.truncate(5);
 
         // lost_relevant: Perdido, sorted by prev_total DESC, top 5
@@ -495,7 +528,11 @@ pub async fn get(
             .filter(|r| r.status == "Perdido")
             .cloned()
             .collect();
-        lost_relevant.sort_by(|a, b| b.prev_mxn.partial_cmp(&a.prev_mxn).unwrap_or(std::cmp::Ordering::Equal));
+        lost_relevant.sort_by(|a, b| {
+            b.prev_mxn
+                .partial_cmp(&a.prev_mxn)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         lost_relevant.truncate(5);
 
         // main rows: Nuevo, Expansión, Contracción only (not Perdido), sorted by ABS(delta) DESC, top limit
@@ -504,7 +541,12 @@ pub async fn get(
             .filter(|r| r.status == "Nuevo" || r.status == "Expansión" || r.status == "Contracción")
             .cloned()
             .collect();
-        rows.sort_by(|a, b| b.delta_mxn.abs().partial_cmp(&a.delta_mxn.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        rows.sort_by(|a, b| {
+            b.delta_mxn
+                .abs()
+                .partial_cmp(&a.delta_mxn.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         rows.truncate(limit as usize);
 
         bridges.push(BridgeEntry {

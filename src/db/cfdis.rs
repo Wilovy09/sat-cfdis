@@ -192,11 +192,7 @@ async fn insert_payment_doc(
     Ok(())
 }
 
-pub async fn insert_nomina(
-    pool: &PgPool,
-    uuid: &str,
-    n: &ParsedNomina,
-) -> Result<(), sqlx::Error> {
+pub async fn insert_nomina(pool: &PgPool, uuid: &str, n: &ParsedNomina) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         INSERT INTO pulso.cfdi_nomina (

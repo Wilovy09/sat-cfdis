@@ -115,7 +115,11 @@ pub async fn get_user_rfcs(pool: &PgPool, user_id: &str) -> Result<Vec<String>, 
 }
 
 /// True if user owns this active RFC OR is admin.
-pub async fn user_has_rfc_or_admin(pool: &PgPool, user_id: &str, rfc: &str) -> Result<bool, sqlx::Error> {
+pub async fn user_has_rfc_or_admin(
+    pool: &PgPool,
+    user_id: &str,
+    rfc: &str,
+) -> Result<bool, sqlx::Error> {
     let uid = parse_uuid(user_id)?;
     let admin_row: Option<(Option<bool>,)> =
         sqlx::query_as("SELECT is_admin FROM public.users WHERE id = $1")

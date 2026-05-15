@@ -6,6 +6,7 @@ pub struct Config {
     pub port: u16,
     pub php_bin: String,
     pub php_cli_path: String,
+    #[allow(dead_code)]
     pub captcha_enabled: bool,
     pub s3_bucket: Option<String>,
     pub adquiere_api: String,

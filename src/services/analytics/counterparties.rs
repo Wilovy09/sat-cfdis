@@ -219,7 +219,9 @@ pub async fn get_evolution(
         let yr_total: f64 = row.try_get("yr_total").unwrap_or(0.0);
 
         all_years.insert(year);
-        let entry = cp_map.entry(cp_rfc.clone()).or_insert_with(|| (cp_nombre.clone(), HashMap::new()));
+        let entry = cp_map
+            .entry(cp_rfc.clone())
+            .or_insert_with(|| (cp_nombre.clone(), HashMap::new()));
         entry.0 = cp_nombre;
         entry.1.insert(year, yr_total);
     }
@@ -243,7 +245,8 @@ pub async fn get_evolution(
             let cagr_pct = if nonzero_years.len() >= 2 {
                 let first_val = nonzero_years.first().unwrap().1;
                 let last_val = nonzero_years.last().unwrap().1;
-                let n_years = (nonzero_years.last().unwrap().0 - nonzero_years.first().unwrap().0) as f64;
+                let n_years =
+                    (nonzero_years.last().unwrap().0 - nonzero_years.first().unwrap().0) as f64;
                 if first_val > 0.0 && n_years > 0.0 {
                     Some(((last_val / first_val).powf(1.0 / n_years) - 1.0) * 100.0)
                 } else {
@@ -285,7 +288,11 @@ pub async fn get_evolution(
         })
         .collect();
 
-    evolution_rows.sort_by(|a, b| b.total_acumulado.partial_cmp(&a.total_acumulado).unwrap_or(std::cmp::Ordering::Equal));
+    evolution_rows.sort_by(|a, b| {
+        b.total_acumulado
+            .partial_cmp(&a.total_acumulado)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     evolution_rows.truncate(20);
 
     Ok(EvolutionResponse {
@@ -402,7 +409,10 @@ pub async fn get_ltm_comparison(
         prev_map.insert(cp_rfc, prev_total);
     }
 
-    let ltm_grand_total: f64 = ltm_rows.iter().map(|r| r.try_get::<f64, _>("ltm_total").unwrap_or(0.0)).sum();
+    let ltm_grand_total: f64 = ltm_rows
+        .iter()
+        .map(|r| r.try_get::<f64, _>("ltm_total").unwrap_or(0.0))
+        .sum();
     let prev_grand_total: f64 = prev_map.values().sum();
 
     let mut rows: Vec<LtmRow> = ltm_rows
@@ -446,7 +456,11 @@ pub async fn get_ltm_comparison(
         })
         .collect();
 
-    rows.sort_by(|a, b| b.ltm_mxn.partial_cmp(&a.ltm_mxn).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        b.ltm_mxn
+            .partial_cmp(&a.ltm_mxn)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     rows.truncate(20);
 
     Ok(LtmComparisonResponse {
@@ -669,7 +683,9 @@ pub async fn get_atypical(
         })
         .collect();
 
-    Ok(AtypicalResponse { rows: atypical_rows })
+    Ok(AtypicalResponse {
+        rows: atypical_rows,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -888,7 +904,8 @@ pub async fn get_individual(
     .await?;
 
     // Aggregate concepts
-    let mut concept_map: HashMap<String, (HashMap<String, f64>, HashMap<String, i64>, f64)> = HashMap::new();
+    let mut concept_map: HashMap<String, (HashMap<String, f64>, HashMap<String, i64>, f64)> =
+        HashMap::new();
     for row in &concept_rows {
         let desc: String = row.try_get("desc_key").unwrap_or_default();
         let year: i32 = row.try_get::<i64, _>("year").unwrap_or(0) as i32;
@@ -896,7 +913,9 @@ pub async fn get_individual(
         let yr_count: i64 = row.try_get("yr_count").unwrap_or(0);
         let year_key = year.to_string();
 
-        let entry = concept_map.entry(desc).or_insert_with(|| (HashMap::new(), HashMap::new(), 0.0));
+        let entry = concept_map
+            .entry(desc)
+            .or_insert_with(|| (HashMap::new(), HashMap::new(), 0.0));
         *entry.0.entry(year_key.clone()).or_insert(0.0) += yr_amount;
         *entry.1.entry(year_key).or_insert(0) += yr_count;
         entry.2 += yr_amount;
@@ -904,14 +923,20 @@ pub async fn get_individual(
 
     let mut top_concepts: Vec<CpConceptRow> = concept_map
         .into_iter()
-        .map(|(desc, (year_amounts, year_counts, total_mxn))| CpConceptRow {
-            descripcion: desc,
-            year_amounts,
-            year_counts,
-            total_mxn,
-        })
+        .map(
+            |(desc, (year_amounts, year_counts, total_mxn))| CpConceptRow {
+                descripcion: desc,
+                year_amounts,
+                year_counts,
+                total_mxn,
+            },
+        )
         .collect();
-    top_concepts.sort_by(|a, b| b.total_mxn.partial_cmp(&a.total_mxn).unwrap_or(std::cmp::Ordering::Equal));
+    top_concepts.sort_by(|a, b| {
+        b.total_mxn
+            .partial_cmp(&a.total_mxn)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     top_concepts.truncate(10);
 
     // 4. pct_of_year: for each year, what % of owner's total does this cp represent

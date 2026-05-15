@@ -2,6 +2,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 
 /// S3 key: `cfdis/{rfc_emisor}/{rfc_receptor}/{year}/{month:02}/{day:02}/{uuid}.xml`
+#[allow(dead_code)]
 fn key(
     rfc_emisor: &str,
     rfc_receptor: &str,
@@ -14,6 +15,7 @@ fn key(
 }
 
 /// Upload XML bytes to S3. Returns the S3 key.
+#[allow(dead_code)]
 pub async fn upload_xml(
     client: &Client,
     bucket: &str,
@@ -39,6 +41,7 @@ pub async fn upload_xml(
 }
 
 /// Download XML bytes from S3 if the key exists. Returns None if not found.
+#[allow(dead_code)]
 pub async fn get_xml(
     client: &Client,
     bucket: &str,

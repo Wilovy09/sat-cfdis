@@ -41,7 +41,11 @@ pub async fn get(
     let (to_y, to_m) = parse_ym(to);
     let dl_filter = dl_type_filter(dl_type);
     let owner_col = rfc_column(dl_type);
-    let cp_col = if dl_type == "recibidos" { "rfc_emisor" } else { "rfc_receptor" };
+    let cp_col = if dl_type == "recibidos" {
+        "rfc_emisor"
+    } else {
+        "rfc_receptor"
+    };
 
     let rows = sqlx::query(&format!(
         r#"
@@ -90,7 +94,9 @@ pub async fn get(
         }
 
         let state = postal_to_state(&cp).to_string();
-        let e = state_map.entry(state.clone()).or_insert((0.0, 0, HashSet::new()));
+        let e = state_map
+            .entry(state.clone())
+            .or_insert((0.0, 0, HashSet::new()));
         e.0 += total;
         e.1 += cnt;
         e.2.insert(counterparty_rfc);

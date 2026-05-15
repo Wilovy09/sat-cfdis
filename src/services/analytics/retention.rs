@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use super::summary::{dl_type_filter, rfc_column};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
-use super::summary::{dl_type_filter, rfc_column};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Serialize)]
 pub struct RetentionResponse {
@@ -42,15 +42,19 @@ pub struct IncompleteYear {
     pub months: i32,
 }
 
-pub async fn get(
-    pool: &DbPool,
-    rfc: &str,
-    dl_type: &str,
-) -> anyhow::Result<RetentionResponse> {
+pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<RetentionResponse> {
     let owner_col = rfc_column(dl_type);
     let dl_filter = dl_type_filter(dl_type);
-    let cp_col = if dl_type == "recibidos" { "rfc_emisor" } else { "rfc_receptor" };
-    let cp_name_col = if dl_type == "recibidos" { "nombre_emisor" } else { "nombre_receptor" };
+    let cp_col = if dl_type == "recibidos" {
+        "rfc_emisor"
+    } else {
+        "rfc_receptor"
+    };
+    let cp_name_col = if dl_type == "recibidos" {
+        "nombre_emisor"
+    } else {
+        "nombre_receptor"
+    };
 
     // Q1: distinct months per year (for incomplete detection)
     let q1 = format!(
@@ -85,7 +89,10 @@ pub async fn get(
         let cp_rfc: String = r.try_get("rfc").unwrap_or_default();
         let nombre: String = r.try_get("nombre").unwrap_or_default();
         let total_mxn: f64 = r.try_get("total_mxn").unwrap_or(0.0);
-        year_clients.entry(year).or_default().insert(cp_rfc, (nombre, total_mxn));
+        year_clients
+            .entry(year)
+            .or_default()
+            .insert(cp_rfc, (nombre, total_mxn));
     }
 
     let mut sorted_years: Vec<i32> = year_clients.keys().copied().collect();
@@ -143,43 +150,97 @@ pub async fn get(
             let retained_rfcs: Vec<&str> = curr_rfcs.intersection(&prev_rfcs).copied().collect();
             let lost_rfcs: Vec<&str> = prev_rfcs.difference(&curr_rfcs).copied().collect();
 
-            let new_mxn: f64 = new_rfcs.iter().filter_map(|r| curr_clients.get(*r)).map(|(_, m)| m).sum();
-            let retained_mxn: f64 = retained_rfcs.iter().filter_map(|r| curr_clients.get(*r)).map(|(_, m)| m).sum();
-            let lost_mxn: f64 = lost_rfcs.iter().filter_map(|r| prev_clients.get(*r)).map(|(_, m)| m).sum();
+            let new_mxn: f64 = new_rfcs
+                .iter()
+                .filter_map(|r| curr_clients.get(*r))
+                .map(|(_, m)| m)
+                .sum();
+            let retained_mxn: f64 = retained_rfcs
+                .iter()
+                .filter_map(|r| curr_clients.get(*r))
+                .map(|(_, m)| m)
+                .sum();
+            let lost_mxn: f64 = lost_rfcs
+                .iter()
+                .filter_map(|r| prev_clients.get(*r))
+                .map(|(_, m)| m)
+                .sum();
 
             let new_cp = new_rfcs.len() as i64;
             let retained_cp = retained_rfcs.len() as i64;
             let lost_cp = lost_rfcs.len() as i64;
 
-            let pct_new_mxn = if total_mxn > 0.0 { Some(new_mxn / total_mxn * 100.0) } else { None };
-            let pct_retained_mxn = if total_mxn > 0.0 { Some(retained_mxn / total_mxn * 100.0) } else { None };
-            let churn_vs_prev_pct = if prev_total_mxn > 0.0 { Some(lost_mxn / prev_total_mxn * 100.0) } else { None };
-            let churn_vs_curr_pct = if total_mxn > 0.0 { Some(lost_mxn / total_mxn * 100.0) } else { None };
+            let pct_new_mxn = if total_mxn > 0.0 {
+                Some(new_mxn / total_mxn * 100.0)
+            } else {
+                None
+            };
+            let pct_retained_mxn = if total_mxn > 0.0 {
+                Some(retained_mxn / total_mxn * 100.0)
+            } else {
+                None
+            };
+            let churn_vs_prev_pct = if prev_total_mxn > 0.0 {
+                Some(lost_mxn / prev_total_mxn * 100.0)
+            } else {
+                None
+            };
+            let churn_vs_curr_pct = if total_mxn > 0.0 {
+                Some(lost_mxn / total_mxn * 100.0)
+            } else {
+                None
+            };
 
             // Top 5 lost clients for this year (sorted by last active mxn desc)
-            let mut lost_vec: Vec<(String, String, f64)> = lost_rfcs.iter()
-                .filter_map(|r| prev_clients.get(*r).map(|(n, m)| (r.to_string(), n.clone(), *m)))
+            let mut lost_vec: Vec<(String, String, f64)> = lost_rfcs
+                .iter()
+                .filter_map(|r| {
+                    prev_clients
+                        .get(*r)
+                        .map(|(n, m)| (r.to_string(), n.clone(), *m))
+                })
                 .collect();
             lost_vec.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
             for (cp_rfc, nombre, last_active_mxn) in lost_vec.into_iter().take(5) {
-                top_lost_by_year.push(TopLostCp { year_lost: year, rfc: cp_rfc, nombre, last_active_mxn });
+                top_lost_by_year.push(TopLostCp {
+                    year_lost: year,
+                    rfc: cp_rfc,
+                    nombre,
+                    last_active_mxn,
+                });
             }
 
             years.push(RetentionYearRow {
-                year, total_cp,
-                new_cp: Some(new_cp), retained_cp: Some(retained_cp), lost_cp: Some(lost_cp),
+                year,
+                total_cp,
+                new_cp: Some(new_cp),
+                retained_cp: Some(retained_cp),
+                lost_cp: Some(lost_cp),
                 total_mxn,
-                new_mxn: Some(new_mxn), retained_mxn: Some(retained_mxn), lost_mxn: Some(lost_mxn),
-                pct_new_mxn, pct_retained_mxn, churn_vs_prev_pct, churn_vs_curr_pct,
+                new_mxn: Some(new_mxn),
+                retained_mxn: Some(retained_mxn),
+                lost_mxn: Some(lost_mxn),
+                pct_new_mxn,
+                pct_retained_mxn,
+                churn_vs_prev_pct,
+                churn_vs_curr_pct,
             });
         }
     }
 
-    let mut incomplete_years: Vec<IncompleteYear> = months_per_year.iter()
+    let mut incomplete_years: Vec<IncompleteYear> = months_per_year
+        .iter()
         .filter(|(_, m)| **m < 12)
-        .map(|(y, m)| IncompleteYear { year: *y, months: *m })
+        .map(|(y, m)| IncompleteYear {
+            year: *y,
+            months: *m,
+        })
         .collect();
     incomplete_years.sort_by_key(|y| y.year);
 
-    Ok(RetentionResponse { years, top_lost_by_year, incomplete_years })
+    Ok(RetentionResponse {
+        years,
+        top_lost_by_year,
+        incomplete_years,
+    })
 }

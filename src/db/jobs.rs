@@ -180,22 +180,25 @@ pub async fn complete(
 
 /// Mark a job as failed.
 pub async fn fail(pool: &PgPool, job_id: &str, error_msg: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(r#"UPDATE pulso.sync_jobs SET status='failed', error_msg=$1, updated_at=$2 WHERE id=$3"#)
-        .bind(error_msg)
-        .bind(now_utc())
-        .bind(job_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        r#"UPDATE pulso.sync_jobs SET status='failed', error_msg=$1, updated_at=$2 WHERE id=$3"#,
+    )
+    .bind(error_msg)
+    .bind(now_utc())
+    .bind(job_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 /// Mark a running job as failed (used on server restart to clean up stale state).
 pub async fn reset_stale_running(pool: &PgPool) -> Result<u64, sqlx::Error> {
-    let r =
-        sqlx::query(r#"UPDATE pulso.sync_jobs SET status='queued', updated_at=$1 WHERE status='running'"#)
-            .bind(now_utc())
-            .execute(pool)
-            .await?;
+    let r = sqlx::query(
+        r#"UPDATE pulso.sync_jobs SET status='queued', updated_at=$1 WHERE status='running'"#,
+    )
+    .bind(now_utc())
+    .execute(pool)
+    .await?;
     Ok(r.rows_affected())
 }
 
@@ -206,13 +209,15 @@ pub async fn update_found(
     found: i64,
     cursor_date: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(r#"UPDATE pulso.sync_jobs SET found=$1, cursor_date=$2, updated_at=$3 WHERE id=$4"#)
-        .bind(found)
-        .bind(cursor_date)
-        .bind(now_utc())
-        .bind(job_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        r#"UPDATE pulso.sync_jobs SET found=$1, cursor_date=$2, updated_at=$3 WHERE id=$4"#,
+    )
+    .bind(found)
+    .bind(cursor_date)
+    .bind(now_utc())
+    .bind(job_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -238,9 +243,11 @@ pub async fn upsert_invoice(
 // ---------------------------------------------------------------------------
 
 pub async fn list_all(pool: &PgPool) -> Result<Vec<SyncJob>, sqlx::Error> {
-    sqlx::query_as::<_, SyncJob>(r#"SELECT * FROM pulso.sync_jobs ORDER BY created_at DESC LIMIT 200"#)
-        .fetch_all(pool)
-        .await
+    sqlx::query_as::<_, SyncJob>(
+        r#"SELECT * FROM pulso.sync_jobs ORDER BY created_at DESC LIMIT 200"#,
+    )
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn get_by_id(pool: &PgPool, id: &str) -> Result<Option<SyncJob>, sqlx::Error> {

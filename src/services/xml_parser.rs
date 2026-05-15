@@ -148,13 +148,17 @@ enum Ctx {
     Complemento,
     Pagos,
     Pago,
+    #[allow(dead_code)]
     PagoTraslados,
     Nomina,
     NominaReceptor,
+    #[allow(dead_code)]
     NominaPercepciones,
     NomPercepciones,
+    #[allow(dead_code)]
     NomPercepcion,
     NomDeducciones,
+    #[allow(dead_code)]
     NomDeduccion,
 }
 
@@ -728,7 +732,10 @@ fn parse_f64_val(v: &serde_json::Value, keys: &[&str]) -> Option<f64> {
             return Some(n);
         }
         if let Some(s) = v[k].as_str() {
-            let clean: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+            let clean: String = s
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                .collect();
             if let Ok(f) = clean.parse::<f64>() {
                 return Some(f);
             }

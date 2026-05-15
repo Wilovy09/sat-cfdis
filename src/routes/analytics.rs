@@ -43,11 +43,15 @@ fn jwt_user_id_analytics(token: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-async fn check_rfc_access(pool: &crate::db::DbPool, req: &HttpRequest, rfc: &str) -> Result<(), AppError> {
-    let token = bearer_token_analytics(req)
-        .ok_or_else(|| AppError::unauthorized("Token requerido"))?;
-    let user_id = jwt_user_id_analytics(&token)
-        .ok_or_else(|| AppError::unauthorized("Token inválido"))?;
+async fn check_rfc_access(
+    pool: &crate::db::DbPool,
+    req: &HttpRequest,
+    rfc: &str,
+) -> Result<(), AppError> {
+    let token =
+        bearer_token_analytics(req).ok_or_else(|| AppError::unauthorized("Token requerido"))?;
+    let user_id =
+        jwt_user_id_analytics(&token).ok_or_else(|| AppError::unauthorized("Token inválido"))?;
     let has_access = crate::db::users::user_has_rfc_or_admin(pool, &user_id, rfc)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -184,7 +188,10 @@ pub async fn get_recurrence(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let dl_type = query.get("dl_type").map(|s| s.as_str()).unwrap_or("emitidos");
+    let dl_type = query
+        .get("dl_type")
+        .map(|s| s.as_str())
+        .unwrap_or("emitidos");
     let window_months: i32 = query
         .get("window_months")
         .and_then(|s| s.parse().ok())
@@ -218,7 +225,10 @@ pub async fn get_retention(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let dl_type = query.get("dl_type").map(|s| s.as_str()).unwrap_or("emitidos");
+    let dl_type = query
+        .get("dl_type")
+        .map(|s| s.as_str())
+        .unwrap_or("emitidos");
     let result = retention::get(&pool, &rfc, dl_type)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -634,9 +644,11 @@ pub async fn list_norm_cfdis(
     let limit = query.limit();
     let (from_y, from_m) = crate::services::analytics::summary::parse_ym(&from);
     let (to_y, to_m) = crate::services::analytics::summary::parse_ym(&to);
-    let rows = normalization::list_cfdis_for_normalization(&pool, &rfc, &dl_type, from_y, from_m, to_y, to_m, limit)
-        .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+    let rows = normalization::list_cfdis_for_normalization(
+        &pool, &rfc, &dl_type, from_y, from_m, to_y, to_m, limit,
+    )
+    .await
+    .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(rows))
 }
 
@@ -652,9 +664,10 @@ pub async fn get_counterparties_evolution(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = counterparties::get_evolution(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+    let result =
+        counterparties::get_evolution(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
+            .await
+            .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -688,9 +701,15 @@ pub async fn get_counterparties_payments_detail(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = counterparties::get_payments_detail(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+    let result = counterparties::get_payments_detail(
+        &pool,
+        &rfc,
+        &query.dl_type(),
+        &query.from(),
+        &query.to(),
+    )
+    .await
+    .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -706,9 +725,10 @@ pub async fn get_counterparties_atypical(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = counterparties::get_atypical(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+    let result =
+        counterparties::get_atypical(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
+            .await
+            .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -726,9 +746,16 @@ pub async fn get_counterparty_individual(
     let rfc = rfc.to_uppercase();
     let cp_rfc = cp_rfc.to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = counterparties::get_individual(&pool, &rfc, &cp_rfc, &query.dl_type(), &query.from(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+    let result = counterparties::get_individual(
+        &pool,
+        &rfc,
+        &cp_rfc,
+        &query.dl_type(),
+        &query.from(),
+        &query.to(),
+    )
+    .await
+    .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 

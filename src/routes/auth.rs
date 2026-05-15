@@ -34,15 +34,15 @@ fn jwt_sub(token: &str) -> Option<String> {
         .decode(payload)
         .ok()?;
     let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    json.get("id").or_else(|| json.get("sub"))?.as_str().map(|s| s.to_string())
+    json.get("id")
+        .or_else(|| json.get("sub"))?
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 /// After a successful Adquiere auth response, enrich the JSON body with
 /// `pulso_complete_profile` queried from our local DB.
-async fn enrich_with_profile(
-    pool: &DbPool,
-    mut body: serde_json::Value,
-) -> serde_json::Value {
+async fn enrich_with_profile(pool: &DbPool, mut body: serde_json::Value) -> serde_json::Value {
     if let Some(token) = body.get("access_token").and_then(|t| t.as_str()) {
         if let Some(user_id) = jwt_sub(token) {
             let complete = crate::db::users::get_profile_complete(pool, &user_id)

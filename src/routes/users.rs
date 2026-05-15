@@ -113,7 +113,9 @@ pub async fn get_profile(req: HttpRequest, pool: web::Data<DbPool>) -> HttpRespo
     tracing::Span::current().record("user_id", &user_id.as_str());
 
     match crate::db::users::get_user_rfcs(&pool, &user_id).await {
-        Ok(rfcs) if !rfcs.is_empty() => HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs })),
+        Ok(rfcs) if !rfcs.is_empty() => {
+            HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs }))
+        }
         Ok(_) => HttpResponse::NotFound().json(ErrorBody {
             error: "Perfil no encontrado".to_string(),
         }),
@@ -203,19 +205,26 @@ pub async fn complete_profile(
 
     // Create the background sync job covering 3 full years + complete months of current year
     let (period_from, period_to) = initial_sync_period();
-    let sync_job_id =
-        match crate::db::jobs::insert_queued(&pool, &rfc, "ciec", &auth_enc, "ambos", &period_from, &period_to)
-            .await
-        {
-            Ok(id) => {
-                tracing::info!(user_id = %user_id, job_id = %id, "Initial sync job queued");
-                Some(id)
-            }
-            Err(e) => {
-                tracing::error!(user_id = %user_id, "Failed to queue initial sync: {e}");
-                None
-            }
-        };
+    let sync_job_id = match crate::db::jobs::insert_queued(
+        &pool,
+        &rfc,
+        "ciec",
+        &auth_enc,
+        "ambos",
+        &period_from,
+        &period_to,
+    )
+    .await
+    {
+        Ok(id) => {
+            tracing::info!(user_id = %user_id, job_id = %id, "Initial sync job queued");
+            Some(id)
+        }
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "Failed to queue initial sync: {e}");
+            None
+        }
+    };
 
     // Save RFC + encrypted CIEC to pulso.users
     if let Err(e) = crate::db::users::create_pulso_user(
@@ -289,7 +298,10 @@ pub async fn trigger_sync(
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    let requested_rfc = body.as_ref().and_then(|b| b.rfc.as_deref().map(|s| s.trim().to_uppercase())).filter(|s| !s.is_empty());
+    let requested_rfc = body
+        .as_ref()
+        .and_then(|b| b.rfc.as_deref().map(|s| s.trim().to_uppercase()))
+        .filter(|s| !s.is_empty());
 
     let (rfc, clave_enc, existing_job_id) = if let Some(ref specific_rfc) = requested_rfc {
         // Specific RFC requested — look up its credentials
@@ -371,7 +383,13 @@ pub async fn trigger_sync(
 
     let (period_from, period_to) = initial_sync_period();
     let job_id = match crate::db::jobs::insert_queued(
-        &pool, &rfc, "ciec", &auth_enc, "ambos", &period_from, &period_to,
+        &pool,
+        &rfc,
+        "ciec",
+        &auth_enc,
+        "ambos",
+        &period_from,
+        &period_to,
     )
     .await
     {
@@ -434,7 +452,11 @@ pub async fn sync_status(
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    let specific_rfc = query.rfc.as_deref().map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty());
+    let specific_rfc = query
+        .rfc
+        .as_deref()
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty());
 
     let job_id_opt = if let Some(ref rfc) = specific_rfc {
         // Look up sync info for a specific RFC
@@ -505,12 +527,11 @@ pub async fn get_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> Result<HttpR
 
     if is_admin {
         // Return all (user_id, rfc) pairs
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT user_id::text, rfc FROM pulso.users ORDER BY ctid",
-        )
-        .fetch_all(pool.as_ref())
-        .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT user_id::text, rfc FROM pulso.users ORDER BY ctid")
+                .fetch_all(pool.as_ref())
+                .await
+                .map_err(|e| AppError::internal(&e.to_string()))?;
         return Ok(HttpResponse::Ok().json(serde_json::json!({ "rfcs": rows.into_iter().map(|(uid, rfc)| serde_json::json!({ "user_id": uid, "rfc": rfc })).collect::<Vec<_>>() })));
     }
 
@@ -584,19 +605,26 @@ pub async fn add_rfc(
     };
 
     let (period_from, period_to) = initial_sync_period();
-    let sync_job_id =
-        match crate::db::jobs::insert_queued(&pool, &rfc, "ciec", &auth_enc, "ambos", &period_from, &period_to)
-            .await
-        {
-            Ok(id) => {
-                tracing::info!(user_id = %user_id, job_id = %id, "Initial sync job queued for new RFC");
-                Some(id)
-            }
-            Err(e) => {
-                tracing::error!(user_id = %user_id, "Failed to queue initial sync: {e}");
-                None
-            }
-        };
+    let sync_job_id = match crate::db::jobs::insert_queued(
+        &pool,
+        &rfc,
+        "ciec",
+        &auth_enc,
+        "ambos",
+        &period_from,
+        &period_to,
+    )
+    .await
+    {
+        Ok(id) => {
+            tracing::info!(user_id = %user_id, job_id = %id, "Initial sync job queued for new RFC");
+            Some(id)
+        }
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "Failed to queue initial sync: {e}");
+            None
+        }
+    };
 
     if let Err(e) = crate::db::users::create_pulso_user(
         &pool,
@@ -609,7 +637,10 @@ pub async fn add_rfc(
     {
         // Detect unique constraint violation (RFC already exists for this user)
         let err_str = e.to_string();
-        if err_str.contains("users_user_id_rfc_unique") || err_str.contains("unique") || err_str.contains("duplicate") {
+        if err_str.contains("users_user_id_rfc_unique")
+            || err_str.contains("unique")
+            || err_str.contains("duplicate")
+        {
             return HttpResponse::Conflict().json(ErrorBody {
                 error: "Este RFC ya está registrado para este usuario".to_string(),
             });
@@ -706,11 +737,19 @@ pub async fn delete_rfc_handler(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".to_string() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".to_string(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".to_string() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".to_string(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
@@ -726,17 +765,23 @@ pub async fn delete_rfc_handler(
         }
         Err(e) => {
             tracing::error!(user_id = %user_id, "delete_rfc: DB error: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".to_string() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".to_string(),
+            });
         }
         _ => {}
     }
 
     match crate::db::users::delete_user_rfc(&pool, &user_id, &rfc).await {
         Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
-        Ok(false) => HttpResponse::NotFound().json(ErrorBody { error: "RFC no encontrado".to_string() }),
+        Ok(false) => HttpResponse::NotFound().json(ErrorBody {
+            error: "RFC no encontrado".to_string(),
+        }),
         Err(e) => {
             tracing::error!(user_id = %user_id, rfc = %rfc, "delete_rfc: DB error: {e}");
-            HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".to_string() })
+            HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".to_string(),
+            })
         }
     }
 }
