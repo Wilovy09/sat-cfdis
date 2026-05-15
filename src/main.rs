@@ -56,7 +56,11 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
         };
 
         for job in queued.into_iter().chain(resumable) {
-            let label = if job.status == "queued" { "Starting queued job" } else { "Resuming paused job" };
+            let label = if job.status == "queued" {
+                "Starting queued job"
+            } else {
+                "Resuming paused job"
+            };
             tracing::info!(job_id = %job.id, rfc = %job.rfc, "{label}");
 
             if let Err(e) = db::jobs::set_running(&pool, &job.id).await {
@@ -212,13 +216,14 @@ async fn monthly_sync_worker(pool: DbPool) {
         let key = services::crypto::load_key();
 
         for (rfc, clave_enc) in users {
-            let already_queued = match db::jobs::has_job_for_period(&pool, &rfc, &period_from, &period_to).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!(rfc = %rfc, "Monthly worker: period check failed: {e}");
-                    continue;
-                }
-            };
+            let already_queued =
+                match db::jobs::has_job_for_period(&pool, &rfc, &period_from, &period_to).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(rfc = %rfc, "Monthly worker: period check failed: {e}");
+                        continue;
+                    }
+                };
 
             if already_queued {
                 continue;
@@ -247,7 +252,17 @@ async fn monthly_sync_worker(pool: DbPool) {
                 }
             };
 
-            match db::jobs::insert_queued(&pool, &rfc, "ciec", &auth_enc, "ambos", &period_from, &period_to).await {
+            match db::jobs::insert_queued(
+                &pool,
+                &rfc,
+                "ciec",
+                &auth_enc,
+                "ambos",
+                &period_from,
+                &period_to,
+            )
+            .await
+            {
                 Ok(job_id) => {
                     tracing::info!(
                         rfc = %rfc,
@@ -391,7 +406,15 @@ async fn run_worker_chunk(
                         let (rfc_e, rfc_r, year, month, day) =
                             crate::routes::invoices::extract_cfdi_path_info(&bytes);
                         let _ = crate::services::storage::upload(
-                            &s3_ref, &bucket, &rfc_e, &rfc_r, year, month, day, &uuid_str.to_lowercase(), bytes,
+                            &s3_ref,
+                            &bucket,
+                            &rfc_e,
+                            &rfc_r,
+                            year,
+                            month,
+                            day,
+                            &uuid_str.to_lowercase(),
+                            bytes,
                         )
                         .await;
                     }
@@ -486,7 +509,17 @@ async fn run_worker_chunk(
         // Send completion email if SendGrid is configured
         if let Some(ref api_key) = cfg.sendgrid_api_key {
             if let Ok(Some(email)) = crate::db::users::get_email_by_rfc(&pool, &job_rfc).await {
-                if let Err(e) = crate::services::email::send_sync_complete(api_key, &cfg.sendgrid_from, &email, &job_rfc, found, &period_from, &period_to).await {
+                if let Err(e) = crate::services::email::send_sync_complete(
+                    api_key,
+                    &cfg.sendgrid_from,
+                    &email,
+                    &job_rfc,
+                    found,
+                    &period_from,
+                    &period_to,
+                )
+                .await
+                {
                     tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}");
                 } else {
                     tracing::info!(job_id = %job_id, "Sent completion email to {email}");
@@ -693,7 +726,10 @@ async fn main() -> std::io::Result<()> {
                     .route("/payments", web::get().to(analytics_routes::get_payments))
                     .route("/cashflow", web::get().to(analytics_routes::get_cashflow))
                     .route("/payroll", web::get().to(analytics_routes::get_payroll))
-                    .route("/period-comparison", web::get().to(analytics_routes::get_period_comparison))
+                    .route(
+                        "/period-comparison",
+                        web::get().to(analytics_routes::get_period_comparison),
+                    )
                     // Normalization rules
                     .route(
                         "/normalization",
@@ -723,8 +759,10 @@ async fn main() -> std::io::Result<()> {
                         "/normalization/excluded",
                         web::get().to(analytics_routes::list_excluded_cfdis),
                     )
-                    .service(web::resource("/normalization/cfdis")
-                        .route(web::get().to(analytics_routes::list_norm_cfdis))),
+                    .service(
+                        web::resource("/normalization/cfdis")
+                            .route(web::get().to(analytics_routes::list_norm_cfdis)),
+                    ),
             )
     })
     .bind(&bind_addr)?
