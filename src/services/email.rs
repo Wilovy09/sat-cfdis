@@ -7,9 +7,18 @@ pub async fn send_sync_complete(
     to_email: &str,
     rfc: &str,
     found: i64,
+    period_from: &str,
+    period_to: &str,
 ) -> anyhow::Result<()> {
+    let period_label = format!(
+        "{} → {}",
+        &period_from[..7.min(period_from.len())],
+        &period_to[..7.min(period_to.len())]
+    );
+
     let plain_text = format!(
-        "¡Tus facturas ya están listas! Descargamos {found} comprobantes del RFC {rfc}. \
+        "¡Tus facturas ya están listas! Descargamos {found} comprobantes del RFC {rfc} \
+        correspondientes al período {period_label}. \
         Entra a Pulso para ver tu análisis financiero."
     );
 
@@ -38,7 +47,8 @@ pub async fn send_sync_complete(
               <h2 style="margin:0 0 16px;color:#00004e;font-size:20px;">Tu descarga del SAT ha terminado</h2>
               <p style="margin:0 0 16px;color:#374151;font-size:16px;line-height:1.6;">
                 ¡Tus facturas ya están listas! Descargamos
-                <strong>{found}</strong> comprobante{plural} del RFC <strong>{rfc}</strong>.
+                <strong>{found}</strong> comprobante{plural} del RFC <strong>{rfc}</strong>
+                correspondientes al período <strong>{period_label}</strong>.
               </p>
               <p style="margin:0 0 32px;color:#374151;font-size:16px;line-height:1.6;">
                 Entra a Pulso para ver tu análisis financiero actualizado.
@@ -69,7 +79,7 @@ pub async fn send_sync_complete(
         plural = if found == 1 { "" } else { "s" },
     );
 
-    let subject = format!("Tu descarga del SAT ha terminado — RFC {rfc}");
+    let subject = format!("Tu descarga del SAT ha terminado — RFC {rfc} · {period_label}");
 
     let body = json!({
         "personalizations": [

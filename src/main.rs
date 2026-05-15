@@ -487,7 +487,7 @@ async fn run_worker_chunk(
         // Send completion email if SendGrid is configured
         if let Some(ref api_key) = cfg.sendgrid_api_key {
             if let Ok(Some(email)) = crate::db::users::get_email_by_rfc(&pool, &job_rfc).await {
-                if let Err(e) = crate::services::email::send_sync_complete(api_key, &cfg.sendgrid_from, &email, &job_rfc, found).await {
+                if let Err(e) = crate::services::email::send_sync_complete(api_key, &cfg.sendgrid_from, &email, &job_rfc, found, &period_from, &period_to).await {
                     tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}");
                 } else {
                     tracing::info!(job_id = %job_id, "Sent completion email to {email}");
