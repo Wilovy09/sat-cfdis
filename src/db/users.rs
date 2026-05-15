@@ -114,6 +114,27 @@ pub async fn get_user_rfcs(pool: &PgPool, user_id: &str) -> Result<Vec<String>, 
     Ok(rows.into_iter().map(|(rfc,)| rfc).collect())
 }
 
+pub async fn get_user_rfcs_with_nombre(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
+    let uid = parse_uuid(user_id)?;
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        r#"SELECT u.rfc,
+                  (SELECT c.nombre_emisor
+                   FROM pulso.cfdis c
+                   WHERE c.rfc_emisor = u.rfc AND c.nombre_emisor IS NOT NULL
+                   ORDER BY c.created_at DESC LIMIT 1) AS nombre
+           FROM pulso.users u
+           WHERE u.user_id = $1 AND u.deleted_at IS NULL
+           ORDER BY u.ctid"#,
+    )
+    .bind(uid)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// True if user owns this active RFC OR is admin.
 pub async fn user_has_rfc_or_admin(
     pool: &PgPool,

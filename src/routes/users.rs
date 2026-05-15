@@ -112,8 +112,12 @@ pub async fn get_profile(req: HttpRequest, pool: web::Data<DbPool>) -> HttpRespo
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    match crate::db::users::get_user_rfcs(&pool, &user_id).await {
-        Ok(rfcs) if !rfcs.is_empty() => {
+    match crate::db::users::get_user_rfcs_with_nombre(&pool, &user_id).await {
+        Ok(rows) if !rows.is_empty() => {
+            let rfcs: Vec<_> = rows
+                .into_iter()
+                .map(|(rfc, nombre)| serde_json::json!({ "rfc": rfc, "nombre": nombre }))
+                .collect();
             HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs }))
         }
         Ok(_) => HttpResponse::NotFound().json(ErrorBody {
@@ -535,9 +539,13 @@ pub async fn get_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> Result<HttpR
         return Ok(HttpResponse::Ok().json(serde_json::json!({ "rfcs": rows.into_iter().map(|(uid, rfc)| serde_json::json!({ "user_id": uid, "rfc": rfc })).collect::<Vec<_>>() })));
     }
 
-    let rfcs = crate::db::users::get_user_rfcs(&pool, &user_id)
+    let rows = crate::db::users::get_user_rfcs_with_nombre(&pool, &user_id)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
+    let rfcs: Vec<_> = rows
+        .into_iter()
+        .map(|(rfc, nombre)| serde_json::json!({ "rfc": rfc, "nombre": nombre }))
+        .collect();
     Ok(HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs })))
 }
 
