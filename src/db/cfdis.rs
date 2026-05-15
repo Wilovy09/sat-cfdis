@@ -341,3 +341,64 @@ pub async fn jobs_needing_etl(pool: &PgPool) -> Result<Vec<String>, sqlx::Error>
         .map(|r| r.try_get("job_id").unwrap_or_default())
         .collect())
 }
+
+/// Job IDs that have cfdis parsed from metadata only (xml_available=0),
+/// which may now have XMLs available in storage.
+pub async fn jobs_needing_enrichment(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT ji.job_id
+        FROM pulso.job_invoices ji
+        JOIN pulso.cfdis c ON UPPER(c.uuid) = UPPER(ji.uuid)
+        WHERE c.xml_available = 0
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| r.try_get("job_id").unwrap_or_default())
+        .collect())
+}
+
+/// Invoices for a job that are in cfdis but were parsed from metadata only.
+/// Limited batch to avoid overwhelming storage on each ETL cycle.
+pub async fn find_needs_enrichment(
+    pool: &PgPool,
+    job_id: &str,
+    limit: i64,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT ji.uuid, ji.metadata
+        FROM pulso.job_invoices ji
+        JOIN pulso.cfdis c ON UPPER(c.uuid) = UPPER(ji.uuid)
+        WHERE ji.job_id = $1 AND c.xml_available = 0
+        LIMIT $2
+        "#,
+    )
+    .bind(job_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let uuid: String = r.try_get("uuid").unwrap_or_default();
+            let meta: String = r.try_get("metadata").unwrap_or_default();
+            (uuid, meta)
+        })
+        .collect())
+}
+
+/// Returns true if concepts already exist for this UUID (prevents duplicate inserts).
+pub async fn concepts_exist(pool: &PgPool, uuid: &str) -> bool {
+    sqlx::query("SELECT 1 FROM pulso.cfdi_concepts WHERE UPPER(uuid) = UPPER($1) LIMIT 1")
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await
+        .map(|r| r.is_some())
+        .unwrap_or(false)
+}

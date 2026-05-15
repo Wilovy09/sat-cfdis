@@ -10,11 +10,13 @@ use std::sync::Arc;
 
 const ETL_POLL_SECS: u64 = 120;
 const BATCH_SIZE: usize = 100;
+const ENRICH_BATCH: i64 = 50;
 
 pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(ETL_POLL_SECS)).await;
 
+        // Normal ETL: insert new invoices not yet in cfdis
         let job_ids = match db::cfdis::jobs_needing_etl(&pool).await {
             Ok(ids) => ids,
             Err(e) => {
@@ -22,10 +24,23 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
                 continue;
             }
         };
-
         for job_id in job_ids {
             if let Err(e) = process_job(&pool, &cfg, &s3, &job_id).await {
                 tracing::error!(job_id = %job_id, "ETL: error processing job: {e}");
+            }
+        }
+
+        // Enrichment: re-try invoices parsed from metadata that may now have XML in storage
+        let enrich_ids = match db::cfdis::jobs_needing_enrichment(&pool).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!("ETL: DB error finding enrichment jobs: {e}");
+                continue;
+            }
+        };
+        for job_id in enrich_ids {
+            if let Err(e) = enrich_job(&pool, &cfg, &s3, &job_id).await {
+                tracing::error!(job_id = %job_id, "ETL: error enriching job: {e}");
             }
         }
     }
@@ -130,6 +145,83 @@ async fn process_invoice(
             tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}");
         }
     }
+}
+
+/// Re-processes invoices that were parsed from metadata only.
+/// Fetches XML from storage; if found, enriches taxes/payments/concepts in place.
+async fn enrich_job(
+    pool: &DbPool,
+    cfg: &Config,
+    s3: &S3Client,
+    job_id: &str,
+) -> anyhow::Result<()> {
+    let pending = db::cfdis::find_needs_enrichment(pool, job_id, ENRICH_BATCH).await?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(job_id = %job_id, count = pending.len(), "ETL: enriching invoices");
+
+    for (uuid, metadata) in &pending {
+        enrich_invoice(pool, cfg, s3, uuid, metadata).await;
+    }
+
+    Ok(())
+}
+
+async fn enrich_invoice(
+    pool: &DbPool,
+    cfg: &Config,
+    s3: &S3Client,
+    uuid: &str,
+    metadata: &str,
+) {
+    let xml_bytes = try_load_xml(cfg, s3, uuid, metadata).await;
+    let Some(bytes) = xml_bytes else {
+        return; // XML not in storage yet — will retry next cycle
+    };
+
+    let estado = extract_estado_from_meta(metadata);
+
+    // job_id and dl_type don't affect enrichment (upsert ON CONFLICT preserves originals)
+    let Some(mut cfdi) = xml_parser::parse(&bytes, "", "ambos", &estado) else {
+        tracing::warn!(uuid = %uuid, "ETL enrich: could not parse XML");
+        return;
+    };
+
+    cfdi.uuid = uuid.to_uppercase();
+
+    // Update header row so xml_available flips to true
+    if let Err(e) = db::cfdis::upsert_cfdi(pool, &cfdi).await {
+        tracing::warn!(uuid = %uuid, "ETL enrich: upsert_cfdi failed: {e}");
+        return;
+    }
+
+    if !cfdi.taxes.is_empty() {
+        if let Err(e) = db::cfdis::insert_taxes(pool, &cfdi.uuid, &cfdi.taxes).await {
+            tracing::warn!(uuid = %uuid, "ETL enrich: insert_taxes: {e}");
+        }
+    }
+
+    if !cfdi.payments.is_empty() {
+        if let Err(e) = db::cfdis::insert_payments(pool, &cfdi.uuid, &cfdi.payments).await {
+            tracing::warn!(uuid = %uuid, "ETL enrich: insert_payments: {e}");
+        }
+    }
+
+    if !cfdi.concepts.is_empty() && !db::cfdis::concepts_exist(pool, &cfdi.uuid).await {
+        if let Err(e) = db::cfdis::insert_concepts(pool, &cfdi.uuid, &cfdi.concepts).await {
+            tracing::warn!(uuid = %uuid, "ETL enrich: insert_concepts: {e}");
+        }
+    }
+
+    if let Some(nomina) = &cfdi.nomina {
+        if let Err(e) = db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await {
+            tracing::warn!(uuid = %uuid, "ETL enrich: insert_nomina: {e}");
+        }
+    }
+
+    tracing::debug!(uuid = %uuid, "ETL enrich: enriched from XML");
 }
 
 /// Attempt to load XML bytes from local storage or S3.
