@@ -392,7 +392,7 @@ async fn run_worker_chunk(
                         let (rfc_e, rfc_r, year, month, day) =
                             crate::routes::invoices::extract_cfdi_path_info(&bytes);
                         let _ = crate::services::storage::upload(
-                            &s3_ref, &bucket, &rfc_e, &rfc_r, year, month, day, &uuid_str, bytes,
+                            &s3_ref, &bucket, &rfc_e, &rfc_r, year, month, day, &uuid_str.to_lowercase(), bytes,
                         )
                         .await;
                     }

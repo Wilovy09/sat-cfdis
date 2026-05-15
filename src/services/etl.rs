@@ -274,13 +274,8 @@ async fn enrich_invoice(
 async fn try_load_xml(cfg: &Config, s3: &S3Client, uuid: &str, metadata: &str) -> Option<Vec<u8>> {
     let (rfc_e, rfc_r, year, month, day) = extract_path_from_meta(metadata);
     let bucket = cfg.s3_bucket.clone().unwrap_or_default();
-    tracing::debug!(
-        uuid = %uuid,
-        bucket = %bucket,
-        path = %format!("cfdis/{rfc_e}/{rfc_r}/{year}/{month:02}/{day:02}/{uuid}.xml"),
-        "ETL: trying S3 load"
-    );
-    storage::get(s3, &bucket, &rfc_e, &rfc_r, year, month, day, uuid).await
+    let uuid_lower = uuid.to_lowercase();
+    storage::get(s3, &bucket, &rfc_e, &rfc_r, year, month, day, &uuid_lower).await
 }
 
 fn extract_path_from_meta(metadata: &str) -> (String, String, u32, u32, u32) {
