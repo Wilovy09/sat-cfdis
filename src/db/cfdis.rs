@@ -30,6 +30,7 @@ pub async fn upsert_cfdi(pool: &PgPool, c: &ParsedCfdi) -> Result<(), sqlx::Erro
             uso_cfdi                  = excluded.uso_cfdi,
             domicilio_fiscal_receptor = excluded.domicilio_fiscal_receptor,
             regimen_fiscal_receptor   = excluded.regimen_fiscal_receptor,
+            tipo_comprobante          = excluded.tipo_comprobante,
             subtotal                  = excluded.subtotal,
             descuento                 = excluded.descuento,
             total                     = excluded.total,
