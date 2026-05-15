@@ -12,12 +12,13 @@ use std::sync::Arc;
 const ETL_POLL_SECS: u64 = 120;
 const BATCH_SIZE: usize = 100;
 const ENRICH_BATCH: i64 = 50;
-/// Cycles to skip a job after a batch yields 0 enriched invoices (~20 min at 120s/cycle).
-const ENRICH_BACKOFF_CYCLES: u32 = 10;
+/// Max skip cycles before a job is considered permanently unresolvable this session (~24h).
+const ENRICH_MAX_SKIP: u32 = 720;
 
 pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
-    // Tracks remaining skip cycles per job_id when enrichment yields nothing.
+    // Tracks remaining skip cycles per job_id. Doubles on each failed round, capped at ENRICH_MAX_SKIP.
     let mut enrich_skip: HashMap<String, u32> = HashMap::new();
+    let mut enrich_fail_rounds: HashMap<String, u32> = HashMap::new();
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(ETL_POLL_SECS)).await;
@@ -31,8 +32,9 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
             }
         };
         for job_id in job_ids {
-            // Reset backoff when a job gets new invoices to process
+            // Reset backoff when a job gets new invoices (XMLs may now be in storage)
             enrich_skip.remove(&job_id);
+            enrich_fail_rounds.remove(&job_id);
             if let Err(e) = process_job(&pool, &cfg, &s3, &job_id).await {
                 tracing::error!(job_id = %job_id, "ETL: error processing job: {e}");
             }
@@ -64,9 +66,15 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
             };
 
             if enriched == 0 {
-                enrich_skip.insert(job_id, ENRICH_BACKOFF_CYCLES);
+                let rounds = enrich_fail_rounds.entry(job_id.clone()).or_insert(0);
+                *rounds += 1;
+                // Exponential backoff: 2^rounds cycles, capped at ENRICH_MAX_SKIP (~24h)
+                let skip = (2u32.saturating_pow(*rounds)).min(ENRICH_MAX_SKIP);
+                tracing::debug!(job_id = %job_id, rounds = *rounds, skip_cycles = skip, "ETL: enrichment backoff");
+                enrich_skip.insert(job_id, skip);
             } else {
                 enrich_skip.remove(&job_id);
+                enrich_fail_rounds.remove(&job_id);
             }
         }
     }
@@ -213,7 +221,8 @@ async fn enrich_invoice(
 ) -> bool {
     let xml_bytes = try_load_xml(cfg, s3, uuid, metadata).await;
     let Some(bytes) = xml_bytes else {
-        return false; // XML not in storage — caller decides whether to backoff
+        tracing::warn!(uuid = %uuid, "ETL enrich: XML not found in storage");
+        return false;
     };
 
     let estado = extract_estado_from_meta(metadata);
@@ -263,10 +272,14 @@ async fn enrich_invoice(
 /// Attempt to load XML bytes from local storage or S3.
 /// Returns None if not found or config not set.
 async fn try_load_xml(cfg: &Config, s3: &S3Client, uuid: &str, metadata: &str) -> Option<Vec<u8>> {
-    // Extract path components from metadata
     let (rfc_e, rfc_r, year, month, day) = extract_path_from_meta(metadata);
-
     let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+    tracing::debug!(
+        uuid = %uuid,
+        bucket = %bucket,
+        path = %format!("cfdis/{rfc_e}/{rfc_r}/{year}/{month:02}/{day:02}/{uuid}.xml"),
+        "ETL: trying S3 load"
+    );
     storage::get(s3, &bucket, &rfc_e, &rfc_r, year, month, day, uuid).await
 }
 
