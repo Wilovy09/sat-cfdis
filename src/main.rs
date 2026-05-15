@@ -10,11 +10,10 @@ mod state;
 use actix_cors::Cors;
 use actix_files::Files;
 use actix_web::{App, HttpServer, web};
-use tracing_actix_web::TracingLogger;
 use aws_sdk_s3::Client as S3Client;
 use std::sync::Arc;
-use tera::Tera;
 use tracing::info;
+use tracing_actix_web::TracingLogger;
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
@@ -23,7 +22,7 @@ use config::Config;
 use db::DbPool;
 use routes::{
     analytics as analytics_routes, auth as auth_routes, invoices, queue as queue_routes,
-    users as users_routes, web as web_routes,
+    users as users_routes,
 };
 use services::etl;
 use state::CaptchaMap;
@@ -511,12 +510,6 @@ async fn main() -> std::io::Result<()> {
     let cfg = Config::from_env();
     let bind_addr = format!("{}:{}", cfg.host, cfg.port);
 
-    let templates_glob =
-        std::env::var("TEMPLATES_DIR").unwrap_or_else(|_| "templates/**/*".to_string());
-    let tera = Tera::new(&templates_glob).unwrap_or_else(|e| {
-        panic!("Failed to load Tera templates from '{templates_glob}': {e}");
-    });
-
     // ── Database ────────────────────────────────────────────────────────────
     let pool = db::init_pool(&cfg).await.unwrap_or_else(|e| {
         panic!("Failed to connect to PostgreSQL at '{}': {e}", cfg.pg_host);
@@ -629,10 +622,6 @@ async fn main() -> std::io::Result<()> {
                 web::resource("/api/v1/users/rfcs/{rfc}")
                     .route(web::delete().to(users_routes::delete_rfc_handler)),
             )
-            // Web UI
-            .route("/", web::get().to(web_routes::index))
-            .route("/analytics", web::get().to(web_routes::analytics_page))
-            .route("/web/list", web::post().to(web_routes::list_web))
             // Invoice API
             .service(
                 web::scope("/api/v1/invoices")
