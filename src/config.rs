@@ -22,6 +22,10 @@ pub struct Config {
     pub sendgrid_api_key: Option<String>,
     /// Sender address for SendGrid emails (defaults to team@adquiere.co)
     pub sendgrid_from: String,
+    /// Comma-separated list of allowed CORS origins (e.g. https://pulso.adquiere.co)
+    pub allowed_origins: Vec<String>,
+    /// Comma-separated list of allowed CORS methods (e.g. GET,POST,PUT,DELETE,OPTIONS)
+    pub allowed_methods: Vec<String>,
 }
 
 impl Config {
@@ -53,6 +57,18 @@ impl Config {
             sendgrid_api_key: env::var("SENDGRID_API_KEY").ok(),
             sendgrid_from: env::var("SENDGRID_FROM")
                 .unwrap_or_else(|_| "team@adquiere.co".to_string()),
+            allowed_origins: env::var("ALLOWED_ORIGINS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            allowed_methods: env::var("ALLOWED_METHODS")
+                .unwrap_or_else(|_| "GET,POST,PUT,DELETE,OPTIONS".to_string())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 }

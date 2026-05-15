@@ -554,23 +554,30 @@ async fn main() -> std::io::Result<()> {
     }
 
     // ── HTTP server ─────────────────────────────────────────────────────────
+    let allowed_origins = cfg.allowed_origins.clone();
+    let allowed_methods = cfg.allowed_methods.clone();
     let cfg_data = web::Data::new(cfg);
-    let tera_data = web::Data::new(tera);
     let pool_data = web::Data::new(pool);
     let captcha_map: web::Data<CaptchaMap> =
         web::Data::new(CaptchaMap::new(std::collections::HashMap::new()));
     let s3_data = web::Data::from(s3_client);
 
     HttpServer::new(move || {
-        let cors = Cors::default()
-            .allow_any_origin()
-            .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+        let methods: Vec<&str> = allowed_methods.iter().map(String::as_str).collect();
+        let mut cors = Cors::default()
+            .allowed_methods(methods)
             .allow_any_header()
             .max_age(3600);
+        if allowed_origins.is_empty() {
+            cors = cors.allow_any_origin();
+        } else {
+            for origin in &allowed_origins {
+                cors = cors.allowed_origin(origin);
+            }
+        };
 
         App::new()
             .app_data(cfg_data.clone())
-            .app_data(tera_data.clone())
             .app_data(captcha_map.clone())
             .app_data(s3_data.clone())
             .app_data(pool_data.clone())
