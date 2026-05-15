@@ -6,13 +6,19 @@ use crate::{
     services::{storage, xml_parser},
 };
 use aws_sdk_s3::Client as S3Client;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const ETL_POLL_SECS: u64 = 120;
 const BATCH_SIZE: usize = 100;
 const ENRICH_BATCH: i64 = 50;
+/// Cycles to skip a job after a batch yields 0 enriched invoices (~20 min at 120s/cycle).
+const ENRICH_BACKOFF_CYCLES: u32 = 10;
 
 pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
+    // Tracks remaining skip cycles per job_id when enrichment yields nothing.
+    let mut enrich_skip: HashMap<String, u32> = HashMap::new();
+
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(ETL_POLL_SECS)).await;
 
@@ -25,6 +31,8 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
             }
         };
         for job_id in job_ids {
+            // Reset backoff when a job gets new invoices to process
+            enrich_skip.remove(&job_id);
             if let Err(e) = process_job(&pool, &cfg, &s3, &job_id).await {
                 tracing::error!(job_id = %job_id, "ETL: error processing job: {e}");
             }
@@ -39,8 +47,26 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
             }
         };
         for job_id in enrich_ids {
-            if let Err(e) = enrich_job(&pool, &cfg, &s3, &job_id).await {
-                tracing::error!(job_id = %job_id, "ETL: error enriching job: {e}");
+            // Decrement and skip if in backoff
+            if let Some(remaining) = enrich_skip.get_mut(&job_id) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    continue;
+                }
+            }
+
+            let enriched = match enrich_job(&pool, &cfg, &s3, &job_id).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(job_id = %job_id, "ETL: error enriching job: {e}");
+                    0
+                }
+            };
+
+            if enriched == 0 {
+                enrich_skip.insert(job_id, ENRICH_BACKOFF_CYCLES);
+            } else {
+                enrich_skip.remove(&job_id);
             }
         }
     }
@@ -149,36 +175,45 @@ async fn process_invoice(
 
 /// Re-processes invoices that were parsed from metadata only.
 /// Fetches XML from storage; if found, enriches taxes/payments/concepts in place.
+/// Returns the number of invoices successfully enriched.
 async fn enrich_job(
     pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
     job_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let pending = db::cfdis::find_needs_enrichment(pool, job_id, ENRICH_BATCH).await?;
     if pending.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     tracing::info!(job_id = %job_id, count = pending.len(), "ETL: enriching invoices");
 
+    let mut enriched = 0usize;
     for (uuid, metadata) in &pending {
-        enrich_invoice(pool, cfg, s3, uuid, metadata).await;
+        if enrich_invoice(pool, cfg, s3, uuid, metadata).await {
+            enriched += 1;
+        }
     }
 
-    Ok(())
+    if enriched > 0 {
+        tracing::info!(job_id = %job_id, enriched, "ETL: enrichment batch done");
+    }
+
+    Ok(enriched)
 }
 
+/// Returns true if the invoice was successfully enriched from XML.
 async fn enrich_invoice(
     pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
     uuid: &str,
     metadata: &str,
-) {
+) -> bool {
     let xml_bytes = try_load_xml(cfg, s3, uuid, metadata).await;
     let Some(bytes) = xml_bytes else {
-        return; // XML not in storage yet — will retry next cycle
+        return false; // XML not in storage — caller decides whether to backoff
     };
 
     let estado = extract_estado_from_meta(metadata);
@@ -186,7 +221,7 @@ async fn enrich_invoice(
     // job_id and dl_type don't affect enrichment (upsert ON CONFLICT preserves originals)
     let Some(mut cfdi) = xml_parser::parse(&bytes, "", "ambos", &estado) else {
         tracing::warn!(uuid = %uuid, "ETL enrich: could not parse XML");
-        return;
+        return false;
     };
 
     cfdi.uuid = uuid.to_uppercase();
@@ -194,7 +229,7 @@ async fn enrich_invoice(
     // Update header row so xml_available flips to true
     if let Err(e) = db::cfdis::upsert_cfdi(pool, &cfdi).await {
         tracing::warn!(uuid = %uuid, "ETL enrich: upsert_cfdi failed: {e}");
-        return;
+        return false;
     }
 
     if !cfdi.taxes.is_empty() {
@@ -222,6 +257,7 @@ async fn enrich_invoice(
     }
 
     tracing::debug!(uuid = %uuid, "ETL enrich: enriched from XML");
+    true
 }
 
 /// Attempt to load XML bytes from local storage or S3.
