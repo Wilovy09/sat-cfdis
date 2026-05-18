@@ -547,9 +547,13 @@ pub async fn get_payments_detail(
                COUNT(DISTINCT inv.uuid) AS facturas_ppd,
                COUNT(DISTINCT CASE WHEN (COALESCE(inv.total_mxn,0) - COALESCE(paid_per_inv.paid,0)) > 1.0 THEN inv.uuid END) AS facturas_abiertas,
                COALESCE(AVG(CASE WHEN cp.fecha_pago IS NOT NULL THEN (cp.fecha_pago::date - inv.fecha_emision::date)::float8 END), 0) AS dias_cobro,
-               COALESCE(SUM(CASE WHEN (COALESCE(inv.total_mxn,0) - COALESCE(paid_per_inv.paid,0)) > 1.0
-                                  AND inv.fecha_emision::date < CURRENT_DATE - INTERVAL '180 days'
-                             THEN (COALESCE(inv.total_mxn,0) - COALESCE(paid_per_inv.paid,0)) END)::float8, 0) AS monto_riesgo
+               COALESCE(SUM(CASE
+                   WHEN (COALESCE(inv.total_mxn,0) - COALESCE(paid_per_inv.paid,0)) > 1000.0
+                    AND inv.fecha_emision::date < CURRENT_DATE - INTERVAL '180 days'
+                    AND (COALESCE(inv.total_mxn,0) - COALESCE(paid_per_inv.paid,0))
+                        / NULLIF(COALESCE(inv.total_mxn,0), 0) >= 0.03
+                   THEN (COALESCE(inv.total_mxn,0) - COALESCE(paid_per_inv.paid,0))
+               END)::float8, 0) AS monto_riesgo
         FROM pulso.cfdis inv
         LEFT JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
         LEFT JOIN pulso.cfdi_payments cp ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
