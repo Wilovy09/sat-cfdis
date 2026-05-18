@@ -303,7 +303,7 @@ pub async fn find_pending_etl(
         r#"
         SELECT ji.uuid, ji.metadata
         FROM pulso.job_invoices ji
-        LEFT JOIN pulso.cfdis c ON UPPER(c.uuid) = UPPER(ji.uuid)
+        LEFT JOIN pulso.cfdis c ON c.uuid = ji.uuid
         WHERE ji.job_id = $1 AND c.uuid IS NULL
         "#,
     )
@@ -327,7 +327,7 @@ pub async fn jobs_needing_etl(pool: &PgPool) -> Result<Vec<String>, sqlx::Error>
         r#"
         SELECT DISTINCT ji.job_id
         FROM pulso.job_invoices ji
-        LEFT JOIN pulso.cfdis c ON UPPER(c.uuid) = UPPER(ji.uuid)
+        LEFT JOIN pulso.cfdis c ON c.uuid = ji.uuid
         WHERE c.uuid IS NULL
         "#,
     )
@@ -347,7 +347,7 @@ pub async fn jobs_needing_enrichment(pool: &PgPool) -> Result<Vec<String>, sqlx:
         r#"
         SELECT DISTINCT ji.job_id
         FROM pulso.job_invoices ji
-        JOIN pulso.cfdis c ON UPPER(c.uuid) = UPPER(ji.uuid)
+        JOIN pulso.cfdis c ON c.uuid = ji.uuid
         WHERE c.xml_available = 0
         "#,
     )
@@ -371,7 +371,7 @@ pub async fn find_needs_enrichment(
         r#"
         SELECT ji.uuid, ji.metadata
         FROM pulso.job_invoices ji
-        JOIN pulso.cfdis c ON UPPER(c.uuid) = UPPER(ji.uuid)
+        JOIN pulso.cfdis c ON c.uuid = ji.uuid
         WHERE ji.job_id = $1 AND c.xml_available = 0
         LIMIT $2
         "#,
@@ -392,7 +392,7 @@ pub async fn find_needs_enrichment(
 
 /// Returns true if concepts already exist for this UUID (prevents duplicate inserts).
 pub async fn concepts_exist(pool: &PgPool, uuid: &str) -> bool {
-    sqlx::query("SELECT 1 FROM pulso.cfdi_concepts WHERE UPPER(uuid) = UPPER($1) LIMIT 1")
+    sqlx::query("SELECT 1 FROM pulso.cfdi_concepts WHERE uuid = $1 LIMIT 1")
         .bind(uuid)
         .fetch_optional(pool)
         .await
