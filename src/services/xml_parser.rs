@@ -425,6 +425,8 @@ pub fn from_metadata(meta_json: &str, job_id: &str, dl_type: &str) -> Option<Par
         .or_else(|| v["NombreReceptor"].as_str())
         .map(str::to_string);
 
+    let subtotal = parse_f64_val(&v, &["subtotal", "SubTotal", "sub_total"]);
+    let descuento = parse_f64_val(&v, &["descuento", "Descuento"]);
     let total = parse_f64_val(&v, &["total", "Total", "monto"]);
     let moneda = v["moneda"]
         .as_str()
@@ -469,6 +471,8 @@ pub fn from_metadata(meta_json: &str, job_id: &str, dl_type: &str) -> Option<Par
         year,
         month,
         tipo_comprobante,
+        subtotal,
+        descuento,
         total,
         moneda,
         tipo_cambio,
