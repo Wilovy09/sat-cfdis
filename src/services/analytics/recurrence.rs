@@ -109,7 +109,7 @@ pub async fn get(
         WITH cp_months AS (
             SELECT {cp_col},
                    COUNT(DISTINCT year * 100 + month)::bigint   AS months_active,
-                   SUM(COALESCE(total_mxn,0)::float8)::float8   AS total_mxn
+                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8   AS total_mxn
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
@@ -152,7 +152,7 @@ pub async fn get(
         ),
         cp_year AS (
             SELECT year, {cp_col},
-                   SUM(COALESCE(total_mxn,0)::float8)::float8 AS year_total
+                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS year_total
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
@@ -194,7 +194,7 @@ pub async fn get(
             SELECT {cp_col}                                           AS rfc,
                    MAX({cp_name_col})                                  AS nombre,
                    COUNT(DISTINCT year * 100 + month)::bigint          AS months_active,
-                   SUM(COALESCE(total_mxn,0)::float8)::float8          AS total_mxn,
+                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8          AS total_mxn,
                    COUNT(*)::bigint                                    AS invoice_count
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
@@ -203,7 +203,7 @@ pub async fn get(
             HAVING COUNT(DISTINCT year * 100 + month) >= $4
         ),
         wt AS (
-            SELECT GREATEST(SUM(COALESCE(total_mxn,0)::float8), 1) AS total
+            SELECT GREATEST(SUM(COALESCE(total_neto_mxn,0)::float8), 1) AS total
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
               AND year * 100 + month >= $2 AND year * 100 + month <= $3

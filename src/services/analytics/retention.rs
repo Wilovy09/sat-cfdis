@@ -74,7 +74,7 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
     // Q2: per (year, cp_rfc) totals
     let q2 = format!(
         "SELECT year, {cp_col} AS rfc, MAX({cp_name_col}) AS nombre, \
-                SUM(COALESCE(total_mxn,0)::float8)::float8 AS total_mxn \
+                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total_mxn \
          FROM pulso.cfdis \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') \
          GROUP BY year, {cp_col} \
@@ -100,7 +100,7 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
 
     // Q3: year totals
     let q3 = format!(
-        "SELECT year, SUM(COALESCE(total_mxn,0)::float8)::float8 AS total_mxn \
+        "SELECT year, SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total_mxn \
          FROM pulso.cfdis \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') \
          GROUP BY year ORDER BY year"

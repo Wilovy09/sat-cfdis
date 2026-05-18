@@ -53,7 +53,7 @@ pub async fn get(
         SELECT
             {cp_col}                                                AS cp_rfc,
             MAX({cp_name_col})                                      AS cp_nombre,
-            SUM(COALESCE(total_mxn,0)::float8)::float8                             AS total,
+            SUM(COALESCE(total_neto_mxn,0)::float8)::float8                          AS total,
             COUNT(*)                                               AS cnt,
             MIN(fecha_emision)                                     AS first_inv,
             MAX(fecha_emision)                                     AS last_inv,
@@ -81,7 +81,7 @@ pub async fn get(
     // Total for percentage calc
     let total_row = sqlx::query(&format!(
         r#"
-        SELECT SUM(COALESCE(total_mxn,0)::float8)::float8 AS total, COUNT(DISTINCT {cp_col}) AS cp_count
+        SELECT SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total, COUNT(DISTINCT {cp_col}) AS cp_count
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
@@ -191,7 +191,7 @@ pub async fn get_evolution(
     let rows = sqlx::query(&format!(
         r#"
         SELECT {cp_col} AS cp_rfc, MAX({cp_name_col}) AS cp_nombre, year,
-               SUM(COALESCE(total_mxn,0)::float8)::float8 AS yr_total
+               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS yr_total
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND (year > $2 OR (year = $2 AND month >= $3))
@@ -365,7 +365,7 @@ pub async fn get_ltm_comparison(
         r#"
         SELECT {cp_col} AS cp_rfc,
                MAX({cp_name_col}) AS cp_nombre,
-               SUM(COALESCE(total_mxn,0)::float8)::float8 AS ltm_total,
+               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS ltm_total,
                COUNT(DISTINCT year * 100 + month) AS months_active,
                COUNT(*) AS invoice_count
         FROM pulso.cfdis
@@ -386,7 +386,8 @@ pub async fn get_ltm_comparison(
     let prev_rows = sqlx::query(&format!(
         r#"
         SELECT {cp_col} AS cp_rfc,
-               SUM(COALESCE(total_mxn,0)::float8)::float8 AS prev_total
+               MAX({cp_name_col}) AS cp_nombre,
+               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS prev_total
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND (year > $2 OR (year = $2 AND month >= $3))
@@ -402,18 +403,20 @@ pub async fn get_ltm_comparison(
     .fetch_all(pool)
     .await?;
 
-    let mut prev_map: HashMap<String, f64> = HashMap::new();
+    // (name, total) for prev LTM counterparties
+    let mut prev_map: HashMap<String, (String, f64)> = HashMap::new();
     for row in &prev_rows {
         let cp_rfc: String = row.try_get("cp_rfc").unwrap_or_default();
+        let cp_nombre: String = row.try_get("cp_nombre").unwrap_or_default();
         let prev_total: f64 = row.try_get("prev_total").unwrap_or(0.0);
-        prev_map.insert(cp_rfc, prev_total);
+        prev_map.insert(cp_rfc, (cp_nombre, prev_total));
     }
 
     let ltm_grand_total: f64 = ltm_rows
         .iter()
         .map(|r| r.try_get::<f64, _>("ltm_total").unwrap_or(0.0))
         .sum();
-    let prev_grand_total: f64 = prev_map.values().sum();
+    let prev_grand_total: f64 = prev_map.values().map(|(_, v)| *v).sum();
 
     let mut rows: Vec<LtmRow> = ltm_rows
         .iter()
@@ -421,7 +424,7 @@ pub async fn get_ltm_comparison(
             let cp_rfc: String = r.try_get("cp_rfc").unwrap_or_default();
             let cp_nombre: String = r.try_get("cp_nombre").unwrap_or_default();
             let ltm_mxn: f64 = r.try_get("ltm_total").unwrap_or(0.0);
-            let prev_ltm_mxn: f64 = *prev_map.get(&cp_rfc).unwrap_or(&0.0);
+            let prev_ltm_mxn: f64 = prev_map.get(&cp_rfc).map(|(_, v)| *v).unwrap_or(0.0);
             let delta_mxn = ltm_mxn - prev_ltm_mxn;
             let delta_pct = if prev_ltm_mxn > 0.0 {
                 Some(delta_mxn / prev_ltm_mxn * 100.0)
@@ -455,6 +458,26 @@ pub async fn get_ltm_comparison(
             }
         })
         .collect();
+
+    // Add "Perdida vs LTM previo" entries for counterparties present in prev LTM but not current
+    let ltm_rfcs: std::collections::HashSet<String> =
+        rows.iter().map(|r| r.rfc.clone()).collect();
+    for (cp_rfc, (cp_nombre, prev_total)) in &prev_map {
+        if !ltm_rfcs.contains(cp_rfc) && *prev_total > 0.0 {
+            rows.push(LtmRow {
+                rfc: cp_rfc.clone(),
+                nombre: cp_nombre.clone(),
+                ltm_mxn: 0.0,
+                prev_ltm_mxn: *prev_total,
+                delta_mxn: -*prev_total,
+                delta_pct: Some(-100.0),
+                share_ltm_pct: 0.0,
+                months_active: 0,
+                invoice_count: 0,
+                status: "Perdida vs LTM previo".to_string(),
+            });
+        }
+    }
 
     rows.sort_by(|a, b| {
         b.ltm_mxn
@@ -627,7 +650,7 @@ pub async fn get_atypical(
             SELECT {cp_col} AS cp_rfc, MAX({cp_name_col}) AS cp_nombre,
                    year, month,
                    year::text || '-' || LPAD(month::text, 2, '0') AS period,
-                   SUM(COALESCE(total_mxn,0)::float8)::float8 AS mo_total
+                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS mo_total
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
               AND (year > $2 OR (year = $2 AND month >= $3))
@@ -755,7 +778,7 @@ pub async fn get_individual(
     let yearly_rows = sqlx::query(&format!(
         r#"
         SELECT year,
-               SUM(COALESCE(total_mxn,0)::float8)::float8 AS yr_total,
+               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS yr_total,
                COUNT(*) AS cnt
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
@@ -847,7 +870,7 @@ pub async fn get_individual(
         r#"
         SELECT year, month,
                year::text || '-' || LPAD(month::text, 2, '0') AS period,
-               SUM(COALESCE(total_mxn,0)::float8)::float8 AS mo_total,
+               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS mo_total,
                COUNT(*) AS cnt
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
@@ -943,7 +966,7 @@ pub async fn get_individual(
     let owner_yearly_rows = sqlx::query(&format!(
         r#"
         SELECT year,
-               SUM(COALESCE(total_mxn,0)::float8)::float8 AS yr_total
+               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS yr_total
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND (year > $2 OR (year = $2 AND month >= $3))
