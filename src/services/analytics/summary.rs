@@ -16,6 +16,7 @@ pub struct SummaryResponse {
     pub avg_monthly_mxn: f64,
     pub ltm_total_mxn: f64,
     pub ltm_months: i64,
+    pub ltm_display_allowed: bool,
     pub by_month: Vec<MonthlyTotal>,
     pub by_year: Vec<YearlyTotal>,
     pub by_tipo: Vec<TipoTotal>,
@@ -60,10 +61,10 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
     let rows = sqlx::query(
         &format!(r#"
         SELECT year, month,
-               SUM(CASE WHEN tipo_comprobante IN ('I','T') THEN COALESCE(total_mxn,0) ELSE 0 END)::float8 AS ingreso,
-               SUM(CASE WHEN tipo_comprobante = 'E' THEN COALESCE(total_mxn,0) ELSE 0 END)::float8        AS egreso,
-               SUM(COALESCE(total_mxn,0))::float8  AS total,
-               COUNT(*)                              AS cnt
+               SUM(CASE WHEN tipo_comprobante IN ('I','T') THEN COALESCE(total_neto_mxn,0) ELSE 0 END)::float8 AS ingreso,
+               SUM(CASE WHEN tipo_comprobante = 'E' THEN -COALESCE(total_neto_mxn,0) ELSE 0 END)::float8       AS egreso,
+               SUM(COALESCE(total_neto_mxn,0))::float8 AS total,
+               COUNT(*)                                  AS cnt
         FROM pulso.cfdis
         WHERE {rfc_col} = $1
           AND {dl_filter}
@@ -133,10 +134,27 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
     // YoY growth: last full year vs prior year
     let growth_pct_yoy = yoy_growth(&by_year);
 
+    // LTM display gate: suppress in Jan/Feb of the year following the last complete FY.
+    // Those two months carry so little data that LTM vs FY comparisons mislead.
+    let ltm_display_allowed = {
+        let last_full_year = by_year
+            .iter()
+            .filter(|y| {
+                let n = by_month.iter().filter(|m| m.year == y.year).count();
+                n == 12
+            })
+            .map(|y| y.year)
+            .max();
+        match last_full_year {
+            Some(fy) => !(to_y == fy + 1 && to_m <= 2),
+            None => true,
+        }
+    };
+
     // By tipo_comprobante
     let tipo_rows = sqlx::query(&format!(
         r#"
-        SELECT tipo_comprobante, SUM(COALESCE(total_mxn,0))::float8 AS total, COUNT(*) AS cnt
+        SELECT tipo_comprobante, SUM(COALESCE(total_neto_mxn,0))::float8 AS total, COUNT(*) AS cnt
         FROM pulso.cfdis
         WHERE {rfc_col} = $1
           AND {dl_filter}
@@ -185,6 +203,7 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
         avg_monthly_mxn: avg_monthly,
         ltm_total_mxn,
         ltm_months,
+        ltm_display_allowed,
         by_month,
         by_year,
         by_tipo,
@@ -202,9 +221,9 @@ fn aggregate_yearly(months: &[MonthlyTotal]) -> Vec<YearlyTotal> {
             ingreso_mxn: 0.0,
             egreso_mxn: 0.0,
         });
-        e.total_mxn += m.total_mxn;
+        e.total_mxn += m.net_mxn;
         e.invoice_count += m.invoice_count;
-        e.ingreso_mxn += m.total_mxn.max(0.0);
+        e.ingreso_mxn += m.net_mxn.max(0.0);
         e.egreso_mxn += (-m.net_mxn).max(0.0);
     }
     map.into_values().collect()
