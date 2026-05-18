@@ -18,7 +18,8 @@ pub struct StateRow {
     pub state_name: String,
     pub total_mxn: f64,
     pub invoice_count: i64,
-    pub unique_cp: i64,
+    pub unique_cp: i64,           // distinct postal codes
+    pub unique_counterparties: i64, // distinct counterparty RFCs
     pub pct_of_total: f64,
 }
 
@@ -52,7 +53,7 @@ pub async fn get(
         SELECT
             COALESCE(lugar_expedicion, 'UNKNOWN') AS cp,
             {cp_col}                              AS counterparty_rfc,
-            SUM(COALESCE(total_mxn,0)::float8)::float8 AS total,
+            SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total,
             COUNT(*)::bigint                      AS cnt
         FROM pulso.cfdis
         WHERE {owner_col} = $1
@@ -60,6 +61,7 @@ pub async fn get(
           AND tipo_comprobante NOT IN ('P','N')
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
         GROUP BY cp, {cp_col}
         ORDER BY total DESC
         "#
@@ -78,7 +80,8 @@ pub async fn get(
         .sum();
 
     // state_code → (total_mxn, invoice_count, unique_cp_rfcs)
-    let mut state_map: HashMap<String, (f64, i64, HashSet<String>)> = Default::default();
+    // state_code → (total_mxn, invoice_count, unique_counterparty_rfcs, unique_postal_codes)
+    let mut state_map: HashMap<String, (f64, i64, HashSet<String>, HashSet<String>)> = Default::default();
     let mut by_postal_code = Vec::new();
     let mut unknown_total = 0.0f64;
 
@@ -96,10 +99,11 @@ pub async fn get(
         let state = postal_to_state(&cp).to_string();
         let e = state_map
             .entry(state.clone())
-            .or_insert((0.0, 0, HashSet::new()));
+            .or_insert((0.0, 0, HashSet::new(), HashSet::new()));
         e.0 += total;
         e.1 += cnt;
         e.2.insert(counterparty_rfc);
+        e.3.insert(cp.clone());
 
         by_postal_code.push(PostalCodeRow {
             postal_code: cp,
@@ -111,7 +115,7 @@ pub async fn get(
 
     let mut by_state: Vec<StateRow> = state_map
         .into_iter()
-        .map(|(code, (total, cnt, rfcs))| StateRow {
+        .map(|(code, (total, cnt, rfcs, cps))| StateRow {
             state_name: state_name(&code).to_string(),
             pct_of_total: if grand_total > 0.0 {
                 total / grand_total * 100.0
@@ -121,7 +125,8 @@ pub async fn get(
             state_code: code,
             total_mxn: total,
             invoice_count: cnt,
-            unique_cp: rfcs.len() as i64,
+            unique_cp: cps.len() as i64,
+            unique_counterparties: rfcs.len() as i64,
         })
         .collect();
     by_state.sort_by(|a, b| b.total_mxn.partial_cmp(&a.total_mxn).unwrap());
@@ -146,8 +151,8 @@ fn postal_to_state(cp: &str) -> &'static str {
         21..=22 => "BCN",
         23 => "BCS",
         24 => "CAM",
-        25..=26 => "COA",
-        27..=28 => "COL",
+        25..=27 => "COA",
+        28 => "COL",
         29..=30 => "CHP",
         31..=33 => "CHI",
         34..=35 => "DGO",
@@ -169,8 +174,8 @@ fn postal_to_state(cp: &str) -> &'static str {
         83..=85 => "SON",
         86 => "TAB",
         87..=89 => "TAM",
-        90..=91 => "TLA",
-        92..=93 => "VER",
+        90 => "TLA",
+        91..=96 => "VER",
         97 => "YUC",
         98..=99 => "ZAC",
         _ => "OTR",
