@@ -497,7 +497,18 @@ fn parse_comprobante_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut Parsed
                 c.year = y;
                 c.month = m;
             }
-            "TipoDeComprobante" => c.tipo_comprobante = val().to_uppercase(),
+            "TipoDeComprobante" => {
+                let raw = val().to_uppercase();
+                c.tipo_comprobante = match raw.as_str() {
+                    "I" | "INGRESO" => "I",
+                    "E" | "EGRESO" => "E",
+                    "T" | "TRASLADO" => "T",
+                    "P" | "PAGO" => "P",
+                    "N" | "NOMINA" | "NÓMINA" => "N",
+                    _ => "I",
+                }
+                .to_string();
+            }
             "SubTotal" => c.subtotal = val().parse().ok(),
             "Descuento" => c.descuento = val().parse().ok(),
             "Total" => c.total = val().parse().ok(),
