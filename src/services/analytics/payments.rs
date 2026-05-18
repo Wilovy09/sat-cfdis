@@ -216,7 +216,8 @@ pub async fn get(
             inv.fecha_emision,
             inv.total_mxn,
             COALESCE(SUM(pd.imp_pagado)::float8, 0)          AS paid,
-            inv.total_mxn - COALESCE(SUM(pd.imp_pagado)::float8, 0) AS outstanding
+            inv.total_mxn - COALESCE(SUM(pd.imp_pagado)::float8, 0) AS outstanding,
+            (CURRENT_DATE - inv.fecha_emision::date)::bigint AS days_out
         FROM pulso.cfdis inv
         LEFT JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
         WHERE inv.{owner_col} = $1
@@ -241,33 +242,58 @@ pub async fn get(
 
     let outstanding_invoices: Vec<OutstandingInvoice> = outstanding_rows
         .iter()
-        .map(|r| {
-            OutstandingInvoice {
-                uuid: r.try_get("uuid").unwrap_or_default(),
-                rfc_cp: r.try_get("cp_rfc").unwrap_or_default(),
-                nombre_cp: r.try_get("cp_nombre").unwrap_or_default(),
-                fecha_emision: r.try_get("fecha_emision").unwrap_or_default(),
-                total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
-                paid_mxn: r.try_get("paid").unwrap_or(0.0),
-                outstanding_mxn: r.try_get("outstanding").unwrap_or(0.0),
-                days_outstanding: 0, // TODO: compute from current date
-            }
+        .map(|r| OutstandingInvoice {
+            uuid: r.try_get("uuid").unwrap_or_default(),
+            rfc_cp: r.try_get("cp_rfc").unwrap_or_default(),
+            nombre_cp: r.try_get("cp_nombre").unwrap_or_default(),
+            fecha_emision: r.try_get("fecha_emision").unwrap_or_default(),
+            total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
+            paid_mxn: r.try_get("paid").unwrap_or(0.0),
+            outstanding_mxn: r.try_get("outstanding").unwrap_or(0.0),
+            days_outstanding: r.try_get("days_out").unwrap_or(0),
         })
         .collect();
 
-    // Monthly payment timeline
+    // Average days to pay (PPD invoices with payment complements)
+    let avg_days_row = sqlx::query(&format!(
+        r#"
+        SELECT AVG((cp.fecha_pago::date - inv.fecha_emision::date)::float8) AS avg_days
+        FROM pulso.cfdis inv
+        JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
+        JOIN pulso.cfdi_payments cp ON cp.payment_uuid = pd.payment_uuid
+            AND cp.pago_num = pd.pago_num
+        WHERE inv.{owner_col} = $1
+          AND inv.{dl_filter}
+          AND inv.tipo_comprobante = 'I'
+          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
+          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+          AND cp.fecha_pago IS NOT NULL
+        "#
+    ))
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_one(pool)
+    .await?;
+    let avg_days_to_pay: f64 = avg_days_row.try_get("avg_days").unwrap_or(0.0);
+
+    // Monthly payment timeline (invoiced by emission month, paid by payment complement date)
     let timeline_rows = sqlx::query(&format!(
         r#"
-        SELECT year, month,
-               SUM(COALESCE(total_mxn,0)::float8)::float8 AS invoiced
-        FROM pulso.cfdis
-        WHERE {owner_col} = $1
-          AND {dl_filter}
-          AND tipo_comprobante = 'I'
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY year, month
-        ORDER BY year, month
+        SELECT inv.year, inv.month,
+               SUM(COALESCE(inv.total_mxn,0)::float8)::float8 AS invoiced,
+               COALESCE(SUM(pd.imp_pagado)::float8, 0) AS paid
+        FROM pulso.cfdis inv
+        LEFT JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
+        WHERE inv.{owner_col} = $1
+          AND inv.{dl_filter}
+          AND inv.tipo_comprobante = 'I'
+          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
+          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+        GROUP BY inv.year, inv.month
+        ORDER BY inv.year, inv.month
         "#
     ))
     .bind(rfc)
@@ -286,7 +312,7 @@ pub async fn get(
             PaymentMonth {
                 period: format!("{year}-{month:02}"),
                 invoiced_mxn: r.try_get("invoiced").unwrap_or(0.0),
-                paid_mxn: 0.0, // TODO: join payment complement dates per month
+                paid_mxn: r.try_get("paid").unwrap_or(0.0),
             }
         })
         .collect();
@@ -296,7 +322,7 @@ pub async fn get(
         total_paid_mxn,
         total_outstanding_mxn: total_outstanding,
         collection_rate_pct: collection_rate,
-        avg_days_to_pay: 0.0, // requires date arithmetic over payment dates
+        avg_days_to_pay,
         by_forma_pago,
         by_metodo_pago,
         outstanding_invoices,
