@@ -663,6 +663,10 @@ async fn main() -> std::io::Result<()> {
                 web::post().to(users_routes::trigger_sync),
             )
             .route(
+                "/api/v1/admin/download",
+                web::post().to(users_routes::admin_download),
+            )
+            .route(
                 "/api/v1/users/sync-status",
                 web::get().to(users_routes::sync_status),
             )

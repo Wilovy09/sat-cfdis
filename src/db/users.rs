@@ -86,6 +86,17 @@ pub async fn get_all_with_credentials(pool: &PgPool) -> Result<Vec<(String, Stri
     Ok(rows)
 }
 
+/// Returns encrypted clave for a given RFC regardless of owner — admin use only.
+pub async fn get_clave_for_rfc(pool: &PgPool, rfc: &str) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT clave FROM pulso.users WHERE rfc = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(rfc)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(c,)| c))
+}
+
 /// Returns (rfc, initial_sync_job_id) for the given user.
 /// Returns the first active RFC (by ctid) for backward compat with multi-RFC users.
 pub async fn get_user_sync_info(

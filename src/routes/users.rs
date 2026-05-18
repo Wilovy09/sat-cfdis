@@ -112,13 +112,17 @@ pub async fn get_profile(req: HttpRequest, pool: web::Data<DbPool>) -> HttpRespo
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
+
     match crate::db::users::get_user_rfcs_with_nombre(&pool, &user_id).await {
-        Ok(rows) if !rows.is_empty() => {
+        Ok(rows) if !rows.is_empty() || is_admin => {
             let rfcs: Vec<_> = rows
                 .into_iter()
                 .map(|(rfc, nombre)| serde_json::json!({ "rfc": rfc, "nombre": nombre }))
                 .collect();
-            HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs }))
+            HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs, "is_admin": is_admin }))
         }
         Ok(_) => HttpResponse::NotFound().json(ErrorBody {
             error: "Perfil no encontrado".to_string(),
@@ -792,4 +796,80 @@ pub async fn delete_rfc_handler(
             })
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/admin/download
+// Admin-only: queue a sync job for any RFC using its stored credentials.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct AdminDownloadDto {
+    pub rfc: String,
+    pub dl_type: Option<String>,
+    pub period_from: String,
+    pub period_to: String,
+}
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn admin_download(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    body: web::Json<AdminDownloadDto>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    if !is_admin {
+        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+    }
+
+    let rfc = body.rfc.trim().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+
+    let clave_enc = match crate::db::users::get_clave_for_rfc(&pool, &rfc).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return HttpResponse::NotFound().json(ErrorBody { error: "RFC no encontrado o sin credenciales".into() }),
+        Err(e) => {
+            tracing::error!("admin_download: DB error: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let key = crypto::load_key();
+    let clave = match crypto::decrypt(&key, &clave_enc) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("admin_download: decrypt failed: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error al descifrar credenciales".into() });
+        }
+    };
+
+    let auth_json = serde_json::json!({ "type": "ciec", "rfc": rfc, "password": clave }).to_string();
+    let auth_enc = match crypto::encrypt(&key, &auth_json) {
+        Ok(e) => e,
+        Err(e) => return HttpResponse::InternalServerError().json(ErrorBody { error: format!("Error al cifrar auth: {e}") }),
+    };
+
+    let dl_type = body.dl_type.as_deref().unwrap_or("ambos");
+    let job_id = match crate::db::jobs::insert_queued(
+        &pool, &rfc, "ciec", &auth_enc, dl_type, &body.period_from, &body.period_to,
+    ).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!("admin_download: insert_queued failed: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error al crear el job".into() });
+        }
+    };
+
+    tracing::info!(rfc = %rfc, job_id = %job_id, "Admin download job queued");
+    HttpResponse::Ok().json(serde_json::json!({ "ok": true, "job_id": job_id, "status": "queued" }))
 }
