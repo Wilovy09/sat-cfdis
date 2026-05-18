@@ -632,6 +632,23 @@ async fn main() -> std::io::Result<()> {
                 web::post().to(auth_routes::register),
             )
             .route("/api/v1/auth/login", web::post().to(auth_routes::login))
+            .route(
+                "/api/v1/auth/google/url",
+                web::get().to(auth_routes::google_auth_url),
+            )
+            .route(
+                "/api/v1/auth/google",
+                web::post().to(auth_routes::google_login),
+            )
+            .route(
+                "/api/v1/auth/google/status",
+                web::get().to(auth_routes::google_status),
+            )
+            .service(
+                web::resource("/api/v1/auth/google/link")
+                    .route(web::post().to(auth_routes::google_link))
+                    .route(web::delete().to(auth_routes::google_unlink)),
+            )
             // Users
             .route(
                 "/api/v1/users/profile",
