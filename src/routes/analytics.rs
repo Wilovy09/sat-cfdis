@@ -6,7 +6,7 @@ use crate::{
     errors::AppError,
     services::analytics::{
         cashflow, concepts, counterparties, fiscal, geography, normalization, payments, payroll,
-        period_comparison, recurrence, retention, summary,
+        period_comparison, quarterly, recurrence, retention, summary,
     },
 };
 
@@ -785,6 +785,26 @@ fn default_from() -> String {
     let fy = total / 12;
     let fm = total % 12 + 1;
     format!("{fy:04}-{fm:02}")
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/quarterly
+// ---------------------------------------------------------------------------
+
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
+pub async fn get_quarterly(
+    req: HttpRequest,
+    path: web::Path<String>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let result = quarterly::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
 }
 
 fn days_to_ymd(days: u64) -> (u64, u64, u64) {

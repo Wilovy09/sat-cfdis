@@ -743,6 +743,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/payments", web::get().to(analytics_routes::get_payments))
                     .route("/cashflow", web::get().to(analytics_routes::get_cashflow))
                     .route("/payroll", web::get().to(analytics_routes::get_payroll))
+                    .route("/quarterly", web::get().to(analytics_routes::get_quarterly))
                     .route(
                         "/period-comparison",
                         web::get().to(analytics_routes::get_period_comparison),
