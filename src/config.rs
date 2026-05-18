@@ -27,6 +27,10 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     /// Comma-separated list of allowed CORS methods (e.g. GET,POST,PUT,DELETE,OPTIONS)
     pub allowed_methods: Vec<String>,
+    pub google_client_id: String,
+    pub google_client_secret: String,
+    pub google_redirect_uri: String,
+    pub jwt_secret: String,
 }
 
 impl Config {
@@ -70,6 +74,13 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            google_client_id: env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
+            google_client_secret: env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
+            google_redirect_uri: env::var("GOOGLE_REDIRECT_URI")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            jwt_secret: env::var("JWT_SECRET").unwrap_or_else(|_| "jwtsecret".to_string()),
         }
     }
 }
