@@ -222,6 +222,86 @@ pub async fn get_email_by_rfc(pool: &PgPool, rfc: &str) -> Result<Option<String>
     Ok(row.map(|(email,)| email))
 }
 
+/// Find a public user by google_id. Returns (id, email, name).
+pub async fn find_by_google_id(
+    pool: &PgPool,
+    google_id: &str,
+) -> Result<Option<(String, String, String)>, sqlx::Error> {
+    let row: Option<(uuid::Uuid, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, email, name FROM public.users WHERE google_id = $1 LIMIT 1",
+    )
+    .bind(google_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id, email, name)| (id.to_string(), email, name.unwrap_or_default())))
+}
+
+/// Find a public user by email. Returns (id, email, name).
+pub async fn find_by_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<(String, String, String)>, sqlx::Error> {
+    let row: Option<(uuid::Uuid, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, email, name FROM public.users WHERE email = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id, email, name)| (id.to_string(), email, name.unwrap_or_default())))
+}
+
+/// Set google_id on a user (used to link Google on first OAuth login).
+pub async fn set_google_id(
+    pool: &PgPool,
+    user_id: &str,
+    google_id: &str,
+) -> Result<(), sqlx::Error> {
+    let uid = parse_uuid(user_id)?;
+    sqlx::query("UPDATE public.users SET google_id = $1 WHERE id = $2")
+        .bind(google_id)
+        .bind(uid)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Returns true if the given user_id has a non-null google_id.
+pub async fn find_by_google_id_linked(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let uid = parse_uuid(user_id)?;
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT google_id FROM public.users WHERE id = $1 LIMIT 1")
+            .bind(uid)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|(g,)| g).is_some())
+}
+
+/// Clear google_id from a user (unlink).
+pub async fn clear_google_id(pool: &PgPool, user_id: &str) -> Result<(), sqlx::Error> {
+    let uid = parse_uuid(user_id)?;
+    sqlx::query("UPDATE public.users SET google_id = NULL WHERE id = $1")
+        .bind(uid)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Find google_id owner (for conflict checks). Returns user_id string if found.
+pub async fn find_user_id_by_google_id(
+    pool: &PgPool,
+    google_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(uuid::Uuid,)> =
+        sqlx::query_as("SELECT id FROM public.users WHERE google_id = $1 LIMIT 1")
+            .bind(google_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(id,)| id.to_string()))
+}
+
 /// Set initial_sync_job_id for a specific active RFC.
 pub async fn set_initial_sync_job_for_rfc(
     pool: &PgPool,
