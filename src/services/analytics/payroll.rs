@@ -20,10 +20,11 @@ pub struct PayrollSummary {
     pub total_pagado_mxn: f64,
     pub total_percepciones_mxn: f64,
     pub total_deducciones_mxn: f64,
+    pub total_otros_pagos_mxn: f64,
     pub total_isr_retenido: f64,
     pub total_employees: i64,
     pub avg_salary_mxn: f64,
-    pub avg_sdi: f64, // Salario Diario Integrado promedio
+    pub avg_sdi: f64,
     pub payrolls_count: i64,
 }
 
@@ -100,15 +101,16 @@ pub async fn get(
     let (from_y, from_m) = parse_ym(from);
     let (to_y, to_m) = parse_ym(to);
 
-    // Summary
+    // Summary (all tipos, to match full payroll spend)
     let summary_row = sqlx::query(r#"
         SELECT
             SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS total_pagado,
             SUM(COALESCE(n.total_percepciones,0)::float8)                                    AS total_perc,
             SUM(COALESCE(n.total_deducciones,0)::float8)                                     AS total_ded,
-            COUNT(DISTINCT c.rfc_receptor)                                            AS emp_count,
+            SUM(COALESCE(n.total_otros_pagos,0)::float8)                                     AS total_otros,
+            COUNT(DISTINCT c.rfc_receptor)                                                   AS emp_count,
             AVG(COALESCE(n.salario_diario_integrado,0)::float8)                              AS avg_sdi,
-            COUNT(*)                                                                  AS payrolls_count
+            COUNT(*)                                                                          AS payrolls_count
         FROM pulso.cfdi_nomina n
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
@@ -131,11 +133,42 @@ pub async fn get(
     let emp_count: i64 = summary_row.try_get("emp_count").unwrap_or(0);
     let payrolls: i64 = summary_row.try_get("payrolls_count").unwrap_or(0);
 
+    // ISR retenido = deducciones tipo '002' (SAT clave ISR)
+    let isr_row = sqlx::query(
+        r#"
+        SELECT COALESCE(SUM(COALESCE(d.importe, 0)::float8), 0) AS total_isr
+        FROM pulso.cfdi_nomina_deducciones d
+        JOIN pulso.cfdi_nomina n ON n.uuid = d.uuid
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND d.tipo_deduccion = '002'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
+        "#,
+    )
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_one(pool)
+    .await?;
+    let total_isr_retenido: f64 = isr_row.try_get("total_isr").unwrap_or(0.0);
+
     let summary = PayrollSummary {
         total_pagado_mxn: total_pagado,
         total_percepciones_mxn: summary_row.try_get("total_perc").unwrap_or(0.0),
         total_deducciones_mxn: summary_row.try_get("total_ded").unwrap_or(0.0),
-        total_isr_retenido: 0.0, // computed below
+        total_otros_pagos_mxn: summary_row.try_get("total_otros").unwrap_or(0.0),
+        total_isr_retenido,
         total_employees: emp_count,
         avg_salary_mxn: if emp_count > 0 {
             total_pagado / emp_count as f64
@@ -403,6 +436,86 @@ pub async fn get(
         })
         .collect();
 
+    // New employees per month: first-ever payslip from this employer is within range
+    let new_emp_rows = sqlx::query(
+        r#"
+        SELECT yr AS year, mo AS month, COUNT(*) AS new_emp
+        FROM (
+            SELECT rfc_receptor,
+                   (MIN(year * 100 + month) / 100)::bigint AS yr,
+                   (MIN(year * 100 + month) % 100)::bigint AS mo
+            FROM pulso.cfdi_nomina n2
+            JOIN pulso.cfdis c2 ON c2.uuid = n2.uuid
+            WHERE c2.rfc_emisor = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.payroll_normalization_rules pnr
+                  WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                    AND pnr.employee_rfc = c2.rfc_receptor
+                    AND (pnr.period_start IS NULL OR (c2.year::text || '-' || LPAD(c2.month::text,2,'0')) >= pnr.period_start)
+                    AND (pnr.period_end IS NULL OR (c2.year::text || '-' || LPAD(c2.month::text,2,'0')) <= pnr.period_end)
+              )
+            GROUP BY rfc_receptor
+        ) sub
+        WHERE (yr > $2 OR (yr = $2 AND mo >= $3))
+          AND (yr < $4 OR (yr = $4 AND mo <= $5))
+        GROUP BY yr, mo
+        "#,
+    )
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    let new_emp_map: std::collections::HashMap<(i64, i64), i64> = new_emp_rows
+        .iter()
+        .map(|r| {
+            let yr: i64 = r.try_get("year").unwrap_or(0);
+            let mo: i64 = r.try_get("month").unwrap_or(0);
+            let n: i64 = r.try_get("new_emp").unwrap_or(0);
+            ((yr, mo), n)
+        })
+        .collect();
+
+    // All (year, month, rfc_receptor) in range — used to compute departures
+    let emp_month_rows = sqlx::query(
+        r#"
+        SELECT DISTINCT c.year, c.month, c.rfc_receptor
+        FROM pulso.cfdi_nomina n
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
+        ORDER BY c.year, c.month
+        "#,
+    )
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    // Build month → set<rfc> and sorted period list
+    let mut emp_by_period: std::collections::BTreeMap<(i64, i64), std::collections::HashSet<String>> =
+        std::collections::BTreeMap::new();
+    for r in &emp_month_rows {
+        let yr: i64 = r.try_get("year").unwrap_or(0);
+        let mo: i64 = r.try_get("month").unwrap_or(0);
+        let emp: String = r.try_get("rfc_receptor").unwrap_or_default();
+        emp_by_period.entry((yr, mo)).or_default().insert(emp);
+    }
+
     // Headcount by month (distinct employees per month)
     let hc_rows = sqlx::query(
         r#"
@@ -431,16 +544,40 @@ pub async fn get(
     .fetch_all(pool)
     .await?;
 
+    let periods: Vec<(i64, i64)> = emp_by_period.keys().cloned().collect();
+
     let headcount_by_month: Vec<HeadcountMonth> = hc_rows
         .iter()
         .map(|r| {
             let year: i64 = r.try_get("year").unwrap_or(0);
             let month: i64 = r.try_get("month").unwrap_or(0);
+            let key = (year, month);
+
+            let prev_key = periods
+                .iter()
+                .rev()
+                .find(|&&k| k < key)
+                .cloned();
+
+            let departures = match prev_key {
+                Some(pk) => {
+                    let prev_set = emp_by_period.get(&pk);
+                    let curr_set = emp_by_period.get(&key);
+                    match (prev_set, curr_set) {
+                        (Some(prev), Some(curr)) => {
+                            prev.iter().filter(|e| !curr.contains(*e)).count() as i64
+                        }
+                        _ => 0,
+                    }
+                }
+                None => 0,
+            };
+
             HeadcountMonth {
                 period: format!("{year}-{month:02}"),
                 headcount: r.try_get("hc").unwrap_or(0),
-                new_employees: 0,
-                departures: 0,
+                new_employees: *new_emp_map.get(&key).unwrap_or(&0),
+                departures,
             }
         })
         .collect();
