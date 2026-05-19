@@ -399,3 +399,21 @@ pub async fn concepts_exist(pool: &PgPool, uuid: &str) -> bool {
         .map(|r| r.is_some())
         .unwrap_or(false)
 }
+
+/// Mark all xml_available=0 CFDIs in a job as permanently unavailable (xml_available=-1).
+/// Called after repeated failed attempts to fetch the XML from both storage and SAT.
+pub async fn mark_xml_unavailable_for_job(
+    pool: &PgPool,
+    job_id: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"UPDATE pulso.cfdis c
+           SET xml_available = -1
+           FROM pulso.job_invoices ji
+           WHERE c.uuid = ji.uuid AND ji.job_id = $1 AND c.xml_available = 0"#,
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}

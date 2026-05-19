@@ -3,9 +3,10 @@
 use crate::{
     config::Config,
     db::{self, DbPool},
-    services::{storage, xml_parser},
+    services::{php_cli::PhpCli, storage, xml_parser},
 };
 use aws_sdk_s3::Client as S3Client;
+use tempfile::TempDir;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -14,11 +15,15 @@ const BATCH_SIZE: usize = 100;
 const ENRICH_BATCH: i64 = 50;
 /// Max skip cycles before a job is considered permanently unresolvable this session (~24h).
 const ENRICH_MAX_SKIP: u32 = 720;
+/// Rounds of failed SAT downloads before marking CFDIs as permanently unavailable.
+const ENRICH_MAX_SAT_FAIL: u32 = 5;
 
 pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
     // Tracks remaining skip cycles per job_id. Doubles on each failed round, capped at ENRICH_MAX_SKIP.
     let mut enrich_skip: HashMap<String, u32> = HashMap::new();
     let mut enrich_fail_rounds: HashMap<String, u32> = HashMap::new();
+    // Counts consecutive rounds where SAT download was attempted but nothing enriched.
+    let mut enrich_sat_fail_rounds: HashMap<String, u32> = HashMap::new();
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(ETL_POLL_SECS)).await;
@@ -32,9 +37,10 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
             }
         };
         for job_id in job_ids {
-            // Reset backoff when a job gets new invoices (XMLs may now be in storage)
+            // Reset backoff when a job gets new invoices
             enrich_skip.remove(&job_id);
             enrich_fail_rounds.remove(&job_id);
+            enrich_sat_fail_rounds.remove(&job_id);
             if let Err(e) = process_job(&pool, &cfg, &s3, &job_id).await {
                 tracing::error!(job_id = %job_id, "ETL: error processing job: {e}");
             }
@@ -57,24 +63,56 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
                 }
             }
 
-            let enriched = match enrich_job(&pool, &cfg, &s3, &job_id).await {
-                Ok(n) => n,
+            let (enriched, sat_failed) = match enrich_job(&pool, &cfg, &s3, &job_id).await {
+                Ok(result) => result,
                 Err(e) => {
                     tracing::error!(job_id = %job_id, "ETL: error enriching job: {e}");
-                    0
+                    (0, 0)
                 }
             };
 
-            if enriched == 0 {
-                let rounds = enrich_fail_rounds.entry(job_id.clone()).or_insert(0);
-                *rounds += 1;
-                // Exponential backoff: 2^rounds cycles, capped at ENRICH_MAX_SKIP (~24h)
-                let skip = (2u32.saturating_pow(*rounds)).min(ENRICH_MAX_SKIP);
-                tracing::debug!(job_id = %job_id, rounds = *rounds, skip_cycles = skip, "ETL: enrichment backoff");
-                enrich_skip.insert(job_id, skip);
-            } else {
+            if enriched > 0 {
+                // Progress made — reset all counters
                 enrich_skip.remove(&job_id);
                 enrich_fail_rounds.remove(&job_id);
+                enrich_sat_fail_rounds.remove(&job_id);
+            } else {
+                // No enrichment this round — apply backoff
+                let rounds = enrich_fail_rounds.entry(job_id.clone()).or_insert(0);
+                *rounds += 1;
+                let skip = (2u32.saturating_pow(*rounds)).min(ENRICH_MAX_SKIP);
+                tracing::debug!(job_id = %job_id, rounds = *rounds, skip_cycles = skip, "ETL: enrichment backoff");
+                enrich_skip.insert(job_id.clone(), skip);
+
+                // Track SAT-download failures separately
+                if sat_failed > 0 {
+                    let sat_rounds = enrich_sat_fail_rounds.entry(job_id.clone()).or_insert(0);
+                    *sat_rounds += 1;
+                    tracing::warn!(
+                        job_id = %job_id,
+                        sat_fail_rounds = *sat_rounds,
+                        max = ENRICH_MAX_SAT_FAIL,
+                        "ETL: SAT download round failed"
+                    );
+
+                    if *sat_rounds >= ENRICH_MAX_SAT_FAIL {
+                        // Give up — mark remaining as permanently unavailable
+                        match db::cfdis::mark_xml_unavailable_for_job(&pool, &job_id).await {
+                            Ok(n) if n > 0 => {
+                                tracing::warn!(
+                                    job_id = %job_id,
+                                    marked = n,
+                                    "ETL: marked CFDIs as xml_available=-1 (SAT unreachable after retries)"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::error!(job_id = %job_id, "ETL: mark_xml_unavailable failed: {e}"),
+                        }
+                        enrich_skip.remove(&job_id);
+                        enrich_fail_rounds.remove(&job_id);
+                        enrich_sat_fail_rounds.remove(&job_id);
+                    }
+                }
             }
         }
     }
@@ -182,25 +220,32 @@ async fn process_invoice(
 }
 
 /// Re-processes invoices that were parsed from metadata only.
-/// Fetches XML from storage; if found, enriches taxes/payments/concepts in place.
-/// Returns the number of invoices successfully enriched.
+/// First tries storage, then downloads from SAT.
+/// Returns (enriched, sat_failed).
 async fn enrich_job(
     pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
     job_id: &str,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<(usize, usize)> {
     let pending = db::cfdis::find_needs_enrichment(pool, job_id, ENRICH_BATCH).await?;
     if pending.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
+
+    // Load job for auth credentials (needed for SAT download fallback)
+    let job = db::jobs::get_by_id(pool, job_id).await?;
 
     tracing::info!(job_id = %job_id, count = pending.len(), "ETL: enriching invoices");
 
     let mut enriched = 0usize;
+    let mut sat_failed = 0usize;
     for (uuid, metadata) in &pending {
-        if enrich_invoice(pool, cfg, s3, uuid, metadata).await {
+        let (ok, tried_sat) = enrich_invoice(pool, cfg, s3, job.as_ref(), uuid, metadata).await;
+        if ok {
             enriched += 1;
+        } else if tried_sat {
+            sat_failed += 1;
         }
     }
 
@@ -208,21 +253,37 @@ async fn enrich_job(
         tracing::info!(job_id = %job_id, enriched, "ETL: enrichment batch done");
     }
 
-    Ok(enriched)
+    Ok((enriched, sat_failed))
 }
 
-/// Returns true if the invoice was successfully enriched from XML.
+/// Returns (enriched, tried_sat). Tries storage first, then SAT download.
 async fn enrich_invoice(
     pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
+    job: Option<&db::jobs::SyncJob>,
     uuid: &str,
     metadata: &str,
-) -> bool {
+) -> (bool, bool) {
+    // 1. Try storage
     let xml_bytes = try_load_xml(cfg, s3, uuid, metadata).await;
+
+    // 2. If not in storage, try to download from SAT using the job's credentials
+    let (xml_bytes, tried_sat) = if xml_bytes.is_none() {
+        if let Some(j) = job {
+            let sat_bytes = try_download_from_sat(cfg, s3, j, uuid, metadata).await;
+            let tried = sat_bytes.is_none(); // only "tried and failed" if still None
+            (sat_bytes, tried)
+        } else {
+            tracing::warn!(uuid = %uuid, "ETL enrich: XML not found in storage, no job credentials");
+            (None, false)
+        }
+    } else {
+        (xml_bytes, false)
+    };
+
     let Some(bytes) = xml_bytes else {
-        tracing::warn!(uuid = %uuid, "ETL enrich: XML not found in storage");
-        return false;
+        return (false, tried_sat);
     };
 
     let estado = extract_estado_from_meta(metadata);
@@ -230,7 +291,7 @@ async fn enrich_invoice(
     // job_id and dl_type don't affect enrichment (upsert ON CONFLICT preserves originals)
     let Some(mut cfdi) = xml_parser::parse(&bytes, "", "ambos", &estado) else {
         tracing::warn!(uuid = %uuid, "ETL enrich: could not parse XML");
-        return false;
+        return (false, tried_sat);
     };
 
     cfdi.uuid = uuid.to_uppercase();
@@ -238,7 +299,7 @@ async fn enrich_invoice(
     // Update header row so xml_available flips to true
     if let Err(e) = db::cfdis::upsert_cfdi(pool, &cfdi).await {
         tracing::warn!(uuid = %uuid, "ETL enrich: upsert_cfdi failed: {e}");
-        return false;
+        return (false, tried_sat);
     }
 
     if !cfdi.taxes.is_empty() {
@@ -266,7 +327,7 @@ async fn enrich_invoice(
     }
 
     tracing::debug!(uuid = %uuid, "ETL enrich: enriched from XML");
-    true
+    (true, false)
 }
 
 /// Attempt to load XML bytes from local storage or S3.
@@ -291,6 +352,70 @@ async fn try_load_xml(cfg: &Config, s3: &S3Client, uuid: &str, metadata: &str) -
         );
     }
     result
+}
+
+/// Try to download a single XML from SAT using the job's stored credentials.
+/// On success, uploads the XML to storage and returns the bytes.
+async fn try_download_from_sat(
+    cfg: &Config,
+    s3: &S3Client,
+    job: &db::jobs::SyncJob,
+    uuid: &str,
+    metadata: &str,
+) -> Option<Vec<u8>> {
+    // Decrypt auth payload
+    let key = crate::services::crypto::load_key();
+    let auth_json = crate::services::crypto::decrypt(&key, &job.auth_enc).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(&auth_json).ok()?;
+
+    // Determine download_type from RFC ownership
+    let (rfc_e, rfc_r, year, month, day) = extract_path_from_meta(metadata);
+    let download_type = if job.rfc.eq_ignore_ascii_case(&rfc_r) {
+        "recibidos"
+    } else {
+        "emitidos"
+    };
+
+    // Temp dir for the PHP CLI output
+    let work_dir = TempDir::new().ok()?;
+    let output_dir = work_dir.path().join("xml");
+    tokio::fs::create_dir_all(&output_dir).await.ok()?;
+
+    let payload = serde_json::json!({
+        "command": "download",
+        "auth": auth,
+        "params": {
+            "uuids":         [uuid.to_lowercase()],
+            "download_type": download_type,
+            "resource_type": "xml",
+            "output_dir":    output_dir.to_string_lossy(),
+        }
+    });
+
+    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path);
+    let result = match cli.run(&payload).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(uuid = %uuid, "ETL: SAT download failed: {e}");
+            return None;
+        }
+    };
+
+    let path = result["files"]
+        .as_array()
+        .and_then(|f| f.first())
+        .and_then(|f| f["path"].as_str())
+        .map(|s| s.to_string())?;
+
+    let bytes = tokio::fs::read(&path).await.ok()?;
+
+    // Upload to S3 so future enrichment rounds find it in storage
+    let uuid_lower = uuid.to_lowercase();
+    let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+    let _ = storage::upload(s3, &bucket, &rfc_e, &rfc_r, year, month, day, &uuid_lower, bytes.clone()).await;
+
+    tracing::info!(uuid = %uuid, download_type, "ETL: downloaded XML from SAT");
+    Some(bytes)
 }
 
 fn extract_path_from_meta(metadata: &str) -> (String, String, u32, u32, u32) {
