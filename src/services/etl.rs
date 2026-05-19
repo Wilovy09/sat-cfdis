@@ -275,7 +275,22 @@ async fn try_load_xml(cfg: &Config, s3: &S3Client, uuid: &str, metadata: &str) -
     let (rfc_e, rfc_r, year, month, day) = extract_path_from_meta(metadata);
     let bucket = cfg.s3_bucket.clone().unwrap_or_default();
     let uuid_lower = uuid.to_lowercase();
-    storage::get(s3, &bucket, &rfc_e, &rfc_r, year, month, day, &uuid_lower).await
+    tracing::debug!(
+        uuid = %uuid,
+        path = %format!("cfdis/{rfc_e}/{rfc_r}/{year}/{month:02}/{day:02}/{uuid_lower}.xml"),
+        "ETL: looking up XML in storage"
+    );
+    let result = storage::get(s3, &bucket, &rfc_e, &rfc_r, year, month, day, &uuid_lower).await;
+    if result.is_none() {
+        tracing::warn!(
+            uuid    = %uuid,
+            rfc_e   = %rfc_e,
+            rfc_r   = %rfc_r,
+            date    = %format!("{year}-{month:02}-{day:02}"),
+            "ETL: XML not in storage — path: cfdis/{rfc_e}/{rfc_r}/{year}/{month:02}/{day:02}/{uuid_lower}.xml"
+        );
+    }
+    result
 }
 
 fn extract_path_from_meta(metadata: &str) -> (String, String, u32, u32, u32) {
