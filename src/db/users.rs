@@ -146,21 +146,34 @@ pub async fn get_user_rfcs_with_nombre(
     Ok(rows)
 }
 
-/// True if user owns this active RFC OR is admin.
+/// True if user has the 'admin' role via public.user_roles → catalogs.roles.
+pub async fn is_user_admin(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {
+    let uid = parse_uuid(user_id)?;
+    let row: Option<(i32,)> = sqlx::query_as(
+        r#"
+        SELECT 1
+        FROM public.user_roles ur
+        JOIN catalogs.roles r ON r.id = ur.role_id
+        WHERE ur.user_id = $1 AND r.name = 'admin'
+        LIMIT 1
+        "#,
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// True if user owns this active RFC OR has the 'admin' role.
 pub async fn user_has_rfc_or_admin(
     pool: &PgPool,
     user_id: &str,
     rfc: &str,
 ) -> Result<bool, sqlx::Error> {
-    let uid = parse_uuid(user_id)?;
-    let admin_row: Option<(Option<bool>,)> =
-        sqlx::query_as("SELECT is_admin FROM public.users WHERE id = $1")
-            .bind(uid)
-            .fetch_optional(pool)
-            .await?;
-    if admin_row.and_then(|(v,)| v).unwrap_or(false) {
+    if is_user_admin(pool, user_id).await? {
         return Ok(true);
     }
+    let uid = parse_uuid(user_id)?;
     let rfc_row: Option<(String,)> = sqlx::query_as(
         "SELECT rfc FROM pulso.users WHERE user_id = $1 AND rfc = $2 AND deleted_at IS NULL",
     )
@@ -169,17 +182,6 @@ pub async fn user_has_rfc_or_admin(
     .fetch_optional(pool)
     .await?;
     Ok(rfc_row.is_some())
-}
-
-/// True if user has is_admin = true in public.users.
-pub async fn is_user_admin(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {
-    let uid = parse_uuid(user_id)?;
-    let row: Option<(Option<bool>,)> =
-        sqlx::query_as("SELECT is_admin FROM public.users WHERE id = $1")
-            .bind(uid)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.and_then(|(v,)| v).unwrap_or(false))
 }
 
 /// Credentials for a specific active RFC (clave_enc, initial_sync_job_id).
