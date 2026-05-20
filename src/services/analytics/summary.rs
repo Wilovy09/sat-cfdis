@@ -61,14 +61,15 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
     let rows = sqlx::query(
         &format!(r#"
         SELECT year, month,
-               SUM(CASE WHEN tipo_comprobante IN ('I','T') THEN COALESCE(total_neto_mxn,0) ELSE 0 END)::float8 AS ingreso,
-               SUM(CASE WHEN tipo_comprobante = 'E' THEN -COALESCE(total_neto_mxn,0) ELSE 0 END)::float8       AS egreso,
+               SUM(CASE WHEN tipo_comprobante = 'I' THEN COALESCE(total_neto_mxn,0) ELSE 0 END)::float8  AS ingreso,
+               SUM(CASE WHEN tipo_comprobante = 'E' THEN -COALESCE(total_neto_mxn,0) ELSE 0 END)::float8 AS egreso,
                SUM(COALESCE(total_neto_mxn,0))::float8 AS total,
                COUNT(*)                                  AS cnt
         FROM pulso.cfdis
         WHERE {rfc_col} = $1
           AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N')
+          AND tipo_comprobante NOT IN ('P','N','T')
+          AND COALESCE(estado_sat,'') != 'cancelado'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (
@@ -158,6 +159,7 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
         FROM pulso.cfdis
         WHERE {rfc_col} = $1
           AND {dl_filter}
+          AND COALESCE(estado_sat,'') != 'cancelado'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (

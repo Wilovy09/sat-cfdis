@@ -115,6 +115,7 @@ pub async fn get(
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
           AND NOT EXISTS (
@@ -142,6 +143,7 @@ pub async fn get(
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND d.tipo_deduccion = '002'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
@@ -192,6 +194,7 @@ pub async fn get(
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
           AND NOT EXISTS (
@@ -252,6 +255,7 @@ pub async fn get(
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
           AND NOT EXISTS (
@@ -302,6 +306,7 @@ pub async fn get(
         FROM pulso.cfdi_nomina n
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
           AND NOT EXISTS (
@@ -356,6 +361,7 @@ pub async fn get(
         JOIN pulso.cfdi_nomina n ON n.uuid = d.uuid
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
           AND NOT EXISTS (
@@ -399,6 +405,7 @@ pub async fn get(
         JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
           AND NOT EXISTS (
@@ -447,6 +454,7 @@ pub async fn get(
             FROM pulso.cfdi_nomina n2
             JOIN pulso.cfdis c2 ON c2.uuid = n2.uuid
             WHERE c2.rfc_emisor = $1
+              AND COALESCE(c2.estado_sat,'') != 'cancelado'
               AND NOT EXISTS (
                   SELECT 1 FROM pulso.payroll_normalization_rules pnr
                   WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
@@ -486,6 +494,7 @@ pub async fn get(
         FROM pulso.cfdi_nomina n
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
           AND NOT EXISTS (
@@ -523,6 +532,7 @@ pub async fn get(
         FROM pulso.cfdi_nomina n
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
           AND NOT EXISTS (
