@@ -11,6 +11,7 @@ pub struct PaymentsResponse {
     pub total_outstanding_mxn: f64,
     pub collection_rate_pct: f64,
     pub avg_days_to_pay: f64,
+    pub exposure_180d_mxn: f64,
     pub by_forma_pago: Vec<FormaRow>,
     pub by_metodo_pago: Vec<MetodoRow>,
     pub outstanding_invoices: Vec<OutstandingInvoice>,
@@ -76,29 +77,28 @@ pub async fn get(
     };
 
     // PUE = cobrada en mes de emisión; PPD = cobrada solo si tiene DR (complemento de pago).
-    // total_paid = PUE_total + PPD_cobrado_via_DR
-    // total_outstanding = PPD_total - PPD_cobrado_via_DR  (PUE nunca queda pendiente)
+    // Per-invoice: cobrado_ppd = MIN(SUM(imp_pagado), total_mxn) to avoid overcounting overpayments.
+    // outstanding_ppd = MAX(total_mxn - SUM(imp_pagado), 0) per invoice, then aggregate.
     let totals_row = sqlx::query(&format!(
         r#"
-        WITH inv_totals AS (
-            SELECT
-                SUM(COALESCE(total_mxn,0)::float8)::float8 AS total_invoiced,
-                SUM(CASE WHEN COALESCE(metodo_pago,'PUE') != 'PPD'
-                    THEN COALESCE(total_mxn,0)::float8 ELSE 0 END)::float8 AS pue_total,
-                SUM(CASE WHEN metodo_pago = 'PPD'
-                    THEN COALESCE(total_mxn,0)::float8 ELSE 0 END)::float8 AS ppd_total
+        WITH pue_totals AS (
+            SELECT SUM(COALESCE(total_mxn,0)::float8)::float8 AS pue_total
             FROM pulso.cfdis
             WHERE {owner_col} = $1
               AND {dl_filter}
               AND tipo_comprobante = 'I'
+              AND COALESCE(metodo_pago,'PUE') != 'PPD'
               AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND (year > $2 OR (year = $2 AND month >= $3))
               AND (year < $4 OR (year = $4 AND month <= $5))
         ),
-        ppd_paid AS (
-            SELECT COALESCE(SUM(pd.imp_pagado)::float8, 0) AS paid
-            FROM pulso.cfdi_payment_docs pd
-            JOIN pulso.cfdis inv ON inv.uuid = pd.invoice_uuid
+        ppd_per_invoice AS (
+            SELECT
+                inv.uuid,
+                COALESCE(inv.total_mxn, 0)::float8                          AS inv_total,
+                COALESCE(SUM(pd.imp_pagado)::float8, 0)                     AS paid_raw
+            FROM pulso.cfdis inv
+            LEFT JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
             WHERE inv.{owner_col} = $1
               AND inv.{dl_filter}
               AND inv.tipo_comprobante = 'I'
@@ -106,12 +106,20 @@ pub async fn get(
               AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
               AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
               AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+            GROUP BY inv.uuid, inv.total_mxn
+        ),
+        ppd_agg AS (
+            SELECT
+                SUM(inv_total)::float8                                       AS ppd_total,
+                SUM(LEAST(paid_raw, inv_total))::float8                      AS ppd_cobrado,
+                SUM(GREATEST(inv_total - paid_raw, 0))::float8               AS ppd_outstanding
+            FROM ppd_per_invoice
         )
         SELECT
-            it.total_invoiced,
-            (it.pue_total + pp.paid)::float8        AS total_paid,
-            GREATEST(it.ppd_total - pp.paid, 0)::float8 AS ppd_outstanding
-        FROM inv_totals it, ppd_paid pp
+            (pt.pue_total + pa.ppd_total)::float8                           AS total_invoiced,
+            (pt.pue_total + pa.ppd_cobrado)::float8                         AS total_paid,
+            pa.ppd_outstanding::float8                                       AS ppd_outstanding
+        FROM pue_totals pt, ppd_agg pa
         "#
     ))
     .bind(rfc)
@@ -262,6 +270,35 @@ pub async fn get(
         })
         .collect();
 
+    // Exposure >180d: outstanding balance on PPD invoices emitted >180 days ago
+    let exposure_row = sqlx::query(&format!(
+        r#"
+        SELECT COALESCE(SUM(GREATEST(inv.total_mxn - COALESCE(pd_sum.paid, 0), 0)::float8), 0) AS exposure
+        FROM pulso.cfdis inv
+        LEFT JOIN (
+            SELECT invoice_uuid, SUM(imp_pagado)::float8 AS paid
+            FROM pulso.cfdi_payment_docs
+            GROUP BY invoice_uuid
+        ) pd_sum ON pd_sum.invoice_uuid = inv.uuid
+        WHERE inv.{owner_col} = $1
+          AND inv.{dl_filter}
+          AND inv.tipo_comprobante = 'I'
+          AND inv.metodo_pago = 'PPD'
+          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
+          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+          AND (CURRENT_DATE - inv.fecha_emision::date) > 180
+        "#
+    ))
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_one(pool)
+    .await?;
+    let exposure_180d_mxn: f64 = exposure_row.try_get("exposure").unwrap_or(0.0);
+
     // Average days to pay (PPD invoices with payment complements)
     let avg_days_row = sqlx::query(&format!(
         r#"
@@ -356,6 +393,7 @@ pub async fn get(
         total_outstanding_mxn: total_outstanding,
         collection_rate_pct: collection_rate,
         avg_days_to_pay,
+        exposure_180d_mxn,
         by_forma_pago,
         by_metodo_pago,
         outstanding_invoices,
