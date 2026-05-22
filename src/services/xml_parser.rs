@@ -455,6 +455,8 @@ pub fn from_metadata(meta_json: &str, job_id: &str, dl_type: &str) -> Option<Par
     let estado_sat = v["estado"]
         .as_str()
         .or_else(|| v["Estado"].as_str())
+        .or_else(|| v["estadoComprobante"].as_str())
+        .or_else(|| v["EstadoComprobante"].as_str())
         .unwrap_or("vigente")
         .to_lowercase();
 
