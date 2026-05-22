@@ -78,6 +78,7 @@ pub async fn get(
         WHERE c.{owner_col} = $1
           AND {dl_filter}
           AND c.tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(c.estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
         GROUP BY t.impuesto, t.tipo_factor, t.tasa, t.is_retenido
@@ -168,6 +169,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY moneda
@@ -221,6 +223,7 @@ pub async fn get(
         WHERE c.{owner_col} = $1
           AND {dl_filter}
           AND c.tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(c.estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
         GROUP BY c.year, c.month

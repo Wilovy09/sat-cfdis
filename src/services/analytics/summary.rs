@@ -69,7 +69,7 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
         WHERE {rfc_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N','T')
-          AND COALESCE(estado_sat,'') != 'cancelado'
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (
@@ -159,7 +159,7 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
         FROM pulso.cfdis
         WHERE {rfc_col} = $1
           AND {dl_filter}
-          AND COALESCE(estado_sat,'') != 'cancelado'
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (

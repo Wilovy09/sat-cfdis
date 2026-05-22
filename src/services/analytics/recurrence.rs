@@ -61,7 +61,7 @@ pub async fn get(
     let max_q = format!(
         "SELECT MAX(year * 100 + month)::bigint AS max_period \
          FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N')"
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'"
     );
     let max_row = sqlx::query(&max_q).bind(rfc).fetch_one(pool).await?;
     let max_period: i64 = max_row.try_get("max_period").unwrap_or(0);
@@ -91,7 +91,7 @@ pub async fn get(
     let actual_q = format!(
         "SELECT COUNT(DISTINCT year * 100 + month)::bigint AS cnt \
          FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') \
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%' \
            AND year * 100 + month >= $2 AND year * 100 + month <= $3"
     );
     let actual_row = sqlx::query(&actual_q)
@@ -111,7 +111,7 @@ pub async fn get(
                    COUNT(DISTINCT year * 100 + month)::bigint   AS months_active,
                    SUM(COALESCE(total_neto_mxn,0)::float8)::float8   AS total_mxn
             FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
             GROUP BY {cp_col}
         ),
@@ -146,7 +146,7 @@ pub async fn get(
             SELECT {cp_col},
                    COUNT(DISTINCT year * 100 + month)::float8 AS months_in_window
             FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
             GROUP BY {cp_col}
         ),
@@ -154,7 +154,7 @@ pub async fn get(
             SELECT year, {cp_col},
                    SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS year_total
             FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
             GROUP BY year, {cp_col}
         ),
@@ -197,7 +197,7 @@ pub async fn get(
                    SUM(COALESCE(total_neto_mxn,0)::float8)::float8          AS total_mxn,
                    COUNT(*)::bigint                                    AS invoice_count
             FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
             GROUP BY {cp_col}
             HAVING COUNT(DISTINCT year * 100 + month) >= $4
@@ -205,7 +205,7 @@ pub async fn get(
         wt AS (
             SELECT GREATEST(SUM(COALESCE(total_neto_mxn,0)::float8), 1) AS total
             FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
         )
         SELECT rfc, nombre, months_active, total_mxn,

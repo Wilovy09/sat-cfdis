@@ -60,7 +60,7 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
     let q1 = format!(
         "SELECT year, COUNT(DISTINCT month)::bigint AS month_count \
          FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') \
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%' \
          GROUP BY year ORDER BY year"
     );
     let rows1 = sqlx::query(&q1).bind(rfc).fetch_all(pool).await?;
@@ -76,7 +76,7 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
         "SELECT year, {cp_col} AS rfc, MAX({cp_name_col}) AS nombre, \
                 SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total_mxn \
          FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') \
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%' \
          GROUP BY year, {cp_col} \
          ORDER BY year"
     );
@@ -102,7 +102,7 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
     let q3 = format!(
         "SELECT year, SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total_mxn \
          FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') \
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%' \
          GROUP BY year ORDER BY year"
     );
     let rows3 = sqlx::query(&q3).bind(rfc).fetch_all(pool).await?;

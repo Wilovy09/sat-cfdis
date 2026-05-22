@@ -52,7 +52,7 @@ pub async fn get(
         r#"
         SELECT
             {cp_col}                                                AS cp_rfc,
-            MAX({cp_name_col})                                      AS cp_nombre,
+            CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
             SUM(COALESCE(total_neto_mxn,0)::float8)::float8                          AS total,
             COUNT(*)                                               AS cnt,
             MIN(fecha_emision)                                     AS first_inv,
@@ -62,6 +62,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY {cp_col}
@@ -86,6 +87,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         "#
@@ -190,10 +192,13 @@ pub async fn get_evolution(
 
     let rows = sqlx::query(&format!(
         r#"
-        SELECT {cp_col} AS cp_rfc, MAX({cp_name_col}) AS cp_nombre, year,
+        SELECT {cp_col} AS cp_rfc,
+               CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
+               year,
                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS yr_total
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY {cp_col}, year
@@ -364,12 +369,13 @@ pub async fn get_ltm_comparison(
     let ltm_rows = sqlx::query(&format!(
         r#"
         SELECT {cp_col} AS cp_rfc,
-               MAX({cp_name_col}) AS cp_nombre,
+               CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS ltm_total,
                COUNT(DISTINCT year * 100 + month) AS months_active,
                COUNT(*) AS invoice_count
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY {cp_col}
@@ -386,10 +392,11 @@ pub async fn get_ltm_comparison(
     let prev_rows = sqlx::query(&format!(
         r#"
         SELECT {cp_col} AS cp_rfc,
-               MAX({cp_name_col}) AS cp_nombre,
+               CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS prev_total
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY {cp_col}
@@ -540,32 +547,71 @@ pub async fn get_payments_detail(
 
     let rows = sqlx::query(&format!(
         r#"
-        SELECT inv.{cp_col} AS cp_rfc,
-               MAX(inv.{cp_name_col}) AS cp_nombre,
-               SUM(COALESCE(inv.total_mxn,0)::float8)::float8 AS facturado,
-               COALESCE(SUM(pd.imp_pagado)::float8, 0) AS cobrado,
-               COUNT(DISTINCT inv.uuid) AS facturas_ppd,
-               COUNT(DISTINCT CASE WHEN (COALESCE(inv.total_mxn,0) - COALESCE(paid_per_inv.paid,0)) > 1.0 THEN inv.uuid END) AS facturas_abiertas,
-               COALESCE(AVG(CASE WHEN cp.fecha_pago IS NOT NULL THEN (cp.fecha_pago::date - inv.fecha_emision::date)::float8 END), 0) AS dias_cobro,
-               COALESCE(SUM(CASE
-                   WHEN (COALESCE(inv.total_mxn,0) - COALESCE(paid_per_inv.paid,0)) > 1000.0
-                    AND inv.fecha_emision::date < CURRENT_DATE - INTERVAL '180 days'
-                    AND (COALESCE(inv.total_mxn,0) - COALESCE(paid_per_inv.paid,0))
-                        / NULLIF(COALESCE(inv.total_mxn,0), 0) >= 0.03
-                   THEN (COALESCE(inv.total_mxn,0) - COALESCE(paid_per_inv.paid,0))
-               END)::float8, 0) AS monto_riesgo
-        FROM pulso.cfdis inv
-        LEFT JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
-        LEFT JOIN pulso.cfdi_payments cp ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
-        LEFT JOIN (
-            SELECT invoice_uuid, SUM(imp_pagado)::float8 AS paid FROM pulso.cfdi_payment_docs GROUP BY invoice_uuid
-        ) paid_per_inv ON paid_per_inv.invoice_uuid = inv.uuid
-        WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
-          AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
-          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
-        GROUP BY inv.{cp_col}
-        ORDER BY facturado DESC
+        WITH inv_base AS (
+            SELECT {cp_col} AS cp_rfc,
+                   CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
+                   SUM(COALESCE(total_mxn,0)::float8) AS facturado,
+                   COUNT(DISTINCT uuid) AS facturas_ppd
+            FROM pulso.cfdis
+            WHERE {owner_col} = $1 AND {dl_filter}
+              AND tipo_comprobante = 'I' AND metodo_pago = 'PPD'
+              AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND (year > $2 OR (year = $2 AND month >= $3))
+              AND (year < $4 OR (year = $4 AND month <= $5))
+            GROUP BY {cp_col}
+        ),
+        paid_per_inv AS (
+            SELECT invoice_uuid, SUM(imp_pagado)::float8 AS paid
+            FROM pulso.cfdi_payment_docs
+            GROUP BY invoice_uuid
+        ),
+        paid_by_cp AS (
+            SELECT inv.{cp_col} AS cp_rfc,
+                   COALESCE(SUM(pd.imp_pagado)::float8, 0) AS cobrado,
+                   COALESCE(AVG(CASE WHEN cp.fecha_pago IS NOT NULL
+                       THEN (cp.fecha_pago::date - inv.fecha_emision::date)::float8 END), 0) AS dias_cobro
+            FROM pulso.cfdis inv
+            JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
+            LEFT JOIN pulso.cfdi_payments cp ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
+            WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
+              AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
+              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
+              AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+            GROUP BY inv.{cp_col}
+        ),
+        risk_by_cp AS (
+            SELECT inv.{cp_col} AS cp_rfc,
+                   COUNT(DISTINCT CASE WHEN (COALESCE(inv.total_mxn,0) - COALESCE(ppi.paid,0)) > 1.0
+                       THEN inv.uuid END) AS facturas_abiertas,
+                   COALESCE(SUM(CASE
+                       WHEN (COALESCE(inv.total_mxn,0) - COALESCE(ppi.paid,0)) > 1000.0
+                        AND inv.fecha_emision::date < CURRENT_DATE - INTERVAL '180 days'
+                        AND (COALESCE(inv.total_mxn,0) - COALESCE(ppi.paid,0))
+                            / NULLIF(COALESCE(inv.total_mxn,0), 0) >= 0.03
+                       THEN (COALESCE(inv.total_mxn,0) - COALESCE(ppi.paid,0))
+                   END)::float8, 0) AS monto_riesgo
+            FROM pulso.cfdis inv
+            LEFT JOIN paid_per_inv ppi ON ppi.invoice_uuid = inv.uuid
+            WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
+              AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
+              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
+              AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+            GROUP BY inv.{cp_col}
+        )
+        SELECT ib.cp_rfc,
+               ib.cp_nombre,
+               ib.facturado,
+               COALESCE(pb.cobrado, 0) AS cobrado,
+               ib.facturas_ppd,
+               COALESCE(rb.facturas_abiertas, 0) AS facturas_abiertas,
+               COALESCE(pb.dias_cobro, 0) AS dias_cobro,
+               COALESCE(rb.monto_riesgo, 0) AS monto_riesgo
+        FROM inv_base ib
+        LEFT JOIN paid_by_cp pb ON pb.cp_rfc = ib.cp_rfc
+        LEFT JOIN risk_by_cp rb ON rb.cp_rfc = ib.cp_rfc
+        ORDER BY ib.facturado DESC
         LIMIT 50
         "#
     ))
@@ -657,6 +703,7 @@ pub async fn get_atypical(
                    SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS mo_total
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+              AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND (year > $2 OR (year = $2 AND month >= $3))
               AND (year < $4 OR (year = $4 AND month <= $5))
             GROUP BY {cp_col}, year, month
@@ -786,6 +833,7 @@ pub async fn get_individual(
                COUNT(*) AS cnt
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND {cp_col} = $2
           AND (year > $3 OR (year = $3 AND month >= $4))
           AND (year < $5 OR (year = $5 AND month <= $6))
@@ -805,9 +853,10 @@ pub async fn get_individual(
     // Get nombre from yearly query (fallback to monthly)
     let cp_nombre_row = sqlx::query(&format!(
         r#"
-        SELECT MAX({cp_name_col}) AS cp_nombre
+        SELECT CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {cp_col} = $2 AND {dl_filter}
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
         "#
     ))
     .bind(owner_rfc)
@@ -878,6 +927,7 @@ pub async fn get_individual(
                COUNT(*) AS cnt
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND {cp_col} = $2
           AND (year > $3 OR (year = $3 AND month >= $4))
           AND (year < $5 OR (year = $5 AND month <= $6))
@@ -915,6 +965,7 @@ pub async fn get_individual(
         FROM pulso.cfdi_concepts cc
         JOIN pulso.cfdis c ON c.uuid = cc.uuid
         WHERE c.{owner_col} = $1 AND c.{dl_filter} AND c.tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(c.estado_sat,'')) NOT LIKE '%CANCEL%'
           AND c.{cp_col} = $2
           AND (c.year > $3 OR (c.year = $3 AND c.month >= $4))
           AND (c.year < $5 OR (c.year = $5 AND c.month <= $6))
@@ -973,6 +1024,7 @@ pub async fn get_individual(
                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS yr_total
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY year

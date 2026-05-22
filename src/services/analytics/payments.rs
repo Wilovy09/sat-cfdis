@@ -75,16 +75,43 @@ pub async fn get(
         "nombre_receptor"
     };
 
-    // Invoices in range (PUE = paid upfront, PPD = deferred)
-    let inv_total_row = sqlx::query(&format!(
+    // PUE = cobrada en mes de emisión; PPD = cobrada solo si tiene DR (complemento de pago).
+    // total_paid = PUE_total + PPD_cobrado_via_DR
+    // total_outstanding = PPD_total - PPD_cobrado_via_DR  (PUE nunca queda pendiente)
+    let totals_row = sqlx::query(&format!(
         r#"
-        SELECT SUM(COALESCE(total_mxn,0)::float8)::float8 AS total
-        FROM pulso.cfdis
-        WHERE {owner_col} = $1
-          AND {dl_filter}
-          AND tipo_comprobante = 'I'
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
+        WITH inv_totals AS (
+            SELECT
+                SUM(COALESCE(total_mxn,0)::float8)::float8 AS total_invoiced,
+                SUM(CASE WHEN COALESCE(metodo_pago,'PUE') != 'PPD'
+                    THEN COALESCE(total_mxn,0)::float8 ELSE 0 END)::float8 AS pue_total,
+                SUM(CASE WHEN metodo_pago = 'PPD'
+                    THEN COALESCE(total_mxn,0)::float8 ELSE 0 END)::float8 AS ppd_total
+            FROM pulso.cfdis
+            WHERE {owner_col} = $1
+              AND {dl_filter}
+              AND tipo_comprobante = 'I'
+              AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND (year > $2 OR (year = $2 AND month >= $3))
+              AND (year < $4 OR (year = $4 AND month <= $5))
+        ),
+        ppd_paid AS (
+            SELECT COALESCE(SUM(pd.imp_pagado)::float8, 0) AS paid
+            FROM pulso.cfdi_payment_docs pd
+            JOIN pulso.cfdis inv ON inv.uuid = pd.invoice_uuid
+            WHERE inv.{owner_col} = $1
+              AND inv.{dl_filter}
+              AND inv.tipo_comprobante = 'I'
+              AND inv.metodo_pago = 'PPD'
+              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
+              AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+        )
+        SELECT
+            it.total_invoiced,
+            (it.pue_total + pp.paid)::float8        AS total_paid,
+            GREATEST(it.ppd_total - pp.paid, 0)::float8 AS ppd_outstanding
+        FROM inv_totals it, ppd_paid pp
         "#
     ))
     .bind(rfc)
@@ -94,31 +121,9 @@ pub async fn get(
     .bind(to_m)
     .fetch_one(pool)
     .await?;
-    let total_invoiced_mxn: f64 = inv_total_row.try_get("total").unwrap_or(0.0);
-
-    // Total paid via payment complements linked to these invoices
-    let paid_row = sqlx::query(&format!(
-        r#"
-        SELECT SUM(COALESCE(pd.imp_pagado, 0)::float8) AS paid
-        FROM pulso.cfdi_payment_docs pd
-        JOIN pulso.cfdis inv ON inv.uuid = pd.invoice_uuid
-        JOIN pulso.cfdis pay ON pay.uuid = pd.payment_uuid
-        WHERE inv.{owner_col} = $1
-          AND inv.{dl_filter}
-          AND inv.tipo_comprobante = 'I'
-          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
-        "#
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_one(pool)
-    .await?;
-    let total_paid_mxn: f64 = paid_row.try_get("paid").unwrap_or(0.0);
-    let total_outstanding = (total_invoiced_mxn - total_paid_mxn).max(0.0);
+    let total_invoiced_mxn: f64 = totals_row.try_get("total_invoiced").unwrap_or(0.0);
+    let total_paid_mxn: f64     = totals_row.try_get("total_paid").unwrap_or(0.0);
+    let total_outstanding: f64  = totals_row.try_get("ppd_outstanding").unwrap_or(0.0);
     let collection_rate = if total_invoiced_mxn > 0.0 {
         total_paid_mxn / total_invoiced_mxn * 100.0
     } else {
@@ -136,6 +141,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante = 'I'
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY forma
@@ -180,6 +186,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante = 'I'
+          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY metodo
@@ -224,6 +231,7 @@ pub async fn get(
           AND inv.{dl_filter}
           AND inv.tipo_comprobante = 'I'
           AND inv.metodo_pago = 'PPD'
+          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
           AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
         GROUP BY inv.uuid
@@ -265,6 +273,7 @@ pub async fn get(
         WHERE inv.{owner_col} = $1
           AND inv.{dl_filter}
           AND inv.tipo_comprobante = 'I'
+          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
           AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
           AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
           AND cp.fecha_pago IS NOT NULL
@@ -279,21 +288,45 @@ pub async fn get(
     .await?;
     let avg_days_to_pay: f64 = avg_days_row.try_get("avg_days").unwrap_or(0.0);
 
-    // Monthly payment timeline (invoiced by emission month, paid by payment complement date)
+    // Monthly timeline: invoiced = PUE+PPD emitted; paid = PUE (immediate) + PPD DR payments
+    // grouped by invoice emission month. Avoids multiplying PUE totals via payment doc JOIN.
     let timeline_rows = sqlx::query(&format!(
         r#"
-        SELECT inv.year, inv.month,
-               SUM(COALESCE(inv.total_mxn,0)::float8)::float8 AS invoiced,
-               COALESCE(SUM(pd.imp_pagado)::float8, 0) AS paid
-        FROM pulso.cfdis inv
-        LEFT JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
-        WHERE inv.{owner_col} = $1
-          AND inv.{dl_filter}
-          AND inv.tipo_comprobante = 'I'
-          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
-        GROUP BY inv.year, inv.month
-        ORDER BY inv.year, inv.month
+        WITH inv_by_month AS (
+            SELECT year, month,
+                   SUM(CASE WHEN COALESCE(metodo_pago,'PUE') != 'PPD'
+                       THEN COALESCE(total_mxn,0)::float8 ELSE 0 END) AS pue_invoiced,
+                   SUM(CASE WHEN metodo_pago = 'PPD'
+                       THEN COALESCE(total_mxn,0)::float8 ELSE 0 END) AS ppd_invoiced
+            FROM pulso.cfdis
+            WHERE {owner_col} = $1
+              AND {dl_filter}
+              AND tipo_comprobante = 'I'
+              AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND (year > $2 OR (year = $2 AND month >= $3))
+              AND (year < $4 OR (year = $4 AND month <= $5))
+            GROUP BY year, month
+        ),
+        ppd_paid_by_month AS (
+            SELECT inv.year, inv.month,
+                   COALESCE(SUM(pd.imp_pagado)::float8, 0) AS ppd_paid
+            FROM pulso.cfdis inv
+            JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
+            WHERE inv.{owner_col} = $1
+              AND inv.{dl_filter}
+              AND inv.tipo_comprobante = 'I'
+              AND inv.metodo_pago = 'PPD'
+              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
+              AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+            GROUP BY inv.year, inv.month
+        )
+        SELECT bm.year, bm.month,
+               (bm.pue_invoiced + bm.ppd_invoiced)::float8 AS invoiced,
+               (bm.pue_invoiced + COALESCE(pbm.ppd_paid, 0))::float8 AS paid
+        FROM inv_by_month bm
+        LEFT JOIN ppd_paid_by_month pbm ON pbm.year = bm.year AND pbm.month = bm.month
+        ORDER BY bm.year, bm.month
         "#
     ))
     .bind(rfc)
