@@ -197,7 +197,9 @@ pub async fn get_recurrence(
         .and_then(|s| s.parse().ok())
         .unwrap_or(24)
         .clamp(6, 60);
-    let result = recurrence::get(&pool, &rfc, dl_type, window_months)
+    let from = query.get("from").map(|s| s.as_str());
+    let to   = query.get("to").map(|s| s.as_str());
+    let result = recurrence::get(&pool, &rfc, dl_type, window_months, from, to)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))

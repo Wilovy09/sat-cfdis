@@ -44,6 +44,8 @@ pub async fn get(
     rfc: &str,
     dl_type: &str,
     window_months: i32,
+    from: Option<&str>,
+    to: Option<&str>,
 ) -> anyhow::Result<RecurrenceResponse> {
     let owner_col = rfc_column(dl_type);
     let dl_filter = dl_type_filter(dl_type);
@@ -58,14 +60,23 @@ pub async fn get(
         "nombre_receptor"
     };
 
+    // If explicit from/to given (user-selected period), clamp window to that range.
+    // Otherwise roll back window_months from the latest date in DB.
+    let parse_yyyymm = |s: &str| -> i64 {
+        let parts: Vec<&str> = s.splitn(2, '-').collect();
+        let y: i64 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let m: i64 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1);
+        y * 100 + m
+    };
+
     let max_q = format!(
         "SELECT MAX(year * 100 + month)::bigint AS max_period \
          FROM pulso.cfdis \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'"
     );
     let max_row = sqlx::query(&max_q).bind(rfc).fetch_one(pool).await?;
-    let max_period: i64 = max_row.try_get("max_period").unwrap_or(0);
-    if max_period == 0 {
+    let max_period_db: i64 = max_row.try_get("max_period").unwrap_or(0);
+    if max_period_db == 0 {
         return Ok(RecurrenceResponse {
             window_months: 0,
             rec_threshold: 1,
@@ -77,16 +88,28 @@ pub async fn get(
         });
     }
 
-    let max_year = (max_period / 100) as i32;
-    let max_month = (max_period % 100) as i32;
-    let max_month_abs = max_year * 12 + max_month - 1;
-    let from_month_abs = max_month_abs - (window_months - 1);
-    let from_year = from_month_abs / 12;
-    let from_month = from_month_abs % 12 + 1;
-    let from_yyyymm = (from_year * 100 + from_month) as i64;
+    let (from_yyyymm, max_period) = if let (Some(f), Some(t)) = (from, to) {
+        // Respect user-selected range, clamped to DB bounds
+        let f_ym = parse_yyyymm(f).max(1);
+        let t_ym = parse_yyyymm(t).min(max_period_db);
+        (f_ym, t_ym)
+    } else {
+        let max_year = (max_period_db / 100) as i32;
+        let max_month = (max_period_db % 100) as i32;
+        let max_month_abs = max_year * 12 + max_month - 1;
+        let from_month_abs = max_month_abs - (window_months - 1);
+        let from_year = from_month_abs / 12;
+        let from_month = from_month_abs % 12 + 1;
+        ((from_year * 100 + from_month) as i64, max_period_db)
+    };
+
+    let from_year = (from_yyyymm / 100) as i32;
+    let from_month = (from_yyyymm % 100) as i32;
+    let to_year = (max_period / 100) as i32;
+    let to_month_num = (max_period % 100) as i32;
 
     let from_period = format!("{from_year}-{from_month:02}");
-    let to_period = format!("{max_year}-{max_month:02}");
+    let to_period = format!("{to_year}-{to_month_num:02}");
 
     let actual_q = format!(
         "SELECT COUNT(DISTINCT year * 100 + month)::bigint AS cnt \
@@ -139,20 +162,23 @@ pub async fn get(
         })
         .collect();
 
-    // Q2: recurrence score per year (revenue-weighted continuity)
+    // Q2: recurrence score per year (revenue-weighted per-year continuity).
+    // ratio_rec = months_active_in_year / months_available_in_year (matches Python).
+    // score_year = weighted_average(ratio_rec, weight=year_total/year_total_all) * 100
     let q2 = format!(
         r#"
-        WITH cp_window AS (
-            SELECT {cp_col},
-                   COUNT(DISTINCT year * 100 + month)::float8 AS months_in_window
+        WITH months_avail_year AS (
+            SELECT year,
+                   COUNT(DISTINCT month)::float8 AS months_avail
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
-            GROUP BY {cp_col}
+            GROUP BY year
         ),
         cp_year AS (
             SELECT year, {cp_col},
-                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS year_total
+                   COUNT(DISTINCT month)::float8                      AS cp_months_in_year,
+                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8   AS year_total
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
@@ -163,10 +189,13 @@ pub async fn get(
         )
         SELECT cy.year,
                LEAST(100.0,
-                 SUM((cw.months_in_window / $4::float8) * (cy.year_total / yt.yt)) * 100
+                 SUM(
+                   (cy.cp_months_in_year / ma.months_avail)
+                   * (cy.year_total / yt.yt)
+                 ) * 100
                )::float8 AS score
         FROM cp_year cy
-        JOIN cp_window cw ON cw.{cp_col} = cy.{cp_col}
+        JOIN months_avail_year ma ON ma.year = cy.year
         JOIN year_totals yt ON yt.year = cy.year
         GROUP BY cy.year ORDER BY cy.year
     "#
@@ -175,7 +204,6 @@ pub async fn get(
         .bind(rfc)
         .bind(from_yyyymm)
         .bind(max_period)
-        .bind(actual_window)
         .fetch_all(pool)
         .await?;
     let scores_by_year: Vec<YearScore> = rows2
