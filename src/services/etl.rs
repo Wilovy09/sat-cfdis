@@ -457,6 +457,8 @@ fn extract_estado_from_meta(metadata: &str) -> String {
     v["estado"]
         .as_str()
         .or_else(|| v["Estado"].as_str())
+        .or_else(|| v["estadoComprobante"].as_str())
+        .or_else(|| v["EstadoComprobante"].as_str())
         .unwrap_or("vigente")
         .to_lowercase()
 }
