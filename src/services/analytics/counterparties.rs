@@ -337,7 +337,7 @@ pub async fn get_ltm_comparison(
     dl_type: &str,
     to: &str,
 ) -> anyhow::Result<LtmComparisonResponse> {
-    let (to_y, to_m) = parse_ym(to);
+    let (req_to_y, req_to_m): (i64, i64) = parse_ym(to);
     let dl_filter = dl_type_filter(dl_type);
     let owner_col = rfc_column(dl_type);
     let cp_col = if dl_type == "recibidos" {
@@ -351,10 +351,32 @@ pub async fn get_ltm_comparison(
         "nombre_receptor"
     };
 
-    // Compute LTM window: [to_y/to_m - 11 months ... to_y/to_m]
-    let ltm_end_y = to_y;
-    let ltm_end_m = to_m;
-    let ltm_start_total_months = (to_y * 12 + to_m - 1) - 11;
+    // Clamp requested `to` to the actual last data month so LTM always ends at
+    // real data regardless of a hardcoded future date from the frontend
+    let max_q = format!(
+        "SELECT MAX(year * 100 + month)::bigint AS max_ym \
+         FROM pulso.cfdis \
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') \
+           AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'"
+    );
+    let max_row = sqlx::query(&max_q).bind(rfc).fetch_one(pool).await?;
+    let max_ym_db: i64 = max_row.try_get("max_ym").unwrap_or(0);
+    let (actual_to_y, actual_to_m): (i64, i64) = if max_ym_db > 0 {
+        let db_y = max_ym_db / 100;
+        let db_m = max_ym_db % 100;
+        if req_to_y * 100 + req_to_m <= db_y * 100 + db_m {
+            (req_to_y, req_to_m)
+        } else {
+            (db_y, db_m)
+        }
+    } else {
+        (req_to_y, req_to_m)
+    };
+
+    // Compute LTM window: [to - 11 months ... to]
+    let ltm_end_y = actual_to_y;
+    let ltm_end_m = actual_to_m;
+    let ltm_start_total_months = (actual_to_y * 12 + actual_to_m - 1) - 11;
     let ltm_start_y = ltm_start_total_months / 12;
     let ltm_start_m = ltm_start_total_months % 12 + 1;
 
@@ -530,8 +552,8 @@ pub async fn get_payments_detail(
     from: &str,
     to: &str,
 ) -> anyhow::Result<PaymentsDetailResponse> {
-    let (from_y, from_m) = parse_ym(from);
-    let (to_y, to_m) = parse_ym(to);
+    let (_from_y, _from_m) = parse_ym(from);
+    let (_to_y, _to_m) = parse_ym(to);
     let dl_filter = dl_type_filter(dl_type);
     let owner_col = rfc_column(dl_type);
     let cp_col = if dl_type == "recibidos" {
@@ -545,19 +567,29 @@ pub async fn get_payments_detail(
         "nombre_receptor"
     };
 
+    // CNT05: full universe of ALL invoices (PUE + PPD), no date filter.
+    // PUE invoices are treated as fully paid at emission (matches Python semantics).
+    // PPD invoices: cobrado from payment complements; dias/risk/open counts are PPD-only.
     let rows = sqlx::query(&format!(
         r#"
-        WITH inv_base AS (
-            SELECT {cp_col} AS cp_rfc,
-                   CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
-                   SUM(COALESCE(total_mxn,0)::float8) AS facturado,
-                   COUNT(DISTINCT uuid) AS facturas_ppd
+        WITH all_inv AS (
+            SELECT {cp_col},
+                   {cp_name_col},
+                   uuid,
+                   fecha_emision,
+                   COALESCE(total_mxn, 0)::float8 AS inv_total,
+                   metodo_pago
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter}
-              AND tipo_comprobante = 'I' AND metodo_pago = 'PPD'
+              AND tipo_comprobante = 'I'
               AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
-              AND (year > $2 OR (year = $2 AND month >= $3))
-              AND (year < $4 OR (year = $4 AND month <= $5))
+        ),
+        inv_base AS (
+            SELECT {cp_col} AS cp_rfc,
+                   CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
+                   SUM(inv_total) AS facturado,
+                   COUNT(DISTINCT CASE WHEN metodo_pago = 'PPD' THEN uuid END) AS facturas_ppd
+            FROM all_inv
             GROUP BY {cp_col}
         ),
         paid_per_inv AS (
@@ -565,82 +597,59 @@ pub async fn get_payments_detail(
             FROM pulso.cfdi_payment_docs
             GROUP BY invoice_uuid
         ),
-        ppd_inv_detail AS (
-            SELECT inv.{cp_col}                             AS cp_rfc,
-                   inv.uuid,
-                   inv.fecha_emision,
-                   COALESCE(inv.total_mxn, 0)::float8       AS inv_total,
-                   COALESCE(ppi.paid, 0)                    AS paid_raw
-            FROM pulso.cfdis inv
+        cobrado_by_cp AS (
+            -- PUE: assumed fully paid at emission; PPD: actual from complements (capped at inv_total)
+            SELECT inv.{cp_col} AS cp_rfc,
+                   SUM(CASE
+                       WHEN inv.metodo_pago = 'PUE' THEN inv.inv_total
+                       ELSE LEAST(COALESCE(ppi.paid, 0), inv.inv_total)
+                   END)::float8 AS cobrado
+            FROM all_inv inv
             LEFT JOIN paid_per_inv ppi ON ppi.invoice_uuid = inv.uuid
-            WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
-              AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
-              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
-              AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-              AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+            GROUP BY inv.{cp_col}
         ),
         dias_by_cp AS (
             SELECT inv.{cp_col}                                             AS cp_rfc,
                    AVG((cp.fecha_pago::date - inv.fecha_emision::date)::float8) AS dias_cobro
-            FROM pulso.cfdis inv
+            FROM all_inv inv
             JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
             JOIN pulso.cfdi_payments cp
                  ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
-            WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
-              AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
-              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
-              AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-              AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
-              AND cp.fecha_pago IS NOT NULL
+            WHERE inv.metodo_pago = 'PPD' AND cp.fecha_pago IS NOT NULL
             GROUP BY inv.{cp_col}
-        ),
-        paid_by_cp AS (
-            SELECT cp_rfc,
-                   SUM(LEAST(paid_raw, inv_total))::float8 AS cobrado
-            FROM ppd_inv_detail
-            GROUP BY cp_rfc
         ),
         risk_by_cp AS (
             SELECT inv.{cp_col} AS cp_rfc,
-                   COUNT(DISTINCT CASE WHEN (COALESCE(inv.total_mxn,0) - COALESCE(ppi.paid,0)) > 1.0
+                   COUNT(DISTINCT CASE WHEN (inv.inv_total - COALESCE(ppi.paid,0)) > 1.0
                        THEN inv.uuid END) AS facturas_abiertas,
                    COALESCE(SUM(CASE
-                       WHEN (COALESCE(inv.total_mxn,0) - COALESCE(ppi.paid,0)) > 1000.0
+                       WHEN (inv.inv_total - COALESCE(ppi.paid,0)) > 1000.0
                         AND inv.fecha_emision::date < CURRENT_DATE - INTERVAL '180 days'
-                        AND (COALESCE(inv.total_mxn,0) - COALESCE(ppi.paid,0))
-                            / NULLIF(COALESCE(inv.total_mxn,0), 0) >= 0.03
-                       THEN (COALESCE(inv.total_mxn,0) - COALESCE(ppi.paid,0))
+                        AND (inv.inv_total - COALESCE(ppi.paid,0)) / NULLIF(inv.inv_total, 0) >= 0.03
+                       THEN (inv.inv_total - COALESCE(ppi.paid,0))
                    END)::float8, 0) AS monto_riesgo
-            FROM pulso.cfdis inv
+            FROM all_inv inv
             LEFT JOIN paid_per_inv ppi ON ppi.invoice_uuid = inv.uuid
-            WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
-              AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
-              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
-              AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-              AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+            WHERE inv.metodo_pago = 'PPD'
             GROUP BY inv.{cp_col}
         )
         SELECT ib.cp_rfc,
                ib.cp_nombre,
                ib.facturado,
-               COALESCE(pb.cobrado, 0)      AS cobrado,
+               COALESCE(cb.cobrado, 0)           AS cobrado,
                ib.facturas_ppd,
                COALESCE(rb.facturas_abiertas, 0) AS facturas_abiertas,
-               COALESCE(dc.dias_cobro, 0)   AS dias_cobro,
-               COALESCE(rb.monto_riesgo, 0) AS monto_riesgo
+               COALESCE(dc.dias_cobro, 0)        AS dias_cobro,
+               COALESCE(rb.monto_riesgo, 0)      AS monto_riesgo
         FROM inv_base ib
-        LEFT JOIN paid_by_cp pb ON pb.cp_rfc = ib.cp_rfc
-        LEFT JOIN dias_by_cp dc ON dc.cp_rfc = ib.cp_rfc
-        LEFT JOIN risk_by_cp rb ON rb.cp_rfc = ib.cp_rfc
+        LEFT JOIN cobrado_by_cp cb ON cb.cp_rfc = ib.cp_rfc
+        LEFT JOIN dias_by_cp dc    ON dc.cp_rfc = ib.cp_rfc
+        LEFT JOIN risk_by_cp rb    ON rb.cp_rfc = ib.cp_rfc
         ORDER BY ib.facturado DESC
         LIMIT 50
         "#
     ))
     .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
     .fetch_all(pool)
     .await?;
 
@@ -795,6 +804,12 @@ pub struct CpIndividualResponse {
     pub by_month_by_year: Vec<CpMonthRow>,
     pub top_concepts: Vec<CpConceptRow>,
     pub pct_of_year: HashMap<String, f64>,
+    // Cobranza (full universe, no date filter)
+    pub cobrado_mxn: f64,
+    pub facturado_ppd_mxn: f64,
+    pub saldo_pendiente_mxn: f64,
+    pub pct_cobrado: f64,
+    pub dias_cobro_ppd: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1081,6 +1096,62 @@ pub async fn get_individual(
         })
         .collect();
 
+    // Cobranza for this specific counterparty — full universe (no date filter)
+    let cobranza_row = sqlx::query(&format!(
+        r#"
+        WITH paid_per_inv AS (
+            SELECT invoice_uuid, SUM(imp_pagado)::float8 AS paid
+            FROM pulso.cfdi_payment_docs
+            GROUP BY invoice_uuid
+        ),
+        ppd_detail AS (
+            SELECT inv.uuid,
+                   COALESCE(inv.total_mxn, 0)::float8 AS inv_total,
+                   COALESCE(ppi.paid, 0)               AS paid_raw
+            FROM pulso.cfdis inv
+            LEFT JOIN paid_per_inv ppi ON ppi.invoice_uuid = inv.uuid
+            WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
+              AND inv.{cp_col} = $2
+              AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
+              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+        )
+        SELECT
+            SUM(inv_total)::float8                         AS facturado,
+            SUM(LEAST(paid_raw, inv_total))::float8        AS cobrado,
+            SUM(GREATEST(inv_total - paid_raw, 0))::float8 AS saldo
+        FROM ppd_detail
+        "#
+    ))
+    .bind(owner_rfc)
+    .bind(cp_rfc)
+    .fetch_one(pool)
+    .await?;
+
+    let facturado_ppd: f64 = cobranza_row.try_get("facturado").unwrap_or(0.0);
+    let cobrado_mxn: f64   = cobranza_row.try_get("cobrado").unwrap_or(0.0);
+    let saldo: f64         = cobranza_row.try_get("saldo").unwrap_or(0.0);
+    let pct_cobrado = if facturado_ppd > 0.0 { cobrado_mxn / facturado_ppd * 100.0 } else { 0.0 };
+
+    let dias_row = sqlx::query(&format!(
+        r#"
+        SELECT AVG((cp.fecha_pago::date - inv.fecha_emision::date)::float8) AS dias
+        FROM pulso.cfdis inv
+        JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
+        JOIN pulso.cfdi_payments cp ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
+        WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
+          AND inv.{cp_col} = $2
+          AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
+          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND cp.fecha_pago IS NOT NULL
+        "#
+    ))
+    .bind(owner_rfc)
+    .bind(cp_rfc)
+    .fetch_one(pool)
+    .await?;
+
+    let dias_cobro_ppd: Option<f64> = dias_row.try_get("dias").unwrap_or(None);
+
     Ok(CpIndividualResponse {
         rfc: cp_rfc.to_string(),
         nombre: cp_nombre,
@@ -1088,5 +1159,10 @@ pub async fn get_individual(
         by_month_by_year,
         top_concepts,
         pct_of_year,
+        cobrado_mxn,
+        facturado_ppd_mxn: facturado_ppd,
+        saldo_pendiente_mxn: saldo,
+        pct_cobrado,
+        dias_cobro_ppd,
     })
 }
