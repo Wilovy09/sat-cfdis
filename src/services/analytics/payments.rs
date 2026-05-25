@@ -76,9 +76,9 @@ pub async fn get(
         "nombre_receptor"
     };
 
-    // PUE = cobrada en mes de emisión; PPD = cobrada solo si tiene DR (complemento de pago).
-    // Per-invoice: cobrado_ppd = MIN(SUM(imp_pagado), total_mxn) to avoid overcounting overpayments.
-    // outstanding_ppd = MAX(total_mxn - SUM(imp_pagado), 0) per invoice, then aggregate.
+    // Collection totals use the FULL universe (no date filter) — "% cobrado del universo"
+    // means all PPD invoices ever emitted, not just those in the selected period.
+    // The date filter applies only to timeline / forma / metodo breakdowns below.
     let totals_row = sqlx::query(&format!(
         r#"
         WITH pue_totals AS (
@@ -89,8 +89,6 @@ pub async fn get(
               AND tipo_comprobante = 'I'
               AND COALESCE(metodo_pago,'PUE') != 'PPD'
               AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
-              AND (year > $2 OR (year = $2 AND month >= $3))
-              AND (year < $4 OR (year = $4 AND month <= $5))
         ),
         ppd_per_invoice AS (
             SELECT
@@ -104,8 +102,6 @@ pub async fn get(
               AND inv.tipo_comprobante = 'I'
               AND inv.metodo_pago = 'PPD'
               AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
-              AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-              AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
             GROUP BY inv.uuid, inv.total_mxn
         ),
         ppd_agg AS (
@@ -123,10 +119,6 @@ pub async fn get(
         "#
     ))
     .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
     .fetch_one(pool)
     .await?;
     let total_invoiced_mxn: f64 = totals_row.try_get("total_invoiced").unwrap_or(0.0);
@@ -221,7 +213,7 @@ pub async fn get(
         })
         .collect();
 
-    // Outstanding invoices (PPD with remaining balance)
+    // Outstanding invoices — full universe (no date filter)
     let outstanding_rows = sqlx::query(&format!(
         r#"
         SELECT
@@ -240,8 +232,6 @@ pub async fn get(
           AND inv.tipo_comprobante = 'I'
           AND inv.metodo_pago = 'PPD'
           AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
-          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
         GROUP BY inv.uuid
         HAVING (inv.total_mxn - COALESCE(SUM(pd.imp_pagado)::float8, 0)) > 1.0
         ORDER BY (inv.total_mxn - COALESCE(SUM(pd.imp_pagado)::float8, 0)) DESC
@@ -249,10 +239,6 @@ pub async fn get(
         "#
     ))
     .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
     .fetch_all(pool)
     .await?;
 
@@ -270,7 +256,7 @@ pub async fn get(
         })
         .collect();
 
-    // Exposure >180d: outstanding balance on PPD invoices emitted >180 days ago
+    // Exposure >180d — full universe (no date filter)
     let exposure_row = sqlx::query(&format!(
         r#"
         SELECT COALESCE(SUM(GREATEST(inv.total_mxn - COALESCE(pd_sum.paid, 0), 0)::float8), 0) AS exposure
@@ -285,21 +271,15 @@ pub async fn get(
           AND inv.tipo_comprobante = 'I'
           AND inv.metodo_pago = 'PPD'
           AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
-          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
           AND (CURRENT_DATE - inv.fecha_emision::date) > 180
         "#
     ))
     .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
     .fetch_one(pool)
     .await?;
     let exposure_180d_mxn: f64 = exposure_row.try_get("exposure").unwrap_or(0.0);
 
-    // Average days to pay (PPD invoices with payment complements)
+    // Average days to pay — full universe (no date filter)
     let avg_days_row = sqlx::query(&format!(
         r#"
         SELECT AVG((cp.fecha_pago::date - inv.fecha_emision::date)::float8) AS avg_days
@@ -311,16 +291,10 @@ pub async fn get(
           AND inv.{dl_filter}
           AND inv.tipo_comprobante = 'I'
           AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
-          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
           AND cp.fecha_pago IS NOT NULL
         "#
     ))
     .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
     .fetch_one(pool)
     .await?;
     let avg_days_to_pay: f64 = avg_days_row.try_get("avg_days").unwrap_or(0.0);
