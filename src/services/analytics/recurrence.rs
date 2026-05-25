@@ -60,6 +60,19 @@ pub async fn get(
         "nombre_receptor"
     };
 
+    // For "emitidos" (ingresos), split XEXX010101000 foreign clients by name — matches Python behaviour
+    // where each distinct foreign entity gets its own contraparte_key ("XEXX010101000||NOMBRE")
+    let cp_key_expr = if dl_type != "recibidos" {
+        format!(
+            "CASE WHEN {cp_col} = 'XEXX010101000' \
+                  AND TRIM(COALESCE({cp_name_col}, '')) <> '' \
+             THEN 'XEXX010101000||' || UPPER(REGEXP_REPLACE(TRIM(COALESCE({cp_name_col},'')), '[^A-Z0-9 &\\-]', '', 'g')) \
+             ELSE {cp_col} END"
+        )
+    } else {
+        cp_col.to_string()
+    };
+
     // If explicit from/to given (user-selected period), clamp window to that range.
     // Otherwise roll back window_months from the latest date in DB.
     let parse_yyyymm = |s: &str| -> i64 {
@@ -103,16 +116,14 @@ pub async fn get(
         ((from_year * 100 + from_month) as i64, max_period_db)
     };
 
-    let from_year = (from_yyyymm / 100) as i32;
-    let from_month = (from_yyyymm % 100) as i32;
     let to_year = (max_period / 100) as i32;
     let to_month_num = (max_period % 100) as i32;
-
-    let from_period = format!("{from_year}-{from_month:02}");
     let to_period = format!("{to_year}-{to_month_num:02}");
 
+    // Find actual data bounds within the computed window (data may start later than from_yyyymm)
     let actual_q = format!(
-        "SELECT COUNT(DISTINCT year * 100 + month)::bigint AS cnt \
+        "SELECT COUNT(DISTINCT year * 100 + month)::bigint AS cnt, \
+                MIN(year * 100 + month)::bigint AS min_period \
          FROM pulso.cfdis \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%' \
            AND year * 100 + month >= $2 AND year * 100 + month <= $3"
@@ -125,18 +136,23 @@ pub async fn get(
         .await?;
     let actual_window: i64 = actual_row.try_get("cnt").unwrap_or(window_months as i64);
     let actual_window = actual_window.max(1);
+    // Use the actual earliest data month so from_period matches Python's window display
+    let actual_min_period: i64 = actual_row.try_get("min_period").unwrap_or(from_yyyymm);
+    let actual_from_year = (actual_min_period / 100) as i32;
+    let actual_from_month = (actual_min_period % 100) as i32;
+    let from_period = format!("{actual_from_year}-{actual_from_month:02}");
 
     // Q1: distribution by active months
     let q1 = format!(
         r#"
         WITH cp_months AS (
-            SELECT {cp_col},
+            SELECT ({cp_key_expr})                               AS cp_key,
                    COUNT(DISTINCT year * 100 + month)::bigint   AS months_active,
                    SUM(COALESCE(total_neto_mxn,0)::float8)::float8   AS total_mxn
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
-            GROUP BY {cp_col}
+            GROUP BY ({cp_key_expr})
         ),
         wt AS (SELECT GREATEST(SUM(total_mxn), 1) AS total FROM cp_months)
         SELECT months_active,
@@ -176,13 +192,13 @@ pub async fn get(
             GROUP BY year
         ),
         cp_year AS (
-            SELECT year, {cp_col},
-                   COUNT(DISTINCT month)::float8                      AS cp_months_in_year,
-                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8   AS year_total
+            SELECT year, ({cp_key_expr}) AS cp_key,
+                   COUNT(DISTINCT month)::float8                                   AS cp_months_in_year,
+                   GREATEST(SUM(COALESCE(total_neto_mxn,0)::float8), 0)::float8   AS year_total
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
-            GROUP BY year, {cp_col}
+            GROUP BY year, ({cp_key_expr})
         ),
         year_totals AS (
             SELECT year, GREATEST(SUM(year_total), 1) AS yt FROM cp_year GROUP BY year
@@ -219,15 +235,15 @@ pub async fn get(
     let q3 = format!(
         r#"
         WITH cp_data AS (
-            SELECT {cp_col}                                           AS rfc,
+            SELECT ({cp_key_expr})                                     AS rfc,
                    MAX({cp_name_col})                                  AS nombre,
                    COUNT(DISTINCT year * 100 + month)::bigint          AS months_active,
-                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8          AS total_mxn,
+                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8    AS total_mxn,
                    COUNT(*)::bigint                                    AS invoice_count
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
-            GROUP BY {cp_col}
+            GROUP BY ({cp_key_expr})
             HAVING COUNT(DISTINCT year * 100 + month) >= $4
         ),
         wt AS (
