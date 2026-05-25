@@ -56,6 +56,18 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
         "nombre_receptor"
     };
 
+    // For "emitidos" (ingresos), split XEXX010101000 foreign clients by name — matches Python behaviour
+    let cp_key_expr = if dl_type != "recibidos" {
+        format!(
+            "CASE WHEN {cp_col} = 'XEXX010101000' \
+                  AND TRIM(COALESCE({cp_name_col}, '')) <> '' \
+             THEN 'XEXX010101000||' || UPPER(REGEXP_REPLACE(TRIM(COALESCE({cp_name_col},'')), '[^A-Z0-9 &\\-]', '', 'g')) \
+             ELSE {cp_col} END"
+        )
+    } else {
+        cp_col.to_string()
+    };
+
     // Q1: distinct months per year (for incomplete detection)
     let q1 = format!(
         "SELECT year, COUNT(DISTINCT month)::bigint AS month_count \
@@ -71,18 +83,18 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
         months_per_year.insert(year, cnt);
     }
 
-    // Q2: per (year, cp_rfc) totals
+    // Q2: per (year, cp_key) totals — uses XEXX-split key for emitidos
     let q2 = format!(
-        "SELECT year, {cp_col} AS rfc, MAX({cp_name_col}) AS nombre, \
+        "SELECT year, ({cp_key_expr}) AS rfc, MAX({cp_name_col}) AS nombre, \
                 SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total_mxn \
          FROM pulso.cfdis \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%' \
-         GROUP BY year, {cp_col} \
+         GROUP BY year, ({cp_key_expr}) \
          ORDER BY year"
     );
     let rows2 = sqlx::query(&q2).bind(rfc).fetch_all(pool).await?;
 
-    // Build: year -> HashMap<rfc, (nombre, total_mxn)>
+    // Build: year -> HashMap<cp_key, (nombre, total_mxn)>
     let mut year_clients: HashMap<i32, HashMap<String, (String, f64)>> = HashMap::new();
     for r in &rows2 {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
