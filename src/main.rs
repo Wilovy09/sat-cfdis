@@ -680,6 +680,15 @@ async fn main() -> std::io::Result<()> {
                     .route(web::put().to(users_routes::update_rfc_clave_handler)),
             )
             .service(
+                web::resource("/api/v1/users/rfcs/{rfc}/shares")
+                    .route(web::get().to(users_routes::list_rfc_shares_handler))
+                    .route(web::post().to(users_routes::share_rfc_handler)),
+            )
+            .service(
+                web::resource("/api/v1/users/rfcs/{rfc}/shares/{share_id}")
+                    .route(web::delete().to(users_routes::revoke_rfc_share_handler)),
+            )
+            .service(
                 web::resource("/api/v1/users/rfcs/{rfc}")
                     .route(web::delete().to(users_routes::delete_rfc_handler)),
             )
