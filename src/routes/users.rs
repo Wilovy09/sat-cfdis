@@ -116,11 +116,11 @@ pub async fn get_profile(req: HttpRequest, pool: web::Data<DbPool>) -> HttpRespo
         .await
         .unwrap_or(false);
 
-    match crate::db::users::get_user_rfcs_with_nombre(&pool, &user_id).await {
+    match crate::db::users::get_user_rfcs_with_role(&pool, &user_id).await {
         Ok(rows) if !rows.is_empty() || is_admin => {
             let rfcs: Vec<_> = rows
                 .into_iter()
-                .map(|(rfc, nombre)| serde_json::json!({ "rfc": rfc, "nombre": nombre }))
+                .map(|(rfc, nombre, role)| serde_json::json!({ "rfc": rfc, "nombre": nombre, "role": role }))
                 .collect();
             HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs, "is_admin": is_admin }))
         }
@@ -235,7 +235,7 @@ pub async fn complete_profile(
     };
 
     // Save RFC + encrypted CIEC to pulso.users
-    if let Err(e) = crate::db::users::create_pulso_user(
+    match crate::db::users::create_pulso_user(
         &pool,
         &user_id,
         &rfc,
@@ -244,10 +244,23 @@ pub async fn complete_profile(
     )
     .await
     {
-        tracing::error!(user_id = %user_id, "Error creating pulso user: {e}");
-        return HttpResponse::InternalServerError().json(ErrorBody {
-            error: "Error al guardar el perfil".to_string(),
-        });
+        Err(crate::db::users::CreateUserError::AlreadyOwnedBySelf) => {
+            return HttpResponse::Conflict().json(ErrorBody {
+                error: "Este RFC ya está registrado para este usuario".to_string(),
+            });
+        }
+        Err(crate::db::users::CreateUserError::AlreadyOwnedByOther) => {
+            return HttpResponse::Conflict().json(ErrorBody {
+                error: "Este RFC ya está registrado por otro usuario en Pulso".to_string(),
+            });
+        }
+        Err(crate::db::users::CreateUserError::Db(e)) => {
+            tracing::error!(user_id = %user_id, "Error creating pulso user: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error al guardar el perfil".to_string(),
+            });
+        }
+        Ok(_) => {}
     }
 
     if let Err(e) = crate::db::users::set_profile_complete(&pool, &user_id).await {
@@ -543,12 +556,12 @@ pub async fn get_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> Result<HttpR
         return Ok(HttpResponse::Ok().json(serde_json::json!({ "rfcs": rows.into_iter().map(|(uid, rfc)| serde_json::json!({ "user_id": uid, "rfc": rfc })).collect::<Vec<_>>() })));
     }
 
-    let rows = crate::db::users::get_user_rfcs_with_nombre(&pool, &user_id)
+    let rows = crate::db::users::get_user_rfcs_with_role(&pool, &user_id)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
     let rfcs: Vec<_> = rows
         .into_iter()
-        .map(|(rfc, nombre)| serde_json::json!({ "rfc": rfc, "nombre": nombre }))
+        .map(|(rfc, nombre, role)| serde_json::json!({ "rfc": rfc, "nombre": nombre, "role": role }))
         .collect();
     Ok(HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs })))
 }
@@ -638,7 +651,7 @@ pub async fn add_rfc(
         }
     };
 
-    if let Err(e) = crate::db::users::create_pulso_user(
+    match crate::db::users::create_pulso_user(
         &pool,
         &user_id,
         &rfc,
@@ -647,20 +660,23 @@ pub async fn add_rfc(
     )
     .await
     {
-        // Detect unique constraint violation (RFC already exists for this user)
-        let err_str = e.to_string();
-        if err_str.contains("users_user_id_rfc_unique")
-            || err_str.contains("unique")
-            || err_str.contains("duplicate")
-        {
+        Err(crate::db::users::CreateUserError::AlreadyOwnedBySelf) => {
             return HttpResponse::Conflict().json(ErrorBody {
                 error: "Este RFC ya está registrado para este usuario".to_string(),
             });
         }
-        tracing::error!(user_id = %user_id, "Error creating pulso user (add_rfc): {e}");
-        return HttpResponse::InternalServerError().json(ErrorBody {
-            error: "Error al guardar el RFC".to_string(),
-        });
+        Err(crate::db::users::CreateUserError::AlreadyOwnedByOther) => {
+            return HttpResponse::Conflict().json(ErrorBody {
+                error: "Este RFC ya está registrado por otro usuario en Pulso".to_string(),
+            });
+        }
+        Err(crate::db::users::CreateUserError::Db(e)) => {
+            tracing::error!(user_id = %user_id, "Error creating pulso user (add_rfc): {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error al guardar el RFC".to_string(),
+            });
+        }
+        Ok(_) => {}
     }
 
     if let Err(e) = crate::db::users::set_profile_complete(&pool, &user_id).await {
@@ -727,6 +743,20 @@ pub async fn update_rfc_clave_handler(
         }
     };
 
+    // Only the owner (or admin) may change the CIEC
+    match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
+        Ok(false) => return HttpResponse::Forbidden().json(ErrorBody {
+            error: "Solo el propietario del RFC puede actualizar la CIEC".to_string(),
+        }),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "update_rfc_clave: access check error: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".to_string(),
+            });
+        }
+        Ok(true) => {}
+    }
+
     match crate::db::users::update_rfc_clave(&pool, &user_id, &rfc, &clave_enc).await {
         Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
         Ok(false) => HttpResponse::NotFound().json(ErrorBody {
@@ -768,7 +798,21 @@ pub async fn delete_rfc_handler(
     let rfc = path.into_inner().trim().to_uppercase();
     tracing::Span::current().record("rfc", &rfc.as_str());
 
-    // Prevent deleting the last RFC
+    // Only the owner may delete
+    match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
+        Ok(false) => return HttpResponse::Forbidden().json(ErrorBody {
+            error: "Solo el propietario del RFC puede eliminarlo".to_string(),
+        }),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "delete_rfc: access check error: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".to_string(),
+            });
+        }
+        Ok(true) => {}
+    }
+
+    // Prevent deleting the last owned RFC
     match crate::db::users::get_user_rfcs(&pool, &user_id).await {
         Ok(rfcs) if rfcs.len() <= 1 => {
             return HttpResponse::UnprocessableEntity().json(ErrorBody {
@@ -784,6 +828,11 @@ pub async fn delete_rfc_handler(
         _ => {}
     }
 
+    // Revoke all active shares before soft-deleting
+    if let Err(e) = crate::db::users::revoke_all_shares_for_rfc(&pool, &rfc).await {
+        tracing::error!(user_id = %user_id, rfc = %rfc, "delete_rfc: revoke shares error: {e}");
+    }
+
     match crate::db::users::delete_user_rfc(&pool, &user_id, &rfc).await {
         Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
         Ok(false) => HttpResponse::NotFound().json(ErrorBody {
@@ -794,6 +843,161 @@ pub async fn delete_rfc_handler(
             HttpResponse::InternalServerError().json(ErrorBody {
                 error: "Error de base de datos".to_string(),
             })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET  /api/v1/users/rfcs/{rfc}/shares   — list active shares (owner only)
+// POST /api/v1/users/rfcs/{rfc}/shares   — share with another user by email
+// DELETE /api/v1/users/rfcs/{rfc}/shares/{share_id} — revoke a share
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ShareRfcDto {
+    pub email: String,
+}
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn list_rfc_shares_handler(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let rfc = path.into_inner().trim().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+
+    // Only owner can list shares
+    match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
+        Ok(false) => return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() }),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "list_rfc_shares: access check error: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+        Ok(true) => {}
+    }
+
+    match crate::db::users::list_rfc_shares(&pool, &rfc).await {
+        Ok(shares) => HttpResponse::Ok().json(serde_json::json!({ "shares": shares })),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, rfc = %rfc, "list_rfc_shares: DB error: {e}");
+            HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() })
+        }
+    }
+}
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn share_rfc_handler(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    path: web::Path<String>,
+    body: web::Json<ShareRfcDto>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let rfc = path.into_inner().trim().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+
+    let email = body.email.trim().to_lowercase();
+    if email.is_empty() {
+        return HttpResponse::UnprocessableEntity().json(ErrorBody { error: "Email requerido".into() });
+    }
+
+    // Only owner can share
+    match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
+        Ok(false) => return HttpResponse::Forbidden().json(ErrorBody { error: "Solo el propietario puede compartir este RFC".into() }),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "share_rfc: access check error: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+        Ok(true) => {}
+    }
+
+    // Resolve email to a user_id
+    let (target_id, _target_email) =
+        match crate::db::users::find_user_by_email_for_share(&pool, &email).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return HttpResponse::NotFound().json(ErrorBody {
+                    error: "No existe un usuario con ese email".to_string(),
+                });
+            }
+            Err(e) => {
+                tracing::error!(user_id = %user_id, "share_rfc: lookup error: {e}");
+                return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            }
+        };
+
+    // Cannot share with yourself
+    if target_id == user_id {
+        return HttpResponse::UnprocessableEntity().json(ErrorBody {
+            error: "No puedes compartir el RFC contigo mismo".to_string(),
+        });
+    }
+
+    match crate::db::users::create_rfc_share(&pool, &rfc, &user_id, &target_id, Some(&email)).await {
+        Ok(share_id) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "share_id": share_id })),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, rfc = %rfc, "share_rfc: insert error: {e}");
+            HttpResponse::InternalServerError().json(ErrorBody { error: "Error al compartir RFC".into() })
+        }
+    }
+}
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn revoke_rfc_share_handler(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    path: web::Path<(String, String)>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let (rfc, share_id) = path.into_inner();
+    let rfc = rfc.trim().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+
+    // Only owner can revoke
+    match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
+        Ok(false) => return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() }),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "revoke_share: access check error: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+        Ok(true) => {}
+    }
+
+    match crate::db::users::revoke_rfc_share(&pool, &share_id, &user_id).await {
+        Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Ok(false) => HttpResponse::NotFound().json(ErrorBody { error: "Acceso compartido no encontrado".into() }),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "revoke_share: DB error: {e}");
+            HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() })
         }
     }
 }
