@@ -900,6 +900,7 @@ pub async fn list_rfc_shares_handler(
 pub async fn share_rfc_handler(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<crate::config::Config>,
     path: web::Path<String>,
     body: web::Json<ShareRfcDto>,
 ) -> HttpResponse {
@@ -953,13 +954,45 @@ pub async fn share_rfc_handler(
         });
     }
 
-    match crate::db::users::create_rfc_share(&pool, &rfc, &user_id, &target_id, Some(&email)).await {
-        Ok(share_id) => HttpResponse::Ok().json(serde_json::json!({ "ok": true, "share_id": share_id })),
+    let share_id = match crate::db::users::create_rfc_share(&pool, &rfc, &user_id, &target_id, Some(&email)).await {
+        Ok(id) => id,
         Err(e) => {
             tracing::error!(user_id = %user_id, rfc = %rfc, "share_rfc: insert error: {e}");
-            HttpResponse::InternalServerError().json(ErrorBody { error: "Error al compartir RFC".into() })
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error al compartir RFC".into() });
+        }
+    };
+
+    // Give the viewer a pulso.users row so they can access the RFC's data.
+    if let Err(e) = crate::db::users::add_viewer_rfc(&pool, &target_id, &rfc).await {
+        tracing::error!(user_id = %user_id, rfc = %rfc, "share_rfc: add_viewer_rfc error: {e}");
+    }
+
+    // Mark the invited user's profile as complete.
+    if let Err(e) = crate::db::users::set_profile_complete(&pool, &target_id).await {
+        tracing::error!(user_id = %user_id, rfc = %rfc, "share_rfc: set_profile_complete error: {e}");
+    }
+
+    // Send email notification (best-effort — don't fail the request if it errors).
+    if let Some(ref api_key) = cfg.sendgrid_api_key {
+        let owner_email = crate::db::users::get_email_by_user_id(&pool, &user_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "un usuario de Pulso".to_string());
+        if let Err(e) = crate::services::email::send_rfc_invite(
+            api_key,
+            &cfg.sendgrid_from,
+            &email,
+            &rfc,
+            &owner_email,
+        )
+        .await
+        {
+            tracing::warn!(rfc = %rfc, "share_rfc: failed to send invite email: {e}");
         }
     }
+
+    HttpResponse::Ok().json(serde_json::json!({ "ok": true, "share_id": share_id }))
 }
 
 #[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
