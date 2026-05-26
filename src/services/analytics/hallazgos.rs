@@ -1245,18 +1245,27 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
                 };
                 let nivel = h4_nivel(ratio_pct);
                 let interp = h4_interpretacion(nivel);
+                let cuerpo_h4 = if snap.months_of_data >= 6 {
+                    format!(
+                        "El pasivo laboral estimado asciende a {}, equivalente al {:.1}% del ingreso LTM y a {:.1} meses de nómina ordinaria estimada.",
+                        fmt_mxn(snap.pasivo_laboral_estimado_mxn),
+                        ratio_pct,
+                        meses_equiv
+                    )
+                } else {
+                    format!(
+                        "El pasivo laboral estimado asciende a {}, equivalente al {:.1}% del ingreso LTM.",
+                        fmt_mxn(snap.pasivo_laboral_estimado_mxn),
+                        ratio_pct,
+                    )
+                };
                 all.push(Hallazgo {
                     id: "H4".to_string(),
                     titulo: "Pasivo laboral estimado".to_string(),
                     familia: "riesgo".to_string(),
                     nivel: nivel.to_string(),
                     metrica_principal: Some(ratio_pct),
-                    cuerpo: format!(
-                        "El pasivo laboral estimado asciende a {}, equivalente al {:.1}% del ingreso LTM y a {:.1} meses de nómina ordinaria estimada.",
-                        fmt_mxn(snap.pasivo_laboral_estimado_mxn),
-                        ratio_pct,
-                        meses_equiv
-                    ),
+                    cuerpo: cuerpo_h4,
                     interpretacion: interp.to_string(),
                     disclaimer: None,
                     nota_fija: Some("Estimación con prestaciones de ley: aguinaldo 15 días, vacaciones y prima vacacional según Ley Federal del Trabajo. No constituye un cálculo definitivo.".to_string()),
