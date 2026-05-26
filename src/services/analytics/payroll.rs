@@ -622,6 +622,7 @@ pub struct PayrollSnapshotResponse {
     pub run_rate_mensual_ltm_mxn: f64,
     pub yoy_masa_salarial_pct: Option<f64>,
     pub pasivo_laboral_estimado_mxn: f64,
+    pub months_of_data: i64,
 }
 
 pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSnapshotResponse> {
@@ -631,6 +632,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
         run_rate_mensual_ltm_mxn: 0.0,
         yoy_masa_salarial_pct: None,
         pasivo_laboral_estimado_mxn: 0.0,
+        months_of_data: 0,
     };
 
     // Most recent period with payroll data
@@ -864,12 +866,27 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
         })
         .sum();
 
+    let months_row = sqlx::query(
+        r#"
+        SELECT COUNT(DISTINCT c.year * 100 + c.month) AS cnt
+        FROM pulso.cfdis c
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+        "#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await?;
+    let months_of_data: i64 = months_row.try_get("cnt").unwrap_or(0);
+
     Ok(PayrollSnapshotResponse {
         has_data: true,
         headcount_actual,
         run_rate_mensual_ltm_mxn,
         yoy_masa_salarial_pct,
         pasivo_laboral_estimado_mxn,
+        months_of_data,
     })
 }
 
