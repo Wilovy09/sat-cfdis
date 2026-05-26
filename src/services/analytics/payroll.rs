@@ -610,3 +610,290 @@ fn tipo_nomina_label(t: &str) -> &str {
         _ => t,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Payroll snapshot (C3 dashboard KPIs)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct PayrollSnapshotResponse {
+    pub has_data: bool,
+    pub headcount_actual: i64,
+    pub run_rate_mensual_ltm_mxn: f64,
+    pub yoy_masa_salarial_pct: Option<f64>,
+    pub pasivo_laboral_estimado_mxn: f64,
+}
+
+pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSnapshotResponse> {
+    let empty = || PayrollSnapshotResponse {
+        has_data: false,
+        headcount_actual: 0,
+        run_rate_mensual_ltm_mxn: 0.0,
+        yoy_masa_salarial_pct: None,
+        pasivo_laboral_estimado_mxn: 0.0,
+    };
+
+    // Most recent period with payroll data
+    let period_row = sqlx::query(
+        r#"
+        SELECT MAX(c.year * 100 + c.month) AS last_period
+        FROM pulso.cfdi_nomina n
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
+        "#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await?;
+
+    let last_period: Option<i64> = period_row.try_get("last_period").ok().flatten();
+    let last_period = match last_period {
+        None => return Ok(empty()),
+        Some(p) => p,
+    };
+
+    let last_y = last_period / 100;
+    let last_m = last_period % 100;
+
+    // LTM window: 12 months ending at last_period
+    let (ltm_from_y, ltm_from_m) = subtract_months(last_y, last_m, 11);
+    // Prior 12 months window (for YoY)
+    let (prior_to_y, prior_to_m) = subtract_months(last_y, last_m, 12);
+    let (prior_from_y, prior_from_m) = subtract_months(prior_to_y, prior_to_m, 11);
+
+    // Headcount in the most recent period
+    let hc_row = sqlx::query(
+        r#"
+        SELECT COUNT(DISTINCT c.rfc_receptor) AS headcount
+        FROM pulso.cfdi_nomina n
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND c.year = $2 AND c.month = $3
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
+        "#,
+    )
+    .bind(rfc)
+    .bind(last_y)
+    .bind(last_m)
+    .fetch_one(pool)
+    .await?;
+    let headcount_actual: i64 = hc_row.try_get("headcount").unwrap_or(0);
+
+    if headcount_actual == 0 {
+        return Ok(empty());
+    }
+
+    // Run-rate LTM: exclude one-off percepciones (002=aguinaldo, 003=PTU, 022=prima vacacional, 038=indemnización)
+    let rr_row = sqlx::query(
+        r#"
+        SELECT COALESCE(SUM(
+            COALESCE(p.importe_gravado, 0)::float8 + COALESCE(p.importe_exento, 0)::float8
+        ), 0) AS total_regular
+        FROM pulso.cfdi_nomina_percepciones p
+        JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND p.tipo_percepcion NOT IN ('002', '003', '022', '038')
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
+        "#,
+    )
+    .bind(rfc)
+    .bind(ltm_from_y)
+    .bind(ltm_from_m)
+    .bind(last_y)
+    .bind(last_m)
+    .fetch_one(pool)
+    .await?;
+    let total_regular: f64 = rr_row.try_get("total_regular").unwrap_or(0.0);
+    let run_rate_mensual_ltm_mxn = total_regular / 12.0;
+
+    // YoY masa salarial: total percepciones LTM vs prior 12 months
+    let ltm_row = sqlx::query(
+        r#"
+        SELECT COALESCE(SUM(COALESCE(n.total_percepciones, 0)::float8), 0) AS total
+        FROM pulso.cfdi_nomina n
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
+        "#,
+    )
+    .bind(rfc)
+    .bind(ltm_from_y)
+    .bind(ltm_from_m)
+    .bind(last_y)
+    .bind(last_m)
+    .fetch_one(pool)
+    .await?;
+    let ltm_masa: f64 = ltm_row.try_get("total").unwrap_or(0.0);
+
+    let prior_row = sqlx::query(
+        r#"
+        SELECT COALESCE(SUM(COALESCE(n.total_percepciones, 0)::float8), 0) AS total
+        FROM pulso.cfdi_nomina n
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
+        "#,
+    )
+    .bind(rfc)
+    .bind(prior_from_y)
+    .bind(prior_from_m)
+    .bind(prior_to_y)
+    .bind(prior_to_m)
+    .fetch_one(pool)
+    .await?;
+    let prior_masa: f64 = prior_row.try_get("total").unwrap_or(0.0);
+    let yoy_masa_salarial_pct = if prior_masa > 0.0 {
+        Some((ltm_masa - prior_masa) / prior_masa * 100.0)
+    } else {
+        None
+    };
+
+    // Labor liability (pasivo laboral): per active employee
+    // SDI = salario diario integrado (daily rate for benefit provisioning)
+    // Tenure from first payroll ever recorded for this employer
+    let emp_rows = sqlx::query(
+        r#"
+        WITH active_emps AS (
+            SELECT DISTINCT c.rfc_receptor
+            FROM pulso.cfdi_nomina n
+            JOIN pulso.cfdis c ON c.uuid = n.uuid
+            WHERE c.rfc_emisor = $1
+              AND c.tipo_comprobante = 'N'
+              AND COALESCE(c.estado_sat,'') != 'cancelado'
+              AND c.year = $2 AND c.month = $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.payroll_normalization_rules pnr
+                  WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                    AND pnr.employee_rfc = c.rfc_receptor
+                    AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                    AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+              )
+        )
+        SELECT
+            c.rfc_receptor,
+            AVG(COALESCE(n.salario_diario_integrado, 0)::float8) AS sdi,
+            COALESCE((CURRENT_DATE - MIN(n.fecha_pago)::date)::integer, 0) AS tenure_days
+        FROM pulso.cfdi_nomina n
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND c.rfc_receptor IN (SELECT rfc_receptor FROM active_emps)
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.payroll_normalization_rules pnr
+              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                AND pnr.employee_rfc = c.rfc_receptor
+                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+          )
+        GROUP BY c.rfc_receptor
+        "#,
+    )
+    .bind(rfc)
+    .bind(last_y)
+    .bind(last_m)
+    .fetch_all(pool)
+    .await?;
+
+    // last_m used as "current month of period" for aguinaldo proportion
+    let period_month = last_m as f64;
+
+    let pasivo_laboral_estimado_mxn: f64 = emp_rows
+        .iter()
+        .map(|r| {
+            let sdi: f64 = r.try_get("sdi").unwrap_or(0.0);
+            let tenure_days: i32 = r.try_get("tenure_days").unwrap_or(0);
+            if sdi <= 0.0 {
+                return 0.0;
+            }
+            let tenure_years = tenure_days as f64 / 365.25;
+            let vac_days = lft_vacation_days(tenure_years);
+            let vac_pend = vac_days * sdi;
+            let prima_vac = vac_pend * 0.25;
+            let aguinaldo = sdi * 15.0 * (period_month / 12.0);
+            let ptu = (sdi * 30.0) * 0.1 / 12.0;
+            vac_pend + prima_vac + aguinaldo + ptu
+        })
+        .sum();
+
+    Ok(PayrollSnapshotResponse {
+        has_data: true,
+        headcount_actual,
+        run_rate_mensual_ltm_mxn,
+        yoy_masa_salarial_pct,
+        pasivo_laboral_estimado_mxn,
+    })
+}
+
+fn lft_vacation_days(tenure_years: f64) -> f64 {
+    if tenure_years < 1.0 {
+        return 12.0 * tenure_years;
+    }
+    match tenure_years.floor() as i64 {
+        1 => 12.0,
+        2 => 14.0,
+        3 => 16.0,
+        4 => 18.0,
+        5..=9 => 20.0,
+        10..=14 => 22.0,
+        15..=19 => 24.0,
+        20..=24 => 26.0,
+        25..=29 => 28.0,
+        _ => 30.0,
+    }
+}
+
+fn subtract_months(y: i64, m: i64, n: i64) -> (i64, i64) {
+    let total = y * 12 + m - n;
+    let ry = total / 12;
+    let rm = total % 12;
+    if rm == 0 { (ry - 1, 12) } else { (ry, rm) }
+}
