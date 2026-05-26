@@ -1,6 +1,6 @@
 use crate::services::xml_parser::{
     ParsedCfdi, ParsedConcept, ParsedNomina, ParsedNominaDeduccion, ParsedNominaPercepcion,
-    ParsedPayment, ParsedPaymentDoc, ParsedTax,
+    ParsedPayment, ParsedPaymentDoc, ParsedRelacionado, ParsedTax,
 };
 use sqlx::PgPool;
 
@@ -189,6 +189,28 @@ async fn insert_payment_doc(
     .bind(d.tipo_cambio_dr)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+pub async fn insert_relacionados(
+    pool: &PgPool,
+    source_uuid: &str,
+    relacionados: &[ParsedRelacionado],
+) -> Result<(), sqlx::Error> {
+    for r in relacionados {
+        sqlx::query(
+            r#"
+            INSERT INTO pulso.cfdi_relacionados (source_uuid, tipo_relacion, related_uuid)
+            VALUES ($1, $2, $3)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(source_uuid)
+        .bind(&r.tipo_relacion)
+        .bind(&r.related_uuid)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
