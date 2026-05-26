@@ -422,6 +422,66 @@ pub async fn concepts_exist(pool: &PgPool, uuid: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Reset CFDIs so they are re-enriched from storage on the next ETL cycle.
+/// Clears all parsed data (taxes, concepts, payments, nomina, relacionados) and sets
+/// xml_available=0 so the enrichment worker picks them up again.
+/// Returns the number of CFDIs queued for reprocessing.
+pub async fn reset_for_reprocessing(
+    pool: &PgPool,
+    rfc: &str,
+    dl_type: &str,       // "emitidos" | "recibidos" | "ambos"
+    from_year: Option<i32>,
+    from_month: Option<i32>,
+    to_year: Option<i32>,
+    to_month: Option<i32>,
+) -> Result<u64, sqlx::Error> {
+    let emit = dl_type != "recibidos";
+    let recv = dl_type != "emitidos";
+
+    let period_clause = match (from_year, to_year) {
+        (Some(fy), Some(ty)) => format!(
+            "AND (c.year > {fy} OR (c.year = {fy} AND c.month >= {fm})) \
+             AND (c.year < {ty} OR (c.year = {ty} AND c.month <= {tm}))",
+            fy = fy, fm = from_month.unwrap_or(1),
+            ty = ty, tm = to_month.unwrap_or(12)
+        ),
+        _ => String::new(),
+    };
+
+    let owner_clause = match (emit, recv) {
+        (true, true) => format!(
+            "(c.rfc_emisor = '{rfc}' OR c.rfc_receptor = '{rfc}')"
+        ),
+        (true, false) => format!("c.rfc_emisor = '{rfc}'"),
+        (false, true) => format!("c.rfc_receptor = '{rfc}'"),
+        _ => return Ok(0),
+    };
+
+    let sql = format!(
+        r#"
+        WITH targets AS (
+            SELECT c.uuid FROM pulso.cfdis c
+            WHERE {owner_clause}
+              AND c.xml_available IN (1, -1)
+              {period_clause}
+        ),
+        del_taxes   AS (DELETE FROM pulso.cfdi_taxes               WHERE uuid         IN (SELECT uuid FROM targets)),
+        del_conc    AS (DELETE FROM pulso.cfdi_concepts             WHERE uuid         IN (SELECT uuid FROM targets)),
+        del_pdocs   AS (DELETE FROM pulso.cfdi_payment_docs         WHERE payment_uuid IN (SELECT uuid FROM targets)),
+        del_pmts    AS (DELETE FROM pulso.cfdi_payments             WHERE payment_uuid IN (SELECT uuid FROM targets)),
+        del_rel     AS (DELETE FROM pulso.cfdi_relacionados         WHERE source_uuid  IN (SELECT uuid FROM targets)),
+        del_nomperc AS (DELETE FROM pulso.cfdi_nomina_percepciones  WHERE uuid         IN (SELECT uuid FROM targets)),
+        del_nomded  AS (DELETE FROM pulso.cfdi_nomina_deducciones   WHERE uuid         IN (SELECT uuid FROM targets)),
+        del_nom     AS (DELETE FROM pulso.cfdi_nomina               WHERE uuid         IN (SELECT uuid FROM targets))
+        UPDATE pulso.cfdis SET xml_available = 0
+        WHERE uuid IN (SELECT uuid FROM targets)
+        "#,
+    );
+
+    let result = sqlx::query(&sql).execute(pool).await?;
+    Ok(result.rows_affected())
+}
+
 /// Mark all xml_available=0 CFDIs in a job as permanently unavailable (xml_available=-1).
 /// Called after repeated failed attempts to fetch the XML from both storage and SAT.
 pub async fn mark_xml_unavailable_for_job(
