@@ -962,11 +962,6 @@ pub async fn share_rfc_handler(
         }
     };
 
-    // Give the viewer a pulso.users row so they can access the RFC's data.
-    if let Err(e) = crate::db::users::add_viewer_rfc(&pool, &target_id, &rfc).await {
-        tracing::error!(user_id = %user_id, rfc = %rfc, "share_rfc: add_viewer_rfc error: {e}");
-    }
-
     // Mark the invited user's profile as complete.
     if let Err(e) = crate::db::users::set_profile_complete(&pool, &target_id).await {
         tracing::error!(user_id = %user_id, rfc = %rfc, "share_rfc: set_profile_complete error: {e}");
