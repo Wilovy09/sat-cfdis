@@ -79,6 +79,7 @@ pub async fn get(
     // Collection totals use the FULL universe (no date filter) — "% cobrado del universo"
     // means all PPD invoices ever emitted, not just those in the selected period.
     // The date filter applies only to timeline / forma / metodo breakdowns below.
+    // paid_raw = valid payment complements (excluding cancelled ones) + credit notes (tipo E, tipo_relacion=01).
     let totals_row = sqlx::query(&format!(
         r#"
         WITH pue_totals AS (
@@ -93,16 +94,29 @@ pub async fn get(
         ppd_per_invoice AS (
             SELECT
                 inv.uuid,
-                COALESCE(inv.total_mxn, 0)::float8                          AS inv_total,
-                COALESCE(SUM(pd.imp_pagado)::float8, 0)                     AS paid_raw
+                COALESCE(inv.total_mxn, 0)::float8 AS inv_total,
+                COALESCE((
+                    SELECT SUM(pd.imp_pagado)
+                    FROM pulso.cfdi_payment_docs pd
+                    JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
+                    WHERE pd.invoice_uuid = inv.uuid
+                      AND UPPER(COALESCE(comp.estado_sat,'')) NOT LIKE '%CANCEL%'
+                )::float8, 0) +
+                COALESCE((
+                    SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
+                    FROM pulso.cfdi_relacionados cr
+                    JOIN pulso.cfdis nc ON nc.uuid = cr.source_uuid
+                    WHERE cr.related_uuid = inv.uuid
+                      AND cr.tipo_relacion = '01'
+                      AND nc.tipo_comprobante = 'E'
+                      AND UPPER(COALESCE(nc.estado_sat,'')) NOT LIKE '%CANCEL%'
+                ), 0) AS paid_raw
             FROM pulso.cfdis inv
-            LEFT JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
             WHERE inv.{owner_col} = $1
               AND inv.{dl_filter}
               AND inv.tipo_comprobante = 'I'
               AND inv.metodo_pago = 'PPD'
               AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
-            GROUP BY inv.uuid, inv.total_mxn
         ),
         ppd_agg AS (
             SELECT
@@ -218,23 +232,69 @@ pub async fn get(
         r#"
         SELECT
             inv.uuid,
-            inv.{cp_rfc_col}                         AS cp_rfc,
-            inv.{cp_name_col}                        AS cp_nombre,
+            inv.{cp_rfc_col}                                AS cp_rfc,
+            inv.{cp_name_col}                               AS cp_nombre,
             inv.fecha_emision,
             inv.total_mxn,
-            COALESCE(SUM(pd.imp_pagado)::float8, 0)          AS paid,
-            inv.total_mxn - COALESCE(SUM(pd.imp_pagado)::float8, 0) AS outstanding,
-            (CURRENT_DATE - inv.fecha_emision::date)::bigint AS days_out
+            (CURRENT_DATE - inv.fecha_emision::date)::bigint AS days_out,
+            COALESCE((
+                SELECT SUM(pd.imp_pagado)
+                FROM pulso.cfdi_payment_docs pd
+                JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
+                WHERE pd.invoice_uuid = inv.uuid
+                  AND UPPER(COALESCE(comp.estado_sat,'')) NOT LIKE '%CANCEL%'
+            )::float8, 0) +
+            COALESCE((
+                SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
+                FROM pulso.cfdi_relacionados cr
+                JOIN pulso.cfdis nc ON nc.uuid = cr.source_uuid
+                WHERE cr.related_uuid = inv.uuid
+                  AND cr.tipo_relacion = '01'
+                  AND nc.tipo_comprobante = 'E'
+                  AND UPPER(COALESCE(nc.estado_sat,'')) NOT LIKE '%CANCEL%'
+            ), 0) AS paid
         FROM pulso.cfdis inv
-        LEFT JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
         WHERE inv.{owner_col} = $1
           AND inv.{dl_filter}
           AND inv.tipo_comprobante = 'I'
           AND inv.metodo_pago = 'PPD'
           AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
-        GROUP BY inv.uuid
-        HAVING (inv.total_mxn - COALESCE(SUM(pd.imp_pagado)::float8, 0)) > 1.0
-        ORDER BY (inv.total_mxn - COALESCE(SUM(pd.imp_pagado)::float8, 0)) DESC
+        HAVING (inv.total_mxn - (
+            COALESCE((
+                SELECT SUM(pd.imp_pagado)
+                FROM pulso.cfdi_payment_docs pd
+                JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
+                WHERE pd.invoice_uuid = inv.uuid
+                  AND UPPER(COALESCE(comp.estado_sat,'')) NOT LIKE '%CANCEL%'
+            )::float8, 0) +
+            COALESCE((
+                SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
+                FROM pulso.cfdi_relacionados cr
+                JOIN pulso.cfdis nc ON nc.uuid = cr.source_uuid
+                WHERE cr.related_uuid = inv.uuid
+                  AND cr.tipo_relacion = '01'
+                  AND nc.tipo_comprobante = 'E'
+                  AND UPPER(COALESCE(nc.estado_sat,'')) NOT LIKE '%CANCEL%'
+            ), 0)
+        )) > 1.0
+        ORDER BY (inv.total_mxn - (
+            COALESCE((
+                SELECT SUM(pd.imp_pagado)
+                FROM pulso.cfdi_payment_docs pd
+                JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
+                WHERE pd.invoice_uuid = inv.uuid
+                  AND UPPER(COALESCE(comp.estado_sat,'')) NOT LIKE '%CANCEL%'
+            )::float8, 0) +
+            COALESCE((
+                SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
+                FROM pulso.cfdi_relacionados cr
+                JOIN pulso.cfdis nc ON nc.uuid = cr.source_uuid
+                WHERE cr.related_uuid = inv.uuid
+                  AND cr.tipo_relacion = '01'
+                  AND nc.tipo_comprobante = 'E'
+                  AND UPPER(COALESCE(nc.estado_sat,'')) NOT LIKE '%CANCEL%'
+            ), 0)
+        )) DESC
         LIMIT 50
         "#
     ))
@@ -244,28 +304,46 @@ pub async fn get(
 
     let outstanding_invoices: Vec<OutstandingInvoice> = outstanding_rows
         .iter()
-        .map(|r| OutstandingInvoice {
-            uuid: r.try_get("uuid").unwrap_or_default(),
-            rfc_cp: r.try_get("cp_rfc").unwrap_or_default(),
-            nombre_cp: r.try_get("cp_nombre").unwrap_or_default(),
-            fecha_emision: r.try_get("fecha_emision").unwrap_or_default(),
-            total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
-            paid_mxn: r.try_get("paid").unwrap_or(0.0),
-            outstanding_mxn: r.try_get("outstanding").unwrap_or(0.0),
-            days_outstanding: r.try_get("days_out").unwrap_or(0),
+        .map(|r| {
+            let total: f64 = r.try_get("total_mxn").unwrap_or(0.0);
+            let paid: f64 = r.try_get("paid").unwrap_or(0.0);
+            OutstandingInvoice {
+                uuid: r.try_get("uuid").unwrap_or_default(),
+                rfc_cp: r.try_get("cp_rfc").unwrap_or_default(),
+                nombre_cp: r.try_get("cp_nombre").unwrap_or_default(),
+                fecha_emision: r.try_get("fecha_emision").unwrap_or_default(),
+                total_mxn: total,
+                paid_mxn: paid,
+                outstanding_mxn: (total - paid).max(0.0),
+                days_outstanding: r.try_get("days_out").unwrap_or(0),
+            }
         })
         .collect();
 
     // Exposure >180d — full universe (no date filter)
     let exposure_row = sqlx::query(&format!(
         r#"
-        SELECT COALESCE(SUM(GREATEST(inv.total_mxn - COALESCE(pd_sum.paid, 0), 0)::float8), 0) AS exposure
+        SELECT COALESCE(SUM(GREATEST(
+            inv.total_mxn -
+            COALESCE((
+                SELECT SUM(pd.imp_pagado)
+                FROM pulso.cfdi_payment_docs pd
+                JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
+                WHERE pd.invoice_uuid = inv.uuid
+                  AND UPPER(COALESCE(comp.estado_sat,'')) NOT LIKE '%CANCEL%'
+            )::float8, 0) -
+            COALESCE((
+                SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
+                FROM pulso.cfdi_relacionados cr
+                JOIN pulso.cfdis nc ON nc.uuid = cr.source_uuid
+                WHERE cr.related_uuid = inv.uuid
+                  AND cr.tipo_relacion = '01'
+                  AND nc.tipo_comprobante = 'E'
+                  AND UPPER(COALESCE(nc.estado_sat,'')) NOT LIKE '%CANCEL%'
+            ), 0),
+            0
+        )::float8), 0) AS exposure
         FROM pulso.cfdis inv
-        LEFT JOIN (
-            SELECT invoice_uuid, SUM(imp_pagado)::float8 AS paid
-            FROM pulso.cfdi_payment_docs
-            GROUP BY invoice_uuid
-        ) pd_sum ON pd_sum.invoice_uuid = inv.uuid
         WHERE inv.{owner_col} = $1
           AND inv.{dl_filter}
           AND inv.tipo_comprobante = 'I'
