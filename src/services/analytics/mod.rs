@@ -1,4 +1,5 @@
 pub mod cashflow;
+pub mod hallazgos;
 pub mod quarterly;
 pub mod concepts;
 pub mod counterparties;
