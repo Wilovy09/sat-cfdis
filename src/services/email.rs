@@ -1,5 +1,100 @@
 use serde_json::json;
 
+/// Notify a user that they've been added as a viewer to an RFC.
+pub async fn send_rfc_invite(
+    api_key: &str,
+    from_email: &str,
+    to_email: &str,
+    rfc: &str,
+    owner_email: &str,
+) -> anyhow::Result<()> {
+    let subject = format!("Te han agregado como invitado al RFC {rfc} en Pulso");
+
+    let plain_text = format!(
+        "{owner_email} te ha agregado como invitado al RFC {rfc} en Pulso. \
+        Entra a pulso.adquiere.co para ver el análisis financiero de este RFC."
+    );
+
+    let html_body = format!(
+        r#"<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Invitación a RFC — Pulso</title>
+</head>
+<body style="margin:0;padding:0;background:#f4f6f8;font-family:Arial,Helvetica,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f8;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;overflow:hidden;max-width:600px;">
+          <tr>
+            <td style="background:#00004e;padding:32px 40px;">
+              <h1 style="margin:0;color:#ffffff;font-size:24px;font-weight:700;letter-spacing:-0.5px;">Pulso</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:40px;">
+              <h2 style="margin:0 0 16px;color:#00004e;font-size:20px;">Te han agregado como invitado</h2>
+              <p style="margin:0 0 16px;color:#374151;font-size:16px;line-height:1.6;">
+                <strong>{owner_email}</strong> te ha agregado como invitado al RFC
+                <strong>{rfc}</strong> en Pulso.
+              </p>
+              <p style="margin:0 0 32px;color:#374151;font-size:16px;line-height:1.6;">
+                Ahora puedes ver el análisis financiero de este RFC desde tu cuenta.
+              </p>
+              <a href="https://pulso.adquiere.co"
+                 style="display:inline-block;background:#00004e;color:#ffffff;text-decoration:none;
+                        padding:14px 28px;border-radius:6px;font-size:16px;font-weight:600;">
+                Ver análisis
+              </a>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 40px;border-top:1px solid #e5e7eb;">
+              <p style="margin:0;color:#9ca3af;font-size:13px;">
+                Pulso · Adquiere &mdash; Este correo fue enviado automáticamente, no es necesario responderlo.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"#,
+        owner_email = owner_email,
+        rfc = rfc,
+    );
+
+    let body = json!({
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": from_email, "name": "Pulso"},
+        "subject": subject,
+        "content": [
+            {"type": "text/plain", "value": plain_text},
+            {"type": "text/html",  "value": html_body}
+        ]
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.sendgrid.com/v3/mail/send")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        anyhow::bail!("SendGrid returned {status}: {text}");
+    }
+
+    Ok(())
+}
+
 /// Send a "sync complete" notification to the user via SendGrid v3 Mail Send API.
 pub async fn send_sync_complete(
     api_key: &str,
