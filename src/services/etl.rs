@@ -211,6 +211,13 @@ async fn process_invoice(
         }
     }
 
+    // Insert cfdi_relacionados (credit notes, etc.)
+    if !cfdi.relacionados.is_empty() {
+        if let Err(e) = db::cfdis::insert_relacionados(pool, &cfdi.uuid, &cfdi.relacionados).await {
+            tracing::warn!(uuid = %uuid, "ETL: insert_relacionados: {e}");
+        }
+    }
+
     // Insert nomina data
     if let Some(nomina) = &cfdi.nomina {
         if let Err(e) = db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await {
@@ -311,6 +318,12 @@ async fn enrich_invoice(
     if !cfdi.payments.is_empty() {
         if let Err(e) = db::cfdis::insert_payments(pool, &cfdi.uuid, &cfdi.payments).await {
             tracing::warn!(uuid = %uuid, "ETL enrich: insert_payments: {e}");
+        }
+    }
+
+    if !cfdi.relacionados.is_empty() {
+        if let Err(e) = db::cfdis::insert_relacionados(pool, &cfdi.uuid, &cfdi.relacionados).await {
+            tracing::warn!(uuid = %uuid, "ETL enrich: insert_relacionados: {e}");
         }
     }
 
