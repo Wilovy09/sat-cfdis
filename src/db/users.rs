@@ -326,6 +326,53 @@ pub async fn user_owns_rfc_or_admin(
     user_owns_rfc(pool, user_id, rfc).await
 }
 
+/// Grant a viewer their own `pulso.users` row for the shared RFC (no clave, no sync job).
+/// Idempotent: restores soft-deleted row or skips if already active.
+pub async fn add_viewer_rfc(
+    pool: &PgPool,
+    user_id: &str,
+    rfc: &str,
+) -> Result<(), sqlx::Error> {
+    let uid = parse_uuid(user_id)?;
+    let rfc_upper = rfc.to_uppercase();
+
+    // Restore previously soft-deleted viewer row if exists.
+    let restored = sqlx::query(
+        "UPDATE pulso.users SET deleted_at = NULL WHERE user_id = $1 AND rfc = $2 AND deleted_at IS NOT NULL",
+    )
+    .bind(uid)
+    .bind(&rfc_upper)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if restored > 0 {
+        return Ok(());
+    }
+
+    // Already active row (owner or prior viewer) — nothing to do.
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pulso.users WHERE user_id = $1 AND rfc = $2 AND deleted_at IS NULL",
+    )
+    .bind(uid)
+    .bind(&rfc_upper)
+    .fetch_one(pool)
+    .await?;
+    if exists > 0 {
+        return Ok(());
+    }
+
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO pulso.users (id, user_id, rfc, clave, initial_sync_job_id, deleted_at) VALUES ($1, $2, $3, '', NULL, NULL)",
+    )
+    .bind(id)
+    .bind(uid)
+    .bind(&rfc_upper)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ── Sharing CRUD ─────────────────────────────────────────────────────────────
 
 pub async fn create_rfc_share(
@@ -422,6 +469,17 @@ pub async fn find_user_by_email_for_share(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(id, email)| (id.to_string(), email)))
+}
+
+pub async fn get_email_by_user_id(pool: &PgPool, user_id: &str) -> Result<Option<String>, sqlx::Error> {
+    let uid = parse_uuid(user_id)?;
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT email FROM public.users WHERE id = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(e,)| e))
 }
 
 /// Credentials for a specific active RFC (clave_enc, initial_sync_job_id).
