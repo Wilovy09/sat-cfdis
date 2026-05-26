@@ -40,6 +40,13 @@ pub struct ParsedCfdi {
     pub concepts: Vec<ParsedConcept>,
     pub payments: Vec<ParsedPayment>,
     pub nomina: Option<ParsedNomina>,
+    pub relacionados: Vec<ParsedRelacionado>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ParsedRelacionado {
+    pub tipo_relacion: String,
+    pub related_uuid: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -140,6 +147,7 @@ pub struct ParsedNominaDeduccion {
 enum Ctx {
     Root,
     Comprobante,
+    CfdiRelacionados,
     Conceptos,
     Concepto,
     ImpuestosGlobal,
@@ -186,6 +194,7 @@ pub fn parse(
     let mut current_concept = ParsedConcept::default();
     let mut current_payment = ParsedPayment::default();
     let mut current_nomina = ParsedNomina::default();
+    let mut current_tipo_relacion = String::new();
     let mut has_nomina = false;
     let mut in_tax_retencion = false;
     let mut buf = Vec::new();
@@ -210,6 +219,20 @@ pub fn parse(
                     }
                     ("Receptor", Ctx::Comprobante) => {
                         parse_receptor_attrs(e, &mut cfdi);
+                    }
+                    ("CfdiRelacionados", Ctx::Comprobante) => {
+                        current_tipo_relacion = attr(e, b"TipoRelacion").unwrap_or_default();
+                        if !is_empty {
+                            ctx_stack.push(Ctx::CfdiRelacionados);
+                        }
+                    }
+                    ("CfdiRelacionado", Ctx::CfdiRelacionados) => {
+                        if let Some(uuid) = attr(e, b"UUID") {
+                            cfdi.relacionados.push(ParsedRelacionado {
+                                tipo_relacion: current_tipo_relacion.clone(),
+                                related_uuid: uuid.to_uppercase(),
+                            });
+                        }
                     }
                     ("Conceptos", Ctx::Comprobante) => {
                         if !is_empty {
