@@ -5,8 +5,8 @@ use crate::{
     db::DbPool,
     errors::AppError,
     services::analytics::{
-        cashflow, concepts, counterparties, fiscal, geography, normalization, payments, payroll,
-        period_comparison, quarterly, recurrence, retention, summary, xml_count,
+        cashflow, concepts, counterparties, fiscal, geography, hallazgos, normalization, payments,
+        payroll, period_comparison, quarterly, recurrence, retention, summary, xml_count,
     },
 };
 
@@ -423,6 +423,58 @@ pub async fn get_payroll(
     tracing::Span::current().record("rfc", &rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = payroll::get(&pool, &rfc, &query.from(), &query.to())
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/payroll/snapshot
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/analytics/{rfc}/payroll/snapshot",
+    tag = "Analytics",
+    params(("rfc" = String, Path, description = "RFC del contribuyente")),
+    responses((status = 200, description = "Snapshot de nómina: headcount, run-rate, YoY, pasivo laboral"))
+)]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
+pub async fn get_payroll_snapshot(
+    req: HttpRequest,
+    path: web::Path<String>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let result = payroll::get_snapshot(&pool, &rfc)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/hallazgos
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/analytics/{rfc}/hallazgos",
+    tag = "Analytics",
+    params(("rfc" = String, Path, description = "RFC del contribuyente")),
+    responses((status = 200, description = "Hallazgos clave automáticos"))
+)]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
+pub async fn get_hallazgos(
+    req: HttpRequest,
+    path: web::Path<String>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let result = hallazgos::get(&pool, &rfc)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
