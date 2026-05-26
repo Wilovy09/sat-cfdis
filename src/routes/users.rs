@@ -1077,3 +1077,80 @@ pub async fn admin_download(
     tracing::info!(rfc = %rfc, job_id = %job_id, "Admin download job queued");
     HttpResponse::Ok().json(serde_json::json!({ "ok": true, "job_id": job_id, "status": "queued" }))
 }
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/admin/reprocess
+// Admin-only: reset parsed CFDI data so the enrichment worker re-processes
+// XMLs from storage on the next ETL cycle.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct AdminReprocessDto {
+    pub rfc: String,
+    pub dl_type: Option<String>,   // emitidos|recibidos|ambos  (default: ambos)
+    pub period_from: Option<String>, // YYYY-MM  (optional — omit to reprocess all)
+    pub period_to: Option<String>,   // YYYY-MM  (optional)
+}
+
+fn parse_ym(s: &str) -> Option<(i32, i32)> {
+    let parts: Vec<&str> = s.splitn(2, '-').collect();
+    if parts.len() != 2 { return None; }
+    let y = parts[0].parse::<i32>().ok()?;
+    let m = parts[1].parse::<i32>().ok()?;
+    if m < 1 || m > 12 { return None; }
+    Some((y, m))
+}
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn admin_reprocess(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    body: web::Json<AdminReprocessDto>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    if !is_admin {
+        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+    }
+
+    let rfc = body.rfc.trim().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+
+    let dl_type = body.dl_type.as_deref().unwrap_or("ambos");
+
+    let (from_year, from_month) = body.period_from.as_deref()
+        .and_then(parse_ym)
+        .map(|(y, m)| (Some(y), Some(m)))
+        .unwrap_or((None, None));
+
+    let (to_year, to_month) = body.period_to.as_deref()
+        .and_then(parse_ym)
+        .map(|(y, m)| (Some(y), Some(m)))
+        .unwrap_or((None, None));
+
+    match crate::db::cfdis::reset_for_reprocessing(
+        &pool, &rfc, dl_type, from_year, from_month, to_year, to_month,
+    ).await {
+        Ok(count) => {
+            tracing::info!(rfc = %rfc, count, "Admin reprocess queued");
+            HttpResponse::Ok().json(serde_json::json!({
+                "ok": true,
+                "count": count,
+                "message": format!("{count} CFDIs marcados para reprocesamiento")
+            }))
+        }
+        Err(e) => {
+            tracing::error!("admin_reprocess: {e}");
+            HttpResponse::InternalServerError().json(ErrorBody { error: "Error al marcar CFDIs".into() })
+        }
+    }
+}
