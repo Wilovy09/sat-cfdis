@@ -6,7 +6,7 @@ use crate::{
     errors::AppError,
     services::analytics::{
         cashflow, concepts, counterparties, fiscal, geography, normalization, payments, payroll,
-        period_comparison, quarterly, recurrence, retention, summary,
+        period_comparison, quarterly, recurrence, retention, summary, xml_count,
     },
 };
 
@@ -883,6 +883,23 @@ pub async fn get_period_comparison(
     let limit = query.limit.unwrap_or(10).clamp(1, 50);
 
     let result = period_comparison::get(&pool, &rfc, &dl_type, from_month, to_month, &years, limit)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
+pub async fn get_xml_count(
+    req: HttpRequest,
+    path: web::Path<String>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let dl_type = query.get("dl_type").map(|s| s.as_str()).unwrap_or("emitidos");
+    let result = xml_count::get(&pool, &rfc, dl_type)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
