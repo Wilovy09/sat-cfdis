@@ -757,6 +757,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/cashflow", web::get().to(analytics_routes::get_cashflow))
                     .route("/payroll", web::get().to(analytics_routes::get_payroll))
                     .route("/quarterly", web::get().to(analytics_routes::get_quarterly))
+                    .route("/xml-count", web::get().to(analytics_routes::get_xml_count))
                     .route(
                         "/period-comparison",
                         web::get().to(analytics_routes::get_period_comparison),
