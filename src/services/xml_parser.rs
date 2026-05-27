@@ -180,6 +180,8 @@ pub fn parse(
     dl_type: &str,
     estado_sat: &str,
 ) -> Option<ParsedCfdi> {
+    // Strip UTF-8 BOM (EF BB BF) if present — some SAT-issued XMLs include it.
+    let xml_bytes = xml_bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(xml_bytes);
     let mut reader = Reader::from_reader(xml_bytes);
     reader.config_mut().trim_text(true);
 
