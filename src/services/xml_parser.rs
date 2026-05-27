@@ -360,6 +360,7 @@ pub fn parse(
                         let should_pop = matches!(
                             (local.as_str(), cur),
                             ("Comprobante", Some(Ctx::Comprobante))
+                                | ("CfdiRelacionados", Some(Ctx::CfdiRelacionados))
                                 | ("Conceptos", Some(Ctx::Conceptos))
                                 | ("Impuestos", Some(Ctx::ImpuestosGlobal))
                                 | ("Traslados", Some(Ctx::Traslados))
