@@ -378,7 +378,10 @@ pub fn parse(
             }
 
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => {
+                tracing::warn!("xml_parser: parse error, aborting: {e}");
+                break;
+            }
             _ => {}
         }
         buf.clear();
@@ -390,6 +393,8 @@ pub fn parse(
 
     // Require at minimum an RFC emisor
     if cfdi.rfc_emisor.is_empty() {
+        let prefix: String = xml_bytes.iter().take(8).map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+        tracing::warn!(first_bytes = %prefix, "xml_parser: rfc_emisor empty after parse");
         return None;
     }
 
