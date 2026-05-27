@@ -76,20 +76,39 @@ pub async fn get(
         "nombre_receptor"
     };
 
-    // Collection totals use the FULL universe (no date filter) — "% cobrado del universo"
-    // means all PPD invoices ever emitted, not just those in the selected period.
-    // The date filter applies only to timeline / forma / metodo breakdowns below.
+    // Collection totals — universe capped at the latest "complete" month (as_of_cutoff).
+    // Sparse months (< 15% of median monthly invoice count, min 3) are excluded so that
+    // a partially-loaded current month doesn't artificially deflate pct_cobrado_total.
     // paid_raw = valid payment complements (excluding cancelled ones) + credit notes (tipo E, tipo_relacion=01).
     let totals_row = sqlx::query(&format!(
         r#"
-        WITH pue_totals AS (
-            SELECT SUM(COALESCE(total_mxn,0)::float8)::float8 AS pue_total
+        WITH monthly_invoice_counts AS (
+            SELECT year AS yr, month AS mo, COUNT(*) AS cnt
             FROM pulso.cfdis
+            WHERE {owner_col} = $1
+              AND {dl_filter}
+              AND tipo_comprobante = 'I'
+              AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+            GROUP BY year, month
+        ),
+        baseline_median AS (
+            SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cnt)::float8 AS median
+            FROM monthly_invoice_counts
+        ),
+        as_of_cutoff AS (
+            SELECT MAX(mc.yr * 100 + mc.mo) AS as_of_ym
+            FROM monthly_invoice_counts mc, baseline_median bm
+            WHERE mc.cnt::float8 >= GREATEST(bm.median * 0.15, 3.0)
+        ),
+        pue_totals AS (
+            SELECT SUM(COALESCE(total_mxn,0)::float8)::float8 AS pue_total
+            FROM pulso.cfdis, as_of_cutoff
             WHERE {owner_col} = $1
               AND {dl_filter}
               AND tipo_comprobante = 'I'
               AND COALESCE(metodo_pago,'PUE') != 'PPD'
               AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND (year * 100 + month) <= as_of_cutoff.as_of_ym
         ),
         ppd_per_invoice AS (
             SELECT
@@ -111,12 +130,13 @@ pub async fn get(
                       AND nc.tipo_comprobante = 'E'
                       AND UPPER(COALESCE(nc.estado_sat,'')) NOT LIKE '%CANCEL%'
                 ), 0) AS paid_raw
-            FROM pulso.cfdis inv
+            FROM pulso.cfdis inv, as_of_cutoff
             WHERE inv.{owner_col} = $1
               AND inv.{dl_filter}
               AND inv.tipo_comprobante = 'I'
               AND inv.metodo_pago = 'PPD'
               AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND (inv.year * 100 + inv.month) <= as_of_cutoff.as_of_ym
         ),
         ppd_agg AS (
             SELECT
@@ -326,19 +346,28 @@ pub async fn get(
     .await?;
     let exposure_180d_mxn: f64 = exposure_row.try_get("exposure").unwrap_or(0.0);
 
-    // Average days to pay — full universe (no date filter)
+    // Average days to pay — PPD invoices only, using the LAST payment date per invoice.
+    // Grouping by invoice and taking MAX(fecha_pago) matches Python's dias_ultimo_pago
+    // logic: partial payments don't count as "collected", only when fully/finally paid.
     let avg_days_row = sqlx::query(&format!(
         r#"
-        SELECT AVG((cp.fecha_pago::date - inv.fecha_emision::date)::float8) AS avg_days
-        FROM pulso.cfdis inv
-        JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
-        JOIN pulso.cfdi_payments cp ON cp.payment_uuid = pd.payment_uuid
-            AND cp.pago_num = pd.pago_num
-        WHERE inv.{owner_col} = $1
-          AND inv.{dl_filter}
-          AND inv.tipo_comprobante = 'I'
-          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
-          AND cp.fecha_pago IS NOT NULL
+        SELECT AVG(last_pay_days) AS avg_days
+        FROM (
+            SELECT inv.uuid,
+                   MAX((cp.fecha_pago::date - inv.fecha_emision::date)::float8) AS last_pay_days
+            FROM pulso.cfdis inv
+            JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
+            JOIN pulso.cfdi_payments cp ON cp.payment_uuid = pd.payment_uuid
+                AND cp.pago_num = pd.pago_num
+            WHERE inv.{owner_col} = $1
+              AND inv.{dl_filter}
+              AND inv.tipo_comprobante = 'I'
+              AND inv.metodo_pago = 'PPD'
+              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND cp.fecha_pago IS NOT NULL
+            GROUP BY inv.uuid
+            HAVING MAX((cp.fecha_pago::date - inv.fecha_emision::date)::float8) >= 0
+        ) per_invoice
         "#
     ))
     .bind(rfc)
