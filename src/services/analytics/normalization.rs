@@ -361,11 +361,17 @@ pub async fn list_cfdis_for_normalization(
     to_m: i64,
     limit: i64,
 ) -> anyhow::Result<Vec<NormCfdiRow>> {
-    let rfc_col = rfc_column(dl_type);
+    let is_nomina = dl_type == "nomina";
+    let rfc_col = if is_nomina { "rfc_emisor" } else { rfc_column(dl_type) };
     let dl_filter = match dl_type {
         "recibidos" => "c.dl_type IN ('recibidos', 'ambos')",
-        "ambos" => "1=1",
+        "ambos" | "nomina" => "1=1",
         _ => "c.dl_type IN ('emitidos', 'ambos')",
+    };
+    let tipo_filter = if is_nomina {
+        "c.tipo_comprobante = 'N'"
+    } else {
+        "c.tipo_comprobante NOT IN ('P','N')"
     };
 
     let sql = format!(
@@ -385,7 +391,7 @@ pub async fn list_cfdis_for_normalization(
             AND nr.owner_rfc = $1 AND nr.action = 'exclude'
         WHERE c.{rfc_col} = $1
           AND {dl_filter}
-          AND c.tipo_comprobante NOT IN ('P','N')
+          AND {tipo_filter}
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
         ORDER BY c.fecha_emision DESC
