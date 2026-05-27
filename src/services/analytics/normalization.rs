@@ -499,3 +499,209 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     }
     (y, mo, rem + 1)
 }
+
+// ---------------------------------------------------------------------------
+// Counterparty list for normalization UI
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct NormCounterpartyRow {
+    pub rfc: String,
+    pub nombre: String,
+    pub year_amounts: std::collections::HashMap<String, f64>,
+    pub total_mxn: f64,
+    pub invoice_count: i64,
+    pub is_excluded: bool,
+    pub rule_id: Option<String>,
+}
+
+/// Returns one row per counterparty with per-year totals and exclusion status.
+/// RFC-level exclusion rule (cfdi_uuid IS NULL, source_rfc = counterparty) sets is_excluded=true.
+pub async fn list_counterparties_for_normalization(
+    pool: &DbPool,
+    owner_rfc: &str,
+    dl_type: &str,
+    from_y: i64,
+    from_m: i64,
+    to_y: i64,
+    to_m: i64,
+) -> anyhow::Result<Vec<NormCounterpartyRow>> {
+    let rfc_col = rfc_column(dl_type);
+    let dl_filter = match dl_type {
+        "recibidos" => "c.dl_type IN ('recibidos', 'ambos')",
+        _ => "c.dl_type IN ('emitidos', 'ambos')",
+    };
+
+    let sql = format!(
+        r#"SELECT
+               CASE WHEN c.rfc_emisor = $1 THEN c.rfc_receptor ELSE c.rfc_emisor END AS rfc_cp,
+               CASE WHEN c.rfc_emisor = $1 THEN COALESCE(c.nombre_receptor,'') ELSE COALESCE(c.nombre_emisor,'') END AS nombre_cp,
+               c.year,
+               SUM(COALESCE(c.total_neto_mxn, c.total_mxn, 0))::float8 AS year_total,
+               COUNT(*)::bigint AS year_count
+           FROM pulso.cfdis c
+           WHERE c.{rfc_col} = $1
+             AND {dl_filter}
+             AND c.tipo_comprobante NOT IN ('P','N','T')
+             AND UPPER(COALESCE(c.estado_sat,'')) NOT LIKE '%CANCEL%'
+             AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+             AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+           GROUP BY rfc_cp, nombre_cp, c.year
+           ORDER BY rfc_cp, c.year"#
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(owner_rfc)
+        .bind(from_y)
+        .bind(from_m)
+        .bind(to_y)
+        .bind(to_m)
+        .fetch_all(pool)
+        .await?;
+
+    // Aggregate per counterparty RFC
+    let mut map: std::collections::HashMap<String, NormCounterpartyRow> = std::collections::HashMap::new();
+    for r in &rows {
+        let rfc: String = r.try_get("rfc_cp").unwrap_or_default();
+        let nombre: String = r.try_get("nombre_cp").unwrap_or_default();
+        let year: i32 = r.try_get("year").unwrap_or(0);
+        let year_total: f64 = r.try_get("year_total").unwrap_or(0.0);
+        let year_count: i64 = r.try_get("year_count").unwrap_or(0);
+
+        let entry = map.entry(rfc.clone()).or_insert_with(|| NormCounterpartyRow {
+            rfc: rfc.clone(),
+            nombre: nombre.clone(),
+            year_amounts: std::collections::HashMap::new(),
+            total_mxn: 0.0,
+            invoice_count: 0,
+            is_excluded: false,
+            rule_id: None,
+        });
+        entry.year_amounts.insert(year.to_string(), year_total);
+        entry.total_mxn += year_total;
+        entry.invoice_count += year_count;
+    }
+
+    // Look up RFC-level exclusion rules for each counterparty
+    let dl_rule_filter = match dl_type {
+        "recibidos" => "nr.dl_type IN ('recibidos','ambos')",
+        _ => "nr.dl_type IN ('emitidos','ambos')",
+    };
+    let rule_sql = format!(
+        r#"SELECT nr.id, nr.source_rfc
+           FROM pulso.normalization_rules nr
+           WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
+             AND nr.cfdi_uuid IS NULL AND nr.source_rfc IS NOT NULL
+             AND {dl_rule_filter}"#
+    );
+    let rule_rows = sqlx::query(&rule_sql)
+        .bind(owner_rfc)
+        .fetch_all(pool)
+        .await?;
+
+    for r in &rule_rows {
+        let source_rfc: String = r.try_get("source_rfc").unwrap_or_default();
+        let rule_id: String = r.try_get("id").unwrap_or_default();
+        if let Some(entry) = map.get_mut(&source_rfc.to_uppercase()) {
+            entry.is_excluded = true;
+            entry.rule_id = Some(rule_id);
+        }
+    }
+
+    let mut result: Vec<NormCounterpartyRow> = map.into_values().collect();
+    result.sort_by(|a, b| b.total_mxn.partial_cmp(&a.total_mxn).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Individual CFDIs for a specific counterparty (normalization drill-down)
+// ---------------------------------------------------------------------------
+
+/// Returns CFDIs for a specific counterparty RFC, with per-CFDI exclusion status.
+/// Marks CFDIs excluded either by UUID-level or by RFC-level rule.
+pub async fn list_cfdis_for_counterparty(
+    pool: &DbPool,
+    owner_rfc: &str,
+    counterparty_rfc: &str,
+    dl_type: &str,
+    from_y: i64,
+    from_m: i64,
+    to_y: i64,
+    to_m: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<NormCfdiRow>> {
+    let rfc_col = rfc_column(dl_type);
+    let dl_filter = match dl_type {
+        "recibidos" => "c.dl_type IN ('recibidos', 'ambos')",
+        _ => "c.dl_type IN ('emitidos', 'ambos')",
+    };
+    let cp_col = match dl_type {
+        "recibidos" => "c.rfc_emisor",
+        _ => "c.rfc_receptor",
+    };
+
+    let sql = format!(
+        r#"SELECT c.uuid,
+               {cp_col} AS rfc_contraparte,
+               CASE WHEN c.rfc_emisor = $1 THEN COALESCE(c.nombre_receptor,'') ELSE COALESCE(c.nombre_emisor,'') END AS nombre_contraparte,
+               c.tipo_comprobante,
+               COALESCE(c.fecha_emision::text, '') AS fecha_emision,
+               COALESCE(c.total_neto_mxn, c.total_mxn, 0)::float8 AS total_mxn,
+               c.year::text || '-' || LPAD(c.month::text, 2, '0') AS period,
+               COALESCE((SELECT cc.descripcion FROM pulso.cfdi_concepts cc WHERE cc.uuid = c.uuid LIMIT 1), '') AS concepto,
+               CASE WHEN nr.id IS NOT NULL THEN true
+                    WHEN rfc_nr.id IS NOT NULL THEN true
+                    ELSE false END AS is_excluded,
+               COALESCE(nr.id, rfc_nr.id) AS rule_id,
+               COALESCE(nr.label, rfc_nr.label) AS label
+           FROM pulso.cfdis c
+           LEFT JOIN pulso.normalization_rules nr
+               ON UPPER(nr.cfdi_uuid) = UPPER(c.uuid)
+               AND nr.owner_rfc = $1 AND nr.action = 'exclude'
+           LEFT JOIN pulso.normalization_rules rfc_nr
+               ON rfc_nr.cfdi_uuid IS NULL
+               AND rfc_nr.source_rfc = $2
+               AND rfc_nr.owner_rfc = $1 AND rfc_nr.action = 'exclude'
+               AND rfc_nr.dl_type IN ({dl_filter_rfc})
+           WHERE c.{rfc_col} = $1
+             AND {cp_col} = $2
+             AND {dl_filter}
+             AND c.tipo_comprobante NOT IN ('P','N','T')
+             AND (c.year > $3 OR (c.year = $3 AND c.month >= $4))
+             AND (c.year < $5 OR (c.year = $5 AND c.month <= $6))
+           ORDER BY c.fecha_emision DESC
+           LIMIT $7"#,
+        dl_filter_rfc = match dl_type {
+            "recibidos" => "'recibidos','ambos'",
+            _ => "'emitidos','ambos'",
+        }
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(owner_rfc)
+        .bind(counterparty_rfc.to_uppercase())
+        .bind(from_y)
+        .bind(from_m)
+        .bind(to_y)
+        .bind(to_m)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| NormCfdiRow {
+            uuid: r.try_get("uuid").unwrap_or_default(),
+            rfc_contraparte: r.try_get("rfc_contraparte").unwrap_or_default(),
+            nombre_contraparte: r.try_get("nombre_contraparte").unwrap_or_default(),
+            tipo_comprobante: r.try_get("tipo_comprobante").unwrap_or_default(),
+            fecha_emision: r.try_get("fecha_emision").unwrap_or_default(),
+            total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
+            period: r.try_get("period").unwrap_or_default(),
+            concepto: r.try_get("concepto").unwrap_or_default(),
+            is_excluded: r.try_get::<bool, _>("is_excluded").unwrap_or(false),
+            rule_id: r.try_get("rule_id").ok(),
+            label: r.try_get("label").ok(),
+        })
+        .collect())
+}
