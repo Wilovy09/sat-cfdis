@@ -707,6 +707,58 @@ pub async fn list_norm_cfdis(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/normalization/counterparties
+// ---------------------------------------------------------------------------
+
+pub async fn list_norm_counterparties(
+    req: HttpRequest,
+    path: web::Path<String>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let dl_type = query.dl_type();
+    let from = query.from();
+    let to = query.to();
+    let (from_y, from_m) = crate::services::analytics::summary::parse_ym(&from);
+    let (to_y, to_m) = crate::services::analytics::summary::parse_ym(&to);
+    let rows = normalization::list_counterparties_for_normalization(
+        &pool, &rfc, &dl_type, from_y, from_m, to_y, to_m,
+    )
+    .await
+    .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/normalization/counterparties/{cp_rfc}/cfdis
+// ---------------------------------------------------------------------------
+
+pub async fn list_norm_counterparty_cfdis(
+    req: HttpRequest,
+    path: web::Path<(String, String)>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let (rfc, cp_rfc) = path.into_inner();
+    let rfc = rfc.to_uppercase();
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let dl_type = query.dl_type();
+    let from = query.from();
+    let to = query.to();
+    let limit = query.limit();
+    let (from_y, from_m) = crate::services::analytics::summary::parse_ym(&from);
+    let (to_y, to_m) = crate::services::analytics::summary::parse_ym(&to);
+    let rows = normalization::list_cfdis_for_counterparty(
+        &pool, &rfc, &cp_rfc.to_uppercase(), &dl_type, from_y, from_m, to_y, to_m, limit,
+    )
+    .await
+    .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/v1/analytics/{rfc}/counterparties/evolution
 // ---------------------------------------------------------------------------
 
