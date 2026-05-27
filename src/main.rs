@@ -800,6 +800,14 @@ async fn main() -> std::io::Result<()> {
                     .service(
                         web::resource("/normalization/cfdis")
                             .route(web::get().to(analytics_routes::list_norm_cfdis)),
+                    )
+                    .service(
+                        web::resource("/normalization/counterparties")
+                            .route(web::get().to(analytics_routes::list_norm_counterparties)),
+                    )
+                    .service(
+                        web::resource("/normalization/counterparties/{cp_rfc}/cfdis")
+                            .route(web::get().to(analytics_routes::list_norm_counterparty_cfdis)),
                     ),
             )
     })
