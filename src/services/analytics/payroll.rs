@@ -1,5 +1,21 @@
 use super::summary::parse_ym;
 /// Payroll: employee analytics from CFDI Nómina complements.
+
+// Reusable exclusion filters for payroll queries (alias = table alias for pulso.cfdis, usually "c").
+// Checks both employee-level payroll rules and individual CFDI UUID rules.
+const NOMINA_EXCL_C: &str = "\
+          AND NOT EXISTS (\
+\n              SELECT 1 FROM pulso.payroll_normalization_rules pnr\
+\n              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'\
+\n                AND pnr.employee_rfc = c.rfc_receptor\
+\n                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)\
+\n                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)\
+\n          )\
+\n          AND NOT EXISTS (\
+\n              SELECT 1 FROM pulso.normalization_rules nr\
+\n              WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'\
+\n                AND nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(c.uuid)\
+\n          )";
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -102,7 +118,7 @@ pub async fn get(
     let (to_y, to_m) = parse_ym(to);
 
     // Summary (all tipos, to match full payroll spend)
-    let summary_row = sqlx::query(r#"
+    let summary_row = sqlx::query(&format!(r#"
         SELECT
             SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS total_pagado,
             SUM(COALESCE(n.total_percepciones,0)::float8)                                    AS total_perc,
@@ -118,14 +134,8 @@ pub async fn get(
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
-    "#)
+{NOMINA_EXCL_C}
+    "#))
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
     .fetch_one(pool)
     .await?;
@@ -135,7 +145,7 @@ pub async fn get(
     let payrolls: i64 = summary_row.try_get("payrolls_count").unwrap_or(0);
 
     // ISR retenido = deducciones tipo '002' (SAT clave ISR)
-    let isr_row = sqlx::query(
+    let isr_row = sqlx::query(&format!(
         r#"
         SELECT COALESCE(SUM(COALESCE(d.importe, 0)::float8), 0) AS total_isr
         FROM pulso.cfdi_nomina_deducciones d
@@ -147,15 +157,9 @@ pub async fn get(
           AND d.tipo_deduccion = '002'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         "#,
-    )
+    ))
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -182,7 +186,7 @@ pub async fn get(
     };
 
     // By month
-    let month_rows = sqlx::query(
+    let month_rows = sqlx::query(&format!(
         r#"
         SELECT c.year, c.month,
                SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
@@ -197,17 +201,11 @@ pub async fn get(
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         GROUP BY c.year, c.month
         ORDER BY c.year, c.month
     "#,
-    )
+    ))
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -235,7 +233,7 @@ pub async fn get(
         .collect();
 
     // By employee (top 100 by total paid)
-    let emp_rows = sqlx::query(
+    let emp_rows = sqlx::query(&format!(
         r#"
         SELECT
             c.rfc_receptor                              AS emp_rfc,
@@ -258,18 +256,12 @@ pub async fn get(
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         GROUP BY c.rfc_receptor
         ORDER BY pagado DESC
         LIMIT 100
     "#,
-    )
+    ))
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -298,7 +290,7 @@ pub async fn get(
         .collect();
 
     // By tipo nomina
-    let tipo_rows = sqlx::query(
+    let tipo_rows = sqlx::query(&format!(
         r#"
         SELECT n.tipo_nomina,
                SUM(COALESCE(n.total_percepciones,0)::float8) AS total,
@@ -309,16 +301,10 @@ pub async fn get(
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         GROUP BY n.tipo_nomina
     "#,
-    )
+    ))
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -351,7 +337,7 @@ pub async fn get(
         .collect();
 
     // By deduccion type
-    let ded_rows = sqlx::query(
+    let ded_rows = sqlx::query(&format!(
         r#"
         SELECT d.tipo_deduccion,
                MAX(d.concepto) AS concepto,
@@ -364,17 +350,11 @@ pub async fn get(
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         GROUP BY d.tipo_deduccion
         ORDER BY total DESC
     "#,
-    )
+    ))
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -394,7 +374,7 @@ pub async fn get(
         .collect();
 
     // By percepcion type
-    let per_rows = sqlx::query(
+    let per_rows = sqlx::query(&format!(
         r#"
         SELECT p.tipo_percepcion,
                MAX(p.concepto) AS concepto,
@@ -408,17 +388,11 @@ pub async fn get(
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         GROUP BY p.tipo_percepcion
         ORDER BY SUM(COALESCE(p.importe_gravado,0)::float8) + SUM(COALESCE(p.importe_exento,0)::float8) DESC
     "#,
-    )
+    ))
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -444,7 +418,7 @@ pub async fn get(
         .collect();
 
     // New employees per month: first-ever payslip from this employer is within range
-    let new_emp_rows = sqlx::query(
+    let new_emp_rows = sqlx::query(&format!(
         r#"
         SELECT yr AS year, mo AS month, COUNT(*) AS new_emp
         FROM (
@@ -462,13 +436,18 @@ pub async fn get(
                     AND (pnr.period_start IS NULL OR (c2.year::text || '-' || LPAD(c2.month::text,2,'0')) >= pnr.period_start)
                     AND (pnr.period_end IS NULL OR (c2.year::text || '-' || LPAD(c2.month::text,2,'0')) <= pnr.period_end)
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.normalization_rules nr
+                  WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
+                    AND nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(c2.uuid)
+              )
             GROUP BY rfc_receptor
         ) sub
         WHERE (yr > $2 OR (yr = $2 AND mo >= $3))
           AND (yr < $4 OR (yr = $4 AND mo <= $5))
         GROUP BY yr, mo
         "#,
-    )
+    ))
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -488,7 +467,7 @@ pub async fn get(
         .collect();
 
     // All (year, month, rfc_receptor) in range — used to compute departures
-    let emp_month_rows = sqlx::query(
+    let emp_month_rows = sqlx::query(&format!(
         r#"
         SELECT DISTINCT c.year, c.month, c.rfc_receptor
         FROM pulso.cfdi_nomina n
@@ -497,16 +476,10 @@ pub async fn get(
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         ORDER BY c.year, c.month
         "#,
-    )
+    ))
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -526,7 +499,7 @@ pub async fn get(
     }
 
     // Headcount by month (distinct employees per month)
-    let hc_rows = sqlx::query(
+    let hc_rows = sqlx::query(&format!(
         r#"
         SELECT c.year, c.month, COUNT(DISTINCT c.rfc_receptor) AS hc
         FROM pulso.cfdi_nomina n
@@ -535,17 +508,11 @@ pub async fn get(
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         GROUP BY c.year, c.month
         ORDER BY c.year, c.month
     "#,
-    )
+    ))
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -636,7 +603,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     };
 
     // Most recent period with payroll data
-    let period_row = sqlx::query(
+    let period_row = sqlx::query(&format!(
         r#"
         SELECT MAX(c.year * 100 + c.month) AS last_period
         FROM pulso.cfdi_nomina n
@@ -644,15 +611,9 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
           AND COALESCE(c.estado_sat,'') != 'cancelado'
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         "#,
-    )
+    ))
     .bind(rfc)
     .fetch_one(pool)
     .await?;
@@ -673,7 +634,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     let (prior_from_y, prior_from_m) = subtract_months(prior_to_y, prior_to_m, 11);
 
     // Headcount in the most recent period
-    let hc_row = sqlx::query(
+    let hc_row = sqlx::query(&format!(
         r#"
         SELECT COUNT(DISTINCT c.rfc_receptor) AS headcount
         FROM pulso.cfdi_nomina n
@@ -682,15 +643,9 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
           AND c.tipo_comprobante = 'N'
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND c.year = $2 AND c.month = $3
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         "#,
-    )
+    ))
     .bind(rfc)
     .bind(last_y)
     .bind(last_m)
@@ -703,7 +658,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     }
 
     // Run-rate LTM: exclude one-off percepciones (002=aguinaldo, 003=PTU, 022=prima vacacional, 038=indemnización)
-    let rr_row = sqlx::query(
+    let rr_row = sqlx::query(&format!(
         r#"
         SELECT COALESCE(SUM(
             COALESCE(p.importe_gravado, 0)::float8 + COALESCE(p.importe_exento, 0)::float8
@@ -717,15 +672,9 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
           AND p.tipo_percepcion NOT IN ('002', '003', '022', '038')
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         "#,
-    )
+    ))
     .bind(rfc)
     .bind(ltm_from_y)
     .bind(ltm_from_m)
@@ -737,7 +686,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     let run_rate_mensual_ltm_mxn = total_regular / 12.0;
 
     // YoY masa salarial: total percepciones LTM vs prior 12 months
-    let ltm_row = sqlx::query(
+    let ltm_row = sqlx::query(&format!(
         r#"
         SELECT COALESCE(SUM(COALESCE(n.total_percepciones, 0)::float8), 0) AS total
         FROM pulso.cfdi_nomina n
@@ -747,15 +696,9 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         "#,
-    )
+    ))
     .bind(rfc)
     .bind(ltm_from_y)
     .bind(ltm_from_m)
@@ -765,7 +708,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     .await?;
     let ltm_masa: f64 = ltm_row.try_get("total").unwrap_or(0.0);
 
-    let prior_row = sqlx::query(
+    let prior_row = sqlx::query(&format!(
         r#"
         SELECT COALESCE(SUM(COALESCE(n.total_percepciones, 0)::float8), 0) AS total
         FROM pulso.cfdi_nomina n
@@ -775,15 +718,9 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         "#,
-    )
+    ))
     .bind(rfc)
     .bind(prior_from_y)
     .bind(prior_from_m)
@@ -801,7 +738,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     // Labor liability (pasivo laboral): per active employee
     // SDI = salario diario integrado (daily rate for benefit provisioning)
     // Tenure from first payroll ever recorded for this employer
-    let emp_rows = sqlx::query(
+    let emp_rows = sqlx::query(&format!(
         r#"
         WITH active_emps AS (
             SELECT DISTINCT c.rfc_receptor
@@ -818,6 +755,11 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
                     AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
                     AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
               )
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.normalization_rules nr
+                  WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
+                    AND nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(c.uuid)
+              )
         )
         SELECT
             c.rfc_receptor,
@@ -829,16 +771,10 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
           AND c.tipo_comprobante = 'N'
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND c.rfc_receptor IN (SELECT rfc_receptor FROM active_emps)
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.payroll_normalization_rules pnr
-              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                AND pnr.employee_rfc = c.rfc_receptor
-                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-          )
+{NOMINA_EXCL_C}
         GROUP BY c.rfc_receptor
         "#,
-    )
+    ))
     .bind(rfc)
     .bind(last_y)
     .bind(last_m)
