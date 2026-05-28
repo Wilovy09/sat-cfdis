@@ -347,12 +347,9 @@ switch ($command) {
         $streamTotal      = 0;
         $streamTypeCounts = [];
 
-        foreach ($streamDownloadTypes as $streamDownloadType) {
-        // Emit a separator so the browser knows which direction we are querying.
-        $dlTypeLabel = ($streamDownloadType === DownloadType::recibidos()) ? 'recibidos' : 'emitidos';
-        echo json_encode(['__dl_type__' => $dlTypeLabel], JSON_UNESCAPED_UNICODE) . "\n";
-        flush();
-
+        // Process day-by-day, and within each day query all requested dl_types.
+        // This ensures the cursor always represents "all types processed up to this date",
+        // so a rate-limit pause and resume never skips recibidos for early dates.
         $streamCurrent = $streamFrom;
 
         while ($streamCurrent->format('Y-m-d') <= $streamTo->format('Y-m-d')) {
@@ -363,6 +360,9 @@ switch ($command) {
 
             $dayStart = $streamCurrent->setTime(0, 0, 0);
             $dayEnd   = $streamCurrent->setTime(23, 59, 59);
+
+        foreach ($streamDownloadTypes as $streamDownloadType) {
+            $dlTypeLabel = ($streamDownloadType === DownloadType::recibidos()) ? 'recibidos' : 'emitidos';
 
             $dayQuery = new QueryByFilters($dayStart, $dayEnd);
             $dayQuery->setDownloadType($streamDownloadType);
@@ -436,12 +436,12 @@ switch ($command) {
                     exit(0);
                 }
                 // Non-limit day error — log and continue.
-                fwrite(STDERR, 'Day error ' . $streamCurrent->format('Y-m-d') . ': ' . $causeChain . "\n");
+                fwrite(STDERR, 'Day error ' . $streamCurrent->format('Y-m-d') . ' [' . $dlTypeLabel . ']: ' . $causeChain . "\n");
             }
+        } // end foreach $streamDownloadTypes (inner — per day)
 
             $streamCurrent = $streamCurrent->modify('+1 day');
-        }
-        } // end foreach $streamDownloadTypes
+        } // end while days
 
         // Cleanup temp dir (should already be empty, but just in case)
         if ($streamAutoXml && is_dir($streamXmlTmpDir)) {
