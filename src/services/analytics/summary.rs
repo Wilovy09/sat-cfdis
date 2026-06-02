@@ -115,9 +115,17 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
         })
         .collect();
 
-    // LTM = last 12 months in range
+    // LTM = last 12 *calendar* months ending at to_y/to_m.
+    // Do NOT use .take(12) — that grabs the last 12 data points and skips
+    // gap months, producing inflated totals when data is sparse.
     by_month.sort_by(|a, b| (a.year, a.month).cmp(&(b.year, b.month)));
-    let ltm_slice: Vec<&MonthlyTotal> = by_month.iter().rev().take(12).collect();
+    let ltm_total_months = to_y * 12 + to_m; // absolute month index of the end
+    let ltm_start_abs = ltm_total_months - 11; // 12-month window inclusive
+    let ltm_start_y = (ltm_start_abs - 1) / 12;
+    let ltm_start_m = ((ltm_start_abs - 1) % 12) + 1;
+    let ltm_slice: Vec<&MonthlyTotal> = by_month.iter()
+        .filter(|m| (m.year, m.month) >= (ltm_start_y, ltm_start_m))
+        .collect();
     let ltm_total_mxn: f64 = ltm_slice.iter().map(|m| m.net_mxn).sum();
     let ltm_months = ltm_slice.len() as i64;
 
