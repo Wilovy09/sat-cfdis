@@ -166,7 +166,7 @@ pub async fn complete(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"UPDATE pulso.sync_jobs
-           SET status='completed', cursor_date=$1, found=$2, updated_at=$3
+           SET status='completed', cursor_date=$1, found=$2, error_msg=NULL, updated_at=$3
            WHERE id=$4"#,
     )
     .bind(cursor_date)
