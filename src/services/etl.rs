@@ -169,7 +169,8 @@ async fn process_invoice(
         xml_parser::parse(bytes, job_id, dl_type, &estado)
     } else {
         // Fallback: build from metadata JSON (no XML)
-        tracing::warn!(uuid = %uuid, meta_preview = %&metadata[..metadata.len().min(120)], "ETL: no XML in storage, trying from_metadata");
+        let preview_end = metadata.char_indices().nth(120).map(|(i,_)| i).unwrap_or(metadata.len());
+        tracing::warn!(uuid = %uuid, meta_preview = %&metadata[..preview_end], "ETL: no XML in storage, trying from_metadata");
         xml_parser::from_metadata(metadata, job_id, dl_type)
     };
 
