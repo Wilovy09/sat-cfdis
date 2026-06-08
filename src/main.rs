@@ -808,6 +808,19 @@ async fn main() -> std::io::Result<()> {
                     .service(
                         web::resource("/normalization/counterparties/{cp_rfc}/cfdis")
                             .route(web::get().to(analytics_routes::list_norm_counterparty_cfdis)),
+                    )
+                    .service(
+                        web::resource("/normalization/payroll/employees")
+                            .route(
+                                web::get()
+                                    .to(analytics_routes::get_normalization_payroll_employees),
+                            ),
+                    )
+                    .service(
+                        web::resource("/normalization/ebitda-bridge")
+                            .route(
+                                web::get().to(analytics_routes::get_normalization_ebitda_bridge),
+                            ),
                     ),
             )
     })
