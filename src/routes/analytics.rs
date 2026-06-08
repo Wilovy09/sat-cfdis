@@ -759,6 +759,51 @@ pub async fn list_norm_counterparty_cfdis(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/normalization/payroll/employees
+// ---------------------------------------------------------------------------
+
+pub async fn get_normalization_payroll_employees(
+    req: HttpRequest,
+    path: web::Path<String>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let from = query.from();
+    let to = query.to();
+    let (from_y, from_m) = crate::services::analytics::summary::parse_ym(&from);
+    let (to_y, to_m) = crate::services::analytics::summary::parse_ym(&to);
+    let rows = normalization::list_payroll_employees(&pool, &rfc, from_y, from_m, to_y, to_m)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/normalization/ebitda-bridge
+// ---------------------------------------------------------------------------
+
+pub async fn get_normalization_ebitda_bridge(
+    req: HttpRequest,
+    path: web::Path<String>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let from = query.from();
+    let to = query.to();
+    let (from_y, from_m) = crate::services::analytics::summary::parse_ym(&from);
+    let (to_y, to_m) = crate::services::analytics::summary::parse_ym(&to);
+    let rows =
+        normalization::list_ebitda_bridge_adjustments(&pool, &rfc, from_y, from_m, to_y, to_m)
+            .await
+            .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/v1/analytics/{rfc}/counterparties/evolution
 // ---------------------------------------------------------------------------
 
