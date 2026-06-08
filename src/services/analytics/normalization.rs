@@ -21,6 +21,14 @@ pub struct NormalizationRule {
     pub label: Option<String>,
     pub rule_name: Option<String>,
     pub cfdi_uuid: Option<String>,
+    // V2 fields
+    pub accounting_line: Option<String>,
+    pub motivo: Option<String>,
+    pub impacts_ebitda: Option<bool>,
+    pub capex_estimate_dep: Option<bool>,
+    pub capex_asset_type: Option<String>,
+    pub capex_useful_life_years: Option<f64>,
+    pub capex_annual_dep_mxn: Option<f64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -35,6 +43,14 @@ pub struct CreateRuleRequest {
     pub label: Option<String>,
     pub rule_name: Option<String>,
     pub cfdi_uuid: Option<String>,
+    // V2 fields
+    pub accounting_line: Option<String>,
+    pub motivo: Option<String>,
+    pub impacts_ebitda: Option<bool>,
+    pub capex_estimate_dep: Option<bool>,
+    pub capex_asset_type: Option<String>,
+    pub capex_useful_life_years: Option<f64>,
+    pub capex_annual_dep_mxn: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,11 +62,13 @@ pub struct PayrollNormRule {
     pub employee_name: Option<String>,
     pub action: String,
     pub value_pct: Option<f64>,
+    pub value_mxn: Option<f64>,
     pub period_start: Option<String>,
     pub period_end: Option<String>,
     pub notes: Option<String>,
     pub label: Option<String>,
     pub rule_name: Option<String>,
+    pub excluded_cfdi_uuids: Option<Vec<String>>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -62,11 +80,37 @@ pub struct CreatePayrollRuleRequest {
     pub employee_name: Option<String>,
     pub action: String,
     pub value_pct: Option<f64>,
+    pub value_mxn: Option<f64>,
     pub period_start: Option<String>,
     pub period_end: Option<String>,
     pub notes: Option<String>,
     pub label: Option<String>,
     pub rule_name: Option<String>,
+    pub excluded_cfdi_uuids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PayrollEmployeeRow {
+    pub employee_rfc: String,
+    pub employee_name: Option<String>,
+    pub first_month: Option<String>,
+    pub last_month: Option<String>,
+    pub active_months: i64,
+    pub historical_cost_mxn: f64,
+    pub run_rate_mensual_mxn: f64,
+    pub cfdi_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EbitdaBridgeRow {
+    pub concepto: String,
+    pub seccion: String,
+    pub rule_name: Option<String>,
+    pub is_subtotal: bool,
+    pub is_bold: bool,
+    pub is_pct: bool,
+    pub is_section_header: bool,
+    pub amounts: std::collections::HashMap<String, f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,7 +132,11 @@ pub struct ExcludedCfdi {
 
 pub async fn list_rules(pool: &DbPool, owner_rfc: &str) -> anyhow::Result<Vec<NormalizationRule>> {
     let rows = sqlx::query(
-        "SELECT id, owner_rfc, dl_type, source_rfc, source_name, group_name, action, label, rule_name, cfdi_uuid, created_at, updated_at
+        "SELECT id, owner_rfc, dl_type, source_rfc, source_name, group_name, action, label,
+                rule_name, cfdi_uuid,
+                accounting_line, motivo, impacts_ebitda, capex_estimate_dep,
+                capex_asset_type, capex_useful_life_years, capex_annual_dep_mxn,
+                created_at, updated_at
          FROM pulso.normalization_rules WHERE owner_rfc = $1 ORDER BY created_at DESC"
     )
     .bind(owner_rfc)
@@ -108,6 +156,13 @@ pub async fn list_rules(pool: &DbPool, owner_rfc: &str) -> anyhow::Result<Vec<No
             label: r.try_get("label").ok(),
             rule_name: r.try_get("rule_name").ok(),
             cfdi_uuid: r.try_get("cfdi_uuid").ok(),
+            accounting_line: r.try_get("accounting_line").ok(),
+            motivo: r.try_get("motivo").ok(),
+            impacts_ebitda: r.try_get("impacts_ebitda").ok(),
+            capex_estimate_dep: r.try_get("capex_estimate_dep").ok(),
+            capex_asset_type: r.try_get("capex_asset_type").ok(),
+            capex_useful_life_years: r.try_get("capex_useful_life_years").ok(),
+            capex_annual_dep_mxn: r.try_get("capex_annual_dep_mxn").ok(),
             created_at: r.try_get("created_at").unwrap_or_default(),
             updated_at: r.try_get("updated_at").unwrap_or_default(),
         })
@@ -124,8 +179,11 @@ pub async fn create_rule(
 
     sqlx::query(
         r#"INSERT INTO pulso.normalization_rules
-            (id, owner_rfc, dl_type, source_rfc, source_name, group_name, action, label, rule_name, cfdi_uuid, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#
+            (id, owner_rfc, dl_type, source_rfc, source_name, group_name, action, label,
+             rule_name, cfdi_uuid, accounting_line, motivo, impacts_ebitda,
+             capex_estimate_dep, capex_asset_type, capex_useful_life_years,
+             capex_annual_dep_mxn, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)"#
     )
     .bind(&id)
     .bind(owner_rfc)
@@ -137,6 +195,13 @@ pub async fn create_rule(
     .bind(&req.label)
     .bind(&req.rule_name)
     .bind(&req.cfdi_uuid)
+    .bind(&req.accounting_line)
+    .bind(&req.motivo)
+    .bind(&req.impacts_ebitda)
+    .bind(&req.capex_estimate_dep)
+    .bind(&req.capex_asset_type)
+    .bind(&req.capex_useful_life_years)
+    .bind(&req.capex_annual_dep_mxn)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -153,6 +218,13 @@ pub async fn create_rule(
         label: req.label.clone(),
         rule_name: req.rule_name.clone(),
         cfdi_uuid: req.cfdi_uuid.clone(),
+        accounting_line: req.accounting_line.clone(),
+        motivo: req.motivo.clone(),
+        impacts_ebitda: req.impacts_ebitda,
+        capex_estimate_dep: req.capex_estimate_dep,
+        capex_asset_type: req.capex_asset_type.clone(),
+        capex_useful_life_years: req.capex_useful_life_years,
+        capex_annual_dep_mxn: req.capex_annual_dep_mxn,
         created_at: now.clone(),
         updated_at: now,
     })
@@ -179,7 +251,8 @@ pub async fn list_payroll_rules(
 ) -> anyhow::Result<Vec<PayrollNormRule>> {
     let rows = sqlx::query(
         "SELECT id, owner_rfc, rule_family, employee_rfc, employee_name, action,
-                value_pct, period_start, period_end, notes, label, rule_name, created_at, updated_at
+                value_pct, value_mxn, period_start, period_end, notes, label, rule_name,
+                excluded_cfdi_uuids, created_at, updated_at
          FROM pulso.payroll_normalization_rules WHERE owner_rfc = $1 ORDER BY created_at DESC",
     )
     .bind(owner_rfc)
@@ -196,11 +269,13 @@ pub async fn list_payroll_rules(
             employee_name: r.try_get("employee_name").ok(),
             action: r.try_get("action").unwrap_or_default(),
             value_pct: r.try_get("value_pct").ok(),
+            value_mxn: r.try_get("value_mxn").ok(),
             period_start: r.try_get("period_start").ok(),
             period_end: r.try_get("period_end").ok(),
             notes: r.try_get("notes").ok(),
             label: r.try_get("label").ok(),
             rule_name: r.try_get("rule_name").ok(),
+            excluded_cfdi_uuids: r.try_get::<Option<Vec<String>>, _>("excluded_cfdi_uuids").ok().flatten(),
             created_at: r.try_get("created_at").unwrap_or_default(),
             updated_at: r.try_get("updated_at").unwrap_or_default(),
         })
@@ -218,8 +293,9 @@ pub async fn create_payroll_rule(
     sqlx::query(
         r#"INSERT INTO pulso.payroll_normalization_rules
             (id, owner_rfc, rule_family, employee_rfc, employee_name, action,
-             value_pct, period_start, period_end, notes, label, rule_name, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"#,
+             value_pct, value_mxn, period_start, period_end, notes, label, rule_name,
+             excluded_cfdi_uuids, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
     )
     .bind(&id)
     .bind(owner_rfc)
@@ -228,11 +304,13 @@ pub async fn create_payroll_rule(
     .bind(&req.employee_name)
     .bind(&req.action)
     .bind(&req.value_pct)
+    .bind(&req.value_mxn)
     .bind(&req.period_start)
     .bind(&req.period_end)
     .bind(&req.notes)
     .bind(&req.label)
     .bind(&req.rule_name)
+    .bind(&req.excluded_cfdi_uuids)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -246,11 +324,13 @@ pub async fn create_payroll_rule(
         employee_name: req.employee_name.clone(),
         action: req.action.clone(),
         value_pct: req.value_pct,
+        value_mxn: req.value_mxn,
         period_start: req.period_start.clone(),
         period_end: req.period_end.clone(),
         notes: req.notes.clone(),
         label: req.label.clone(),
         rule_name: req.rule_name.clone(),
+        excluded_cfdi_uuids: req.excluded_cfdi_uuids.clone(),
         created_at: now.clone(),
         updated_at: now,
     })
@@ -704,4 +784,164 @@ pub async fn list_cfdis_for_counterparty(
             label: r.try_get("label").ok(),
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// GET /normalization/payroll/employees
+// ---------------------------------------------------------------------------
+
+pub async fn list_payroll_employees(
+    pool: &DbPool,
+    owner_rfc: &str,
+    from_y: i64,
+    from_m: i64,
+    to_y: i64,
+    to_m: i64,
+) -> anyhow::Result<Vec<PayrollEmployeeRow>> {
+    let rows = sqlx::query(
+        r#"
+        WITH monthly AS (
+            SELECT
+                c.rfc_receptor                                          AS employee_rfc,
+                MAX(c.nombre_receptor)                                  AS employee_name,
+                c.year::text || '-' || LPAD(c.month::text, 2, '0')     AS month_key,
+                SUM(COALESCE(c.total_mxn, 0))                           AS month_total
+            FROM pulso.cfdis c
+            WHERE c.rfc_emisor = $1
+              AND c.tipo_comprobante = 'N'
+              AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+              AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+              AND (c.estado_sat IS NULL OR c.estado_sat != 'cancelado')
+              AND c.rfc_receptor IS NOT NULL
+              AND c.rfc_receptor != ''
+            GROUP BY c.rfc_receptor, month_key
+        )
+        SELECT
+            employee_rfc,
+            MAX(employee_name)                      AS employee_name,
+            MIN(month_key)                          AS first_month,
+            MAX(month_key)                          AS last_month,
+            COUNT(DISTINCT month_key)               AS active_months,
+            SUM(month_total)                        AS historical_cost_mxn,
+            AVG(month_total)                        AS run_rate_mensual_mxn,
+            COUNT(*)                                AS cfdi_count
+        FROM monthly
+        GROUP BY employee_rfc
+        ORDER BY historical_cost_mxn DESC NULLS LAST
+        "#,
+    )
+    .bind(owner_rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| PayrollEmployeeRow {
+            employee_rfc: r.try_get("employee_rfc").unwrap_or_default(),
+            employee_name: r.try_get("employee_name").ok(),
+            first_month: r.try_get("first_month").ok(),
+            last_month: r.try_get("last_month").ok(),
+            active_months: r.try_get::<i64, _>("active_months").unwrap_or(0),
+            historical_cost_mxn: r.try_get::<f64, _>("historical_cost_mxn").unwrap_or(0.0),
+            run_rate_mensual_mxn: r.try_get::<f64, _>("run_rate_mensual_mxn").unwrap_or(0.0),
+            cfdi_count: r.try_get::<i64, _>("cfdi_count").unwrap_or(0),
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// GET /normalization/ebitda-bridge
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct EbitdaBridgeAdjustment {
+    pub rule_id: String,
+    pub rule_name: Option<String>,
+    pub accounting_line: Option<String>,
+    pub motivo: Option<String>,
+    pub impacts_ebitda: Option<bool>,
+    pub dl_type: String,
+    pub capex_estimate_dep: Option<bool>,
+    pub capex_asset_type: Option<String>,
+    pub capex_useful_life_years: Option<f64>,
+    pub capex_annual_dep_mxn: Option<f64>,
+    pub amounts_by_year: std::collections::HashMap<String, f64>,
+    pub total_mxn: f64,
+}
+
+pub async fn list_ebitda_bridge_adjustments(
+    pool: &DbPool,
+    owner_rfc: &str,
+    from_y: i64,
+    from_m: i64,
+    to_y: i64,
+    to_m: i64,
+) -> anyhow::Result<Vec<EbitdaBridgeAdjustment>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            nr.id, nr.rule_name, nr.accounting_line, nr.motivo, nr.impacts_ebitda,
+            nr.dl_type, nr.capex_estimate_dep, nr.capex_asset_type,
+            nr.capex_useful_life_years, nr.capex_annual_dep_mxn,
+            c.year,
+            SUM(COALESCE(c.total_mxn, 0))::float8 AS year_total
+        FROM pulso.normalization_rules nr
+        JOIN pulso.cfdis c ON (
+            (nr.cfdi_uuid IS NOT NULL AND c.uuid = nr.cfdi_uuid)
+            OR (nr.source_rfc IS NOT NULL AND c.rfc_emisor = nr.source_rfc AND nr.dl_type IN ('recibidos','ambos'))
+            OR (nr.source_rfc IS NOT NULL AND c.rfc_receptor = nr.source_rfc AND nr.dl_type IN ('emitidos','ambos'))
+        )
+        WHERE nr.owner_rfc = $1
+          AND nr.accounting_line IS NOT NULL
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND (c.estado_sat IS NULL OR c.estado_sat != 'cancelado')
+        GROUP BY nr.id, nr.rule_name, nr.accounting_line, nr.motivo, nr.impacts_ebitda,
+                 nr.dl_type, nr.capex_estimate_dep, nr.capex_asset_type,
+                 nr.capex_useful_life_years, nr.capex_annual_dep_mxn, c.year
+        ORDER BY nr.id, c.year
+        "#,
+    )
+    .bind(owner_rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    let mut map: std::collections::HashMap<String, EbitdaBridgeAdjustment> =
+        std::collections::HashMap::new();
+
+    for row in &rows {
+        let rule_id: String = row.try_get("id").unwrap_or_default();
+        let year: i64 = row.try_get("year").unwrap_or(0);
+        let year_total: f64 = row.try_get("year_total").unwrap_or(0.0);
+
+        let entry = map.entry(rule_id.clone()).or_insert_with(|| EbitdaBridgeAdjustment {
+            rule_id: rule_id.clone(),
+            rule_name: row.try_get("rule_name").ok(),
+            accounting_line: row.try_get("accounting_line").ok(),
+            motivo: row.try_get("motivo").ok(),
+            impacts_ebitda: row.try_get("impacts_ebitda").ok(),
+            dl_type: row.try_get("dl_type").unwrap_or_default(),
+            capex_estimate_dep: row.try_get("capex_estimate_dep").ok(),
+            capex_asset_type: row.try_get("capex_asset_type").ok(),
+            capex_useful_life_years: row.try_get("capex_useful_life_years").ok(),
+            capex_annual_dep_mxn: row.try_get("capex_annual_dep_mxn").ok(),
+            amounts_by_year: std::collections::HashMap::new(),
+            total_mxn: 0.0,
+        });
+
+        entry.amounts_by_year.insert(year.to_string(), year_total);
+        entry.total_mxn += year_total;
+    }
+
+    let mut result: Vec<EbitdaBridgeAdjustment> = map.into_values().collect();
+    result.sort_by(|a, b| a.rule_id.cmp(&b.rule_id));
+    Ok(result)
 }
