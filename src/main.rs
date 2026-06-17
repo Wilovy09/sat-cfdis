@@ -342,15 +342,31 @@ async fn run_worker_chunk(
         let _ = stdin.write_all(&input_bytes).await;
     }
 
-    // Drain stderr so it never blocks and errors are visible in traces
+    // Drain stderr so it never blocks and errors are visible in traces.
+    // Auth errors (wrong CIEC/RFC) are captured to fail the job with a user-visible message.
+    let auth_error: std::sync::Arc<tokio::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
     if let Some(stderr) = child.stderr.take() {
         let job_id_err = job_id.clone();
+        let auth_error_clone = auth_error.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt as _;
             let mut lines = tokio::io::BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if !line.is_empty() {
                     tracing::error!(job_id = %job_id_err, php_stderr = %line, "PHP worker stderr");
+                    if line.contains("Incorrect login")
+                        || line.contains("login data")
+                        || line.contains("auth error")
+                        || line.contains("credenciales")
+                    {
+                        let mut guard = auth_error_clone.lock().await;
+                        if guard.is_none() {
+                            *guard = Some(
+                                "CIEC incorrecta — actualiza tu contraseña SAT".to_string(),
+                            );
+                        }
+                    }
                 }
             }
         });
@@ -488,6 +504,15 @@ async fn run_worker_chunk(
             tracing::error!(job_id = %job_id, "PHP worker wait failed: {e}");
         }
         _ => {}
+    }
+
+    // Small yield so the stderr task has a chance to flush its last lines
+    tokio::task::yield_now().await;
+
+    if let Some(err_msg) = auth_error.lock().await.clone() {
+        let _ = db::jobs::fail(&pool, &job_id, &err_msg).await;
+        tracing::warn!(job_id = %job_id, "Job failed: auth error");
+        return;
     }
 
     if limit_hit {

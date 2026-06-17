@@ -521,6 +521,7 @@ pub async fn sync_status(
             "job_id":      job.id,
             "period_from": job.period_from,
             "period_to":   job.period_to,
+            "error_msg":   job.error_msg,
         })),
         Ok(None) => HttpResponse::Ok().json(serde_json::json!({ "status": "none" })),
         Err(e) => {
