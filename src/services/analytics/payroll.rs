@@ -29,6 +29,12 @@ pub struct PayrollResponse {
     pub by_deduccion: Vec<DeduccionRow>,
     pub by_percepcion: Vec<PercepcionRow>,
     pub headcount_by_month: Vec<HeadcountMonth>,
+    pub by_year: Vec<PayrollYearRow>,
+    pub by_month_ordinaria: Vec<PayrollMonth>,
+    pub by_percepcion_year: Vec<PercepcionYearRow>,
+    pub by_deduccion_year: Vec<DeduccionYearRow>,
+    pub by_department_year: Vec<DepartmentYearRow>,
+    pub by_employee_year: Vec<EmployeeYearRow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +58,7 @@ pub struct PayrollMonth {
     pub total_pagado: f64,
     pub total_percepciones: f64,
     pub total_deducciones: f64,
+    pub total_otros_pagos: f64,
     pub employee_count: i64,
     pub payrolls_count: i64,
 }
@@ -71,6 +78,9 @@ pub struct EmployeeRow {
     pub months_active: i64,
     pub first_payroll: String,
     pub last_payroll: String,
+    pub tipo_contrato: String,
+    pub tipo_jornada: String,
+    pub tipo_regimen: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +116,54 @@ pub struct HeadcountMonth {
     pub headcount: i64,
     pub new_employees: i64,
     pub departures: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PayrollYearRow {
+    pub year: i64,
+    pub total_pagado: f64,
+    pub total_percepciones: f64,
+    pub total_deducciones: f64,
+    pub total_otros_pagos: f64,
+    pub employee_count: i64,
+    pub months_with_data: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PercepcionYearRow {
+    pub tipo_percepcion: String,
+    pub concepto: String,
+    pub year: i64,
+    pub total: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeduccionYearRow {
+    pub tipo_deduccion: String,
+    pub concepto: String,
+    pub year: i64,
+    pub total: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DepartmentYearRow {
+    pub departamento: String,
+    pub year: i64,
+    pub total_pagado: f64,
+    pub employee_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmployeeYearRow {
+    pub rfc: String,
+    pub nombre: String,
+    pub departamento: String,
+    pub puesto: String,
+    pub year: i64,
+    pub sueldo_bruto: f64,
+    pub months_active: i64,
+    pub avg_monthly: f64,
+    pub avg_sdi: f64,
 }
 
 pub async fn get(
@@ -192,6 +250,7 @@ pub async fn get(
                SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
                SUM(COALESCE(n.total_percepciones,0)::float8)  AS perc,
                SUM(COALESCE(n.total_deducciones,0)::float8)   AS ded,
+               SUM(COALESCE(n.total_otros_pagos,0)::float8) AS otros,
                COUNT(DISTINCT c.rfc_receptor)          AS emp_count,
                COUNT(*)                               AS payrolls_count
         FROM pulso.cfdi_nomina n
@@ -226,6 +285,7 @@ pub async fn get(
                 total_pagado: r.try_get("pagado").unwrap_or(0.0),
                 total_percepciones: r.try_get("perc").unwrap_or(0.0),
                 total_deducciones: r.try_get("ded").unwrap_or(0.0),
+                total_otros_pagos: r.try_get("otros").unwrap_or(0.0),
                 employee_count: r.try_get("emp_count").unwrap_or(0),
                 payrolls_count: r.try_get("payrolls_count").unwrap_or(0),
             }
@@ -241,6 +301,9 @@ pub async fn get(
             MAX(n.num_empleado)                         AS num_emp,
             MAX(n.departamento)                         AS dpto,
             MAX(n.puesto)                               AS puesto,
+            MAX(n.tipo_contrato) AS tipo_contrato,
+            MAX(n.tipo_jornada) AS tipo_jornada,
+            MAX(n.tipo_regimen) AS tipo_regimen,
             SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
             SUM(COALESCE(n.total_percepciones,0)::float8)       AS perc,
             SUM(COALESCE(n.total_deducciones,0)::float8)        AS ded,
@@ -286,6 +349,9 @@ pub async fn get(
             months_active: r.try_get("months_active").unwrap_or(0),
             first_payroll: r.try_get("first_pay").unwrap_or_default(),
             last_payroll: r.try_get("last_pay").unwrap_or_default(),
+            tipo_contrato: r.try_get("tipo_contrato").unwrap_or_default(),
+            tipo_jornada: r.try_get("tipo_jornada").unwrap_or_default(),
+            tipo_regimen: r.try_get("tipo_regimen").unwrap_or_default(),
         })
         .collect();
 
@@ -413,6 +479,240 @@ pub async fn get(
                 total_exento: exen,
                 total_importe: grav + exen,
                 count: r.try_get("cnt").unwrap_or(0),
+            }
+        })
+        .collect();
+
+    // By year
+    let year_rows = sqlx::query(&format!(
+        r#"
+        SELECT c.year,
+               SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
+               SUM(COALESCE(n.total_percepciones,0)::float8) AS perc,
+               SUM(COALESCE(n.total_deducciones,0)::float8) AS ded,
+               SUM(COALESCE(n.total_otros_pagos,0)::float8) AS otros,
+               COUNT(DISTINCT c.rfc_receptor) AS emp_count,
+               COUNT(DISTINCT c.month) AS months_count
+        FROM pulso.cfdi_nomina n
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+{NOMINA_EXCL_C}
+        GROUP BY c.year
+        ORDER BY c.year
+    "#,
+    ))
+    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    let by_year: Vec<PayrollYearRow> = year_rows
+        .iter()
+        .map(|r| PayrollYearRow {
+            year: r.try_get("year").unwrap_or(0),
+            total_pagado: r.try_get("pagado").unwrap_or(0.0),
+            total_percepciones: r.try_get("perc").unwrap_or(0.0),
+            total_deducciones: r.try_get("ded").unwrap_or(0.0),
+            total_otros_pagos: r.try_get("otros").unwrap_or(0.0),
+            employee_count: r.try_get("emp_count").unwrap_or(0),
+            months_with_data: r.try_get("months_count").unwrap_or(0),
+        })
+        .collect();
+
+    // By month ordinaria (tipo_nomina = 'O' only)
+    let month_ord_rows = sqlx::query(&format!(
+        r#"
+        SELECT c.year, c.month,
+               SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
+               SUM(COALESCE(n.total_percepciones,0)::float8)  AS perc,
+               SUM(COALESCE(n.total_deducciones,0)::float8)   AS ded,
+               SUM(COALESCE(n.total_otros_pagos,0)::float8)   AS otros,
+               COUNT(DISTINCT c.rfc_receptor)                 AS emp_count,
+               COUNT(*)                                       AS payrolls_count
+        FROM pulso.cfdi_nomina n
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND n.tipo_nomina = 'O'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+{NOMINA_EXCL_C}
+        GROUP BY c.year, c.month
+        ORDER BY c.year, c.month
+    "#,
+    ))
+    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    let by_month_ordinaria: Vec<PayrollMonth> = month_ord_rows
+        .iter()
+        .map(|r| {
+            let year: i64 = r.try_get("year").unwrap_or(0);
+            let month: i64 = r.try_get("month").unwrap_or(0);
+            PayrollMonth {
+                period: format!("{year}-{month:02}"),
+                year,
+                month,
+                total_pagado: r.try_get("pagado").unwrap_or(0.0),
+                total_percepciones: r.try_get("perc").unwrap_or(0.0),
+                total_deducciones: r.try_get("ded").unwrap_or(0.0),
+                total_otros_pagos: r.try_get("otros").unwrap_or(0.0),
+                employee_count: r.try_get("emp_count").unwrap_or(0),
+                payrolls_count: r.try_get("payrolls_count").unwrap_or(0),
+            }
+        })
+        .collect();
+
+    // By percepcion year
+    let per_year_rows = sqlx::query(&format!(
+        r#"
+        SELECT p.tipo_percepcion,
+               MAX(p.concepto) AS concepto,
+               c.year,
+               SUM(COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) AS total
+        FROM pulso.cfdi_nomina_percepciones p
+        JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+{NOMINA_EXCL_C}
+        GROUP BY p.tipo_percepcion, c.year
+        ORDER BY c.year, SUM(COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) DESC
+    "#,
+    ))
+    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    let by_percepcion_year: Vec<PercepcionYearRow> = per_year_rows
+        .iter()
+        .map(|r| PercepcionYearRow {
+            tipo_percepcion: r.try_get("tipo_percepcion").unwrap_or_default(),
+            concepto: r.try_get("concepto").unwrap_or_default(),
+            year: r.try_get("year").unwrap_or(0),
+            total: r.try_get("total").unwrap_or(0.0),
+        })
+        .collect();
+
+    // By deduccion year
+    let ded_year_rows = sqlx::query(&format!(
+        r#"
+        SELECT d.tipo_deduccion,
+               MAX(d.concepto) AS concepto,
+               c.year,
+               SUM(COALESCE(d.importe,0)::float8) AS total
+        FROM pulso.cfdi_nomina_deducciones d
+        JOIN pulso.cfdi_nomina n ON n.uuid = d.uuid
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+{NOMINA_EXCL_C}
+        GROUP BY d.tipo_deduccion, c.year
+        ORDER BY c.year, SUM(COALESCE(d.importe,0)::float8) DESC
+    "#,
+    ))
+    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    let by_deduccion_year: Vec<DeduccionYearRow> = ded_year_rows
+        .iter()
+        .map(|r| DeduccionYearRow {
+            tipo_deduccion: r.try_get("tipo_deduccion").unwrap_or_default(),
+            concepto: r.try_get("concepto").unwrap_or_default(),
+            year: r.try_get("year").unwrap_or(0),
+            total: r.try_get("total").unwrap_or(0.0),
+        })
+        .collect();
+
+    // By department year
+    let dept_year_rows = sqlx::query(&format!(
+        r#"
+        SELECT COALESCE(NULLIF(TRIM(n.departamento),''), 'Sin departamento') AS departamento,
+               c.year,
+               SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
+               COUNT(DISTINCT c.rfc_receptor) AS emp_count
+        FROM pulso.cfdi_nomina n
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND n.tipo_nomina = 'O'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+{NOMINA_EXCL_C}
+        GROUP BY departamento, c.year
+        ORDER BY c.year, pagado DESC
+    "#,
+    ))
+    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    let by_department_year: Vec<DepartmentYearRow> = dept_year_rows
+        .iter()
+        .map(|r| DepartmentYearRow {
+            departamento: r.try_get("departamento").unwrap_or_default(),
+            year: r.try_get("year").unwrap_or(0),
+            total_pagado: r.try_get("pagado").unwrap_or(0.0),
+            employee_count: r.try_get("emp_count").unwrap_or(0),
+        })
+        .collect();
+
+    // By employee year
+    let emp_year_rows = sqlx::query(&format!(
+        r#"
+        SELECT c.rfc_receptor AS rfc,
+               MAX(c.nombre_receptor) AS nombre,
+               MAX(n.departamento) AS dpto,
+               MAX(n.puesto) AS puesto,
+               c.year,
+               SUM(COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) AS sueldo_bruto,
+               COUNT(DISTINCT c.month) AS months_active,
+               AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi
+        FROM pulso.cfdi_nomina_percepciones p
+        JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND p.tipo_percepcion = '001'
+          AND n.tipo_nomina = 'O'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+{NOMINA_EXCL_C}
+        GROUP BY c.rfc_receptor, c.year
+        ORDER BY c.rfc_receptor, c.year
+    "#,
+    ))
+    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    let by_employee_year: Vec<EmployeeYearRow> = emp_year_rows
+        .iter()
+        .map(|r| {
+            let sueldo_bruto: f64 = r.try_get("sueldo_bruto").unwrap_or(0.0);
+            let months_active: i64 = r.try_get("months_active").unwrap_or(1);
+            EmployeeYearRow {
+                rfc: r.try_get("rfc").unwrap_or_default(),
+                nombre: r.try_get("nombre").unwrap_or_default(),
+                departamento: r.try_get("dpto").unwrap_or_default(),
+                puesto: r.try_get("puesto").unwrap_or_default(),
+                year: r.try_get("year").unwrap_or(0),
+                sueldo_bruto,
+                months_active,
+                avg_monthly: sueldo_bruto / months_active.max(1) as f64,
+                avg_sdi: r.try_get("avg_sdi").unwrap_or(0.0),
             }
         })
         .collect();
@@ -567,6 +867,12 @@ pub async fn get(
         by_deduccion,
         by_percepcion,
         headcount_by_month,
+        by_year,
+        by_month_ordinaria,
+        by_percepcion_year,
+        by_deduccion_year,
+        by_department_year,
+        by_employee_year,
     })
 }
 
