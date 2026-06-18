@@ -415,7 +415,9 @@ switch ($command) {
                 }
                 // Detect SAT session / download limit errors and stop gracefully.
                 // The Rust layer saves the job and resumes after 24.5 h.
-                if (
+                $isAuthFailure = ($dayError instanceof \PhpCfdi\CfdiSatScraper\Exceptions\SatAuthenticationException)
+                    || str_contains($causeChain, 'SatAuthenticationException');
+                $isRateLimit = !$isAuthFailure && (
                     str_contains($errMsg, '429') ||
                     str_contains($errMsg, 'Too Many') ||
                     str_contains($errMsg, 'bloqueado') ||
@@ -423,10 +425,20 @@ switch ($command) {
                     str_contains($errMsg, 'limite') ||
                     str_contains($errMsg, 'limit') ||
                     str_contains($errMsg, 'No tiene acceso') ||
-                    str_contains($errMsg, 'SatAuthenticationException') ||
                     ($dayError instanceof \PhpCfdi\CfdiSatScraper\Exceptions\SatException)
-                ) {
-                    fwrite(STDERR, 'SAT limit/auth error: ' . $causeChain . "\n");
+                );
+                if ($isAuthFailure) {
+                    fwrite(STDERR, 'CIEC_AUTH_FAILURE: ' . $causeChain . "\n");
+                    echo json_encode([
+                        '__limit_reached__' => true,
+                        'date'   => $streamCurrent->format('Y-m-d'),
+                        'reason' => $causeChain,
+                    ], JSON_UNESCAPED_UNICODE) . "\n";
+                    flush();
+                    exit(0);
+                }
+                if ($isRateLimit) {
+                    fwrite(STDERR, 'SAT rate-limit: ' . $causeChain . "\n");
                     echo json_encode([
                         '__limit_reached__' => true,
                         'date'   => $streamCurrent->format('Y-m-d'),

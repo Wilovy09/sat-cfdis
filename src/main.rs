@@ -355,9 +355,9 @@ async fn run_worker_chunk(
             while let Ok(Some(line)) = lines.next_line().await {
                 if !line.is_empty() {
                     tracing::error!(job_id = %job_id_err, php_stderr = %line, "PHP worker stderr");
-                    if line.contains("Incorrect login")
+                    if line.contains("CIEC_AUTH_FAILURE")
+                        || line.contains("Incorrect login")
                         || line.contains("login data")
-                        || line.contains("auth error")
                         || line.contains("credenciales")
                     {
                         let mut guard = auth_error_clone.lock().await;
