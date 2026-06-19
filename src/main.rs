@@ -458,25 +458,7 @@ async fn run_worker_chunk(
                 }
             });
 
-            // Count this CFDI and persist metadata (strip xml_b64 to keep DB lean)
-            if !uuid_str.is_empty() {
-                let mut meta = data.clone();
-                if let Some(obj) = meta.as_object_mut() {
-                    obj.remove("xml_b64");
-                    obj.remove("__xml_ready__");
-                }
-                let meta_str = serde_json::to_string(&meta).unwrap_or_default();
-                let _ = db::jobs::upsert_invoice(&pool, &job_id, &uuid_str, &meta_str).await;
-                found += 1;
-
-                if let Some(fecha) = data["fecha"].as_str().or(data["Fecha"].as_str()) {
-                    let day = &fecha[..10.min(fecha.len())];
-                    cursor = format!("{day} 00:00:00");
-                }
-                if found % 50 == 0 {
-                    let _ = db::jobs::update_found(&pool, &job_id, found, &cursor).await;
-                }
-            }
+            // XML already counted when its metadata line arrived — no found increment here.
             continue;
         }
 
