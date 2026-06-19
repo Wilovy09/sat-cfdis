@@ -12,4 +12,5 @@ pub mod period_comparison;
 pub mod recurrence;
 pub mod retention;
 pub mod summary;
+pub mod xml_breakdown;
 pub mod xml_count;

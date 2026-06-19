@@ -6,7 +6,7 @@ use crate::{
     errors::AppError,
     services::analytics::{
         cashflow, concepts, counterparties, fiscal, geography, hallazgos, normalization, payments,
-        payroll, period_comparison, quarterly, recurrence, retention, summary, xml_count,
+        payroll, period_comparison, quarterly, recurrence, retention, summary, xml_breakdown, xml_count,
     },
 };
 
@@ -1049,6 +1049,20 @@ pub async fn get_xml_count(
     check_rfc_access(&pool, &req, &rfc).await?;
     let dl_type = query.get("dl_type").map(|s| s.as_str()).unwrap_or("emitidos");
     let result = xml_count::get(&pool, &rfc, dl_type)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+pub async fn get_xml_breakdown(
+    req: HttpRequest,
+    path: web::Path<String>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let result = xml_breakdown::get(&pool, &rfc)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
