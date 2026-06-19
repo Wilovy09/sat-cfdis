@@ -116,6 +116,7 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                 cfg.clone(),
                 s3_client.clone(),
                 job.id.clone(),
+                job.job_type.clone(),
                 job.rfc.clone(),
                 auth_payload,
                 job.auth_type.clone(),
@@ -176,39 +177,57 @@ fn next_day(date_str: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Monthly auto-sync worker
+// Daily auto-sync worker
 // ---------------------------------------------------------------------------
 
-/// How often the monthly worker wakes to check for new complete months (6 h).
-const MONTHLY_POLL_SECS: u64 = 6 * 3600;
+/// How often the daily worker wakes to check whether yesterday has been synced (1 h).
+const DAILY_POLL_SECS: u64 = 3600;
 
-/// When a calendar month of the current year finishes, queue a sync job covering
-/// only that month for every registered user whose period hasn't been synced yet.
-async fn monthly_sync_worker(pool: DbPool) {
+/// Every day, queue a one-day sync job for yesterday for every registered user
+/// whose credentials are stored and whose yesterday period hasn't been synced yet.
+async fn daily_sync_worker(pool: DbPool) {
     // Short initial delay so the main worker gets a head start on startup.
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
     loop {
-        let now_str = db::jobs::utc_offset(0);
-        let cur_year: u32 = now_str[0..4].parse().unwrap_or(2026);
-        let cur_month: u32 = now_str[5..7].parse().unwrap_or(1);
-
-        // The last fully completed month
-        let (lc_year, lc_month) = if cur_month <= 1 {
-            (cur_year - 1, 12u32)
-        } else {
-            (cur_year, cur_month - 1)
+        // Yesterday in UTC (seconds-since-epoch - 86400, then format as date).
+        let yesterday_secs = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(86400)
+        };
+        let (yy, ym, yd) = {
+            // Gregorian calendar from epoch seconds (no external crate needed).
+            let days = yesterday_secs / 86400;
+            let mut y = 1970u32;
+            let mut d = days as u32;
+            loop {
+                let dy = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+                if d < dy { break; }
+                d -= dy;
+                y += 1;
+            }
+            let mut m = 1u32;
+            loop {
+                let dm = days_in_month(y, m);
+                if d < dm { break; }
+                d -= dm;
+                m += 1;
+            }
+            (y, m, d + 1)
         };
 
-        let period_from = format!("{lc_year:04}-{lc_month:02}-01 00:00:00");
-        let last_day = days_in_month(lc_year, lc_month);
-        let period_to = format!("{lc_year:04}-{lc_month:02}-{last_day:02} 23:59:59");
+        let period_from = format!("{yy:04}-{ym:02}-{yd:02} 00:00:00");
+        let period_to   = format!("{yy:04}-{ym:02}-{yd:02} 23:59:59");
 
         let users = match db::users::get_all_with_credentials(&pool).await {
             Ok(u) => u,
             Err(e) => {
-                tracing::error!("Monthly worker: DB error fetching users: {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(MONTHLY_POLL_SECS)).await;
+                tracing::error!("Daily worker: DB error fetching users: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(DAILY_POLL_SECS)).await;
                 continue;
             }
         };
@@ -220,7 +239,7 @@ async fn monthly_sync_worker(pool: DbPool) {
                 match db::jobs::has_job_for_period(&pool, &rfc, &period_from, &period_to).await {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::error!(rfc = %rfc, "Monthly worker: period check failed: {e}");
+                        tracing::error!(rfc = %rfc, "Daily worker: period check failed: {e}");
                         continue;
                     }
                 };
@@ -232,7 +251,7 @@ async fn monthly_sync_worker(pool: DbPool) {
             let clave = match services::crypto::decrypt(&key, &clave_enc) {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::error!(rfc = %rfc, "Monthly worker: decrypt failed: {e}");
+                    tracing::error!(rfc = %rfc, "Daily worker: decrypt failed: {e}");
                     continue;
                 }
             };
@@ -247,13 +266,14 @@ async fn monthly_sync_worker(pool: DbPool) {
             let auth_enc = match services::crypto::encrypt(&key, &auth_json) {
                 Ok(e) => e,
                 Err(e) => {
-                    tracing::error!(rfc = %rfc, "Monthly worker: encrypt failed: {e}");
+                    tracing::error!(rfc = %rfc, "Daily worker: encrypt failed: {e}");
                     continue;
                 }
             };
 
             match db::jobs::insert_queued(
                 &pool,
+                "auto_daily",
                 &rfc,
                 "ciec",
                 &auth_enc,
@@ -267,17 +287,17 @@ async fn monthly_sync_worker(pool: DbPool) {
                     tracing::info!(
                         rfc = %rfc,
                         job_id = %job_id,
-                        month = %format!("{lc_year:04}-{lc_month:02}"),
-                        "Monthly auto-sync queued"
+                        date = %format!("{yy:04}-{ym:02}-{yd:02}"),
+                        "Daily auto-sync queued"
                     );
                 }
                 Err(e) => {
-                    tracing::error!(rfc = %rfc, "Monthly worker: insert_queued failed: {e}");
+                    tracing::error!(rfc = %rfc, "Daily worker: insert_queued failed: {e}");
                 }
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(MONTHLY_POLL_SECS)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(DAILY_POLL_SECS)).await;
     }
 }
 
@@ -290,6 +310,7 @@ async fn run_worker_chunk(
     cfg: Arc<Config>,
     s3: Arc<S3Client>,
     job_id: String,
+    job_type: String,
     job_rfc: String,
     auth_payload: serde_json::Value,
     _auth_type: String,
@@ -531,23 +552,25 @@ async fn run_worker_chunk(
         let _ = db::jobs::complete(&pool, &job_id, &period_to, found).await;
         tracing::info!(job_id = %job_id, found = found, "Job completed");
 
-        // Send completion email if SendGrid is configured
-        if let Some(ref api_key) = cfg.sendgrid_api_key {
-            if let Ok(Some(email)) = crate::db::users::get_email_by_rfc(&pool, &job_rfc).await {
-                if let Err(e) = crate::services::email::send_sync_complete(
-                    api_key,
-                    &cfg.sendgrid_from,
-                    &email,
-                    &job_rfc,
-                    found,
-                    &period_from,
-                    &period_to,
-                )
-                .await
-                {
-                    tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}");
-                } else {
-                    tracing::info!(job_id = %job_id, "Sent completion email to {email}");
+        // Send completion email only for manual jobs (not auto_daily background syncs)
+        if job_type != "auto_daily" {
+            if let Some(ref api_key) = cfg.sendgrid_api_key {
+                if let Ok(Some(email)) = crate::db::users::get_email_by_rfc(&pool, &job_rfc).await {
+                    if let Err(e) = crate::services::email::send_sync_complete(
+                        api_key,
+                        &cfg.sendgrid_from,
+                        &email,
+                        &job_rfc,
+                        found,
+                        &period_from,
+                        &period_to,
+                    )
+                    .await
+                    {
+                        tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}");
+                    } else {
+                        tracing::info!(job_id = %job_id, "Sent completion email to {email}");
+                    }
                 }
             }
         }
@@ -608,7 +631,7 @@ async fn main() -> std::io::Result<()> {
         tokio::spawn(etl::etl_worker(etl_pool, etl_cfg, etl_s3));
     }
     {
-        tokio::spawn(monthly_sync_worker(pool.clone()));
+        tokio::spawn(daily_sync_worker(pool.clone()));
     }
 
     // ── HTTP server ─────────────────────────────────────────────────────────

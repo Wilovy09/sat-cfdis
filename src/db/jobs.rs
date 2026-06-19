@@ -312,8 +312,10 @@ pub async fn set_running(pool: &PgPool, job_id: &str) -> Result<(), sqlx::Error>
 }
 
 /// Insert a new job with status 'queued' (will be picked up by the background worker).
+/// `job_type`: `"list"` for manual jobs, `"auto_daily"` for automatic daily sync.
 pub async fn insert_queued(
     pool: &PgPool,
+    job_type: &str,
     rfc: &str,
     auth_type: &str,
     auth_enc: &str,
@@ -327,9 +329,10 @@ pub async fn insert_queued(
         r#"INSERT INTO pulso.sync_jobs
            (id, job_type, rfc, auth_type, auth_enc, dl_type,
             period_from, period_to, found, status, created_at, updated_at)
-           VALUES ($1, 'list', $2, $3, $4, $5, $6, $7, 0, 'queued', $8, $9)"#,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'queued', $9, $10)"#,
     )
     .bind(&id)
+    .bind(job_type)
     .bind(rfc)
     .bind(auth_type)
     .bind(auth_enc)

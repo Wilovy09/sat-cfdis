@@ -215,6 +215,7 @@ pub async fn complete_profile(
     let (period_from, period_to) = initial_sync_period();
     let sync_job_id = match crate::db::jobs::insert_queued(
         &pool,
+        "list",
         &rfc,
         "ciec",
         &auth_enc,
@@ -405,6 +406,7 @@ pub async fn trigger_sync(
     let (period_from, period_to) = initial_sync_period();
     let job_id = match crate::db::jobs::insert_queued(
         &pool,
+        "list",
         &rfc,
         "ciec",
         &auth_enc,
@@ -633,6 +635,7 @@ pub async fn add_rfc(
     let (period_from, period_to) = initial_sync_period();
     let sync_job_id = match crate::db::jobs::insert_queued(
         &pool,
+        "list",
         &rfc,
         "ciec",
         &auth_enc,
@@ -1094,7 +1097,7 @@ pub async fn admin_download(
 
     let dl_type = body.dl_type.as_deref().unwrap_or("ambos");
     let job_id = match crate::db::jobs::insert_queued(
-        &pool, &rfc, "ciec", &auth_enc, dl_type, &body.period_from, &body.period_to,
+        &pool, "list", &rfc, "ciec", &auth_enc, dl_type, &body.period_from, &body.period_to,
     ).await {
         Ok(id) => id,
         Err(e) => {
