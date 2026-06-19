@@ -914,6 +914,7 @@ pub async fn get_counterparty_individual(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Returns the last fully-closed month (i.e. never the current in-progress month).
 fn current_month() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -921,7 +922,11 @@ fn current_month() -> String {
         .unwrap_or(0);
     let days = secs / 86400;
     let (y, m, _) = days_to_ymd(days);
-    format!("{y:04}-{m:02}")
+    // Step back one month to get the last complete month
+    let total = y as i64 * 12 + m as i64 - 1 - 1;
+    let ly = total / 12;
+    let lm = total % 12 + 1;
+    format!("{ly:04}-{lm:02}")
 }
 
 fn default_from() -> String {
@@ -931,8 +936,8 @@ fn default_from() -> String {
         .unwrap_or(0);
     let days = secs / 86400;
     let (y, m, _) = days_to_ymd(days);
-    // 12 months back
-    let total = y as i64 * 12 + m as i64 - 1 - 11;
+    // 12 months back from the last complete month (current month - 13)
+    let total = y as i64 * 12 + m as i64 - 1 - 12;
     let fy = total / 12;
     let fm = total % 12 + 1;
     format!("{fy:04}-{fm:02}")
