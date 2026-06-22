@@ -35,6 +35,7 @@ pub struct PayrollResponse {
     pub by_deduccion_year: Vec<DeduccionYearRow>,
     pub by_department_year: Vec<DepartmentYearRow>,
     pub by_employee_year: Vec<EmployeeYearRow>,
+    pub has_payments_without_relacion: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,9 +79,19 @@ pub struct EmployeeRow {
     pub months_active: i64,
     pub first_payroll: String,
     pub last_payroll: String,
+    pub fecha_inicio_rel_laboral: Option<String>,
+    pub fecha_final_pago: Option<String>,
+    pub sdi_at_first: f64,
+    pub sdi_latest: f64,
     pub tipo_contrato: String,
     pub tipo_jornada: String,
     pub tipo_regimen: String,
+    // Compensación desglosada (últimos 3 meses completos, tipo_nomina=O)
+    pub clasificacion: String,
+    pub sueldo_mensual_ordinario: Option<f64>,
+    pub pago_mensual_asimilado: Option<f64>,
+    pub total_mensual_promedio: f64,
+    pub warning_flags: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -292,18 +303,51 @@ pub async fn get(
         })
         .collect();
 
-    // By employee (top 100 by total paid)
+    // By employee (top 100 by total paid) — latest dept/puesto/contrato via DISTINCT ON
     let emp_rows = sqlx::query(&format!(
         r#"
+        WITH latest_attrs AS (
+            SELECT DISTINCT ON (c.rfc_receptor)
+                c.rfc_receptor AS emp_rfc,
+                n.departamento,
+                n.puesto,
+                n.tipo_contrato,
+                n.tipo_jornada,
+                n.tipo_regimen,
+                n.salario_diario_integrado AS sdi_latest,
+                n.fecha_final_pago
+            FROM pulso.cfdi_nomina n
+            JOIN pulso.cfdis c ON c.uuid = n.uuid
+            WHERE c.rfc_emisor = $1
+              AND c.tipo_comprobante = 'N'
+              AND COALESCE(c.estado_sat,'') != 'cancelado'
+            ORDER BY c.rfc_receptor, c.fecha_emision DESC
+        ),
+        earliest_attrs AS (
+            SELECT DISTINCT ON (c.rfc_receptor)
+                c.rfc_receptor AS emp_rfc,
+                n.salario_diario_integrado AS sdi_at_first,
+                NULLIF(TRIM(COALESCE(n.fecha_inicio_rel_laboral, '')), '') AS fecha_inicio_rel_laboral
+            FROM pulso.cfdi_nomina n
+            JOIN pulso.cfdis c ON c.uuid = n.uuid
+            WHERE c.rfc_emisor = $1
+              AND c.tipo_comprobante = 'N'
+              AND COALESCE(c.estado_sat,'') != 'cancelado'
+            ORDER BY c.rfc_receptor, c.fecha_emision ASC
+        )
         SELECT
             c.rfc_receptor                              AS emp_rfc,
             MAX(c.nombre_receptor)                      AS emp_nombre,
             MAX(n.num_empleado)                         AS num_emp,
-            MAX(n.departamento)                         AS dpto,
-            MAX(n.puesto)                               AS puesto,
-            MAX(n.tipo_contrato) AS tipo_contrato,
-            MAX(n.tipo_jornada) AS tipo_jornada,
-            MAX(n.tipo_regimen) AS tipo_regimen,
+            la.departamento                             AS dpto,
+            la.puesto                                   AS puesto,
+            la.tipo_contrato,
+            la.tipo_jornada,
+            la.tipo_regimen,
+            COALESCE(la.sdi_latest, 0)::float8          AS sdi_latest,
+            la.fecha_final_pago,
+            COALESCE(ea.sdi_at_first, 0)::float8        AS sdi_at_first,
+            ea.fecha_inicio_rel_laboral,
             SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
             SUM(COALESCE(n.total_percepciones,0)::float8)       AS perc,
             SUM(COALESCE(n.total_deducciones,0)::float8)        AS ded,
@@ -314,13 +358,16 @@ pub async fn get(
             MAX(n.fecha_pago)                           AS last_pay
         FROM pulso.cfdi_nomina n
         JOIN pulso.cfdis c ON c.uuid = n.uuid
+        JOIN latest_attrs la ON la.emp_rfc = c.rfc_receptor
+        LEFT JOIN earliest_attrs ea ON ea.emp_rfc = c.rfc_receptor
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
           AND COALESCE(c.estado_sat,'') != 'cancelado'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
 {NOMINA_EXCL_C}
-        GROUP BY c.rfc_receptor
+        GROUP BY c.rfc_receptor, la.departamento, la.puesto, la.tipo_contrato, la.tipo_jornada, la.tipo_regimen,
+                 la.sdi_latest, la.fecha_final_pago, ea.sdi_at_first, ea.fecha_inicio_rel_laboral
         ORDER BY pagado DESC
         LIMIT 100
     "#,
@@ -333,25 +380,178 @@ pub async fn get(
     .fetch_all(pool)
     .await?;
 
+    // Percepciones desglosadas — últimos 3 meses completos, tipo_nomina='O'
+    // Usado para clasificación e sueldos promedio por clave SAT (001 = ordinario, 046 = asimilado)
+    let perc_3m_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            c.rfc_receptor                                                              AS emp_rfc,
+            SUM(CASE WHEN p.tipo_percepcion = '001'
+                     THEN COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8
+                     ELSE 0.0 END)                                                      AS total_001,
+            SUM(CASE WHEN p.tipo_percepcion = '046'
+                     THEN COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8
+                     ELSE 0.0 END)                                                      AS total_046,
+            SUM(COALESCE(n.num_dias_pagados,0)::float8)                                 AS total_dias,
+            COUNT(DISTINCT (c.year * 100 + c.month))                                    AS meses_con_dato,
+            BOOL_OR(p.tipo_percepcion = '001')                                          AS has_001,
+            BOOL_OR(p.tipo_percepcion = '046')                                          AS has_046
+        FROM pulso.cfdi_nomina_percepciones p
+        JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND n.tipo_nomina = 'O'
+          AND (c.year * 100 + c.month) >= (
+              EXTRACT(YEAR FROM DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months')::int * 100 +
+              EXTRACT(MONTH FROM DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months')::int
+          )
+          AND (c.year * 100 + c.month) < (
+              EXTRACT(YEAR FROM DATE_TRUNC('month', CURRENT_DATE))::int * 100 +
+              EXTRACT(MONTH FROM DATE_TRUNC('month', CURRENT_DATE))::int
+          )
+{NOMINA_EXCL_C}
+        GROUP BY c.rfc_receptor
+        "#,
+    ))
+    .bind(rfc)
+    .fetch_all(pool)
+    .await?;
+
+    struct Perc3m {
+        total_001: f64,
+        total_046: f64,
+        total_dias: f64,
+        meses_con_dato: i64,
+        has_001: bool,
+        has_046: bool,
+    }
+    let perc_3m_map: std::collections::HashMap<String, Perc3m> = perc_3m_rows
+        .iter()
+        .map(|r| {
+            let k: String = r.try_get("emp_rfc").unwrap_or_default();
+            let v = Perc3m {
+                total_001: r.try_get("total_001").unwrap_or(0.0),
+                total_046: r.try_get("total_046").unwrap_or(0.0),
+                total_dias: r.try_get("total_dias").unwrap_or(0.0),
+                meses_con_dato: r.try_get("meses_con_dato").unwrap_or(0),
+                has_001: r.try_get("has_001").unwrap_or(false),
+                has_046: r.try_get("has_046").unwrap_or(false),
+            };
+            (k, v)
+        })
+        .collect();
+
     let by_employee: Vec<EmployeeRow> = emp_rows
         .iter()
-        .map(|r| EmployeeRow {
-            rfc: r.try_get("emp_rfc").unwrap_or_default(),
-            nombre: r.try_get("emp_nombre").unwrap_or_default(),
-            num_empleado: r.try_get("num_emp").unwrap_or_default(),
-            departamento: r.try_get("dpto").unwrap_or_default(),
-            puesto: r.try_get("puesto").unwrap_or_default(),
-            total_pagado_mxn: r.try_get("pagado").unwrap_or(0.0),
-            total_percepciones: r.try_get("perc").unwrap_or(0.0),
-            total_deducciones: r.try_get("ded").unwrap_or(0.0),
-            avg_sdi: r.try_get("avg_sdi").unwrap_or(0.0),
-            payrolls_count: r.try_get("payrolls").unwrap_or(0),
-            months_active: r.try_get("months_active").unwrap_or(0),
-            first_payroll: r.try_get("first_pay").unwrap_or_default(),
-            last_payroll: r.try_get("last_pay").unwrap_or_default(),
-            tipo_contrato: r.try_get("tipo_contrato").unwrap_or_default(),
-            tipo_jornada: r.try_get("tipo_jornada").unwrap_or_default(),
-            tipo_regimen: r.try_get("tipo_regimen").unwrap_or_default(),
+        .map(|r| {
+            let emp_rfc: String = r.try_get("emp_rfc").unwrap_or_default();
+            let sdi_latest: f64 = r.try_get("sdi_latest").unwrap_or(0.0);
+            let tipo_contrato: String = r.try_get("tipo_contrato").unwrap_or_default();
+            let last_pay: String = r.try_get("last_pay").unwrap_or_default();
+
+            let (clasificacion, sueldo_mensual_ordinario, pago_mensual_asimilado,
+                 total_mensual_promedio, warning_flags) = match perc_3m_map.get(&emp_rfc) {
+                Some(p) => {
+                    let mes_equiv = if p.total_dias > 0.0 { p.total_dias / 30.0 } else { 1.0 };
+                    let mes_equiv = mes_equiv.max(0.1);
+
+                    let smo = if p.has_001 && p.total_001 > 0.0 {
+                        Some(p.total_001 / mes_equiv)
+                    } else {
+                        None
+                    };
+                    let pma = if p.has_046 && p.total_046 > 0.0 {
+                        Some(p.total_046 / mes_equiv)
+                    } else {
+                        None
+                    };
+                    let tmp = smo.unwrap_or(0.0) + pma.unwrap_or(0.0);
+
+                    let clas = if p.has_001 && p.has_046 {
+                        "Mixto / revisar"
+                    } else if p.has_001 {
+                        "Empleado asalariado"
+                    } else if p.has_046 {
+                        "Asimilado a salarios"
+                    } else {
+                        "No determinado"
+                    };
+
+                    let mut w: Vec<String> = Vec::new();
+                    if p.meses_con_dato < 3 {
+                        w.push("menos_3_meses".to_string());
+                    }
+                    if p.has_001 && p.has_046 {
+                        w.push("mixto".to_string());
+                    }
+                    if tmp > 0.0 && sdi_latest > 0.0 {
+                        let sdi_mens = sdi_latest * 30.0;
+                        if (sdi_mens - tmp).abs() / tmp > 0.20 {
+                            w.push("sdi_difiere_20pct".to_string());
+                        }
+                    }
+                    // Último pago fuera del rango de los 3 meses analizados
+                    let last_pay_ym: i64 = last_pay.get(..7).and_then(|s| {
+                        let yr: i64 = s[..4].parse().ok()?;
+                        let mo: i64 = s[5..7].parse().ok()?;
+                        Some(yr * 100 + mo)
+                    }).unwrap_or(0);
+                    let cutoff_ym: i64 = {
+                        // first month of the 3-month window: current_month - 3
+                        // We approximate with to_y/to_m from the request scope
+                        to_y * 100 + to_m
+                    };
+                    if last_pay_ym > 0 && last_pay_ym < cutoff_ym - 1 {
+                        w.push("ultimo_pago_antiguo".to_string());
+                    }
+
+                    (clas.to_string(), smo, pma, tmp, w)
+                }
+                None => {
+                    // No percepcion rows in 3-month window — sin desglose o inactivo
+                    let mut w = vec!["sin_desglose".to_string()];
+                    if tipo_contrato == "09" {
+                        w.push("sin_relacion_laboral".to_string());
+                    }
+                    ("No determinado".to_string(), None, None, 0.0, w)
+                }
+            };
+
+            // sin_relacion_laboral para empleados con desglose también
+            let mut warning_flags = warning_flags;
+            if tipo_contrato == "09" && !warning_flags.contains(&"sin_relacion_laboral".to_string()) {
+                warning_flags.push("sin_relacion_laboral".to_string());
+            }
+
+            EmployeeRow {
+                rfc: emp_rfc,
+                nombre: r.try_get("emp_nombre").unwrap_or_default(),
+                num_empleado: r.try_get("num_emp").unwrap_or_default(),
+                departamento: r.try_get("dpto").unwrap_or_default(),
+                puesto: r.try_get("puesto").unwrap_or_default(),
+                total_pagado_mxn: r.try_get("pagado").unwrap_or(0.0),
+                total_percepciones: r.try_get("perc").unwrap_or(0.0),
+                total_deducciones: r.try_get("ded").unwrap_or(0.0),
+                avg_sdi: r.try_get("avg_sdi").unwrap_or(0.0),
+                payrolls_count: r.try_get("payrolls").unwrap_or(0),
+                months_active: r.try_get("months_active").unwrap_or(0),
+                first_payroll: r.try_get("first_pay").unwrap_or_default(),
+                last_payroll: r.try_get("last_pay").unwrap_or_default(),
+                fecha_inicio_rel_laboral: r.try_get("fecha_inicio_rel_laboral").ok(),
+                fecha_final_pago: r.try_get("fecha_final_pago").ok(),
+                sdi_at_first: r.try_get("sdi_at_first").unwrap_or(0.0),
+                sdi_latest: r.try_get("sdi_latest").unwrap_or(0.0),
+                tipo_contrato,
+                tipo_jornada: r.try_get("tipo_jornada").unwrap_or_default(),
+                tipo_regimen: r.try_get("tipo_regimen").unwrap_or_default(),
+                clasificacion,
+                sueldo_mensual_ordinario,
+                pago_mensual_asimilado,
+                total_mensual_promedio,
+                warning_flags,
+            }
         })
         .collect();
 
@@ -522,7 +722,7 @@ pub async fn get(
         })
         .collect();
 
-    // By month ordinaria (tipo_nomina = 'O' only)
+    // By month ordinaria (tipo_nomina O + E — extraordinary payrolls included to match full payroll spend)
     let month_ord_rows = sqlx::query(&format!(
         r#"
         SELECT c.year, c.month,
@@ -537,7 +737,7 @@ pub async fn get(
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
           AND COALESCE(c.estado_sat,'') != 'cancelado'
-          AND n.tipo_nomina = 'O'
+          AND n.tipo_nomina IN ('O', 'E')
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
 {NOMINA_EXCL_C}
@@ -859,6 +1059,27 @@ pub async fn get(
         })
         .collect();
 
+    // Detect CFDIs with missing/invalid FechaInicioRelLaboral (payments without labor relationship)
+    let relacion_row = sqlx::query(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM pulso.cfdi_nomina n
+            JOIN pulso.cfdis c ON c.uuid = n.uuid
+            WHERE c.rfc_emisor = $1
+              AND c.tipo_comprobante = 'N'
+              AND COALESCE(c.estado_sat,'') != 'cancelado'
+              AND (n.fecha_inicio_rel_laboral IS NULL
+                   OR TRIM(n.fecha_inicio_rel_laboral) = ''
+                   OR n.fecha_inicio_rel_laboral = '0000-00-00')
+        ) AS has_without
+        "#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await?;
+    let has_payments_without_relacion: bool =
+        relacion_row.try_get("has_without").unwrap_or(false);
+
     Ok(PayrollResponse {
         summary,
         by_month,
@@ -873,6 +1094,7 @@ pub async fn get(
         by_deduccion_year,
         by_department_year,
         by_employee_year,
+        has_payments_without_relacion,
     })
 }
 
