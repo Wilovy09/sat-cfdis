@@ -251,6 +251,16 @@ pub async fn get_user_rfcs_with_role(
 }
 
 /// True if user has the 'admin' role via public.user_roles → catalogs.roles.
+pub async fn count_user_rfcs(pool: &PgPool, user_id: &str) -> Result<i64, sqlx::Error> {
+    let uid = parse_uuid(user_id)?;
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pulso.users WHERE user_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(uid)
+    .fetch_one(pool)
+    .await
+}
+
 pub async fn is_user_admin(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {
     let uid = parse_uuid(user_id)?;
     let row: Option<(i32,)> = sqlx::query_as(

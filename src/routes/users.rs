@@ -605,6 +605,26 @@ pub async fn add_rfc(
         });
     }
 
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
+    if !is_admin {
+        let rfc_count = match crate::db::users::count_user_rfcs(&pool, &user_id).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(user_id = %user_id, "Error counting RFCs: {e}");
+                return HttpResponse::InternalServerError().json(ErrorBody {
+                    error: "Error al verificar RFCs existentes".to_string(),
+                });
+            }
+        };
+        if rfc_count >= 1 {
+            return HttpResponse::Conflict().json(ErrorBody {
+                error: "Tu cuenta solo puede tener un RFC. Contacta a soporte si necesitas acceso a más.".to_string(),
+            });
+        }
+    }
+
     let key = crypto::load_key();
 
     let clave_enc = match crypto::encrypt(&key, &body.clave) {
