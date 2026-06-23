@@ -31,6 +31,7 @@ pub struct Config {
     pub google_client_secret: String,
     pub google_redirect_uri: String,
     pub jwt_secret: String,
+    pub app_base_url: String,
 }
 
 impl Config {
@@ -81,6 +82,8 @@ impl Config {
                 .trim()
                 .to_string(),
             jwt_secret: env::var("JWT_SECRET").unwrap_or_else(|_| "jwtsecret".to_string()),
+            app_base_url: env::var("APP_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:5173".to_string()),
         }
     }
 }

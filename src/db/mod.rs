@@ -1,5 +1,6 @@
 pub mod cfdis;
 pub mod jobs;
+pub mod subscriptions;
 pub mod users;
 
 use sqlx::PgPool;

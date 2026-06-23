@@ -52,12 +52,25 @@ async fn check_rfc_access(
         bearer_token_analytics(req).ok_or_else(|| AppError::unauthorized("Token requerido"))?;
     let user_id =
         jwt_user_id_analytics(&token).ok_or_else(|| AppError::unauthorized("Token inválido"))?;
-    let has_access = crate::db::users::user_has_rfc_or_admin(pool, &user_id, rfc)
+
+    let rfc_access = crate::db::users::user_has_rfc_or_admin(pool, &user_id, rfc)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
-    if !has_access {
+    if !rfc_access {
         return Err(AppError::forbidden("Acceso denegado"));
     }
+
+    // Non-admins must have an active pulso subscription.
+    let is_admin = crate::db::users::is_user_admin(pool, &user_id)
+        .await
+        .unwrap_or(false);
+    if !is_admin {
+        let subscribed = crate::routes::billing::has_access(pool, &user_id).await;
+        if !subscribed {
+            return Err(AppError::payment_required("Suscripción requerida"));
+        }
+    }
+
     Ok(())
 }
 

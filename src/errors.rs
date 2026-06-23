@@ -45,6 +45,13 @@ impl AppError {
             status: 403,
         }
     }
+
+    pub fn payment_required(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+            status: 402,
+        }
+    }
 }
 
 impl fmt::Display for AppError {
@@ -59,6 +66,7 @@ impl ResponseError for AppError {
         match self.status {
             400 => HttpResponse::BadRequest().json(body),
             401 => HttpResponse::Unauthorized().json(body),
+            402 => HttpResponse::PaymentRequired().json(body),
             403 => HttpResponse::Forbidden().json(body),
             404 => HttpResponse::NotFound().json(body),
             _ => HttpResponse::InternalServerError().json(body),

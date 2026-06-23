@@ -21,8 +21,8 @@ use utoipa_scalar::{Scalar, Servable};
 use config::Config;
 use db::DbPool;
 use routes::{
-    analytics as analytics_routes, auth as auth_routes, invoices, queue as queue_routes,
-    users as users_routes,
+    analytics as analytics_routes, auth as auth_routes, billing as billing_routes, invoices,
+    queue as queue_routes, users as users_routes,
 };
 use services::etl;
 use state::CaptchaMap;
@@ -656,6 +656,11 @@ async fn main() -> std::io::Result<()> {
             .service(Files::new("/static", "static").prefer_utf8(true))
             // Health check
             .route("/health", web::get().to(invoices::health))
+            // Billing
+            .route(
+                "/api/v1/billing/status",
+                web::get().to(billing_routes::get_status),
+            )
             // Auth
             .route(
                 "/api/v1/auth/register",
