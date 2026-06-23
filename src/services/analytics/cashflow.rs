@@ -187,6 +187,37 @@ pub async fn get(
     .await?;
     let ppd_paid: f64 = ppd_paid_row.try_get("paid").unwrap_or(0.0);
 
+    // Average collection days: AVG(fecha_pago - fecha_emision) for PPD invoices with payments
+    let avg_days_row = sqlx::query(&format!(
+        r#"
+        SELECT COALESCE(AVG(
+            LEFT(p.fecha_pago, 10)::date - LEFT(inv.fecha_emision, 10)::date
+        )::float8, 0.0) AS avg_days
+        FROM pulso.cfdi_payment_docs pd
+        JOIN pulso.cfdi_payments p ON p.payment_uuid = pd.payment_uuid
+                                   AND p.pago_num    = pd.pago_num
+        JOIN pulso.cfdis inv ON inv.uuid = pd.invoice_uuid
+        WHERE inv.{owner_col} = $1
+          AND inv.{dl_filter}
+          AND inv.tipo_comprobante = 'I'
+          AND inv.metodo_pago = 'PPD'
+          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
+          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+          AND p.fecha_pago IS NOT NULL
+          AND inv.fecha_emision IS NOT NULL
+          AND LEFT(p.fecha_pago, 10)::date >= LEFT(inv.fecha_emision, 10)::date
+        "#
+    ))
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_one(pool)
+    .await?;
+    let avg_collection_days: f64 = avg_days_row.try_get("avg_days").unwrap_or(0.0);
+
     // Build timeline
     let mut all_yms: std::collections::BTreeSet<Ym> = Default::default();
     for &ym in ingreso_map.keys() {
@@ -262,7 +293,7 @@ pub async fn get(
     Ok(CashflowResponse {
         timeline,
         cumulative_position: cumulative,
-        avg_collection_days: 0.0,
+        avg_collection_days,
         pue_total_mxn: pue_total,
         ppd_invoiced_mxn: ppd_inv,
         ppd_paid_mxn: ppd_paid,
