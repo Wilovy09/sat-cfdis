@@ -26,6 +26,7 @@ pub struct PayrollResponse {
     pub by_month: Vec<PayrollMonth>,
     pub by_employee: Vec<EmployeeRow>,
     pub by_tipo_nomina: Vec<TipoNominaRow>,
+    pub indemnizaciones: Vec<IndemnizacionRow>,
     pub by_deduccion: Vec<DeduccionRow>,
     pub by_percepcion: Vec<PercepcionRow>,
     pub headcount_by_month: Vec<HeadcountMonth>,
@@ -101,6 +102,17 @@ pub struct TipoNominaRow {
     pub total_mxn: f64,
     pub count: i64,
     pub pct_of_total: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IndemnizacionRow {
+    pub emp_rfc: String,
+    pub nombre: String,
+    pub puesto: String,
+    pub year: i64,
+    pub month: i64,
+    pub total_percepciones: f64,
+    pub tipo_regimen: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -610,6 +622,56 @@ pub async fn get(
         })
         .collect();
 
+    // NRS03: individual indemnization records filtered by tipo_regimen LIKE '13%'
+    let indem_rows = sqlx::query(&format!(
+        r#"
+        SELECT
+            c.rfc_receptor                                                               AS emp_rfc,
+            COALESCE(NULLIF(TRIM(c.nombre_receptor), ''), c.rfc_receptor)                AS nombre,
+            COALESCE(NULLIF(TRIM(n.puesto), ''), '')                                     AS puesto,
+            EXTRACT(YEAR FROM COALESCE(
+              NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
+              c.fecha_emision
+            ))::bigint                                                                   AS year,
+            EXTRACT(MONTH FROM COALESCE(
+              NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
+              c.fecha_emision
+            ))::bigint                                                                   AS month,
+            COALESCE(n.total_percepciones, 0)::float8                                   AS total_perc,
+            COALESCE(n.tipo_regimen, '')                                                 AS tipo_regimen
+        FROM pulso.cfdi_nomina n
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND TRIM(COALESCE(n.tipo_regimen,'')) LIKE '13%'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+{NOMINA_EXCL_C}
+        ORDER BY year, month, total_perc DESC
+    "#,
+    ))
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    let indemnizaciones: Vec<IndemnizacionRow> = indem_rows
+        .iter()
+        .map(|r| IndemnizacionRow {
+            emp_rfc: r.try_get("emp_rfc").unwrap_or_default(),
+            nombre: r.try_get("nombre").unwrap_or_default(),
+            puesto: r.try_get("puesto").unwrap_or_default(),
+            year: r.try_get("year").unwrap_or(0),
+            month: r.try_get("month").unwrap_or(0),
+            total_percepciones: r.try_get("total_perc").unwrap_or(0.0),
+            tipo_regimen: r.try_get("tipo_regimen").unwrap_or_default(),
+        })
+        .collect();
+
     // By deduccion type
     let ded_rows = sqlx::query(&format!(
         r#"
@@ -1108,6 +1170,7 @@ pub async fn get(
         by_month,
         by_employee,
         by_tipo_nomina,
+        indemnizaciones,
         by_deduccion,
         by_percepcion,
         headcount_by_month,
