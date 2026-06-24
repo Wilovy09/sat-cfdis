@@ -1,5 +1,6 @@
 use crate::services::xml_parser::{
-    ParsedCfdi, ParsedConcept, ParsedNomina, ParsedNominaDeduccion, ParsedNominaPercepcion,
+    ParsedCfdi, ParsedConcept, ParsedNomina, ParsedNominaDeduccion, ParsedNominaOtroPago,
+    ParsedNominaPercepcion,
     ParsedPayment, ParsedPaymentDoc, ParsedRelacionado, ParsedTax,
 };
 use sqlx::PgPool;
@@ -263,6 +264,9 @@ pub async fn insert_nomina(pool: &PgPool, uuid: &str, n: &ParsedNomina) -> Resul
     for d in &n.deducciones {
         insert_nomina_deduccion(pool, uuid, d).await?;
     }
+    for op in &n.otros_pagos {
+        insert_nomina_otro_pago(pool, uuid, op).await?;
+    }
     Ok(())
 }
 
@@ -306,6 +310,28 @@ async fn insert_nomina_deduccion(
     .bind(&d.clave)
     .bind(&d.concepto)
     .bind(d.importe)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn insert_nomina_otro_pago(
+    pool: &PgPool,
+    uuid: &str,
+    op: &ParsedNominaOtroPago,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO pulso.cfdi_nomina_otros_pagos
+            (uuid, tipo_otro_pago, clave, concepto, importe)
+        VALUES ($1,$2,$3,$4,$5)
+        "#,
+    )
+    .bind(uuid)
+    .bind(&op.tipo_otro_pago)
+    .bind(&op.clave)
+    .bind(&op.concepto)
+    .bind(op.importe)
     .execute(pool)
     .await?;
     Ok(())
@@ -472,6 +498,7 @@ pub async fn reset_for_reprocessing(
         del_rel     AS (DELETE FROM pulso.cfdi_relacionados         WHERE source_uuid  IN (SELECT uuid FROM targets)),
         del_nomperc AS (DELETE FROM pulso.cfdi_nomina_percepciones  WHERE uuid         IN (SELECT uuid FROM targets)),
         del_nomded  AS (DELETE FROM pulso.cfdi_nomina_deducciones   WHERE uuid         IN (SELECT uuid FROM targets)),
+        del_nomop   AS (DELETE FROM pulso.cfdi_nomina_otros_pagos   WHERE uuid         IN (SELECT uuid FROM targets)),
         del_nom     AS (DELETE FROM pulso.cfdi_nomina               WHERE uuid         IN (SELECT uuid FROM targets))
         UPDATE pulso.cfdis SET xml_available = 0
         WHERE uuid IN (SELECT uuid FROM targets)
