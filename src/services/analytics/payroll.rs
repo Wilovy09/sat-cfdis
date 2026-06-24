@@ -281,11 +281,11 @@ pub async fn get(
         SELECT
                EXTRACT(YEAR FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision
+                 c.fecha_emision::date
                ))::bigint AS year,
                EXTRACT(MONTH FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision
+                 c.fecha_emision::date
                ))::bigint AS month,
                SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
                SUM(COALESCE(n.total_percepciones,0)::float8)  AS perc,
@@ -640,11 +640,11 @@ pub async fn get(
             COALESCE(NULLIF(TRIM(n.puesto), ''), '')                                     AS puesto,
             EXTRACT(YEAR FROM COALESCE(
               NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-              c.fecha_emision
+              c.fecha_emision::date
             ))::bigint                                                                   AS year,
             EXTRACT(MONTH FROM COALESCE(
               NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-              c.fecha_emision
+              c.fecha_emision::date
             ))::bigint                                                                   AS month,
             COALESCE(n.total_percepciones, 0)::float8                                   AS total_perc,
             COALESCE(n.tipo_regimen, '')                                                 AS tipo_regimen
@@ -768,7 +768,7 @@ pub async fn get(
         SELECT
                EXTRACT(YEAR FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision
+                 c.fecha_emision::date
                ))::bigint AS year,
                SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
                SUM(COALESCE(n.total_percepciones,0)::float8) AS perc,
@@ -777,7 +777,7 @@ pub async fn get(
                COUNT(DISTINCT c.rfc_receptor) AS emp_count,
                COUNT(DISTINCT EXTRACT(MONTH FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision
+                 c.fecha_emision::date
                ))::int) AS months_count
         FROM pulso.cfdi_nomina n
         JOIN pulso.cfdis c ON c.uuid = n.uuid
@@ -814,11 +814,11 @@ pub async fn get(
         SELECT
                EXTRACT(YEAR FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision
+                 c.fecha_emision::date
                ))::bigint AS year,
                EXTRACT(MONTH FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision
+                 c.fecha_emision::date
                ))::bigint AS month,
                SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
                SUM(COALESCE(n.total_percepciones,0)::float8)  AS perc,
