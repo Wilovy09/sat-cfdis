@@ -257,7 +257,15 @@ pub async fn get(
     // By month
     let month_rows = sqlx::query(&format!(
         r#"
-        SELECT c.year, c.month,
+        SELECT
+               EXTRACT(YEAR FROM COALESCE(
+                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
+                 c.fecha_emision
+               ))::bigint AS year,
+               EXTRACT(MONTH FROM COALESCE(
+                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
+                 c.fecha_emision
+               ))::bigint AS month,
                SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
                SUM(COALESCE(n.total_percepciones,0)::float8)  AS perc,
                SUM(COALESCE(n.total_deducciones,0)::float8)   AS ded,
@@ -272,8 +280,8 @@ pub async fn get(
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
 {NOMINA_EXCL_C}
-        GROUP BY c.year, c.month
-        ORDER BY c.year, c.month
+        GROUP BY 1, 2
+        ORDER BY 1, 2
     "#,
     ))
     .bind(rfc)
@@ -686,13 +694,20 @@ pub async fn get(
     // By year
     let year_rows = sqlx::query(&format!(
         r#"
-        SELECT c.year,
+        SELECT
+               EXTRACT(YEAR FROM COALESCE(
+                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
+                 c.fecha_emision
+               ))::bigint AS year,
                SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
                SUM(COALESCE(n.total_percepciones,0)::float8) AS perc,
                SUM(COALESCE(n.total_deducciones,0)::float8) AS ded,
                SUM(COALESCE(n.total_otros_pagos,0)::float8) AS otros,
                COUNT(DISTINCT c.rfc_receptor) AS emp_count,
-               COUNT(DISTINCT c.month) AS months_count
+               COUNT(DISTINCT EXTRACT(MONTH FROM COALESCE(
+                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
+                 c.fecha_emision
+               ))::int) AS months_count
         FROM pulso.cfdi_nomina n
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
@@ -701,8 +716,8 @@ pub async fn get(
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
 {NOMINA_EXCL_C}
-        GROUP BY c.year
-        ORDER BY c.year
+        GROUP BY 1
+        ORDER BY 1
     "#,
     ))
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
@@ -725,7 +740,15 @@ pub async fn get(
     // By month ordinaria (tipo_nomina O + E — extraordinary payrolls included to match full payroll spend)
     let month_ord_rows = sqlx::query(&format!(
         r#"
-        SELECT c.year, c.month,
+        SELECT
+               EXTRACT(YEAR FROM COALESCE(
+                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
+                 c.fecha_emision
+               ))::bigint AS year,
+               EXTRACT(MONTH FROM COALESCE(
+                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
+                 c.fecha_emision
+               ))::bigint AS month,
                SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
                SUM(COALESCE(n.total_percepciones,0)::float8)  AS perc,
                SUM(COALESCE(n.total_deducciones,0)::float8)   AS ded,
@@ -741,8 +764,8 @@ pub async fn get(
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
 {NOMINA_EXCL_C}
-        GROUP BY c.year, c.month
-        ORDER BY c.year, c.month
+        GROUP BY 1, 2
+        ORDER BY 1, 2
     "#,
     ))
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
