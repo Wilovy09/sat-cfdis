@@ -42,14 +42,18 @@ fn jwt_sub(token: &str) -> Option<String> {
 }
 
 /// After a successful Adquiere auth response, enrich the JSON body with
-/// `pulso_complete_profile` queried from our local DB.
+/// `pulso_complete_profile` and `is_admin` queried from our local DB.
 async fn enrich_with_profile(pool: &DbPool, mut body: serde_json::Value) -> serde_json::Value {
     if let Some(token) = body.get("access_token").and_then(|t| t.as_str()) {
         if let Some(user_id) = jwt_sub(token) {
             let complete = crate::db::users::get_profile_complete(pool, &user_id)
                 .await
                 .unwrap_or(false);
+            let is_admin = crate::db::users::is_user_admin(pool, &user_id)
+                .await
+                .unwrap_or(false);
             body["pulso_complete_profile"] = serde_json::Value::Bool(complete);
+            body["is_admin"] = serde_json::Value::Bool(is_admin);
         }
     }
     body
@@ -217,11 +221,12 @@ struct JwtClaims {
     id: String,
     email: String,
     name: String,
+    is_admin: bool,
     iat: i64,
     exp: i64,
 }
 
-fn make_jwt(secret: &str, id: &str, email: &str, name: &str) -> String {
+fn make_jwt(secret: &str, id: &str, email: &str, name: &str, is_admin: bool) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -230,6 +235,7 @@ fn make_jwt(secret: &str, id: &str, email: &str, name: &str) -> String {
         id: id.to_string(),
         email: email.to_string(),
         name: name.to_string(),
+        is_admin,
         iat: now,
         exp: now + 3600,
     };
@@ -369,15 +375,19 @@ pub async fn google_login(
         tracing::warn!("Could not set google_id for {user_id}: {e}");
     }
 
-    let jwt = make_jwt(&cfg.jwt_secret, &user_id, &email, &name);
     let profile_complete = crate::db::users::get_profile_complete(&pool, &user_id)
         .await
         .unwrap_or(false);
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
+    let jwt = make_jwt(&cfg.jwt_secret, &user_id, &email, &name, is_admin);
 
     tracing::info!(user_id = %user_id, "Google login successful");
     HttpResponse::Ok().json(serde_json::json!({
         "access_token": jwt,
         "pulso_complete_profile": profile_complete,
+        "is_admin": is_admin,
     }))
 }
 
