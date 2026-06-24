@@ -120,6 +120,7 @@ pub struct ParsedNomina {
     pub total_exento: Option<f64>,
     pub percepciones: Vec<ParsedNominaPercepcion>,
     pub deducciones: Vec<ParsedNominaDeduccion>,
+    pub otros_pagos: Vec<ParsedNominaOtroPago>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -134,6 +135,14 @@ pub struct ParsedNominaPercepcion {
 #[derive(Debug, Default, Clone)]
 pub struct ParsedNominaDeduccion {
     pub tipo_deduccion: Option<String>,
+    pub clave: Option<String>,
+    pub concepto: Option<String>,
+    pub importe: Option<f64>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ParsedNominaOtroPago {
+    pub tipo_otro_pago: Option<String>,
     pub clave: Option<String>,
     pub concepto: Option<String>,
     pub importe: Option<f64>,
@@ -168,6 +177,7 @@ enum Ctx {
     NomDeducciones,
     #[allow(dead_code)]
     NomDeduccion,
+    NomOtrosPagos,
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +345,15 @@ pub fn parse(
                         let d = parse_nomina_deduccion(e);
                         current_nomina.deducciones.push(d);
                     }
+                    ("OtrosPagos", Ctx::Nomina) => {
+                        if !is_empty {
+                            ctx_stack.push(Ctx::NomOtrosPagos);
+                        }
+                    }
+                    ("OtroPago", Ctx::NomOtrosPagos) => {
+                        let op = parse_nomina_otro_pago(e);
+                        current_nomina.otros_pagos.push(op);
+                    }
                     _ => {}
                 }
             }
@@ -369,6 +388,7 @@ pub fn parse(
                                 | ("Pagos", Some(Ctx::Pagos))
                                 | ("Percepciones", Some(Ctx::NomPercepciones))
                                 | ("Deducciones", Some(Ctx::NomDeducciones))
+                                | ("OtrosPagos", Some(Ctx::NomOtrosPagos))
                                 | ("Receptor", Some(Ctx::NominaReceptor))
                         );
                         if should_pop {
@@ -738,6 +758,22 @@ fn parse_nomina_deduccion(e: &quick_xml::events::BytesStart<'_>) -> ParsedNomina
         }
     }
     d
+}
+
+fn parse_nomina_otro_pago(e: &quick_xml::events::BytesStart<'_>) -> ParsedNominaOtroPago {
+    let mut op = ParsedNominaOtroPago::default();
+    for attr in e.attributes().flatten() {
+        let key = local_name(attr.key.as_ref());
+        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        match key.as_str() {
+            "TipoOtroPago" => op.tipo_otro_pago = Some(val()),
+            "Clave" => op.clave = Some(val()),
+            "Concepto" => op.concepto = Some(val()),
+            "Importe" => op.importe = val().parse().ok(),
+            _ => {}
+        }
+    }
+    op
 }
 
 // ---------------------------------------------------------------------------
