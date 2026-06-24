@@ -34,6 +34,7 @@ pub struct PayrollResponse {
     pub by_month_ordinaria: Vec<PayrollMonth>,
     pub by_percepcion_year: Vec<PercepcionYearRow>,
     pub by_deduccion_year: Vec<DeduccionYearRow>,
+    pub by_otro_pago_year: Vec<OtroPagoYearRow>,
     pub by_department_year: Vec<DepartmentYearRow>,
     pub by_employee_year: Vec<EmployeeYearRow>,
     pub has_payments_without_relacion: bool,
@@ -163,6 +164,14 @@ pub struct PercepcionYearRow {
 #[derive(Debug, Serialize)]
 pub struct DeduccionYearRow {
     pub tipo_deduccion: String,
+    pub concepto: String,
+    pub year: i64,
+    pub total: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OtroPagoYearRow {
+    pub tipo_otro_pago: String,
     pub concepto: String,
     pub year: i64,
     pub total: f64,
@@ -919,6 +928,39 @@ pub async fn get(
         })
         .collect();
 
+    // By otro pago year
+    let op_year_rows = sqlx::query(&format!(
+        r#"
+        SELECT op.tipo_otro_pago,
+               MAX(op.concepto) AS concepto,
+               c.year,
+               SUM(COALESCE(op.importe,0)::float8) AS total
+        FROM pulso.cfdi_nomina_otros_pagos op
+        JOIN pulso.cfdi_nomina n ON n.uuid = op.uuid
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+{NOMINA_EXCL_C}
+        GROUP BY op.tipo_otro_pago, c.year
+        ORDER BY c.year, SUM(COALESCE(op.importe,0)::float8) DESC
+    "#,
+    ))
+    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    let by_otro_pago_year: Vec<OtroPagoYearRow> = op_year_rows
+        .iter()
+        .map(|r| OtroPagoYearRow {
+            tipo_otro_pago: r.try_get("tipo_otro_pago").unwrap_or_default(),
+            concepto: r.try_get("concepto").unwrap_or_default(),
+            year: r.try_get("year").unwrap_or(0),
+            total: r.try_get("total").unwrap_or(0.0),
+        })
+        .collect();
+
     // By department year
     let dept_year_rows = sqlx::query(&format!(
         r#"
@@ -1178,6 +1220,7 @@ pub async fn get(
         by_month_ordinaria,
         by_percepcion_year,
         by_deduccion_year,
+        by_otro_pago_year,
         by_department_year,
         by_employee_year,
         has_payments_without_relacion,
