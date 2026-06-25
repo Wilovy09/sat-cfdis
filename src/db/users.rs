@@ -63,9 +63,13 @@ pub async fn create_pulso_user(
     let uid = parse_uuid(user_id)?;
     let rfc_upper = rfc.to_uppercase();
 
-    // Already active for THIS user?
-    let owned_by_self: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pulso.users WHERE user_id = $1 AND rfc = $2 AND deleted_at IS NULL",
+    // One query: count rows owned by this user and rows owned by a different user.
+    let (owned_by_self, owned_by_other): (i64, i64) = sqlx::query_as(
+        r#"SELECT
+               COUNT(*) FILTER (WHERE user_id = $1) AS owned_by_self,
+               COUNT(*) FILTER (WHERE user_id <> $1) AS owned_by_other
+           FROM pulso.users
+           WHERE rfc = $2 AND deleted_at IS NULL"#,
     )
     .bind(uid)
     .bind(&rfc_upper)
@@ -74,15 +78,6 @@ pub async fn create_pulso_user(
     if owned_by_self > 0 {
         return Err(CreateUserError::AlreadyOwnedBySelf);
     }
-
-    // Owned by a DIFFERENT user?
-    let owned_by_other: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pulso.users WHERE rfc = $1 AND user_id <> $2 AND deleted_at IS NULL",
-    )
-    .bind(&rfc_upper)
-    .bind(uid)
-    .fetch_one(pool)
-    .await?;
     if owned_by_other > 0 {
         return Err(CreateUserError::AlreadyOwnedByOther);
     }
@@ -130,14 +125,14 @@ pub async fn set_profile_complete(pool: &PgPool, user_id: &str) -> Result<(), sq
 }
 
 /// Returns (rfc, encrypted_clave, initial_sync_job_id) for trigger-sync.
-/// Returns the first active RFC (by ctid) for backward compat with multi-RFC users.
+/// Returns the first active RFC (by created_at) for backward compat with multi-RFC users.
 pub async fn get_user_credentials(
     pool: &PgPool,
     user_id: &str,
 ) -> Result<Option<(String, String, Option<String>)>, sqlx::Error> {
     let uid = parse_uuid(user_id)?;
     let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT rfc, clave, initial_sync_job_id FROM pulso.users WHERE user_id = $1 AND deleted_at IS NULL ORDER BY ctid LIMIT 1",
+        "SELECT rfc, clave, initial_sync_job_id FROM pulso.users WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at LIMIT 1",
     )
     .bind(uid)
     .fetch_optional(pool)
@@ -166,14 +161,14 @@ pub async fn get_clave_for_rfc(pool: &PgPool, rfc: &str) -> Result<Option<String
 }
 
 /// Returns (rfc, initial_sync_job_id) for the given user.
-/// Returns the first active RFC (by ctid) for backward compat with multi-RFC users.
+/// Returns the first active RFC (by created_at) for backward compat with multi-RFC users.
 pub async fn get_user_sync_info(
     pool: &PgPool,
     user_id: &str,
 ) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
     let uid = parse_uuid(user_id)?;
     let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT rfc, initial_sync_job_id FROM pulso.users WHERE user_id = $1 AND deleted_at IS NULL ORDER BY ctid LIMIT 1",
+        "SELECT rfc, initial_sync_job_id FROM pulso.users WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at LIMIT 1",
     )
     .bind(uid)
     .fetch_optional(pool)
@@ -185,7 +180,7 @@ pub async fn get_user_sync_info(
 pub async fn get_user_rfcs(pool: &PgPool, user_id: &str) -> Result<Vec<String>, sqlx::Error> {
     let uid = parse_uuid(user_id)?;
     let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT rfc FROM pulso.users WHERE user_id = $1 AND deleted_at IS NULL ORDER BY ctid",
+        "SELECT rfc FROM pulso.users WHERE user_id = $1 AND deleted_at IS NULL ORDER BY created_at",
     )
     .bind(uid)
     .fetch_all(pool)
@@ -199,14 +194,16 @@ pub async fn get_user_rfcs_with_nombre(
 ) -> Result<Vec<(String, Option<String>)>, sqlx::Error> {
     let uid = parse_uuid(user_id)?;
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        r#"SELECT u.rfc,
-                  (SELECT c.nombre_emisor
-                   FROM pulso.cfdis c
-                   WHERE c.rfc_emisor = u.rfc AND c.nombre_emisor IS NOT NULL
-                   ORDER BY c.created_at DESC LIMIT 1) AS nombre
+        r#"SELECT u.rfc, lat.nombre
            FROM pulso.users u
+           LEFT JOIN LATERAL (
+               SELECT c.nombre_emisor AS nombre
+               FROM pulso.cfdis c
+               WHERE c.rfc_emisor = u.rfc AND c.nombre_emisor IS NOT NULL
+               ORDER BY c.created_at DESC LIMIT 1
+           ) lat ON true
            WHERE u.user_id = $1 AND u.deleted_at IS NULL
-           ORDER BY u.ctid"#,
+           ORDER BY u.created_at"#,
     )
     .bind(uid)
     .fetch_all(pool)
@@ -225,21 +222,29 @@ pub async fn get_user_rfcs_with_role(
     let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
         r#"SELECT rfc, nombre, role FROM (
             SELECT u.rfc,
-                   (SELECT c.nombre_emisor FROM pulso.cfdis c
-                    WHERE c.rfc_emisor = u.rfc AND c.nombre_emisor IS NOT NULL
-                    ORDER BY c.created_at DESC LIMIT 1) AS nombre,
+                   lat.nombre,
                    'owner'::text AS role,
-                   u.ctid AS ord
+                   u.created_at AS ord
             FROM pulso.users u
+            LEFT JOIN LATERAL (
+                SELECT c.nombre_emisor AS nombre
+                FROM pulso.cfdis c
+                WHERE c.rfc_emisor = u.rfc AND c.nombre_emisor IS NOT NULL
+                ORDER BY c.created_at DESC LIMIT 1
+            ) lat ON true
             WHERE u.user_id = $1 AND u.deleted_at IS NULL
             UNION ALL
             SELECT s.rfc,
-                   (SELECT c.nombre_emisor FROM pulso.cfdis c
-                    WHERE c.rfc_emisor = s.rfc AND c.nombre_emisor IS NOT NULL
-                    ORDER BY c.created_at DESC LIMIT 1) AS nombre,
+                   lat.nombre,
                    'viewer'::text AS role,
-                   s.ctid AS ord
+                   s.granted_at AS ord
             FROM pulso.rfc_shares s
+            LEFT JOIN LATERAL (
+                SELECT c.nombre_emisor AS nombre
+                FROM pulso.cfdis c
+                WHERE c.rfc_emisor = s.rfc AND c.nombre_emisor IS NOT NULL
+                ORDER BY c.created_at DESC LIMIT 1
+            ) lat ON true
             WHERE s.shared_with = $1 AND s.revoked_at IS NULL
         ) combined
         ORDER BY role DESC, ord"#,
