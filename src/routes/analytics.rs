@@ -28,17 +28,15 @@ fn bearer_token_analytics(req: &HttpRequest) -> Option<String> {
     Some(token.to_string())
 }
 
-fn jwt_user_id_analytics(token: &str) -> Option<String> {
-    use base64::Engine as _;
-    let payload = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
-        .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    json.get("id")
-        .or_else(|| json.get("sub"))?
+fn jwt_user_id_analytics(token: &str, secret: &str) -> Option<String> {
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = true;
+    let key = DecodingKey::from_secret(secret.as_bytes());
+    let data = decode::<serde_json::Value>(token, &key, &validation).ok()?;
+    data.claims
+        .get("id")
+        .or_else(|| data.claims.get("sub"))?
         .as_str()
         .map(|s| s.to_string())
 }
@@ -50,8 +48,11 @@ async fn check_rfc_access(
 ) -> Result<(), AppError> {
     let token =
         bearer_token_analytics(req).ok_or_else(|| AppError::unauthorized("Token requerido"))?;
-    let user_id =
-        jwt_user_id_analytics(&token).ok_or_else(|| AppError::unauthorized("Token inválido"))?;
+    let cfg = req
+        .app_data::<web::Data<crate::config::Config>>()
+        .ok_or_else(|| AppError::internal("Config no disponible"))?;
+    let user_id = jwt_user_id_analytics(&token, &cfg.jwt_secret)
+        .ok_or_else(|| AppError::unauthorized("Token inválido o expirado"))?;
 
     let rfc_access = crate::db::users::user_has_rfc_or_admin(pool, &user_id, rfc)
         .await
@@ -199,7 +200,7 @@ pub async fn get_recurrence(
     query: web::Query<std::collections::HashMap<String, String>>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
-    let rfc = path.into_inner();
+    let rfc = path.into_inner().to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
     let dl_type = query
         .get("dl_type")
@@ -238,7 +239,7 @@ pub async fn get_retention(
     query: web::Query<std::collections::HashMap<String, String>>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
-    let rfc = path.into_inner();
+    let rfc = path.into_inner().to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
     let dl_type = query
         .get("dl_type")
