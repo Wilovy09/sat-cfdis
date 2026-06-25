@@ -82,28 +82,48 @@ pub async fn insert_taxes(
     uuid: &str,
     taxes: &[ParsedTax],
 ) -> Result<(), sqlx::Error> {
+    let mut uuids: Vec<&str> = Vec::new();
+    let mut impuestos: Vec<Option<String>> = Vec::new();
+    let mut tipo_factores: Vec<Option<String>> = Vec::new();
+    let mut tasas: Vec<Option<f64>> = Vec::new();
+    let mut bases: Vec<Option<f64>> = Vec::new();
+    let mut importes: Vec<Option<f64>> = Vec::new();
+    let mut is_retenidos: Vec<i64> = Vec::new();
+
     for t in taxes {
         if t.tasa.is_none() {
             continue;
         }
-        sqlx::query(
-            r#"
-            INSERT INTO pulso.cfdi_taxes
-                (uuid, impuesto, tipo_factor, tasa, base, importe, is_retenido)
-            VALUES ($1,$2,$3,$4,$5,$6,$7)
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(uuid)
-        .bind(&t.impuesto)
-        .bind(&t.tipo_factor)
-        .bind(t.tasa)
-        .bind(t.base)
-        .bind(t.importe)
-        .bind(t.is_retenido)
-        .execute(pool)
-        .await?;
+        uuids.push(uuid);
+        impuestos.push(t.impuesto.clone());
+        tipo_factores.push(t.tipo_factor.clone());
+        tasas.push(t.tasa);
+        bases.push(t.base);
+        importes.push(t.importe);
+        is_retenidos.push(t.is_retenido);
     }
+
+    if uuids.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO pulso.cfdi_taxes
+            (uuid, impuesto, tipo_factor, tasa, base, importe, is_retenido)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::float8[], $5::float8[], $6::float8[], $7::int8[])
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(&uuids)
+    .bind(&impuestos)
+    .bind(&tipo_factores)
+    .bind(&tasas)
+    .bind(&bases)
+    .bind(&importes)
+    .bind(&is_retenidos)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -112,23 +132,46 @@ pub async fn insert_concepts(
     uuid: &str,
     concepts: &[ParsedConcept],
 ) -> Result<(), sqlx::Error> {
-    for c in concepts {
-        sqlx::query(r#"
-            INSERT INTO pulso.cfdi_concepts
-                (uuid, clave_prod_serv, clave_unidad, descripcion, cantidad, valor_unitario, importe, descuento)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            "#)
-        .bind(uuid)
-        .bind(&c.clave_prod_serv)
-        .bind(&c.clave_unidad)
-        .bind(&c.descripcion)
-        .bind(c.cantidad)
-        .bind(c.valor_unitario)
-        .bind(c.importe)
-        .bind(c.descuento)
-        .execute(pool)
-        .await?;
+    if concepts.is_empty() {
+        return Ok(());
     }
+
+    let mut uuids: Vec<&str> = Vec::with_capacity(concepts.len());
+    let mut clave_prod_servs: Vec<Option<String>> = Vec::with_capacity(concepts.len());
+    let mut clave_unidades: Vec<Option<String>> = Vec::with_capacity(concepts.len());
+    let mut descripciones: Vec<Option<String>> = Vec::with_capacity(concepts.len());
+    let mut cantidades: Vec<Option<f64>> = Vec::with_capacity(concepts.len());
+    let mut valor_unitarios: Vec<Option<f64>> = Vec::with_capacity(concepts.len());
+    let mut importes: Vec<Option<f64>> = Vec::with_capacity(concepts.len());
+    let mut descuentos: Vec<Option<f64>> = Vec::with_capacity(concepts.len());
+
+    for c in concepts {
+        uuids.push(uuid);
+        clave_prod_servs.push(c.clave_prod_serv.clone());
+        clave_unidades.push(c.clave_unidad.clone());
+        descripciones.push(c.descripcion.clone());
+        cantidades.push(c.cantidad);
+        valor_unitarios.push(c.valor_unitario);
+        importes.push(c.importe);
+        descuentos.push(c.descuento);
+    }
+
+    sqlx::query(r#"
+        INSERT INTO pulso.cfdi_concepts
+            (uuid, clave_prod_serv, clave_unidad, descripcion, cantidad, valor_unitario, importe, descuento)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::float8[], $7::float8[], $8::float8[])
+        ON CONFLICT DO NOTHING
+        "#)
+    .bind(&uuids)
+    .bind(&clave_prod_servs)
+    .bind(&clave_unidades)
+    .bind(&descripciones)
+    .bind(&cantidades)
+    .bind(&valor_unitarios)
+    .bind(&importes)
+    .bind(&descuentos)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -137,26 +180,50 @@ pub async fn insert_payments(
     payment_uuid: &str,
     payments: &[ParsedPayment],
 ) -> Result<(), sqlx::Error> {
+    if payments.is_empty() {
+        return Ok(());
+    }
+
+    let mut payment_uuids: Vec<&str> = Vec::with_capacity(payments.len());
+    let mut pago_nums: Vec<i64> = Vec::with_capacity(payments.len());
+    let mut fecha_pagos: Vec<Option<String>> = Vec::with_capacity(payments.len());
+    let mut forma_pagos: Vec<Option<String>> = Vec::with_capacity(payments.len());
+    let mut moneda_ps: Vec<Option<String>> = Vec::with_capacity(payments.len());
+    let mut montos: Vec<Option<f64>> = Vec::with_capacity(payments.len());
+    let mut tipo_cambio_ps: Vec<Option<f64>> = Vec::with_capacity(payments.len());
+
     for (i, p) in payments.iter().enumerate() {
         let idx = i as i64;
-        sqlx::query(
-            r#"
-            INSERT INTO pulso.cfdi_payments
-                (payment_uuid, pago_num, fecha_pago, forma_pago, moneda_p, monto, tipo_cambio_p)
-            VALUES ($1,$2,$3,$4,$5,$6,$7)
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(payment_uuid)
-        .bind(idx)
-        .bind(&p.fecha_pago)
-        .bind(&p.forma_pago)
-        .bind(&p.moneda_p)
-        .bind(p.monto)
-        .bind(p.tipo_cambio_p)
-        .execute(pool)
-        .await?;
+        payment_uuids.push(payment_uuid);
+        pago_nums.push(idx);
+        fecha_pagos.push(p.fecha_pago.clone());
+        forma_pagos.push(p.forma_pago.clone());
+        moneda_ps.push(p.moneda_p.clone());
+        montos.push(p.monto);
+        tipo_cambio_ps.push(p.tipo_cambio_p);
+    }
 
+    sqlx::query(
+        r#"
+        INSERT INTO pulso.cfdi_payments
+            (payment_uuid, pago_num, fecha_pago, forma_pago, moneda_p, monto, tipo_cambio_p)
+        SELECT * FROM UNNEST($1::text[], $2::int8[], $3::text[], $4::text[], $5::text[], $6::float8[], $7::float8[])
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(&payment_uuids)
+    .bind(&pago_nums)
+    .bind(&fecha_pagos)
+    .bind(&forma_pagos)
+    .bind(&moneda_ps)
+    .bind(&montos)
+    .bind(&tipo_cambio_ps)
+    .execute(pool)
+    .await?;
+
+    // insert_payment_doc is left as-is per task instructions (nested docs are complex)
+    for (i, p) in payments.iter().enumerate() {
+        let idx = i as i64;
         for doc in &p.docs {
             insert_payment_doc(pool, payment_uuid, idx, doc).await?;
         }
@@ -198,20 +265,32 @@ pub async fn insert_relacionados(
     source_uuid: &str,
     relacionados: &[ParsedRelacionado],
 ) -> Result<(), sqlx::Error> {
-    for r in relacionados {
-        sqlx::query(
-            r#"
-            INSERT INTO pulso.cfdi_relacionados (source_uuid, tipo_relacion, related_uuid)
-            VALUES ($1, $2, $3)
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(source_uuid)
-        .bind(&r.tipo_relacion)
-        .bind(&r.related_uuid)
-        .execute(pool)
-        .await?;
+    if relacionados.is_empty() {
+        return Ok(());
     }
+
+    let mut source_uuids: Vec<&str> = Vec::with_capacity(relacionados.len());
+    let mut tipo_relaciones: Vec<&str> = Vec::with_capacity(relacionados.len());
+    let mut related_uuids: Vec<&str> = Vec::with_capacity(relacionados.len());
+
+    for r in relacionados {
+        source_uuids.push(source_uuid);
+        tipo_relaciones.push(&r.tipo_relacion);
+        related_uuids.push(&r.related_uuid);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO pulso.cfdi_relacionados (source_uuid, tipo_relacion, related_uuid)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[])
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(&source_uuids)
+    .bind(&tipo_relaciones)
+    .bind(&related_uuids)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -258,36 +337,51 @@ pub async fn insert_nomina(pool: &PgPool, uuid: &str, n: &ParsedNomina) -> Resul
     .execute(pool)
     .await?;
 
-    for p in &n.percepciones {
-        insert_nomina_percepcion(pool, uuid, p).await?;
-    }
-    for d in &n.deducciones {
-        insert_nomina_deduccion(pool, uuid, d).await?;
-    }
-    for op in &n.otros_pagos {
-        insert_nomina_otro_pago(pool, uuid, op).await?;
-    }
+    insert_nomina_percepcion(pool, uuid, &n.percepciones).await?;
+    insert_nomina_deduccion(pool, uuid, &n.deducciones).await?;
+    insert_nomina_otro_pago(pool, uuid, &n.otros_pagos).await?;
     Ok(())
 }
 
 async fn insert_nomina_percepcion(
     pool: &PgPool,
     uuid: &str,
-    p: &ParsedNominaPercepcion,
+    percepciones: &[ParsedNominaPercepcion],
 ) -> Result<(), sqlx::Error> {
+    if percepciones.is_empty() {
+        return Ok(());
+    }
+
+    let mut uuids: Vec<&str> = Vec::with_capacity(percepciones.len());
+    let mut tipo_percepciones: Vec<Option<String>> = Vec::with_capacity(percepciones.len());
+    let mut claves: Vec<Option<String>> = Vec::with_capacity(percepciones.len());
+    let mut conceptos: Vec<Option<String>> = Vec::with_capacity(percepciones.len());
+    let mut importe_gravados: Vec<Option<f64>> = Vec::with_capacity(percepciones.len());
+    let mut importe_exentos: Vec<Option<f64>> = Vec::with_capacity(percepciones.len());
+
+    for p in percepciones {
+        uuids.push(uuid);
+        tipo_percepciones.push(p.tipo_percepcion.clone());
+        claves.push(p.clave.clone());
+        conceptos.push(p.concepto.clone());
+        importe_gravados.push(p.importe_gravado);
+        importe_exentos.push(p.importe_exento);
+    }
+
     sqlx::query(
         r#"
         INSERT INTO pulso.cfdi_nomina_percepciones
             (uuid, tipo_percepcion, clave, concepto, importe_gravado, importe_exento)
-        VALUES ($1,$2,$3,$4,$5,$6)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::float8[])
+        ON CONFLICT DO NOTHING
         "#,
     )
-    .bind(uuid)
-    .bind(&p.tipo_percepcion)
-    .bind(&p.clave)
-    .bind(&p.concepto)
-    .bind(p.importe_gravado)
-    .bind(p.importe_exento)
+    .bind(&uuids)
+    .bind(&tipo_percepciones)
+    .bind(&claves)
+    .bind(&conceptos)
+    .bind(&importe_gravados)
+    .bind(&importe_exentos)
     .execute(pool)
     .await?;
     Ok(())
@@ -296,20 +390,39 @@ async fn insert_nomina_percepcion(
 async fn insert_nomina_deduccion(
     pool: &PgPool,
     uuid: &str,
-    d: &ParsedNominaDeduccion,
+    deducciones: &[ParsedNominaDeduccion],
 ) -> Result<(), sqlx::Error> {
+    if deducciones.is_empty() {
+        return Ok(());
+    }
+
+    let mut uuids: Vec<&str> = Vec::with_capacity(deducciones.len());
+    let mut tipo_deducciones: Vec<Option<String>> = Vec::with_capacity(deducciones.len());
+    let mut claves: Vec<Option<String>> = Vec::with_capacity(deducciones.len());
+    let mut conceptos: Vec<Option<String>> = Vec::with_capacity(deducciones.len());
+    let mut importes: Vec<Option<f64>> = Vec::with_capacity(deducciones.len());
+
+    for d in deducciones {
+        uuids.push(uuid);
+        tipo_deducciones.push(d.tipo_deduccion.clone());
+        claves.push(d.clave.clone());
+        conceptos.push(d.concepto.clone());
+        importes.push(d.importe);
+    }
+
     sqlx::query(
         r#"
         INSERT INTO pulso.cfdi_nomina_deducciones
             (uuid, tipo_deduccion, clave, concepto, importe)
-        VALUES ($1,$2,$3,$4,$5)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[])
+        ON CONFLICT DO NOTHING
         "#,
     )
-    .bind(uuid)
-    .bind(&d.tipo_deduccion)
-    .bind(&d.clave)
-    .bind(&d.concepto)
-    .bind(d.importe)
+    .bind(&uuids)
+    .bind(&tipo_deducciones)
+    .bind(&claves)
+    .bind(&conceptos)
+    .bind(&importes)
     .execute(pool)
     .await?;
     Ok(())
@@ -318,20 +431,39 @@ async fn insert_nomina_deduccion(
 async fn insert_nomina_otro_pago(
     pool: &PgPool,
     uuid: &str,
-    op: &ParsedNominaOtroPago,
+    otros_pagos: &[ParsedNominaOtroPago],
 ) -> Result<(), sqlx::Error> {
+    if otros_pagos.is_empty() {
+        return Ok(());
+    }
+
+    let mut uuids: Vec<&str> = Vec::with_capacity(otros_pagos.len());
+    let mut tipo_otros_pagos: Vec<Option<String>> = Vec::with_capacity(otros_pagos.len());
+    let mut claves: Vec<Option<String>> = Vec::with_capacity(otros_pagos.len());
+    let mut conceptos: Vec<Option<String>> = Vec::with_capacity(otros_pagos.len());
+    let mut importes: Vec<Option<f64>> = Vec::with_capacity(otros_pagos.len());
+
+    for op in otros_pagos {
+        uuids.push(uuid);
+        tipo_otros_pagos.push(op.tipo_otro_pago.clone());
+        claves.push(op.clave.clone());
+        conceptos.push(op.concepto.clone());
+        importes.push(op.importe);
+    }
+
     sqlx::query(
         r#"
         INSERT INTO pulso.cfdi_nomina_otros_pagos
             (uuid, tipo_otro_pago, clave, concepto, importe)
-        VALUES ($1,$2,$3,$4,$5)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[])
+        ON CONFLICT DO NOTHING
         "#,
     )
-    .bind(uuid)
-    .bind(&op.tipo_otro_pago)
-    .bind(&op.clave)
-    .bind(&op.concepto)
-    .bind(op.importe)
+    .bind(&uuids)
+    .bind(&tipo_otros_pagos)
+    .bind(&claves)
+    .bind(&conceptos)
+    .bind(&importes)
     .execute(pool)
     .await?;
     Ok(())
@@ -421,6 +553,7 @@ pub async fn find_needs_enrichment(
         FROM pulso.job_invoices ji
         JOIN pulso.cfdis c ON c.uuid = ji.uuid
         WHERE ji.job_id = $1 AND c.xml_available = 0
+        ORDER BY ji.uuid
         LIMIT $2
         "#,
     )
@@ -475,11 +608,9 @@ pub async fn reset_for_reprocessing(
     };
 
     let owner_clause = match (emit, recv) {
-        (true, true) => format!(
-            "(c.rfc_emisor = '{rfc}' OR c.rfc_receptor = '{rfc}')"
-        ),
-        (true, false) => format!("c.rfc_emisor = '{rfc}'"),
-        (false, true) => format!("c.rfc_receptor = '{rfc}'"),
+        (true, true) => "(c.rfc_emisor = $1 OR c.rfc_receptor = $1)".to_string(),
+        (true, false) => "c.rfc_emisor = $1".to_string(),
+        (false, true) => "c.rfc_receptor = $1".to_string(),
         _ => return Ok(0),
     };
 
@@ -505,7 +636,7 @@ pub async fn reset_for_reprocessing(
         "#,
     );
 
-    let result = sqlx::query(&sql).execute(pool).await?;
+    let result = sqlx::query(&sql).bind(rfc).execute(pool).await?;
     Ok(result.rows_affected())
 }
 
