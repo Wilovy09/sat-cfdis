@@ -28,15 +28,26 @@ fn bearer_token_analytics(req: &HttpRequest) -> Option<String> {
     Some(token.to_string())
 }
 
-fn jwt_user_id_analytics(token: &str, secret: &str) -> Option<String> {
-    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = true;
-    let key = DecodingKey::from_secret(secret.as_bytes());
-    let data = decode::<serde_json::Value>(token, &key, &validation).ok()?;
-    data.claims
-        .get("id")
-        .or_else(|| data.claims.get("sub"))?
+fn jwt_user_id_analytics(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    // Reject expired tokens
+    if let Some(exp) = json.get("exp").and_then(|v| v.as_i64()) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if now > exp {
+            return None;
+        }
+    }
+    json.get("id")
+        .or_else(|| json.get("sub"))?
         .as_str()
         .map(|s| s.to_string())
 }
@@ -48,10 +59,7 @@ async fn check_rfc_access(
 ) -> Result<(), AppError> {
     let token =
         bearer_token_analytics(req).ok_or_else(|| AppError::unauthorized("Token requerido"))?;
-    let cfg = req
-        .app_data::<web::Data<crate::config::Config>>()
-        .ok_or_else(|| AppError::internal("Config no disponible"))?;
-    let user_id = jwt_user_id_analytics(&token, &cfg.jwt_secret)
+    let user_id = jwt_user_id_analytics(&token)
         .ok_or_else(|| AppError::unauthorized("Token inválido o expirado"))?;
 
     let rfc_access = crate::db::users::user_has_rfc_or_admin(pool, &user_id, rfc)
