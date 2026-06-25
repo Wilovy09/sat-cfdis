@@ -304,7 +304,7 @@ async fn compute_ltm_ingreso(
         WHERE rfc_emisor = $1
           AND dl_type IN ('emitidos','ambos')
           AND tipo_comprobante = 'I'
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         "#,
@@ -338,7 +338,7 @@ async fn compute_h1(
         WHERE rfc_emisor = $1
           AND dl_type IN ('emitidos','ambos')
           AND tipo_comprobante = 'I'
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY rfc_receptor
@@ -457,7 +457,7 @@ async fn compute_h5a(
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
-          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
         GROUP BY c.year, c.month
@@ -489,7 +489,7 @@ async fn compute_h5a(
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
-          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND NOT c.is_cancelled
           AND c.year = $2 AND c.month = $3
         "#,
     )
@@ -510,7 +510,7 @@ async fn compute_h5a(
             JOIN pulso.cfdis c ON c.uuid = n.uuid
             WHERE c.rfc_emisor = $1
               AND c.tipo_comprobante = 'N'
-              AND COALESCE(c.estado_sat,'') != 'cancelado'
+              AND NOT c.is_cancelled
               AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
               AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
         ) ltm
@@ -519,7 +519,7 @@ async fn compute_h5a(
             JOIN pulso.cfdis c2 ON c2.uuid = n2.uuid
             WHERE c2.rfc_emisor = $1
               AND c2.tipo_comprobante = 'N'
-              AND COALESCE(c2.estado_sat,'') != 'cancelado'
+              AND NOT c2.is_cancelled
               AND c2.rfc_receptor = ltm.rfc_receptor
               AND c2.year = $4 AND c2.month = $5
         )
@@ -589,7 +589,7 @@ async fn compute_h5b(
         JOIN pulso.cfdis c ON c.uuid = n.uuid
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
-          AND COALESCE(c.estado_sat,'') != 'cancelado'
+          AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
         GROUP BY c.rfc_receptor
@@ -720,7 +720,7 @@ async fn compute_h6(
             JOIN pulso.cfdis c ON c.uuid = cp.payment_uuid
             WHERE c.rfc_emisor = $1
               AND c.tipo_comprobante = 'P'
-              AND UPPER(COALESCE(c.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT c.is_cancelled
         ) AS has_pagos
         "#,
     )
@@ -742,7 +742,7 @@ async fn compute_h6(
                 FROM pulso.cfdi_payment_docs pd
                 JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
                 WHERE pd.invoice_uuid = inv.uuid
-                  AND UPPER(COALESCE(comp.estado_sat,'')) NOT LIKE '%CANCEL%'
+                  AND NOT comp.is_cancelled
             ), 0)
             - COALESCE((
                 SELECT SUM(cr_inv.total_mxn)
@@ -751,7 +751,7 @@ async fn compute_h6(
                 WHERE cr.related_uuid = inv.uuid
                   AND cr.tipo_relacion = '01'
                   AND cr_inv.tipo_comprobante = 'E'
-                  AND UPPER(COALESCE(cr_inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+                  AND NOT cr_inv.is_cancelled
             ), 0),
             0
         )), 0)::float8 AS outstanding
@@ -760,7 +760,7 @@ async fn compute_h6(
           AND inv.dl_type IN ('emitidos','ambos')
           AND inv.tipo_comprobante = 'I'
           AND inv.metodo_pago = 'PPD'
-          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT inv.is_cancelled
         "#,
     )
     .bind(rfc)
@@ -818,7 +818,7 @@ async fn compute_h7(
             JOIN pulso.cfdis c ON c.uuid = cp.payment_uuid
             WHERE c.rfc_receptor = $1
               AND c.tipo_comprobante = 'P'
-              AND UPPER(COALESCE(c.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT c.is_cancelled
         ) AS has_pagos
         "#,
     )
@@ -839,7 +839,7 @@ async fn compute_h7(
                 FROM pulso.cfdi_payment_docs pd
                 JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
                 WHERE pd.invoice_uuid = inv.uuid
-                  AND UPPER(COALESCE(comp.estado_sat,'')) NOT LIKE '%CANCEL%'
+                  AND NOT comp.is_cancelled
             ), 0)
             - COALESCE((
                 SELECT SUM(cr_inv.total_mxn)
@@ -848,7 +848,7 @@ async fn compute_h7(
                 WHERE cr.related_uuid = inv.uuid
                   AND cr.tipo_relacion = '01'
                   AND cr_inv.tipo_comprobante = 'E'
-                  AND UPPER(COALESCE(cr_inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+                  AND NOT cr_inv.is_cancelled
             ), 0),
             0
         )), 0)::float8 AS outstanding
@@ -857,7 +857,7 @@ async fn compute_h7(
           AND inv.dl_type IN ('recibidos','ambos')
           AND inv.tipo_comprobante = 'I'
           AND inv.metodo_pago = 'PPD'
-          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT inv.is_cancelled
         "#,
     )
     .bind(rfc)
@@ -873,7 +873,7 @@ async fn compute_h7(
         WHERE rfc_receptor = $1
           AND dl_type IN ('recibidos','ambos')
           AND tipo_comprobante = 'I'
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         "#,
@@ -934,7 +934,7 @@ async fn compute_h8(
         WHERE rfc_receptor = $1
           AND dl_type IN ('recibidos','ambos')
           AND tipo_comprobante = 'I'
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY rfc_emisor
@@ -1028,7 +1028,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         WHERE rfc_emisor = $1
           AND dl_type IN ('emitidos','ambos')
           AND tipo_comprobante NOT IN ('P','N','T')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
         "#,
     )
     .bind(rfc)
@@ -1065,7 +1065,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         WHERE rfc_emisor = $1
           AND dl_type IN ('emitidos','ambos')
           AND tipo_comprobante NOT IN ('P','N','T')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
         GROUP BY year
         ORDER BY year
         "#,
@@ -1131,7 +1131,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             WHERE rfc_receptor = $1
               AND dl_type IN ('recibidos','ambos')
               AND tipo_comprobante = 'I'
-              AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT is_cancelled
             GROUP BY year
             "#,
         )
@@ -1158,7 +1158,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             JOIN pulso.cfdis c ON c.uuid = n.uuid
             WHERE c.rfc_emisor = $1
               AND c.tipo_comprobante = 'N'
-              AND COALESCE(c.estado_sat,'') != 'cancelado'
+              AND NOT c.is_cancelled
               AND p.tipo_percepcion NOT IN ('002','003','022','038','039','044','045')
             GROUP BY c.year
             "#,
@@ -1323,7 +1323,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         WHERE rfc_emisor = $1
           AND dl_type IN ('emitidos','ambos')
           AND tipo_comprobante NOT IN ('P','N','T')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
         "#,
     )
     .bind(rfc)

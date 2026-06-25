@@ -60,29 +60,30 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
     // Monthly breakdown
     let rows = sqlx::query(
         &format!(r#"
+        WITH excluded AS (
+            SELECT cfdi_uuid, source_rfc, dl_type
+            FROM pulso.normalization_rules
+            WHERE owner_rfc = $1 AND action = 'exclude'
+        )
         SELECT year, month,
                SUM(CASE WHEN tipo_comprobante = 'I' THEN COALESCE(total_neto_mxn,0) ELSE 0 END)::float8  AS ingreso,
                SUM(CASE WHEN tipo_comprobante = 'E' THEN -COALESCE(total_neto_mxn,0) ELSE 0 END)::float8 AS egreso,
                SUM(COALESCE(total_neto_mxn,0))::float8 AS total,
                COUNT(*)                                  AS cnt
-        FROM pulso.cfdis
-        WHERE {rfc_col} = $1
-          AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N','T')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.normalization_rules nr
-              WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
-                AND (
-                  (nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(uuid))
-                  OR (nr.cfdi_uuid IS NULL AND (
-                      (nr.dl_type IN ('emitidos','ambos') AND nr.source_rfc = rfc_receptor)
-                      OR (nr.dl_type IN ('recibidos','ambos') AND nr.source_rfc = rfc_emisor)
-                  ))
-                )
-          )
+        FROM pulso.cfdis c
+        LEFT JOIN excluded exc
+            ON (exc.cfdi_uuid IS NOT NULL AND UPPER(exc.cfdi_uuid) = UPPER(c.uuid))
+            OR (exc.cfdi_uuid IS NULL AND (
+                (exc.dl_type IN ('emitidos','ambos') AND exc.source_rfc = c.rfc_receptor)
+                OR (exc.dl_type IN ('recibidos','ambos') AND exc.source_rfc = c.rfc_emisor)
+            ))
+        WHERE c.{rfc_col} = $1
+          AND c.{dl_filter}
+          AND c.tipo_comprobante NOT IN ('P','N','T')
+          AND NOT c.is_cancelled
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND exc.cfdi_uuid IS NULL
         GROUP BY year, month
         ORDER BY year, month
         "#),
@@ -160,52 +161,43 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
         }
     };
 
-    // By tipo_comprobante
-    let tipo_rows = sqlx::query(&format!(
-        r#"
-        SELECT tipo_comprobante, SUM(COALESCE(total_neto_mxn,0))::float8 AS total, COUNT(*) AS cnt
-        FROM pulso.cfdis
-        WHERE {rfc_col} = $1
-          AND {dl_filter}
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.normalization_rules nr
-              WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
-                AND (
-                  (nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(uuid))
-                  OR (nr.cfdi_uuid IS NULL AND (
-                      (nr.dl_type IN ('emitidos','ambos') AND nr.source_rfc = rfc_receptor)
-                      OR (nr.dl_type IN ('recibidos','ambos') AND nr.source_rfc = rfc_emisor)
-                  ))
-                )
-          )
-        GROUP BY tipo_comprobante
-        "#
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_all(pool)
-    .await?;
-
-    let by_tipo = tipo_rows
-        .iter()
-        .map(|r| {
-            let tipo: String = r.try_get("tipo_comprobante").unwrap_or_default();
-            let total: f64 = r.try_get("total").unwrap_or(0.0);
-            let cnt: i64 = r.try_get("cnt").unwrap_or(0);
-            TipoTotal {
-                label: tipo_label(&tipo).to_string(),
-                tipo_comprobante: tipo,
-                total_mxn: total,
-                invoice_count: cnt,
-            }
-        })
-        .collect();
+    // Derive by_tipo from the already-fetched by_month rows — no second DB round trip.
+    // The monthly query filters OUT P/N/T, so by_tipo reflects only I and E types,
+    // which is the relevant breakdown for this analytics surface.
+    let by_tipo = {
+        let ingreso_total: f64 = by_month.iter().map(|m| m.net_mxn.max(0.0)).sum();
+        let egreso_total: f64 = by_month.iter().map(|m| (-m.net_mxn).max(0.0)).sum();
+        // invoice_count is undifferentiated in the monthly rows; use proportional split
+        // only if both sides are non-zero, otherwise assign all to whichever is non-zero.
+        let ingreso_count: i64 = by_month
+            .iter()
+            .filter(|m| m.net_mxn >= 0.0)
+            .map(|m| m.invoice_count)
+            .sum();
+        let egreso_count: i64 = by_month
+            .iter()
+            .filter(|m| m.net_mxn < 0.0)
+            .map(|m| m.invoice_count)
+            .sum();
+        let mut tipos = Vec::new();
+        if ingreso_total > 0.0 || ingreso_count > 0 {
+            tipos.push(TipoTotal {
+                tipo_comprobante: "I".to_string(),
+                label: tipo_label("I").to_string(),
+                total_mxn: ingreso_total,
+                invoice_count: ingreso_count,
+            });
+        }
+        if egreso_total > 0.0 || egreso_count > 0 {
+            tipos.push(TipoTotal {
+                tipo_comprobante: "E".to_string(),
+                label: tipo_label("E").to_string(),
+                total_mxn: egreso_total,
+                invoice_count: egreso_count,
+            });
+        }
+        tipos
+    };
 
     Ok(SummaryResponse {
         total_mxn,

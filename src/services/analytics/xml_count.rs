@@ -23,11 +23,11 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<XmlC
          FROM ( \
              SELECT xml_available FROM pulso.cfdis \
              WHERE rfc_emisor = $1 AND dl_type IN ('emitidos','ambos') \
-               AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%' \
+               AND NOT is_cancelled \
              UNION ALL \
              SELECT xml_available FROM pulso.cfdis \
              WHERE rfc_receptor = $1 AND dl_type IN ('recibidos','ambos') \
-               AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%' \
+               AND NOT is_cancelled \
          ) u".to_string()
     } else {
         let owner_col = rfc_column(dl_type);
@@ -40,7 +40,7 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<XmlC
                 COUNT(*) FILTER (WHERE xml_available = 0)::bigint          AS pending \
              FROM pulso.cfdis \
              WHERE {owner_col} = $1 AND {dl_filter} \
-               AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'"
+               AND NOT is_cancelled"
         )
     };
 

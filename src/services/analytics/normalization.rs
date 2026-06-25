@@ -623,7 +623,7 @@ pub async fn list_counterparties_for_normalization(
            WHERE c.{rfc_col} = $1
              AND {dl_filter}
              AND c.tipo_comprobante NOT IN ('P','N','T')
-             AND UPPER(COALESCE(c.estado_sat,'')) NOT LIKE '%CANCEL%'
+             AND NOT c.is_cancelled
              AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
              AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
            GROUP BY rfc_cp, nombre_cp, c.year
@@ -811,7 +811,7 @@ pub async fn list_payroll_employees(
               AND c.tipo_comprobante = 'N'
               AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
               AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-              AND (c.estado_sat IS NULL OR c.estado_sat != 'cancelado')
+              AND NOT c.is_cancelled
               AND c.rfc_receptor IS NOT NULL
               AND c.rfc_receptor != ''
             GROUP BY c.rfc_receptor, month_key
@@ -899,7 +899,7 @@ pub async fn list_ebitda_bridge_adjustments(
           AND nr.accounting_line IS NOT NULL
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND (c.estado_sat IS NULL OR c.estado_sat != 'cancelado')
+          AND NOT c.is_cancelled
         GROUP BY nr.id, nr.rule_name, nr.accounting_line, nr.motivo, nr.impacts_ebitda,
                  nr.dl_type, nr.capex_estimate_dep, nr.capex_asset_type,
                  nr.capex_useful_life_years, nr.capex_annual_dep_mxn, c.year

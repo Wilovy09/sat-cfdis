@@ -85,7 +85,7 @@ pub async fn get(
     let max_q = format!(
         "SELECT MAX(year * 100 + month)::bigint AS max_period \
          FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'"
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND NOT is_cancelled"
     );
     let max_row = sqlx::query(&max_q).bind(rfc).fetch_one(pool).await?;
     let max_period_db: i64 = max_row.try_get("max_period").unwrap_or(0);
@@ -125,7 +125,7 @@ pub async fn get(
         "SELECT COUNT(DISTINCT year * 100 + month)::bigint AS cnt, \
                 MIN(year * 100 + month)::bigint AS min_period \
          FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%' \
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND NOT is_cancelled \
            AND year * 100 + month >= $2 AND year * 100 + month <= $3"
     );
     let actual_row = sqlx::query(&actual_q)
@@ -150,7 +150,7 @@ pub async fn get(
                    COUNT(DISTINCT year * 100 + month)::bigint   AS months_active,
                    SUM(COALESCE(total_neto_mxn,0)::float8)::float8   AS total_mxn
             FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
             GROUP BY ({cp_key_expr})
         ),
@@ -187,7 +187,7 @@ pub async fn get(
             SELECT year,
                    COUNT(DISTINCT month)::float8 AS months_avail
             FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
             GROUP BY year
         ),
@@ -196,7 +196,7 @@ pub async fn get(
                    COUNT(DISTINCT month)::float8                                   AS cp_months_in_year,
                    GREATEST(SUM(COALESCE(total_neto_mxn,0)::float8), 0)::float8   AS year_total
             FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
             GROUP BY year, ({cp_key_expr})
         ),
@@ -241,7 +241,7 @@ pub async fn get(
                    SUM(COALESCE(total_neto_mxn,0)::float8)::float8    AS total_mxn,
                    COUNT(*)::bigint                                    AS invoice_count
             FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
             GROUP BY ({cp_key_expr})
             HAVING COUNT(DISTINCT year * 100 + month) >= $4
@@ -249,7 +249,7 @@ pub async fn get(
         wt AS (
             SELECT GREATEST(SUM(COALESCE(total_neto_mxn,0)::float8), 1) AS total
             FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
         )
         SELECT rfc, nombre, months_active, total_mxn,

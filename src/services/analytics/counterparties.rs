@@ -48,6 +48,8 @@ pub async fn get(
         "nombre_receptor"
     };
 
+    // Window functions supply grand_total and cp_count alongside each top-N row,
+    // eliminating the second full-table scan.
     let rows = sqlx::query(&format!(
         r#"
         SELECT
@@ -57,12 +59,14 @@ pub async fn get(
             COUNT(*)                                               AS cnt,
             MIN(fecha_emision)                                     AS first_inv,
             MAX(fecha_emision)                                     AS last_inv,
-            COUNT(DISTINCT year * 100 + month)                     AS months_active
+            COUNT(DISTINCT year * 100 + month)                     AS months_active,
+            SUM(SUM(COALESCE(total_neto_mxn,0)::float8)) OVER ()::float8 AS grand_total,
+            COUNT(*) OVER ()                                       AS cp_count
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY {cp_col}
@@ -79,29 +83,8 @@ pub async fn get(
     .fetch_all(pool)
     .await?;
 
-    // Total for percentage calc
-    let total_row = sqlx::query(&format!(
-        r#"
-        SELECT SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total, COUNT(DISTINCT {cp_col}) AS cp_count
-        FROM pulso.cfdis
-        WHERE {owner_col} = $1
-          AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-        "#
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_one(pool)
-    .await?;
-
-    let grand_total: f64 = total_row.try_get("total").unwrap_or(0.0);
-    let cp_count: i64 = total_row.try_get("cp_count").unwrap_or(0);
+    let grand_total: f64 = rows.first().map_or(0.0, |r| r.try_get("grand_total").unwrap_or(0.0));
+    let cp_count: i64 = rows.first().map_or(0, |r| r.try_get("cp_count").unwrap_or(0));
 
     let top: Vec<CounterpartyRow> = rows
         .iter()
@@ -198,7 +181,7 @@ pub async fn get_evolution(
                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS yr_total
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY {cp_col}, year
@@ -357,7 +340,7 @@ pub async fn get_ltm_comparison(
         "SELECT MAX(year * 100 + month)::bigint AS max_ym \
          FROM pulso.cfdis \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') \
-           AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'"
+           AND NOT is_cancelled"
     );
     let max_row = sqlx::query(&max_q).bind(rfc).fetch_one(pool).await?;
     let max_ym_db: i64 = max_row.try_get("max_ym").unwrap_or(0);
@@ -397,7 +380,7 @@ pub async fn get_ltm_comparison(
                COUNT(*) AS invoice_count
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY {cp_col}
@@ -418,7 +401,7 @@ pub async fn get_ltm_comparison(
                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS prev_total
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY {cp_col}
@@ -582,7 +565,7 @@ pub async fn get_payments_detail(
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter}
               AND tipo_comprobante = 'I'
-              AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT is_cancelled
         ),
         inv_base AS (
             SELECT {cp_col} AS cp_rfc,
@@ -733,7 +716,7 @@ pub async fn get_atypical(
                    SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS mo_total
             FROM pulso.cfdis
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
-              AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT is_cancelled
               AND (year > $2 OR (year = $2 AND month >= $3))
               AND (year < $4 OR (year = $4 AND month <= $5))
             GROUP BY {cp_col}, year, month
@@ -869,7 +852,7 @@ pub async fn get_individual(
                COUNT(*) AS cnt
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND {cp_col} = $2
           AND (year > $3 OR (year = $3 AND month >= $4))
           AND (year < $5 OR (year = $5 AND month <= $6))
@@ -892,7 +875,7 @@ pub async fn get_individual(
         SELECT CASE WHEN $2 LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {cp_col} = $2 AND {dl_filter}
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
         "#
     ))
     .bind(owner_rfc)
@@ -963,7 +946,7 @@ pub async fn get_individual(
                COUNT(*) AS cnt
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND {cp_col} = $2
           AND (year > $3 OR (year = $3 AND month >= $4))
           AND (year < $5 OR (year = $5 AND month <= $6))
@@ -1001,7 +984,7 @@ pub async fn get_individual(
         FROM pulso.cfdi_concepts cc
         JOIN pulso.cfdis c ON c.uuid = cc.uuid
         WHERE c.{owner_col} = $1 AND c.{dl_filter} AND c.tipo_comprobante NOT IN ('P','N')
-          AND UPPER(COALESCE(c.estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT c.is_cancelled
           AND c.{cp_col} = $2
           AND (c.year > $3 OR (c.year = $3 AND c.month >= $4))
           AND (c.year < $5 OR (c.year = $5 AND c.month <= $6))
@@ -1060,7 +1043,7 @@ pub async fn get_individual(
                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS yr_total
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY year
@@ -1113,7 +1096,7 @@ pub async fn get_individual(
             WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
               AND inv.{cp_col} = $2
               AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
-              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT inv.is_cancelled
         )
         SELECT
             SUM(inv_total)::float8                         AS facturado,
@@ -1141,7 +1124,7 @@ pub async fn get_individual(
         WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
           AND inv.{cp_col} = $2
           AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
-          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT inv.is_cancelled
           AND cp.fecha_pago IS NOT NULL
         "#
     ))

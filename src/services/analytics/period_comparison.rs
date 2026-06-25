@@ -121,7 +121,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P', 'N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND year = ANY($2)
           AND month >= $3 AND month <= $4
         GROUP BY year
@@ -158,7 +158,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P', 'N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND year = ANY($2)
         GROUP BY year
         "#
@@ -193,7 +193,7 @@ pub async fn get(
             WHERE {owner_col} = $1
               AND {dl_filter}
               AND tipo_comprobante NOT IN ('P', 'N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
               AND year = ANY($2)
               AND month >= $3 AND month <= $4
             GROUP BY year, {cp_col}
@@ -234,7 +234,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P', 'N')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND year = ANY($2)
           AND month >= $3 AND month <= $4
         GROUP BY year, month
@@ -417,7 +417,7 @@ pub async fn get(
                 SELECT {cp_col} AS cp_rfc, MAX({cp_name_col}) AS cp_nombre,
                        SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total
                 FROM pulso.cfdis
-                WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+                WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
                   AND year = $2 AND month >= $3 AND month <= $4
                 GROUP BY {cp_col}
             ),
@@ -425,7 +425,7 @@ pub async fn get(
                 SELECT {cp_col} AS cp_rfc, MAX({cp_name_col}) AS cp_nombre,
                        SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total
                 FROM pulso.cfdis
-                WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+                WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
                   AND year = $5 AND month >= $3 AND month <= $4
                 GROUP BY {cp_col}
             )

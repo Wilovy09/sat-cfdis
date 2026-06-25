@@ -60,7 +60,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante IN ('I','E')
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY year, month, tipo_comprobante
@@ -85,7 +85,7 @@ pub async fn get(
         WHERE c.{owner_col} = $1
           AND {dl_filter}
           AND c.tipo_comprobante = 'P'
-          AND UPPER(COALESCE(c.estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
         GROUP BY c.year, c.month
@@ -139,7 +139,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante = 'I'
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY metodo_pago
@@ -173,7 +173,7 @@ pub async fn get(
           AND inv.{dl_filter}
           AND inv.tipo_comprobante = 'I'
           AND inv.metodo_pago = 'PPD'
-          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT inv.is_cancelled
           AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
           AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
         "#
@@ -201,7 +201,7 @@ pub async fn get(
           AND inv.{dl_filter}
           AND inv.tipo_comprobante = 'I'
           AND inv.metodo_pago = 'PPD'
-          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT inv.is_cancelled
           AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
           AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
           AND p.fecha_pago IS NOT NULL

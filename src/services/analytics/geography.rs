@@ -61,7 +61,7 @@ pub async fn get(
           AND tipo_comprobante NOT IN ('P','N')
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
         GROUP BY cp, {cp_col}
         ORDER BY total DESC
         "#

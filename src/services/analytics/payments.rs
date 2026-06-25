@@ -88,7 +88,7 @@ pub async fn get(
             WHERE {owner_col} = $1
               AND {dl_filter}
               AND tipo_comprobante = 'I'
-              AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT is_cancelled
             GROUP BY year, month
         ),
         baseline_median AS (
@@ -107,7 +107,7 @@ pub async fn get(
               AND {dl_filter}
               AND tipo_comprobante = 'I'
               AND COALESCE(metodo_pago,'PUE') != 'PPD'
-              AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT is_cancelled
               AND (year * 100 + month) <= as_of_cutoff.as_of_ym
         ),
         ppd_per_invoice AS (
@@ -119,7 +119,7 @@ pub async fn get(
                     FROM pulso.cfdi_payment_docs pd
                     JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
                     WHERE pd.invoice_uuid = inv.uuid
-                      AND UPPER(COALESCE(comp.estado_sat,'')) NOT LIKE '%CANCEL%'
+                      AND NOT comp.is_cancelled
                 )::float8, 0) +
                 COALESCE((
                     SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
@@ -128,14 +128,14 @@ pub async fn get(
                     WHERE cr.related_uuid = inv.uuid
                       AND cr.tipo_relacion = '01'
                       AND nc.tipo_comprobante = 'E'
-                      AND UPPER(COALESCE(nc.estado_sat,'')) NOT LIKE '%CANCEL%'
+                      AND NOT nc.is_cancelled
                 ), 0) AS paid_raw
             FROM pulso.cfdis inv, as_of_cutoff
             WHERE inv.{owner_col} = $1
               AND inv.{dl_filter}
               AND inv.tipo_comprobante = 'I'
               AND inv.metodo_pago = 'PPD'
-              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT inv.is_cancelled
               AND (inv.year * 100 + inv.month) <= as_of_cutoff.as_of_ym
         ),
         ppd_agg AS (
@@ -175,7 +175,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante = 'I'
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY forma
@@ -220,7 +220,7 @@ pub async fn get(
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante = 'I'
-          AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
         GROUP BY metodo
@@ -264,7 +264,7 @@ pub async fn get(
                     FROM pulso.cfdi_payment_docs pd
                     JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
                     WHERE pd.invoice_uuid = inv.uuid
-                      AND UPPER(COALESCE(comp.estado_sat,'')) NOT LIKE '%CANCEL%'
+                      AND NOT comp.is_cancelled
                 )::float8, 0) +
                 COALESCE((
                     SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
@@ -273,14 +273,14 @@ pub async fn get(
                     WHERE cr.related_uuid = inv.uuid
                       AND cr.tipo_relacion = '01'
                       AND nc.tipo_comprobante = 'E'
-                      AND UPPER(COALESCE(nc.estado_sat,'')) NOT LIKE '%CANCEL%'
+                      AND NOT nc.is_cancelled
                 ), 0) AS paid
             FROM pulso.cfdis inv
             WHERE inv.{owner_col} = $1
               AND inv.{dl_filter}
               AND inv.tipo_comprobante = 'I'
               AND inv.metodo_pago = 'PPD'
-              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT inv.is_cancelled
         ) sub
         WHERE (sub.total_mxn - sub.paid) > 1.0
         ORDER BY (sub.total_mxn - sub.paid) DESC
@@ -319,7 +319,7 @@ pub async fn get(
                 FROM pulso.cfdi_payment_docs pd
                 JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
                 WHERE pd.invoice_uuid = inv.uuid
-                  AND UPPER(COALESCE(comp.estado_sat,'')) NOT LIKE '%CANCEL%'
+                  AND NOT comp.is_cancelled
             )::float8, 0) -
             COALESCE((
                 SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
@@ -328,7 +328,7 @@ pub async fn get(
                 WHERE cr.related_uuid = inv.uuid
                   AND cr.tipo_relacion = '01'
                   AND nc.tipo_comprobante = 'E'
-                  AND UPPER(COALESCE(nc.estado_sat,'')) NOT LIKE '%CANCEL%'
+                  AND NOT nc.is_cancelled
             ), 0),
             0
         )::float8), 0) AS exposure
@@ -337,7 +337,7 @@ pub async fn get(
           AND inv.{dl_filter}
           AND inv.tipo_comprobante = 'I'
           AND inv.metodo_pago = 'PPD'
-          AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+          AND NOT inv.is_cancelled
           AND (CURRENT_DATE - inv.fecha_emision::date) > 180
         "#
     ))
@@ -363,7 +363,7 @@ pub async fn get(
               AND inv.{dl_filter}
               AND inv.tipo_comprobante = 'I'
               AND inv.metodo_pago = 'PPD'
-              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT inv.is_cancelled
               AND cp.fecha_pago IS NOT NULL
             GROUP BY inv.uuid
             HAVING MAX((cp.fecha_pago::date - inv.fecha_emision::date)::float8) >= 0
@@ -389,7 +389,7 @@ pub async fn get(
             WHERE {owner_col} = $1
               AND {dl_filter}
               AND tipo_comprobante = 'I'
-              AND UPPER(COALESCE(estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT is_cancelled
               AND (year > $2 OR (year = $2 AND month >= $3))
               AND (year < $4 OR (year = $4 AND month <= $5))
             GROUP BY year, month
@@ -403,7 +403,7 @@ pub async fn get(
               AND inv.{dl_filter}
               AND inv.tipo_comprobante = 'I'
               AND inv.metodo_pago = 'PPD'
-              AND UPPER(COALESCE(inv.estado_sat,'')) NOT LIKE '%CANCEL%'
+              AND NOT inv.is_cancelled
               AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
               AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
             GROUP BY inv.year, inv.month
