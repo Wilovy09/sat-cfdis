@@ -1206,3 +1206,60 @@ pub async fn admin_reprocess(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/admin/rfcs
+// Admin-only: list all platform RFCs with their most-recent nombre_emisor.
+// ---------------------------------------------------------------------------
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
+pub async fn admin_list_rfcs(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    if !is_admin {
+        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+    }
+
+    let rows: Vec<(String, Option<String>)> = match sqlx::query_as(
+        r#"
+        SELECT DISTINCT ON (u.rfc) u.rfc, lat.nombre
+        FROM pulso.users u
+        LEFT JOIN LATERAL (
+            SELECT c.nombre_emisor AS nombre
+            FROM pulso.cfdis c
+            WHERE c.rfc_emisor = u.rfc AND c.nombre_emisor IS NOT NULL
+            ORDER BY c.created_at DESC LIMIT 1
+        ) lat ON true
+        WHERE u.deleted_at IS NULL
+        ORDER BY u.rfc
+        "#,
+    )
+    .fetch_all(pool.as_ref())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("admin_list_rfcs: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let rfcs: Vec<_> = rows
+        .into_iter()
+        .map(|(rfc, nombre)| serde_json::json!({ "rfc": rfc, "nombre": nombre }))
+        .collect();
+
+    HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs }))
+}
