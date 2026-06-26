@@ -706,6 +706,10 @@ async fn main() -> std::io::Result<()> {
                 web::post().to(users_routes::admin_reprocess),
             )
             .route(
+                "/api/v1/admin/rfcs",
+                web::get().to(users_routes::admin_list_rfcs),
+            )
+            .route(
                 "/api/v1/users/sync-status",
                 web::get().to(users_routes::sync_status),
             )
