@@ -482,14 +482,36 @@ pub async fn sync_status(
         .filter(|s| !s.is_empty());
 
     let job_id_opt = if let Some(ref rfc) = specific_rfc {
-        // Look up sync info for a specific RFC
-        match crate::db::users::get_credentials_for_rfc(&pool, &user_id, rfc).await {
-            Ok(Some((_clave, job_id))) => job_id,
+        // Prefer any active (running/queued/paused_limit) job over the stored initial_sync_job_id,
+        // so admin-queued jobs and paused syncs are always surfaced correctly.
+        match crate::db::jobs::get_active_for_rfc(&pool, rfc).await {
+            Ok(Some(active_job)) => {
+                return HttpResponse::Ok().json(serde_json::json!({
+                    "status":      active_job.status,
+                    "found":       active_job.found,
+                    "job_id":      active_job.id,
+                    "period_from": active_job.period_from,
+                    "period_to":   active_job.period_to,
+                    "error_msg":   active_job.error_msg,
+                }));
+            }
             Ok(None) => {
-                return HttpResponse::Ok().json(serde_json::json!({ "status": "none" }));
+                // No active job — fall through to initial_sync_job_id
+                match crate::db::users::get_credentials_for_rfc(&pool, &user_id, rfc).await {
+                    Ok(Some((_clave, job_id))) => job_id,
+                    Ok(None) => {
+                        return HttpResponse::Ok().json(serde_json::json!({ "status": "none" }));
+                    }
+                    Err(e) => {
+                        tracing::error!(user_id = %user_id, "Error fetching sync info for RFC: {e}");
+                        return HttpResponse::InternalServerError().json(ErrorBody {
+                            error: "Error al consultar estado".to_string(),
+                        });
+                    }
+                }
             }
             Err(e) => {
-                tracing::error!(user_id = %user_id, "Error fetching sync info for RFC: {e}");
+                tracing::error!(user_id = %user_id, rfc = %rfc, "Error fetching active job for RFC: {e}");
                 return HttpResponse::InternalServerError().json(ErrorBody {
                     error: "Error al consultar estado".to_string(),
                 });

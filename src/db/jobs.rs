@@ -347,6 +347,28 @@ pub async fn insert_queued(
 }
 
 /// Paginated invoice results for a job.
+/// Most relevant job for a given RFC: active jobs (running > queued > paused_limit) first,
+/// then most recent by created_at. Used by sync_status to surface newer admin-queued jobs
+/// that aren't linked to initial_sync_job_id.
+pub async fn get_active_for_rfc(pool: &PgPool, rfc: &str) -> Result<Option<SyncJob>, sqlx::Error> {
+    sqlx::query_as::<_, SyncJob>(
+        r#"SELECT * FROM pulso.sync_jobs
+           WHERE rfc = $1
+             AND status IN ('running', 'queued', 'paused_limit')
+           ORDER BY
+             CASE status
+               WHEN 'running'      THEN 0
+               WHEN 'queued'       THEN 1
+               WHEN 'paused_limit' THEN 2
+             END,
+             created_at DESC
+           LIMIT 1"#,
+    )
+    .bind(rfc.to_uppercase())
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn get_invoices(
     pool: &PgPool,
     job_id: &str,
