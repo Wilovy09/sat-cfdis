@@ -406,6 +406,7 @@ async fn run_worker_chunk(
     let mut found = initial_found;
     let mut cursor = period_from.clone();
     let mut limit_hit = false;
+    let mut done_received = false;
 
     while let Ok(Some(line)) = lines.next_line().await {
         if line.is_empty() {
@@ -478,6 +479,7 @@ async fn run_worker_chunk(
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {
+            done_received = true;
             break;
         }
 
@@ -499,15 +501,18 @@ async fn run_worker_chunk(
         }
     }
 
-    match child.wait().await {
-        Ok(status) if !status.success() => {
-            tracing::error!(job_id = %job_id, exit_code = ?status.code(), "PHP worker exited with error");
+    let php_exit_ok = match child.wait().await {
+        Ok(status) => {
+            if !status.success() {
+                tracing::error!(job_id = %job_id, exit_code = ?status.code(), "PHP worker exited with error");
+            }
+            status.success()
         }
         Err(e) => {
             tracing::error!(job_id = %job_id, "PHP worker wait failed: {e}");
+            false
         }
-        _ => {}
-    }
+    };
 
     // Small yield so the stderr task has a chance to flush its last lines
     tokio::task::yield_now().await;
@@ -515,6 +520,13 @@ async fn run_worker_chunk(
     if let Some(err_msg) = auth_error.lock().await.clone() {
         let _ = db::jobs::fail(&pool, &job_id, &err_msg).await;
         tracing::warn!(job_id = %job_id, "Job failed: auth error");
+        return;
+    }
+
+    // PHP crashed before sending __done__ — fail the job so it can be retried
+    if !done_received && !php_exit_ok {
+        let _ = db::jobs::fail(&pool, &job_id, "PHP worker crashed before completion").await;
+        tracing::error!(job_id = %job_id, "Job failed: PHP worker did not send __done__");
         return;
     }
 
