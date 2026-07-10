@@ -290,7 +290,7 @@ pub async fn has_job_for_period(
         r#"SELECT EXISTS(
                SELECT 1 FROM pulso.sync_jobs
                WHERE rfc = $1 AND period_from = $2 AND period_to = $3
-               AND status NOT IN ('cancelled', 'failed')
+               AND status NOT IN ('cancelled')
            )"#,
     )
     .bind(rfc)
