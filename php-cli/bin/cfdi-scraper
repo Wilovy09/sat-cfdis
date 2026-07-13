@@ -77,7 +77,11 @@ function createCaptchaResolver(): CaptchaResolverInterface
         && file_exists($configPath)
         && class_exists(\PhpCfdi\ImageCaptchaResolver\BoxFacturaAI\BoxFacturaAIResolver::class)
     ) {
-        return \PhpCfdi\ImageCaptchaResolver\BoxFacturaAI\BoxFacturaAIResolver::createFromConfigs($configPath);
+        try {
+            return \PhpCfdi\ImageCaptchaResolver\BoxFacturaAI\BoxFacturaAIResolver::createFromConfigs($configPath);
+        } catch (Throwable $e) {
+            fwrite(STDERR, 'BoxFactura AI unavailable (' . $e->getMessage() . ') — falling back to UserCaptchaResolver' . PHP_EOL);
+        }
     }
 
     return new UserCaptchaResolver();
