@@ -628,6 +628,18 @@ pub async fn find_user_id_by_google_id(
     Ok(row.map(|(id,)| id.to_string()))
 }
 
+/// Returns true if job_id is the initial_sync_job_id for the given RFC.
+pub async fn is_initial_sync_job(pool: &PgPool, rfc: &str, job_id: &str) -> Result<bool, sqlx::Error> {
+    let (exists,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM pulso.users WHERE rfc = $1 AND initial_sync_job_id = $2 AND deleted_at IS NULL)"
+    )
+    .bind(rfc.to_uppercase())
+    .bind(job_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
 /// Set initial_sync_job_id for a specific active RFC.
 pub async fn set_initial_sync_job_for_rfc(
     pool: &PgPool,
