@@ -487,12 +487,14 @@ pub async fn sync_status(
         match crate::db::jobs::get_active_for_rfc(&pool, rfc).await {
             Ok(Some(active_job)) => {
                 return HttpResponse::Ok().json(serde_json::json!({
-                    "status":      active_job.status,
-                    "found":       active_job.found,
-                    "job_id":      active_job.id,
-                    "period_from": active_job.period_from,
-                    "period_to":   active_job.period_to,
-                    "error_msg":   active_job.error_msg,
+                    "status":          active_job.status,
+                    "found":           active_job.found,
+                    "total_expected":  active_job.total_expected,
+                    "cursor_date":     active_job.cursor_date,
+                    "job_id":          active_job.id,
+                    "period_from":     active_job.period_from,
+                    "period_to":       active_job.period_to,
+                    "error_msg":       active_job.error_msg,
                 }));
             }
             Ok(None) => {
@@ -540,12 +542,14 @@ pub async fn sync_status(
 
     match crate::db::jobs::get_by_id(&pool, &job_id).await {
         Ok(Some(job)) => HttpResponse::Ok().json(serde_json::json!({
-            "status":      job.status,
-            "found":       job.found,
-            "job_id":      job.id,
-            "period_from": job.period_from,
-            "period_to":   job.period_to,
-            "error_msg":   job.error_msg,
+            "status":         job.status,
+            "found":          job.found,
+            "total_expected": job.total_expected,
+            "cursor_date":    job.cursor_date,
+            "job_id":         job.id,
+            "period_from":    job.period_from,
+            "period_to":      job.period_to,
+            "error_msg":      job.error_msg,
         })),
         Ok(None) => HttpResponse::Ok().json(serde_json::json!({ "status": "none" })),
         Err(e) => {
