@@ -120,10 +120,12 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                 job.rfc.clone(),
                 auth_payload,
                 job.auth_type.clone(),
+                job.period_from.clone(),
                 resume_from,
                 job.period_to.clone(),
                 job.dl_type.clone(),
                 job.found,
+                job.total_expected,
             )
             .await;
         }
@@ -343,6 +345,65 @@ fn month_label_es(date_str: &str) -> String {
     format!("{} {}", MONTHS[month_idx - 1], year)
 }
 
+/// Run the list-count PHP pass and return the total invoice count.
+/// Only counts complete calendar months within the period.
+/// Returns None on any failure (count is best-effort; stream will run regardless).
+async fn run_count_pass(
+    cfg: &Config,
+    auth_payload: &serde_json::Value,
+    period_from: &str,
+    period_to: &str,
+    dl_type: &str,
+) -> Option<i64> {
+    use std::process::Stdio;
+    use tokio::io::AsyncBufReadExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let payload = serde_json::json!({
+        "command": "list-count",
+        "auth":    auth_payload,
+        "params": {
+            "period_from":   period_from,
+            "period_to":     period_to,
+            "download_type": dl_type,
+        }
+    });
+
+    let mut input_bytes = serde_json::to_vec(&payload).ok()?;
+    input_bytes.push(b'\n');
+
+    let mut cmd = tokio::process::Command::new(&cfg.php_bin);
+    cmd.arg(&cfg.php_cli_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(ref proxy) = cfg.https_proxy {
+        cmd.env("HTTPS_PROXY", proxy).env("https_proxy", proxy);
+    }
+
+    let mut child = cmd.spawn().ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&input_bytes).await;
+    }
+
+    let stdout = child.stdout.take()?;
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+
+    let mut total: Option<i64> = None;
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.is_empty() { continue; }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+            if val.get("__count__").is_some() {
+                total = val["total"].as_i64();
+                break;
+            }
+        }
+    }
+
+    let _ = child.wait().await;
+    total
+}
+
 /// Run one PHP list-stream chunk for a background worker job.
 /// Results go to DB (job_invoices) and S3/local storage.
 /// No SSE — silent background processing.
@@ -356,14 +417,30 @@ async fn run_worker_chunk(
     job_rfc: String,
     auth_payload: serde_json::Value,
     _auth_type: String,
-    period_from: String,
+    full_period_from: String, // original job start (for count pass)
+    period_from: String,      // resume point (may differ from full_period_from)
     period_to: String,
     dl_type: String,
     initial_found: i64,
+    total_expected: Option<i64>,
 ) {
     use std::process::Stdio;
     use tokio::io::AsyncBufReadExt as _;
     use tokio::io::AsyncWriteExt as _;
+
+    // Count pass: only for non-auto_daily jobs where total is still unknown.
+    if job_type != "auto_daily" && total_expected.is_none() {
+        tracing::info!(job_id = %job_id, "Starting list-count pre-pass");
+        match run_count_pass(&cfg, &auth_payload, &full_period_from, &period_to, &dl_type).await {
+            Some(total) => {
+                tracing::info!(job_id = %job_id, total = total, "list-count complete");
+                let _ = db::jobs::set_total_expected(&pool, &job_id, total).await;
+            }
+            None => {
+                tracing::warn!(job_id = %job_id, "list-count returned no result, skipping");
+            }
+        }
+    }
 
     let payload = serde_json::json!({
         "command": "list-stream",
