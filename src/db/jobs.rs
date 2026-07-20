@@ -22,6 +22,8 @@ pub struct SyncJob {
     /// Last date (YYYY-MM-DD) fully processed; None = not started yet
     pub cursor_date: Option<String>,
     pub found: i64,
+    /// Total invoices expected (from list-count pre-pass); None until count completes
+    pub total_expected: Option<i64>,
     pub status: String,
     pub error_msg: Option<String>,
     /// ISO-8601 UTC — when the worker should resume this job
@@ -200,6 +202,23 @@ pub async fn reset_stale_running(pool: &PgPool) -> Result<u64, sqlx::Error> {
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
+}
+
+/// Store the pre-count total from the list-count pass.
+pub async fn set_total_expected(
+    pool: &PgPool,
+    job_id: &str,
+    total: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE pulso.sync_jobs SET total_expected=$1, updated_at=$2 WHERE id=$3"#,
+    )
+    .bind(total)
+    .bind(now_utc())
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Update found count in place (called as invoices stream in).
