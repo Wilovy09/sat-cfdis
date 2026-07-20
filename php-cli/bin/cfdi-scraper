@@ -470,6 +470,97 @@ switch ($command) {
         exit(0);
 
     // ----------------------------------------------------------------------
+    // list-count: iterate complete months in period_from..period_to, count
+    // metadata only (no XML downloads). Emits keepalives during processing.
+    // Final line: {"__count__":true,"total":N,"type_counts":{...}}
+    // Only counts COMPLETE calendar months (skips partial months at edges).
+    // ----------------------------------------------------------------------
+    case 'list-count':
+        if (empty($params['period_from']) || empty($params['period_to'])) {
+            outputError("'list-count' requires 'period_from' and 'period_to' in params");
+        }
+
+        try {
+            $lcFrom = new DateTimeImmutable($params['period_from']);
+            $lcTo   = new DateTimeImmutable($params['period_to']);
+        } catch (Throwable $e) {
+            outputError('Invalid date format: ' . $e->getMessage());
+        }
+
+        $rawLcDlType = strtolower($params['download_type'] ?? 'emitidos');
+        $lcDownloadTypes = ($rawLcDlType === 'ambas' || $rawLcDlType === 'ambos')
+            ? [DownloadType::emitidos(), DownloadType::recibidos()]
+            : [resolveDownloadType($rawLcDlType)];
+
+        while (ob_get_level()) { ob_end_clean(); }
+        ini_set('output_buffering', 'Off');
+        ini_set('implicit_flush', '1');
+
+        // Build list of complete calendar months fully within [lcFrom, lcTo].
+        // A month is "complete" if its first day >= lcFrom and its last day <= lcTo.
+        $lcMonths = [];
+        $lcCursor = new DateTimeImmutable($lcFrom->format('Y-m-01') . ' 00:00:00');
+        while (true) {
+            $lcMonthEnd = new DateTimeImmutable(
+                $lcCursor->format('Y-m-') . $lcCursor->format('t') . ' 23:59:59'
+            );
+            // Month must start on or after lcFrom day-1 and end on or before lcTo
+            if ($lcCursor->format('Y-m-d') < $lcFrom->format('Y-m-01')) {
+                $lcCursor = (new DateTimeImmutable($lcCursor->format('Y-m-01')))->modify('+1 month');
+                continue;
+            }
+            if ($lcMonthEnd > $lcTo) break;
+            // Require full month: first day must be the 1st
+            if ($lcCursor->format('d') !== '01') {
+                $lcCursor = (new DateTimeImmutable($lcCursor->format('Y-m-01')))->modify('+1 month');
+                continue;
+            }
+            // Require full month: lcFrom must be on or before the 1st of this month
+            if ($lcFrom->format('Y-m-d') > $lcCursor->format('Y-m-d')) {
+                $lcCursor = (new DateTimeImmutable($lcCursor->format('Y-m-01')))->modify('+1 month');
+                continue;
+            }
+            $lcMonths[] = [$lcCursor->setTime(0, 0, 0), $lcMonthEnd];
+            $lcCursor = (new DateTimeImmutable($lcCursor->format('Y-m-01')))->modify('+1 month');
+        }
+
+        $lcTotal      = 0;
+        $lcTypeCounts = [];
+
+        foreach ($lcMonths as [$lcMonthStart, $lcMonthEnd]) {
+            $lcDay = $lcMonthStart;
+            while ($lcDay->format('Y-m-d') <= $lcMonthEnd->format('Y-m-d')) {
+                echo json_encode(['__keepalive__' => true], JSON_UNESCAPED_UNICODE) . "\n";
+                flush();
+
+                $lcDayStart = $lcDay->setTime(0, 0, 0);
+                $lcDayEnd   = $lcDay->setTime(23, 59, 59);
+
+                foreach ($lcDownloadTypes as $lcDlType) {
+                    $lcQuery = new QueryByFilters($lcDayStart, $lcDayEnd);
+                    $lcQuery->setDownloadType($lcDlType);
+                    try {
+                        $lcList = $scraper->listByDateTime($lcQuery);
+                        foreach ($lcList as $lcMeta) {
+                            $lcData = $lcMeta->getData();
+                            $lcTipo = $lcData['efectoComprobante'] ?? 'Desconocido';
+                            $lcTypeCounts[$lcTipo] = ($lcTypeCounts[$lcTipo] ?? 0) + 1;
+                            $lcTotal++;
+                        }
+                    } catch (Throwable $e) {
+                        fwrite(STDERR, 'list-count error on ' . $lcDay->format('Y-m-d') . ': ' . $e->getMessage() . "\n");
+                    }
+                }
+
+                $lcDay = $lcDay->modify('+1 day');
+            }
+        }
+
+        echo json_encode(['__count__' => true, 'total' => $lcTotal, 'type_counts' => $lcTypeCounts]) . "\n";
+        flush();
+        exit(0);
+
+    // ----------------------------------------------------------------------
     // download: fetch XML or PDF files for given UUIDs
     // ----------------------------------------------------------------------
     case 'download':
