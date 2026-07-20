@@ -301,6 +301,48 @@ async fn daily_sync_worker(pool: DbPool) {
     }
 }
 
+/// Returns true if the date string "YYYY-MM-DD …" falls on the last day of its month.
+fn is_last_day_of_month(date_str: &str) -> bool {
+    // Expect at least "YYYY-MM-DD"
+    if date_str.len() < 10 {
+        return false;
+    }
+    let parts: Vec<&str> = date_str[..10].split('-').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (
+        parts[0].parse::<u32>(),
+        parts[1].parse::<u32>(),
+        parts[2].parse::<u32>(),
+    ) else {
+        return false;
+    };
+    let last = days_in_month(y, m);
+    d == last
+}
+
+/// Build a Spanish month label like "Julio 2026" from "YYYY-MM-DD …".
+fn month_label_es(date_str: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+        "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+    ];
+    if date_str.len() < 7 {
+        return date_str.to_string();
+    }
+    let parts: Vec<&str> = date_str[..7].split('-').collect();
+    if parts.len() != 2 {
+        return date_str.to_string();
+    }
+    let year = parts[0];
+    let month_idx: usize = parts[1].parse::<usize>().unwrap_or(0);
+    if month_idx == 0 || month_idx > 12 {
+        return date_str.to_string();
+    }
+    format!("{} {}", MONTHS[month_idx - 1], year)
+}
+
 /// Run one PHP list-stream chunk for a background worker job.
 /// Results go to DB (job_invoices) and S3/local storage.
 /// No SSE — silent background processing.
@@ -546,25 +588,42 @@ async fn run_worker_chunk(
         let _ = db::jobs::complete(&pool, &job_id, &period_to, found).await;
         tracing::info!(job_id = %job_id, found = found, "Job completed");
 
-        // Send completion email only for manual jobs (not auto_daily background syncs)
-        if job_type != "auto_daily" {
-            if let Some(ref api_key) = cfg.sendgrid_api_key {
-                if let Ok(Some(email)) = crate::db::users::get_email_by_rfc(&pool, &job_rfc).await {
-                    if let Err(e) = crate::services::email::send_sync_complete(
+        // Email 1: initial sync complete (job_type == "list" and this is the user's initial_sync_job_id)
+        // Email 2: monthly complete (job_type == "auto_daily" and period_to falls on the last day of its month)
+        if let Some(ref api_key) = cfg.sendgrid_api_key {
+            if let Ok(Some(email)) = crate::db::users::get_email_by_rfc(&pool, &job_rfc).await {
+                let send_result = if job_type == "list" {
+                    match crate::db::users::is_initial_sync_job(&pool, &job_rfc, &job_id).await {
+                        Ok(true) => {
+                            Some(crate::services::email::send_sync_complete(
+                                api_key,
+                                &cfg.sendgrid_from,
+                                &email,
+                                &job_rfc,
+                                found,
+                                &period_from,
+                                &period_to,
+                            ).await)
+                        }
+                        _ => None,
+                    }
+                } else if job_type == "auto_daily" && is_last_day_of_month(&period_to) {
+                    let month_label = month_label_es(&period_to);
+                    Some(crate::services::email::send_monthly_complete(
                         api_key,
                         &cfg.sendgrid_from,
                         &email,
                         &job_rfc,
-                        found,
-                        &period_from,
-                        &period_to,
-                    )
-                    .await
-                    {
-                        tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}");
-                    } else {
-                        tracing::info!(job_id = %job_id, "Sent completion email to {email}");
-                    }
+                        &month_label,
+                    ).await)
+                } else {
+                    None
+                };
+
+                match send_result {
+                    Some(Err(e)) => tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}"),
+                    Some(Ok(_))  => tracing::info!(job_id = %job_id, "Sent completion email to {email}"),
+                    None         => {}
                 }
             }
         }
