@@ -55,7 +55,22 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
             }
         };
 
-        for job in queued.into_iter().chain(resumable) {
+        // list jobs have priority over auto_daily per RFC.
+        // If any RFC has a list job pending (queued or paused_limit), skip auto_daily for that RFC.
+        let rfcs_with_list: std::collections::HashSet<String> = queued
+            .iter()
+            .chain(resumable.iter())
+            .filter(|j| j.job_type == "list")
+            .map(|j| j.rfc.clone())
+            .collect();
+
+        let all_jobs: Vec<_> = queued
+            .into_iter()
+            .chain(resumable)
+            .filter(|j| !(j.job_type == "auto_daily" && rfcs_with_list.contains(&j.rfc)))
+            .collect();
+
+        for job in all_jobs {
             let label = if job.status == "queued" {
                 "Starting queued job"
             } else {
