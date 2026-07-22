@@ -176,15 +176,16 @@ pub async fn complete_profile(
 
     let rfc = body.rfc.trim().to_uppercase();
     tracing::Span::current().record("rfc", &rfc.as_str());
-    if rfc.is_empty() || body.clave.is_empty() {
+    if rfc.is_empty() {
         return HttpResponse::UnprocessableEntity().json(ErrorBody {
-            error: "RFC y CIEC son requeridos".to_string(),
+            error: "RFC es requerido".to_string(),
         });
     }
 
     let key = crypto::load_key();
 
-    // Encrypt the CIEC password for storage in pulso.users
+    // Encrypt the CIEC password for storage in pulso.users.
+    // clave may be empty when the user will authenticate via FIEL instead.
     let clave_enc = match crypto::encrypt(&key, &body.clave) {
         Ok(enc) => enc,
         Err(e) => {
@@ -625,9 +626,9 @@ pub async fn add_rfc(
 
     let rfc = body.rfc.trim().to_uppercase();
     tracing::Span::current().record("rfc", &rfc.as_str());
-    if rfc.is_empty() || body.clave.is_empty() {
+    if rfc.is_empty() {
         return HttpResponse::UnprocessableEntity().json(ErrorBody {
-            error: "RFC y CIEC son requeridos".to_string(),
+            error: "RFC es requerido".to_string(),
         });
     }
 
