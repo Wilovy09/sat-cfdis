@@ -1,4 +1,5 @@
 pub mod cfdis;
+pub mod fiel;
 pub mod jobs;
 pub mod subscriptions;
 pub mod users;

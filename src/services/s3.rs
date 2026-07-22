@@ -67,3 +67,50 @@ pub async fn get_xml(
         .map(|data| data.into_bytes().to_vec())
         .ok()
 }
+
+/// Upload raw bytes to S3 at an arbitrary key (used for FIEL .cer / .key files).
+pub async fn upload_fiel(
+    client: &Client,
+    bucket: &str,
+    s3_key: &str,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(s3_key)
+        .content_type("application/octet-stream")
+        .body(ByteStream::from(data))
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Download raw bytes from S3 at an arbitrary key. Returns None if not found.
+pub async fn get_fiel(client: &Client, bucket: &str, s3_key: &str) -> Option<Vec<u8>> {
+    let resp = client
+        .get_object()
+        .bucket(bucket)
+        .key(s3_key)
+        .send()
+        .await
+        .ok()?;
+    resp.body
+        .collect()
+        .await
+        .map(|data| data.into_bytes().to_vec())
+        .ok()
+}
+
+/// Delete an object from S3. Best-effort — errors are returned but non-fatal.
+pub async fn delete_fiel(client: &Client, bucket: &str, s3_key: &str) -> Result<(), String> {
+    client
+        .delete_object()
+        .bucket(bucket)
+        .key(s3_key)
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}

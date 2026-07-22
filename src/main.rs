@@ -21,11 +21,71 @@ use utoipa_scalar::{Scalar, Servable};
 use config::Config;
 use db::DbPool;
 use routes::{
-    analytics as analytics_routes, auth as auth_routes, billing as billing_routes, invoices,
-    queue as queue_routes, users as users_routes,
+    analytics as analytics_routes, auth as auth_routes, billing as billing_routes, fiel as fiel_routes,
+    invoices, queue as queue_routes, users as users_routes,
 };
 use services::etl;
 use state::CaptchaMap;
+
+// ---------------------------------------------------------------------------
+// FIEL auth helper — checks DB for FIEL credentials and converts DER → PEM
+// ---------------------------------------------------------------------------
+
+/// If the RFC has FIEL configured, downloads .cer/.key from S3, decrypts the
+/// password, converts DER to PEM via openssl, and returns a FIEL auth payload
+/// together with the TempDir that holds the PEM files.
+///
+/// The caller must keep the returned `TempDir` alive until the PHP process exits.
+/// Returns `None` on any failure (FIEL not configured, S3 error, bad password, …).
+async fn try_fiel_auth(
+    pool: &DbPool,
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    rfc: &str,
+) -> Option<(serde_json::Value, tempfile::TempDir)> {
+    let row = db::fiel::get(pool, rfc)
+        .await
+        .map_err(|e| tracing::error!(rfc = %rfc, "FIEL check: DB error: {e}"))
+        .ok()??;
+
+    let cert_bytes = services::s3::get_fiel(s3, bucket, &row.cert_s3_key).await.or_else(|| {
+        tracing::error!(rfc = %rfc, key = %row.cert_s3_key, "FIEL: S3 cert download failed");
+        None
+    })?;
+
+    let key_bytes = services::s3::get_fiel(s3, bucket, &row.key_s3_key).await.or_else(|| {
+        tracing::error!(rfc = %rfc, key = %row.key_s3_key, "FIEL: S3 key download failed");
+        None
+    })?;
+
+    let enc_key = services::crypto::load_key();
+    let password = services::crypto::decrypt(&enc_key, &row.password_enc)
+        .map_err(|e| tracing::error!(rfc = %rfc, "FIEL: decrypt password failed: {e}"))
+        .ok()?;
+
+    use base64::Engine as _;
+    let cert_b64 = base64::engine::general_purpose::STANDARD.encode(&cert_bytes);
+    let key_b64 = base64::engine::general_purpose::STANDARD.encode(&key_bytes);
+
+    let tmp = tempfile::TempDir::new()
+        .map_err(|e| tracing::error!(rfc = %rfc, "FIEL: TempDir creation failed: {e}"))
+        .ok()?;
+
+    let (cert_pem, key_pem) =
+        services::fiel::der_to_pem(&cert_b64, &key_b64, &password, tmp.path())
+            .await
+            .map_err(|e| tracing::error!(rfc = %rfc, "FIEL: der_to_pem failed: {e}"))
+            .ok()?;
+
+    let auth = serde_json::json!({
+        "type":          "fiel",
+        "cert_pem_path": cert_pem.to_string_lossy(),
+        "key_pem_path":  key_pem.to_string_lossy(),
+        "password":      "",
+    });
+
+    Some((auth, tmp))
+}
 
 // ---------------------------------------------------------------------------
 // Background worker — resumes paused_limit jobs after 24.5 h
@@ -101,6 +161,18 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                     continue;
                 }
             };
+
+            // If RFC has FIEL configured, override CIEC auth with FIEL.
+            // _fiel_tmp must stay alive until run_worker_chunk returns.
+            let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+            let (auth_payload, _fiel_tmp) =
+                match try_fiel_auth(&pool, &s3_client, &bucket, &job.rfc).await {
+                    Some((fiel_auth, tmp)) => {
+                        tracing::info!(rfc = %job.rfc, "Worker: using FIEL auth");
+                        (fiel_auth, Some(tmp))
+                    }
+                    None => (auth_payload, None::<tempfile::TempDir>),
+                };
 
             // Queued jobs start from period_from; paused jobs resume from day after cursor
             let resume_from = match &job.cursor_date {
@@ -897,6 +969,13 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::resource("/api/v1/users/rfcs/{rfc}")
                     .route(web::delete().to(users_routes::delete_rfc_handler)),
+            )
+            // FIEL API
+            .service(
+                web::resource("/api/v1/users/rfcs/{rfc}/fiel")
+                    .route(web::post().to(fiel_routes::upload))
+                    .route(web::get().to(fiel_routes::get_status))
+                    .route(web::delete().to(fiel_routes::delete)),
             )
             // Invoice API
             .service(
