@@ -536,7 +536,7 @@ async fn run_worker_chunk(
             "period_from":       period_from,
             "period_to":         period_to,
             "download_type":     dl_type,
-            "auto_download_xml": true,
+            "auto_download_xml": false,
         }
     });
 

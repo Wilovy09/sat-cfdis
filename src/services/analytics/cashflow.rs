@@ -134,7 +134,8 @@ pub async fn get(
     // PUE / PPD totals
     let metodo_row = sqlx::query(&format!(
         r#"
-        SELECT metodo_pago, SUM(COALESCE(total_mxn,0)::float8)::float8 AS total
+        SELECT COALESCE(metodo_pago, 'PUE') AS metodo_pago,
+               SUM(COALESCE(total_mxn,0)::float8)::float8 AS total
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
@@ -142,7 +143,7 @@ pub async fn get(
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY metodo_pago
+        GROUP BY COALESCE(metodo_pago, 'PUE')
         "#
     ))
     .bind(rfc)
