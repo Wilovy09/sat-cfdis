@@ -429,6 +429,9 @@ switch ($command) {
                     str_contains($errMsg, 'limite') ||
                     str_contains($errMsg, 'limit') ||
                     str_contains($errMsg, 'No tiene acceso') ||
+                    str_contains($causeChain, 'falla en el servicio') ||
+                    str_contains($causeChain, 'Se ha presentado una falla') ||
+                    str_contains($causeChain, 'Folio: DT-') ||
                     ($dayError instanceof \PhpCfdi\CfdiSatScraper\Exceptions\SatException)
                 );
                 if ($isAuthFailure) {
