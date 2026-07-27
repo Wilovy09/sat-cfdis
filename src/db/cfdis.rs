@@ -641,14 +641,27 @@ pub async fn reset_for_reprocessing(
 }
 
 /// Mark all xml_available=0 CFDIs in a job as permanently unavailable (xml_available=-1).
-/// Called after repeated failed attempts to fetch the XML from both storage and SAT.
+/// Also backfills subtotal from total when subtotal is NULL so that the STORED GENERATED
+/// column total_neto_mxn has a meaningful value instead of 0 for analytics.
 pub async fn mark_xml_unavailable_for_job(
     pool: &PgPool,
     job_id: &str,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         r#"UPDATE pulso.cfdis c
-           SET xml_available = -1
+           SET xml_available = -1,
+               subtotal  = CASE
+                   WHEN c.subtotal IS NULL AND c.total IS NOT NULL
+                        AND c.tipo_comprobante NOT IN ('P', 'N')
+                       THEN c.total / NULLIF(COALESCE(c.tipo_cambio, 1.0), 0)
+                   ELSE c.subtotal
+               END,
+               descuento = CASE
+                   WHEN c.subtotal IS NULL AND c.descuento IS NULL
+                        AND c.tipo_comprobante NOT IN ('P', 'N')
+                       THEN 0.0
+                   ELSE c.descuento
+               END
            FROM pulso.job_invoices ji
            WHERE c.uuid = ji.uuid AND ji.job_id = $1 AND c.xml_available = 0"#,
     )
