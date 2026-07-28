@@ -432,6 +432,11 @@ fn month_label_es(date_str: &str) -> String {
     format!("{} {}", MONTHS[month_idx - 1], year)
 }
 
+/// Max time to wait for the next line from the PHP scraper subprocess before
+/// treating it as hung (SAT stalled, dead connection) and killing it. Without
+/// this, a stuck child blocks resume_worker's sequential job loop forever.
+const PHP_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
+
 /// Run the list-count PHP pass and return the total invoice count.
 /// Only counts complete calendar months within the period.
 /// Returns None on any failure (count is best-effort; stream will run regardless).
@@ -477,7 +482,22 @@ async fn run_count_pass(
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
     let mut total: Option<i64> = None;
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(PHP_IDLE_TIMEOUT_SECS),
+            lines.next_line(),
+        )
+        .await;
+        let line = match next {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                tracing::error!("list-count: PHP worker idle timeout, killing");
+                let _ = child.start_kill();
+                break;
+            }
+        };
         if line.is_empty() { continue; }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
             if val.get("__count__").is_some() {
@@ -613,8 +633,25 @@ async fn run_worker_chunk(
     let mut cursor = period_from.clone();
     let mut limit_hit = false;
     let mut done_received = false;
+    let mut idle_timeout = false;
 
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(PHP_IDLE_TIMEOUT_SECS),
+            lines.next_line(),
+        )
+        .await;
+        let line = match next {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                tracing::error!(job_id = %job_id, "PHP worker idle timeout, killing");
+                let _ = child.start_kill();
+                idle_timeout = true;
+                break;
+            }
+        };
         if line.is_empty() {
             continue;
         }
@@ -729,10 +766,16 @@ async fn run_worker_chunk(
         return;
     }
 
-    // PHP crashed before sending __done__ — fail the job so it can be retried
+    // PHP crashed (or was killed after an idle timeout) before sending __done__ —
+    // fail the job so it can be retried instead of leaving it stuck in 'running'.
     if !done_received && !php_exit_ok {
-        let _ = db::jobs::fail(&pool, &job_id, "PHP worker crashed before completion").await;
-        tracing::error!(job_id = %job_id, "Job failed: PHP worker did not send __done__");
+        let msg = if idle_timeout {
+            "PHP worker idle timeout — killed (no output for too long)"
+        } else {
+            "PHP worker crashed before completion"
+        };
+        let _ = db::jobs::fail(&pool, &job_id, msg).await;
+        tracing::error!(job_id = %job_id, idle_timeout, "Job failed: PHP worker did not send __done__");
         return;
     }
 
