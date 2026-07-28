@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, rfc_column};
+use super::summary::{cp_key_expr, dl_type_filter, rfc_column};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -60,18 +60,10 @@ pub async fn get(
         "nombre_receptor"
     };
 
-    // For "emitidos" (ingresos), split XEXX010101000 foreign clients by name — matches Python behaviour
-    // where each distinct foreign entity gets its own contraparte_key ("XEXX010101000||NOMBRE")
-    let cp_key_expr = if dl_type != "recibidos" {
-        format!(
-            "CASE WHEN {cp_col} = 'XEXX010101000' \
-                  AND TRIM(COALESCE({cp_name_col}, '')) <> '' \
-             THEN 'XEXX010101000||' || UPPER(REGEXP_REPLACE(TRIM(COALESCE({cp_name_col},'')), '[^A-Z0-9 &\\-]', '', 'g')) \
-             ELSE {cp_col} END"
-        )
-    } else {
-        cp_col.to_string()
-    };
+    // Split generic SAT RFCs (XAXX/XEXX) by name — matches Python behaviour where each
+    // distinct real entity gets its own contraparte_key ("GENERIC_RFC||NOMBRE"). Degrades
+    // to the bare RFC on the "recibidos" side, where rfc_emisor never carries a generic RFC.
+    let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
 
     // If explicit from/to given (user-selected period), clamp window to that range.
     // Otherwise roll back window_months from the latest date in DB.

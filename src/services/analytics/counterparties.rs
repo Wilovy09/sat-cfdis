@@ -1,4 +1,7 @@
-use super::summary::{dl_type_filter, parse_ym, rfc_column};
+use super::summary::{
+    cp_key_expr, cp_nombre_expr, dl_type_filter, normalized_name_expr, parse_ym, rfc_column,
+    LABEL_EXTRANJERO_GENERICO, LABEL_PUBLICO_GENERAL, RFC_EXTRANJERO_GENERICO, RFC_PUBLICO_GENERAL,
+};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -47,14 +50,16 @@ pub async fn get(
     } else {
         "nombre_receptor"
     };
+    let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
+    let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
     // Window functions supply grand_total and cp_count alongside each top-N row,
     // eliminating the second full-table scan.
     let rows = sqlx::query(&format!(
         r#"
         SELECT
-            {cp_col}                                                AS cp_rfc,
-            CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
+            ({cp_key_expr})                                        AS cp_rfc,
+            {cp_nombre_expr}                                       AS cp_nombre,
             SUM(COALESCE(total_neto_mxn,0)::float8)::float8                          AS total,
             COUNT(*)                                               AS cnt,
             MIN(fecha_emision)                                     AS first_inv,
@@ -69,7 +74,7 @@ pub async fn get(
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY {cp_col}
+        GROUP BY ({cp_key_expr})
         ORDER BY total DESC
         LIMIT $6
         "#
@@ -172,11 +177,13 @@ pub async fn get_evolution(
     } else {
         "nombre_receptor"
     };
+    let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
+    let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
     let rows = sqlx::query(&format!(
         r#"
-        SELECT {cp_col} AS cp_rfc,
-               CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
+        SELECT ({cp_key_expr}) AS cp_rfc,
+               {cp_nombre_expr} AS cp_nombre,
                year,
                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS yr_total
         FROM pulso.cfdis
@@ -184,8 +191,8 @@ pub async fn get_evolution(
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY {cp_col}, year
-        ORDER BY {cp_col}, year
+        GROUP BY ({cp_key_expr}), year
+        ORDER BY ({cp_key_expr}), year
         "#
     ))
     .bind(rfc)
@@ -333,6 +340,8 @@ pub async fn get_ltm_comparison(
     } else {
         "nombre_receptor"
     };
+    let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
+    let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
     // Clamp requested `to` to the actual last data month so LTM always ends at
     // real data regardless of a hardcoded future date from the frontend
@@ -373,8 +382,8 @@ pub async fn get_ltm_comparison(
 
     let ltm_rows = sqlx::query(&format!(
         r#"
-        SELECT {cp_col} AS cp_rfc,
-               CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
+        SELECT ({cp_key_expr}) AS cp_rfc,
+               {cp_nombre_expr} AS cp_nombre,
                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS ltm_total,
                COUNT(DISTINCT year * 100 + month) AS months_active,
                COUNT(*) AS invoice_count
@@ -383,7 +392,7 @@ pub async fn get_ltm_comparison(
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY {cp_col}
+        GROUP BY ({cp_key_expr})
         "#
     ))
     .bind(rfc)
@@ -396,15 +405,15 @@ pub async fn get_ltm_comparison(
 
     let prev_rows = sqlx::query(&format!(
         r#"
-        SELECT {cp_col} AS cp_rfc,
-               CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
+        SELECT ({cp_key_expr}) AS cp_rfc,
+               {cp_nombre_expr} AS cp_nombre,
                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS prev_total
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY {cp_col}
+        GROUP BY ({cp_key_expr})
         "#
     ))
     .bind(rfc)
@@ -549,6 +558,13 @@ pub async fn get_payments_detail(
     } else {
         "nombre_receptor"
     };
+    // Two qualification variants: `all_inv` (bare column names) vs the CTEs that
+    // reference it through the `inv` alias. All four CTEs below MUST use the
+    // matching variant consistently, or the joins between them (on cp_rfc) will
+    // silently stop matching for split (generic-RFC) counterparties.
+    let cp_key_bare = cp_key_expr(cp_col, cp_name_col);
+    let cp_nombre_bare = cp_nombre_expr(cp_col, cp_name_col);
+    let cp_key_inv = cp_key_expr(&format!("inv.{cp_col}"), &format!("inv.{cp_name_col}"));
 
     // CNT05: full universe of ALL invoices (PUE + PPD), no date filter.
     // PUE invoices are treated as fully paid at emission (matches Python semantics).
@@ -568,12 +584,12 @@ pub async fn get_payments_detail(
               AND NOT is_cancelled
         ),
         inv_base AS (
-            SELECT {cp_col} AS cp_rfc,
-                   CASE WHEN {cp_col} LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre,
+            SELECT ({cp_key_bare}) AS cp_rfc,
+                   {cp_nombre_bare} AS cp_nombre,
                    SUM(inv_total) AS facturado,
                    COUNT(DISTINCT CASE WHEN metodo_pago = 'PPD' THEN uuid END) AS facturas_ppd
             FROM all_inv
-            GROUP BY {cp_col}
+            GROUP BY ({cp_key_bare})
         ),
         paid_per_inv AS (
             SELECT invoice_uuid, SUM(imp_pagado)::float8 AS paid
@@ -582,27 +598,27 @@ pub async fn get_payments_detail(
         ),
         cobrado_by_cp AS (
             -- PUE: assumed fully paid at emission; PPD: actual from complements (capped at inv_total)
-            SELECT inv.{cp_col} AS cp_rfc,
+            SELECT ({cp_key_inv}) AS cp_rfc,
                    SUM(CASE
                        WHEN inv.metodo_pago = 'PUE' THEN inv.inv_total
                        ELSE LEAST(COALESCE(ppi.paid, 0), inv.inv_total)
                    END)::float8 AS cobrado
             FROM all_inv inv
             LEFT JOIN paid_per_inv ppi ON ppi.invoice_uuid = inv.uuid
-            GROUP BY inv.{cp_col}
+            GROUP BY ({cp_key_inv})
         ),
         dias_by_cp AS (
-            SELECT inv.{cp_col}                                             AS cp_rfc,
+            SELECT ({cp_key_inv})                                             AS cp_rfc,
                    AVG((cp.fecha_pago::date - inv.fecha_emision::date)::float8) AS dias_cobro
             FROM all_inv inv
             JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
             JOIN pulso.cfdi_payments cp
                  ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
             WHERE inv.metodo_pago = 'PPD' AND cp.fecha_pago IS NOT NULL
-            GROUP BY inv.{cp_col}
+            GROUP BY ({cp_key_inv})
         ),
         risk_by_cp AS (
-            SELECT inv.{cp_col} AS cp_rfc,
+            SELECT ({cp_key_inv}) AS cp_rfc,
                    COUNT(DISTINCT CASE WHEN (inv.inv_total - COALESCE(ppi.paid,0)) > 1.0
                        THEN inv.uuid END) AS facturas_abiertas,
                    COALESCE(SUM(CASE
@@ -614,7 +630,7 @@ pub async fn get_payments_detail(
             FROM all_inv inv
             LEFT JOIN paid_per_inv ppi ON ppi.invoice_uuid = inv.uuid
             WHERE inv.metodo_pago = 'PPD'
-            GROUP BY inv.{cp_col}
+            GROUP BY ({cp_key_inv})
         )
         SELECT ib.cp_rfc,
                ib.cp_nombre,
@@ -706,11 +722,13 @@ pub async fn get_atypical(
     } else {
         "nombre_receptor"
     };
+    let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
+    let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
     let rows = sqlx::query(&format!(
         r#"
         WITH monthly AS (
-            SELECT {cp_col} AS cp_rfc, MAX({cp_name_col}) AS cp_nombre,
+            SELECT ({cp_key_expr}) AS cp_rfc, {cp_nombre_expr} AS cp_nombre,
                    year, month,
                    year::text || '-' || LPAD(month::text, 2, '0') AS period,
                    SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS mo_total
@@ -719,7 +737,7 @@ pub async fn get_atypical(
               AND NOT is_cancelled
               AND (year > $2 OR (year = $2 AND month >= $3))
               AND (year < $4 OR (year = $4 AND month <= $5))
-            GROUP BY {cp_col}, year, month
+            GROUP BY ({cp_key_expr}), year, month
         ),
         stats AS (
             SELECT cp_rfc,
@@ -844,6 +862,17 @@ pub async fn get_individual(
         "nombre_receptor"
     };
 
+    // `cp_rfc` may be a composite "GENERIC_RFC||NORMALIZED_NAME" key produced by the
+    // top-list/evolution/LTM endpoints (see cp_key_expr). Split it back apart so
+    // drill-down filters down to exactly the one real counterparty that key
+    // represents, instead of every invoice sharing the generic RFC. Ordinary RFCs
+    // never contain "||", so `name_filter` is empty and every filter below becomes
+    // a no-op — identical to the pre-fix behavior.
+    let (base_rfc, name_filter): (&str, &str) = cp_rfc.split_once("||").unwrap_or((cp_rfc, ""));
+    let name_filter_expr = normalized_name_expr(cp_name_col);
+    let name_filter_expr_c = normalized_name_expr(&format!("c.{cp_name_col}"));
+    let name_filter_expr_inv = normalized_name_expr(&format!("inv.{cp_name_col}"));
+
     // 1. Yearly totals for this counterparty
     let yearly_rows = sqlx::query(&format!(
         r#"
@@ -853,15 +882,16 @@ pub async fn get_individual(
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
-          AND {cp_col} = $2
-          AND (year > $3 OR (year = $3 AND month >= $4))
-          AND (year < $5 OR (year = $5 AND month <= $6))
+          AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
+          AND (year > $4 OR (year = $4 AND month >= $5))
+          AND (year < $6 OR (year = $6 AND month <= $7))
         GROUP BY year
         ORDER BY year
         "#
     ))
     .bind(owner_rfc)
-    .bind(cp_rfc)
+    .bind(base_rfc)
+    .bind(name_filter)
     .bind(from_y)
     .bind(from_m)
     .bind(to_y)
@@ -869,24 +899,33 @@ pub async fn get_individual(
     .fetch_all(pool)
     .await?;
 
-    // Get nombre from yearly query (fallback to monthly)
-    let cp_nombre_row = sqlx::query(&format!(
-        r#"
-        SELECT CASE WHEN $2 LIKE 'XAXX%' THEN 'Público en General' ELSE MAX({cp_name_col}) END AS cp_nombre
-        FROM pulso.cfdis
-        WHERE {owner_col} = $1 AND {cp_col} = $2 AND {dl_filter}
-          AND NOT is_cancelled
-        "#
-    ))
-    .bind(owner_rfc)
-    .bind(cp_rfc)
-    .fetch_optional(pool)
-    .await?;
+    // Resolve nombre in Rust for generic RFCs (no extra DB round-trip needed); for
+    // ordinary RFCs, fall back to the pre-existing lookup query.
+    let cp_nombre: String = match base_rfc {
+        RFC_PUBLICO_GENERAL if !name_filter.is_empty() => name_filter.to_string(),
+        RFC_PUBLICO_GENERAL => LABEL_PUBLICO_GENERAL.to_string(),
+        RFC_EXTRANJERO_GENERICO if !name_filter.is_empty() => name_filter.to_string(),
+        RFC_EXTRANJERO_GENERICO => LABEL_EXTRANJERO_GENERICO.to_string(),
+        _ => {
+            let cp_nombre_row = sqlx::query(&format!(
+                r#"
+                SELECT MAX({cp_name_col}) AS cp_nombre
+                FROM pulso.cfdis
+                WHERE {owner_col} = $1 AND {cp_col} = $2 AND {dl_filter}
+                  AND NOT is_cancelled
+                "#
+            ))
+            .bind(owner_rfc)
+            .bind(base_rfc)
+            .fetch_optional(pool)
+            .await?;
 
-    let cp_nombre: String = cp_nombre_row
-        .as_ref()
-        .and_then(|r| r.try_get("cp_nombre").ok())
-        .unwrap_or_else(|| cp_rfc.to_string());
+            cp_nombre_row
+                .as_ref()
+                .and_then(|r| r.try_get("cp_nombre").ok())
+                .unwrap_or_else(|| cp_rfc.to_string())
+        }
+    };
 
     let mut raw_years: Vec<(i32, f64, i64)> = yearly_rows
         .iter()
@@ -947,15 +986,16 @@ pub async fn get_individual(
         FROM pulso.cfdis
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
-          AND {cp_col} = $2
-          AND (year > $3 OR (year = $3 AND month >= $4))
-          AND (year < $5 OR (year = $5 AND month <= $6))
+          AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
+          AND (year > $4 OR (year = $4 AND month >= $5))
+          AND (year < $6 OR (year = $6 AND month <= $7))
         GROUP BY year, month
         ORDER BY year, month
         "#
     ))
     .bind(owner_rfc)
-    .bind(cp_rfc)
+    .bind(base_rfc)
+    .bind(name_filter)
     .bind(from_y)
     .bind(from_m)
     .bind(to_y)
@@ -985,14 +1025,15 @@ pub async fn get_individual(
         JOIN pulso.cfdis c ON c.uuid = cc.uuid
         WHERE c.{owner_col} = $1 AND c.{dl_filter} AND c.tipo_comprobante NOT IN ('P','N')
           AND NOT c.is_cancelled
-          AND c.{cp_col} = $2
-          AND (c.year > $3 OR (c.year = $3 AND c.month >= $4))
-          AND (c.year < $5 OR (c.year = $5 AND c.month <= $6))
+          AND c.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_c} = $3)
+          AND (c.year > $4 OR (c.year = $4 AND c.month >= $5))
+          AND (c.year < $6 OR (c.year = $6 AND c.month <= $7))
         GROUP BY SUBSTRING(cc.descripcion, 1, 80), c.year
         "#
     ))
     .bind(owner_rfc)
-    .bind(cp_rfc)
+    .bind(base_rfc)
+    .bind(name_filter)
     .bind(from_y)
     .bind(from_m)
     .bind(to_y)
@@ -1094,7 +1135,7 @@ pub async fn get_individual(
             FROM pulso.cfdis inv
             LEFT JOIN paid_per_inv ppi ON ppi.invoice_uuid = inv.uuid
             WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
-              AND inv.{cp_col} = $2
+              AND inv.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_inv} = $3)
               AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
               AND NOT inv.is_cancelled
         )
@@ -1106,7 +1147,8 @@ pub async fn get_individual(
         "#
     ))
     .bind(owner_rfc)
-    .bind(cp_rfc)
+    .bind(base_rfc)
+    .bind(name_filter)
     .fetch_one(pool)
     .await?;
 
@@ -1122,14 +1164,15 @@ pub async fn get_individual(
         JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
         JOIN pulso.cfdi_payments cp ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
         WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
-          AND inv.{cp_col} = $2
+          AND inv.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_inv} = $3)
           AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
           AND NOT inv.is_cancelled
           AND cp.fecha_pago IS NOT NULL
         "#
     ))
     .bind(owner_rfc)
-    .bind(cp_rfc)
+    .bind(base_rfc)
+    .bind(name_filter)
     .fetch_one(pool)
     .await?;
 

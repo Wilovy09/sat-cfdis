@@ -275,3 +275,98 @@ pub fn dl_type_filter(dl_type: &str) -> &'static str {
         _ => "dl_type IN ('emitidos', 'ambos')",
     }
 }
+
+// ---------------------------------------------------------------------------
+// Generic SAT RFCs (XAXX/XEXX) — counterparty grouping
+// ---------------------------------------------------------------------------
+// SAT overloads a handful of RFCs to mean "no real RFC available": XAXX010101000
+// (Público en General, and other miscellaneous cases) and XEXX010101000 (foreign
+// counterparties with no Mexican RFC). Grouping naively by RFC merges every distinct
+// real counterparty hiding behind one of these into a single row and mislabels it
+// with whichever name an aggregate happens to pick. The helpers below build a
+// row-level (non-aggregate) composite key `RFC||NORMALIZED_NAME` so each real
+// counterparty gets its own group, while leaving ordinary RFCs untouched.
+
+pub const RFC_PUBLICO_GENERAL: &str = "XAXX010101000";
+pub const RFC_EXTRANJERO_GENERICO: &str = "XEXX010101000";
+pub const LABEL_PUBLICO_GENERAL: &str = "Público en General";
+pub const LABEL_EXTRANJERO_GENERICO: &str = "Cliente extranjero (RFC genérico)";
+
+/// Row-level (non-aggregate) name normalization: upper, trim, collapse internal
+/// whitespace, strip punctuation other than `&` and `-`. Mirrors the normalization
+/// used by the Python reference implementation (xml-dashboard-mvp).
+pub fn normalized_name_expr(name_col: &str) -> String {
+    format!(
+        r#"REGEXP_REPLACE(REGEXP_REPLACE(TRIM(UPPER(COALESCE({name_col}, ''))), '\s+', ' ', 'g'), '[^A-Z0-9 &\-]', '', 'g')"#
+    )
+}
+
+/// Row-level counterparty grouping key: the bare RFC for ordinary counterparties
+/// (unchanged behavior), but for invoices carrying a generic SAT RFC (XAXX/XEXX)
+/// with a non-blank name, a composite `RFC||NORMALIZED_NAME` so each distinct real
+/// counterparty hiding behind the generic RFC gets its own group. Generic-RFC rows
+/// with a genuinely blank name still collapse to the bare RFC.
+///
+/// Must be used identically (same `cp_col`/`cp_name_col` qualification) in every
+/// query that groups by counterparty, or the same real-world counterparty will
+/// produce different keys in different endpoints and silently fail to join.
+pub fn cp_key_expr(cp_col: &str, cp_name_col: &str) -> String {
+    let norm = normalized_name_expr(cp_name_col);
+    format!(
+        r#"CASE WHEN {cp_col} IN ('{RFC_PUBLICO_GENERAL}', '{RFC_EXTRANJERO_GENERICO}') AND {norm} <> ''
+                THEN {cp_col} || '||' || {norm}
+                ELSE {cp_col} END"#
+    )
+}
+
+/// Companion aggregate display-name expression for a query already `GROUP BY`ed on
+/// `cp_key_expr(...)`. Must be selected as an aggregate (it wraps everything in
+/// `MAX(...)`) since Postgres can't select a bare column when grouping by a derived
+/// expression.
+pub fn cp_nombre_expr(cp_col: &str, cp_name_col: &str) -> String {
+    let norm = normalized_name_expr(cp_name_col);
+    format!(
+        r#"CASE
+             WHEN MAX({cp_col}) = '{RFC_PUBLICO_GENERAL}' THEN COALESCE(NULLIF(MAX({norm}), ''), '{LABEL_PUBLICO_GENERAL}')
+             WHEN MAX({cp_col}) = '{RFC_EXTRANJERO_GENERICO}' THEN COALESCE(NULLIF(MAX({norm}), ''), '{LABEL_EXTRANJERO_GENERICO}')
+             ELSE MAX({cp_name_col})
+           END"#
+    )
+}
+
+#[cfg(test)]
+mod generic_rfc_tests {
+    use super::*;
+
+    #[test]
+    fn cp_key_expr_builds_case_with_composite_key() {
+        let expr = cp_key_expr("rfc_receptor", "nombre_receptor");
+        assert!(expr.contains("rfc_receptor IN ('XAXX010101000', 'XEXX010101000')"));
+        assert!(expr.contains("rfc_receptor || '||' ||"));
+        assert!(expr.contains("ELSE rfc_receptor END"));
+    }
+
+    #[test]
+    fn cp_nombre_expr_falls_back_to_labels() {
+        let expr = cp_nombre_expr("rfc_receptor", "nombre_receptor");
+        assert!(expr.contains("'Público en General'"));
+        assert!(expr.contains("'Cliente extranjero (RFC genérico)'"));
+        assert!(expr.contains("MAX(nombre_receptor)"));
+    }
+
+    #[test]
+    fn normalized_name_expr_collapses_whitespace_and_strips_punctuation() {
+        let expr = normalized_name_expr("nombre_receptor");
+        assert!(expr.contains(r"'\s+'"));
+        assert!(expr.contains(r"'[^A-Z0-9 &\-]'"));
+    }
+
+    #[test]
+    fn composite_key_splits_back_apart() {
+        assert_eq!(
+            "XAXX010101000||ACME CORP".split_once("||"),
+            Some(("XAXX010101000", "ACME CORP"))
+        );
+        assert_eq!("REAL0101010AB1".split_once("||"), None);
+    }
+}

@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, rfc_column};
+use super::summary::{cp_key_expr, cp_nombre_expr, dl_type_filter, rfc_column};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -97,6 +97,8 @@ pub async fn get(
     } else {
         "nombre_receptor"
     };
+    let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
+    let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
     let years_vec: Vec<i32> = years.iter().copied().collect();
 
@@ -184,8 +186,8 @@ pub async fn get(
         r#"
         WITH ranked AS (
             SELECT year,
-                   {cp_col} AS cp_rfc,
-                   MAX({cp_name_col}) AS cp_nombre,
+                   ({cp_key_expr}) AS cp_rfc,
+                   {cp_nombre_expr} AS cp_nombre,
                    SUM(COALESCE(total_neto_mxn, 0)::float8)::float8 AS total,
                    COUNT(*) AS invoice_count,
                    ROW_NUMBER() OVER (PARTITION BY year ORDER BY SUM(COALESCE(total_neto_mxn, 0)) DESC) AS rnk
@@ -196,7 +198,7 @@ pub async fn get(
           AND NOT is_cancelled
               AND year = ANY($2)
               AND month >= $3 AND month <= $4
-            GROUP BY year, {cp_col}
+            GROUP BY year, ({cp_key_expr})
         )
         SELECT year, cp_rfc, cp_nombre, total, invoice_count, rnk
         FROM ranked
@@ -414,20 +416,20 @@ pub async fn get(
         let q5 = format!(
             r#"
             WITH curr AS (
-                SELECT {cp_col} AS cp_rfc, MAX({cp_name_col}) AS cp_nombre,
+                SELECT ({cp_key_expr}) AS cp_rfc, {cp_nombre_expr} AS cp_nombre,
                        SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total
                 FROM pulso.cfdis
                 WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
                   AND year = $2 AND month >= $3 AND month <= $4
-                GROUP BY {cp_col}
+                GROUP BY ({cp_key_expr})
             ),
             prev AS (
-                SELECT {cp_col} AS cp_rfc, MAX({cp_name_col}) AS cp_nombre,
+                SELECT ({cp_key_expr}) AS cp_rfc, {cp_nombre_expr} AS cp_nombre,
                        SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total
                 FROM pulso.cfdis
                 WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
                   AND year = $5 AND month >= $3 AND month <= $4
-                GROUP BY {cp_col}
+                GROUP BY ({cp_key_expr})
             )
             SELECT COALESCE(c.cp_rfc, p.cp_rfc) AS cp_rfc,
                    COALESCE(c.cp_nombre, p.cp_nombre) AS cp_nombre,
