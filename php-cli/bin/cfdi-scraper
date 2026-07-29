@@ -117,6 +117,19 @@ function resolveGuzzleVerify(): string|bool
     return true;
 }
 
+// Without these, a connection the SAT leaves hanging (no response, no RST)
+// never throws — Guzzle just waits forever. The only backstop left is Rust's
+// blunt "no output for N seconds, kill the whole process" idle timeout, which
+// loses all progress and reports an unclassified "PHP worker crashed" instead
+// of a proper sat_connection_error. These bound every HTTP call so a hang
+// surfaces as a normal SatHttpGatewayException well before that.
+const SAT_HTTP_CONNECT_TIMEOUT_SECS = 15;
+const SAT_HTTP_TIMEOUT_SECS = 60;
+// descarga-masiva transfers whole package ZIPs (can be several MB) — same
+// idea, just a longer ceiling so a legitimately slow-but-working download
+// isn't cut off, while still bounding a genuine hang.
+const SAT_HTTP_BULK_TIMEOUT_SECS = 180;
+
 /**
  * Creates a SatScraper with a Guzzle client configured for the SAT portal.
  *
@@ -131,8 +144,10 @@ function makeScraper(
 ): SatScraper {
     $cookieJar = new CookieJar();
     $guzzle = new GuzzleClient([
-        'verify' => resolveGuzzleVerify(),
-        'curl'   => [
+        'verify'          => resolveGuzzleVerify(),
+        'connect_timeout' => SAT_HTTP_CONNECT_TIMEOUT_SECS,
+        'timeout'         => SAT_HTTP_TIMEOUT_SECS,
+        'curl'            => [
             // Accept the SAT's legacy 1024-bit DH key (OpenSSL 3.x SECLEVEL=1).
             CURLOPT_SSL_CIPHER_LIST => 'DEFAULT@SECLEVEL=1',
         ],
@@ -670,8 +685,10 @@ switch ($command) {
         }
         $dmBuilder = new FielRequestBuilder($dmFiel);
         $dmGuzzle  = new GuzzleClient([
-            'verify' => resolveGuzzleVerify(),
-            'curl'   => [CURLOPT_SSL_CIPHER_LIST => 'DEFAULT@SECLEVEL=1'],
+            'verify'          => resolveGuzzleVerify(),
+            'connect_timeout' => SAT_HTTP_CONNECT_TIMEOUT_SECS,
+            'timeout'         => SAT_HTTP_BULK_TIMEOUT_SECS,
+            'curl'            => [CURLOPT_SSL_CIPHER_LIST => 'DEFAULT@SECLEVEL=1'],
         ]);
         $dmWebClient = new GuzzleWebClient($dmGuzzle);
         $dmService   = new Service($dmBuilder, $dmWebClient);
