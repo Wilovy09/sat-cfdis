@@ -149,7 +149,7 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                 Ok(j) => j,
                 Err(e) => {
                     tracing::error!(job_id = %job.id, "Worker: decrypt failed: {e}");
-                    let _ = db::jobs::fail(&pool, &job.id, &format!("Decrypt failed: {e}")).await;
+                    let _ = db::jobs::fail(&pool, &job.id, None, &format!("Decrypt failed: {e}")).await;
                     continue;
                 }
             };
@@ -157,7 +157,7 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
             let auth_payload: serde_json::Value = match serde_json::from_str(&auth_json) {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = db::jobs::fail(&pool, &job.id, &format!("Bad auth JSON: {e}")).await;
+                    let _ = db::jobs::fail(&pool, &job.id, None, &format!("Bad auth JSON: {e}")).await;
                     continue;
                 }
             };
@@ -563,7 +563,7 @@ async fn run_worker_chunk(
     let mut input_bytes = match serde_json::to_vec(&payload) {
         Ok(b) => b,
         Err(e) => {
-            let _ = db::jobs::fail(&pool, &job_id, &e.to_string()).await;
+            let _ = db::jobs::fail(&pool, &job_id, None, &e.to_string()).await;
             return;
         }
     };
@@ -580,7 +580,7 @@ async fn run_worker_chunk(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = db::jobs::fail(&pool, &job_id, &e.to_string()).await;
+            let _ = db::jobs::fail(&pool, &job_id, None, &e.to_string()).await;
             return;
         }
     };
@@ -590,30 +590,18 @@ async fn run_worker_chunk(
     }
 
     // Drain stderr so it never blocks and errors are visible in traces.
-    // Auth errors (wrong CIEC/RFC) are captured to fail the job with a user-visible message.
-    let auth_error: std::sync::Arc<tokio::sync::Mutex<Option<String>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    // Classification comes from the structured __auth_error__/__limit_reached__
+    // stdout events below (see classifySatError() in cfdi-scraper) — not from
+    // sniffing this raw text, which would misclassify a transient SAT
+    // connection error (message contains "login data") as a bad password.
     if let Some(stderr) = child.stderr.take() {
         let job_id_err = job_id.clone();
-        let auth_error_clone = auth_error.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt as _;
             let mut lines = tokio::io::BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if !line.is_empty() {
                     tracing::error!(job_id = %job_id_err, php_stderr = %line, "PHP worker stderr");
-                    if line.contains("CIEC_AUTH_FAILURE")
-                        || line.contains("Incorrect login")
-                        || line.contains("login data")
-                        || line.contains("credenciales")
-                    {
-                        let mut guard = auth_error_clone.lock().await;
-                        if guard.is_none() {
-                            *guard = Some(
-                                "CIEC incorrecta — actualiza tu contraseña SAT".to_string(),
-                            );
-                        }
-                    }
                 }
             }
         });
@@ -622,7 +610,7 @@ async fn run_worker_chunk(
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
-            let _ = db::jobs::fail(&pool, &job_id, "no stdout").await;
+            let _ = db::jobs::fail(&pool, &job_id, None, "no stdout").await;
             return;
         }
     };
@@ -632,6 +620,10 @@ async fn run_worker_chunk(
     let mut found = initial_found;
     let mut cursor = period_from.clone();
     let mut limit_hit = false;
+    let mut limit_code: Option<String> = None;
+    let mut limit_reason: Option<String> = None;
+    let mut limit_retry_after: u64 = 24 * 3600 + 1800; // fallback: 24.5h
+    let mut auth_error: Option<(String, String)> = None; // (code, message)
     let mut done_received = false;
     let mut idle_timeout = false;
 
@@ -707,6 +699,17 @@ async fn run_worker_chunk(
         }
 
         if data
+            .get("__auth_error__")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let code = data["code"].as_str().unwrap_or("unknown_error").to_string();
+            let reason = data["reason"].as_str().unwrap_or("").to_string();
+            auth_error = Some((code, reason));
+            break;
+        }
+
+        if data
             .get("__limit_reached__")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
@@ -714,6 +717,11 @@ async fn run_worker_chunk(
             limit_hit = true;
             let reported_date = data["date"].as_str().unwrap_or(&cursor).to_string();
             cursor = reported_date;
+            limit_code = data["code"].as_str().map(|s| s.to_string());
+            limit_reason = data["reason"].as_str().map(|s| s.to_string());
+            if let Some(ra) = data["retry_after"].as_u64() {
+                limit_retry_after = ra;
+            }
             break;
         }
 
@@ -760,9 +768,9 @@ async fn run_worker_chunk(
     // Small yield so the stderr task has a chance to flush its last lines
     tokio::task::yield_now().await;
 
-    if let Some(err_msg) = auth_error.lock().await.clone() {
-        let _ = db::jobs::fail(&pool, &job_id, &err_msg).await;
-        tracing::warn!(job_id = %job_id, "Job failed: auth error");
+    if let Some((code, message)) = auth_error {
+        let _ = db::jobs::fail(&pool, &job_id, Some(&code), &message).await;
+        tracing::warn!(job_id = %job_id, code = %code, "Job failed: auth error");
         return;
     }
 
@@ -774,23 +782,26 @@ async fn run_worker_chunk(
         } else {
             "PHP worker crashed before completion"
         };
-        let _ = db::jobs::fail(&pool, &job_id, msg).await;
+        let _ = db::jobs::fail(&pool, &job_id, None, msg).await;
         tracing::error!(job_id = %job_id, idle_timeout, "Job failed: PHP worker did not send __done__");
         return;
     }
 
     if limit_hit {
-        let resume_at = db::jobs::utc_offset(24 * 3600 + 1800); // +24.5 h
+        let resume_at = db::jobs::utc_offset(limit_retry_after);
+        let reason = limit_reason
+            .unwrap_or_else(|| "SAT download limit reached — will resume automatically".to_string());
         let _ = db::jobs::pause_limit(
             &pool,
             &job_id,
             &cursor,
             found,
             &resume_at,
-            Some("SAT download limit reached — will resume automatically"),
+            limit_code.as_deref(),
+            Some(&reason),
         )
         .await;
-        tracing::info!(job_id = %job_id, cursor = %cursor, resume_at = %resume_at, "Job paused (limit)");
+        tracing::info!(job_id = %job_id, cursor = %cursor, resume_at = %resume_at, code = ?limit_code, "Job paused (limit)");
     } else {
         let _ = db::jobs::complete(&pool, &job_id, &period_to, found).await;
         tracing::info!(job_id = %job_id, found = found, "Job completed");

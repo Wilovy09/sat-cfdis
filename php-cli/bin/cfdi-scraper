@@ -5,6 +5,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../vendor/autoload.php';
 
+use Adquiere\CfdiCli\ErrorClassifier;
 use GuzzleHttp\Client as GuzzleClient;
 use GuzzleHttp\Cookie\CookieJar;
 use PhpCfdi\CfdiSatScraper\Filters\DownloadType;
@@ -409,53 +410,41 @@ switch ($command) {
                     }
                 }
             } catch (Throwable $dayError) {
-                $errMsg = $dayError->getMessage();
-                // Build full cause chain for logging
-                $causeChain = $errMsg;
-                $cause = $dayError->getPrevious();
-                while ($cause !== null) {
-                    $causeChain .= ' | caused by: ' . $cause->getMessage();
-                    $cause = $cause->getPrevious();
+                $classified = ErrorClassifier::classify($dayError);
+                ['code' => $code, 'message' => $reason, 'retry_after' => $retryAfter] = $classified;
+
+                // Genuinely unrecognized single-day error (not a login/session/
+                // connection/rate-limit failure) — log and keep going, same as
+                // before; aborting the whole range for a one-off glitch would
+                // be worse than skipping a day.
+                if ($code === 'unknown_error') {
+                    fwrite(STDERR, 'Day error ' . $streamCurrent->format('Y-m-d') . " [$dlTypeLabel]: $reason\n");
+                    continue;
                 }
-                // Detect SAT session / download limit errors and stop gracefully.
-                // The Rust layer saves the job and resumes after 24.5 h.
-                $isAuthFailure = ($dayError instanceof \PhpCfdi\CfdiSatScraper\Exceptions\SatAuthenticationException)
-                    || str_contains($causeChain, 'SatAuthenticationException');
-                $isRateLimit = !$isAuthFailure && (
-                    str_contains($errMsg, '429') ||
-                    str_contains($errMsg, 'Too Many') ||
-                    str_contains($errMsg, 'bloqueado') ||
-                    str_contains($errMsg, 'demasiadas') ||
-                    str_contains($errMsg, 'limite') ||
-                    str_contains($errMsg, 'limit') ||
-                    str_contains($errMsg, 'No tiene acceso') ||
-                    str_contains($causeChain, 'falla en el servicio') ||
-                    str_contains($causeChain, 'Se ha presentado una falla') ||
-                    str_contains($causeChain, 'Folio: DT-') ||
-                    ($dayError instanceof \PhpCfdi\CfdiSatScraper\Exceptions\SatException)
-                );
-                if ($isAuthFailure) {
-                    fwrite(STDERR, 'CIEC_AUTH_FAILURE: ' . $causeChain . "\n");
+
+                if (ErrorClassifier::isAuthErrorCode($code)) {
+                    fwrite(STDERR, "SAT auth error [$code]: $reason\n");
                     echo json_encode([
-                        '__limit_reached__' => true,
-                        'date'   => $streamCurrent->format('Y-m-d'),
-                        'reason' => $causeChain,
+                        '__auth_error__' => true,
+                        'code'    => $code,
+                        'reason'  => $reason,
+                        'date'    => $streamCurrent->format('Y-m-d'),
                     ], JSON_UNESCAPED_UNICODE) . "\n";
                     flush();
                     exit(0);
                 }
-                if ($isRateLimit) {
-                    fwrite(STDERR, 'SAT rate-limit: ' . $causeChain . "\n");
-                    echo json_encode([
-                        '__limit_reached__' => true,
-                        'date'   => $streamCurrent->format('Y-m-d'),
-                        'reason' => $causeChain,
-                    ], JSON_UNESCAPED_UNICODE) . "\n";
-                    flush();
-                    exit(0);
-                }
-                // Non-limit day error — log and continue.
-                fwrite(STDERR, 'Day error ' . $streamCurrent->format('Y-m-d') . ' [' . $dlTypeLabel . ']: ' . $causeChain . "\n");
+                // sat_connection_error / rate_limited — stop gracefully, Rust
+                // layer saves the job and resumes after $retryAfter seconds.
+                fwrite(STDERR, "SAT $code: $reason\n");
+                echo json_encode([
+                    '__limit_reached__' => true,
+                    'code'         => $code,
+                    'date'         => $streamCurrent->format('Y-m-d'),
+                    'reason'       => $reason,
+                    'retry_after'  => $retryAfter,
+                ], JSON_UNESCAPED_UNICODE) . "\n";
+                flush();
+                exit(0);
             }
         } // end foreach $streamDownloadTypes (inner — per day)
 
@@ -603,24 +592,18 @@ switch ($command) {
             $scraper->resourceDownloader($resourceType, $list)
                 ->saveTo($outputDir);
         } catch (Throwable $dlError) {
-            $errMsg = $dlError->getMessage();
-            if (
-                str_contains($errMsg, '429') ||
-                str_contains($errMsg, 'Too Many') ||
-                str_contains($errMsg, 'bloqueado') ||
-                str_contains($errMsg, 'demasiadas') ||
-                str_contains($errMsg, 'limite') ||
-                str_contains($errMsg, 'limit') ||
-                str_contains($errMsg, 'No tiene acceso') ||
-                ($dlError instanceof \PhpCfdi\CfdiSatScraper\Exceptions\SatException)
-            ) {
+            $classified = ErrorClassifier::classify($dlError);
+            ['code' => $dlCode, 'message' => $dlReason] = $classified;
+
+            if (!ErrorClassifier::isAuthErrorCode($dlCode) && $dlCode !== 'unknown_error') {
                 outputJson([
                     '__limit_reached__' => true,
-                    'reason' => $errMsg,
+                    'code'   => $dlCode,
+                    'reason' => $dlReason,
                     'files'  => [], // partial — whatever was saved before the error
                 ]);
             }
-            outputError('Download failed: ' . $errMsg);
+            outputError("Download failed [$dlCode]: $dlReason");
         }
 
         // Collect info about downloaded files
@@ -743,110 +726,137 @@ switch ($command) {
                 continue;
             }
 
-            $dmQueryParams = QueryParameters::create(
-                period: $dmPeriod,
-                downloadType: $dmDownloadTypeWs,
-                requestType: RequestType::cfdi(),
-            );
+            // SOAP/WS calls (query/verify/download) can throw on a bad FIEL
+            // cert, an expired session, or a transient SAT outage — classify
+            // and either stop the whole job (auth-family) or skip this month
+            // and keep going (connection/rate-limit), instead of letting an
+            // uncaught exception crash the process mid-stream.
+            try {
+                $dmQueryParams = QueryParameters::create(
+                    period: $dmPeriod,
+                    downloadType: $dmDownloadTypeWs,
+                    requestType: RequestType::cfdi(),
+                );
 
-            $dmQueryResult = $dmService->query($dmQueryParams);
-            if (!$dmQueryResult->getStatus()->isAccepted()) {
-                fwrite(STDERR, 'SAT rejected query for ' . $dmMonthLabel . ': ' . $dmQueryResult->getStatus()->getMessage() . "\n");
-                continue;
-            }
-            $dmRequestId = $dmQueryResult->getRequestId();
-
-            echo json_encode([
-                '__progress__' => true,
-                'stage'        => 'queued',
-                'month'        => $dmMonthLabel,
-                'request_id'   => $dmRequestId,
-            ], JSON_UNESCAPED_UNICODE) . "\n";
-            flush();
-
-            // ── Step 2: Poll verify ────────────────────────────────────────
-            $dmPackageIds = [];
-            $dmMaxPolls   = 120; // up to 10 min per month (5 s × 120)
-            $dmSuccess    = false;
-            for ($dmPoll = 0; $dmPoll < $dmMaxPolls; $dmPoll++) {
-                sleep(5);
-
-                $dmVerifyResult = $dmService->verify($dmRequestId);
-                $dmStatusReq    = $dmVerifyResult->getStatusRequest();
+                $dmQueryResult = $dmService->query($dmQueryParams);
+                if (!$dmQueryResult->getStatus()->isAccepted()) {
+                    fwrite(STDERR, 'SAT rejected query for ' . $dmMonthLabel . ': ' . $dmQueryResult->getStatus()->getMessage() . "\n");
+                    continue;
+                }
+                $dmRequestId = $dmQueryResult->getRequestId();
 
                 echo json_encode([
                     '__progress__' => true,
-                    'stage'        => 'verifying',
+                    'stage'        => 'queued',
                     'month'        => $dmMonthLabel,
                     'request_id'   => $dmRequestId,
-                    'status'       => $dmStatusReq->getMessage(),
-                    'cfdis'        => $dmVerifyResult->getNumberCfdis(),
-                    'packages'     => $dmVerifyResult->countPackages(),
                 ], JSON_UNESCAPED_UNICODE) . "\n";
                 flush();
 
-                if ($dmStatusReq->isFinished()) {
-                    $dmPackageIds = $dmVerifyResult->getPackagesIds();
-                    $dmSuccess    = true;
-                    break;
+                // ── Step 2: Poll verify ────────────────────────────────────
+                $dmPackageIds = [];
+                $dmMaxPolls   = 120; // up to 10 min per month (5 s × 120)
+                $dmSuccess    = false;
+                for ($dmPoll = 0; $dmPoll < $dmMaxPolls; $dmPoll++) {
+                    sleep(5);
+
+                    $dmVerifyResult = $dmService->verify($dmRequestId);
+                    $dmStatusReq    = $dmVerifyResult->getStatusRequest();
+
+                    echo json_encode([
+                        '__progress__' => true,
+                        'stage'        => 'verifying',
+                        'month'        => $dmMonthLabel,
+                        'request_id'   => $dmRequestId,
+                        'status'       => $dmStatusReq->getMessage(),
+                        'cfdis'        => $dmVerifyResult->getNumberCfdis(),
+                        'packages'     => $dmVerifyResult->countPackages(),
+                    ], JSON_UNESCAPED_UNICODE) . "\n";
+                    flush();
+
+                    if ($dmStatusReq->isFinished()) {
+                        $dmPackageIds = $dmVerifyResult->getPackagesIds();
+                        $dmSuccess    = true;
+                        break;
+                    }
+                    if ($dmStatusReq->isFailure() || $dmStatusReq->isRejected() || $dmStatusReq->isExpired()) {
+                        fwrite(STDERR, 'Bulk request failed for ' . $dmMonthLabel . ': ' . $dmStatusReq->getMessage() . "\n");
+                        break;
+                    }
                 }
-                if ($dmStatusReq->isFailure() || $dmStatusReq->isRejected() || $dmStatusReq->isExpired()) {
-                    fwrite(STDERR, 'Bulk request failed for ' . $dmMonthLabel . ': ' . $dmStatusReq->getMessage() . "\n");
-                    break;
-                }
-            }
 
-            if (!$dmSuccess) {
-                fwrite(STDERR, 'Timed out or failed for ' . $dmMonthLabel . " (request_id: $dmRequestId)\n");
-                continue;
-            }
-
-            // ── Step 3: Download packages ──────────────────────────────────
-            foreach ($dmPackageIds as $dmPkgIdx => $dmPkgId) {
-                echo json_encode([
-                    '__progress__' => true,
-                    'stage'        => 'downloading',
-                    'month'        => $dmMonthLabel,
-                    'request_id'   => $dmRequestId,
-                    'package'      => $dmPkgIdx + 1,
-                    'total_pkgs'   => count($dmPackageIds),
-                ], JSON_UNESCAPED_UNICODE) . "\n";
-                flush();
-
-                $dmDownloadResult = $dmService->download($dmPkgId);
-                if (!$dmDownloadResult->getStatus()->isAccepted()) {
-                    fwrite(STDERR, 'Package download failed (' . $dmPkgId . '): ' . $dmDownloadResult->getStatus()->getMessage() . "\n");
+                if (!$dmSuccess) {
+                    fwrite(STDERR, 'Timed out or failed for ' . $dmMonthLabel . " (request_id: $dmRequestId)\n");
                     continue;
                 }
 
-                $dmTmpZip = tempnam(sys_get_temp_dir(), 'sat_pkg_') . '.zip';
-                file_put_contents($dmTmpZip, $dmDownloadResult->getPackageContent());
+                // ── Step 3: Download packages ──────────────────────────────
+                foreach ($dmPackageIds as $dmPkgIdx => $dmPkgId) {
+                    echo json_encode([
+                        '__progress__' => true,
+                        'stage'        => 'downloading',
+                        'month'        => $dmMonthLabel,
+                        'request_id'   => $dmRequestId,
+                        'package'      => $dmPkgIdx + 1,
+                        'total_pkgs'   => count($dmPackageIds),
+                    ], JSON_UNESCAPED_UNICODE) . "\n";
+                    flush();
 
-                try {
-                    $dmReader = CfdiPackageReader::createFromFile($dmTmpZip);
-                    foreach ($dmReader as $dmUuid => $dmXmlContent) {
-                        $dmFilePath = $dmOutputDir . '/' . strtolower($dmUuid) . '.xml';
-                        file_put_contents($dmFilePath, $dmXmlContent);
-                        $dmFiles[] = [
-                            'uuid'     => strtolower($dmUuid),
-                            'path'     => $dmFilePath,
-                            'filename' => basename($dmFilePath),
-                            'size'     => strlen($dmXmlContent),
-                        ];
-                        $dmTotalFiles++;
+                    $dmDownloadResult = $dmService->download($dmPkgId);
+                    if (!$dmDownloadResult->getStatus()->isAccepted()) {
+                        fwrite(STDERR, 'Package download failed (' . $dmPkgId . '): ' . $dmDownloadResult->getStatus()->getMessage() . "\n");
+                        continue;
                     }
-                } finally {
-                    @unlink($dmTmpZip);
-                }
-            }
 
-            echo json_encode([
-                '__progress__' => true,
-                'stage'        => 'month_done',
-                'month'        => $dmMonthLabel,
-                'month_total'  => $dmTotalFiles,
-            ], JSON_UNESCAPED_UNICODE) . "\n";
-            flush();
+                    $dmTmpZip = tempnam(sys_get_temp_dir(), 'sat_pkg_') . '.zip';
+                    file_put_contents($dmTmpZip, $dmDownloadResult->getPackageContent());
+
+                    try {
+                        $dmReader = CfdiPackageReader::createFromFile($dmTmpZip);
+                        foreach ($dmReader as $dmUuid => $dmXmlContent) {
+                            $dmFilePath = $dmOutputDir . '/' . strtolower($dmUuid) . '.xml';
+                            file_put_contents($dmFilePath, $dmXmlContent);
+                            $dmFiles[] = [
+                                'uuid'     => strtolower($dmUuid),
+                                'path'     => $dmFilePath,
+                                'filename' => basename($dmFilePath),
+                                'size'     => strlen($dmXmlContent),
+                            ];
+                            $dmTotalFiles++;
+                        }
+                    } finally {
+                        @unlink($dmTmpZip);
+                    }
+                }
+
+                echo json_encode([
+                    '__progress__' => true,
+                    'stage'        => 'month_done',
+                    'month'        => $dmMonthLabel,
+                    'month_total'  => $dmTotalFiles,
+                ], JSON_UNESCAPED_UNICODE) . "\n";
+                flush();
+            } catch (Throwable $dmError) {
+                $classified = ErrorClassifier::classify($dmError);
+                ['code' => $dmCode, 'message' => $dmReason] = $classified;
+
+                if (ErrorClassifier::isAuthErrorCode($dmCode)) {
+                    fwrite(STDERR, "descarga-masiva auth error [$dmCode] ($dmMonthLabel): $dmReason\n");
+                    echo json_encode([
+                        '__error__' => true,
+                        'code'    => $dmCode,
+                        'reason'  => $dmReason,
+                        'month'   => $dmMonthLabel,
+                    ], JSON_UNESCAPED_UNICODE) . "\n";
+                    flush();
+                    exit(0);
+                }
+                // sat_connection_error / rate_limited — log and skip to the
+                // next month; a transient failure on one month shouldn't
+                // abort the whole multi-month job.
+                fwrite(STDERR, "descarga-masiva $dmCode ($dmMonthLabel): $dmReason\n");
+                continue;
+            }
         }
 
         outputJson([

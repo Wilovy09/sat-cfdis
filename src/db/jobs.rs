@@ -25,6 +25,10 @@ pub struct SyncJob {
     /// Total invoices expected (from list-count pre-pass); None until count completes
     pub total_expected: Option<i64>,
     pub status: String,
+    /// Machine-readable classification of error_msg, from classifySatError() in
+    /// cfdi-scraper: "invalid_credentials" | "captcha_failed" | "login_not_registered"
+    /// | "fiel_login_failed" | "sat_connection_error" | "rate_limited" | "unknown_error".
+    pub error_code: Option<String>,
     pub error_msg: Option<String>,
     /// ISO-8601 UTC — when the worker should resume this job
     pub resume_at: Option<String>,
@@ -131,26 +135,31 @@ pub async fn insert(
     Ok(id)
 }
 
-/// Mark a job as paused due to SAT download limit.
+/// Mark a job as paused due to SAT download limit (or a transient SAT
+/// connection error — see classifySatError() in cfdi-scraper).
 /// `cursor_date` = last date successfully processed (YYYY-MM-DD).
-/// `resume_at`   = when the worker should retry (typically +24.5 h).
+/// `resume_at`   = when the worker should retry (24.5h for a real rate limit,
+///                 much shorter for a transient connection error).
+/// `error_code`  = machine-readable classification, e.g. "rate_limited" | "sat_connection_error".
 pub async fn pause_limit(
     pool: &PgPool,
     job_id: &str,
     cursor_date: &str,
     found: i64,
     resume_at: &str,
+    error_code: Option<&str>,
     error_msg: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"UPDATE pulso.sync_jobs
            SET status='paused_limit', cursor_date=$1, found=$2,
-               resume_at=$3, error_msg=$4, updated_at=$5
-           WHERE id=$6"#,
+               resume_at=$3, error_code=$4, error_msg=$5, updated_at=$6
+           WHERE id=$7"#,
     )
     .bind(cursor_date)
     .bind(found)
     .bind(resume_at)
+    .bind(error_code)
     .bind(error_msg)
     .bind(now_utc())
     .bind(job_id)
@@ -181,10 +190,19 @@ pub async fn complete(
 }
 
 /// Mark a job as failed.
-pub async fn fail(pool: &PgPool, job_id: &str, error_msg: &str) -> Result<(), sqlx::Error> {
+/// `error_code` = machine-readable classification (see classifySatError() in
+/// cfdi-scraper), e.g. "invalid_credentials" | "fiel_login_failed"; `None`
+/// for infra-level failures (crash, decrypt error) that aren't SAT-classified.
+pub async fn fail(
+    pool: &PgPool,
+    job_id: &str,
+    error_code: Option<&str>,
+    error_msg: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
-        r#"UPDATE pulso.sync_jobs SET status='failed', error_msg=$1, updated_at=$2 WHERE id=$3"#,
+        r#"UPDATE pulso.sync_jobs SET status='failed', error_code=$1, error_msg=$2, updated_at=$3 WHERE id=$4"#,
     )
+    .bind(error_code)
     .bind(error_msg)
     .bind(now_utc())
     .bind(job_id)

@@ -883,6 +883,7 @@ pub async fn list_stream(
         let mut total: u64 = 0;
         let mut type_counts = serde_json::Map::new();
         let mut limit_cursor: Option<String> = None; // set when __limit_reached__ received
+        let mut auth_error_hit = false; // set when __auth_error__ received (job already failed)
         let mut job_id_ls: Option<String> = None; // DB job id, created on first invoice
 
         while let Some(line) = line_rx.recv().await {
@@ -927,7 +928,59 @@ pub async fn list_stream(
                     continue;
                 }
 
-                // SAT download limit reached — save job to DB and forward to browser
+                // Non-retryable SAT/login failure (bad CIEC password, unsolvable
+                // captcha, invalid FIEL cert, ...) — fail the job immediately
+                // instead of routing it through the pause/auto-resume path,
+                // since retrying with the same input reproduces the same error.
+                if data
+                    .get("__auth_error__")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    auth_error_hit = true;
+                    let code = data["code"].as_str().unwrap_or("unknown_error").to_string();
+                    let reason = data["reason"].as_str().unwrap_or("").to_string();
+
+                    let jid = if let Some(ref id) = job_id_ls {
+                        id.clone()
+                    } else {
+                        match db_jobs::insert(
+                            &pool_ls,
+                            &user_rfc_ls,
+                            &auth_type_ls,
+                            &auth_enc_ls,
+                            &download_type,
+                            &period_from,
+                            &period_to,
+                        )
+                        .await
+                        {
+                            Ok(id) => {
+                                job_id_ls = Some(id.clone());
+                                id
+                            }
+                            Err(e) => {
+                                tracing::error!("Queue insert failed: {e}");
+                                String::new()
+                            }
+                        }
+                    };
+
+                    if !jid.is_empty() {
+                        let _ = db_jobs::fail(&pool_ls, &jid, Some(&code), &reason).await;
+                    }
+
+                    let evt = json!({
+                        "__auth_error__": true,
+                        "job_id": jid,
+                        "code":   code,
+                        "reason": reason,
+                    });
+                    let _ = sse_tx.send(Bytes::from(format!("data: {evt}\n\n"))).await;
+                    continue;
+                }
+
+                // SAT download limit / transient connection error — save job to DB and forward to browser
                 if data
                     .get("__limit_reached__")
                     .and_then(|v| v.as_bool())
@@ -935,6 +988,8 @@ pub async fn list_stream(
                 {
                     let cursor = data["date"].as_str().unwrap_or(&period_from).to_string();
                     limit_cursor = Some(cursor.clone());
+                    let code = data["code"].as_str().map(|s| s.to_string());
+                    let retry_after = data["retry_after"].as_u64().unwrap_or(24 * 3600 + 1800);
 
                     // Create or reuse job record
                     let jid = if let Some(ref id) = job_id_ls {
@@ -963,13 +1018,14 @@ pub async fn list_stream(
                     };
 
                     if !jid.is_empty() {
-                        let resume_at = db_jobs::utc_offset(24 * 3600 + 1800); // +24.5 h
+                        let resume_at = db_jobs::utc_offset(retry_after);
                         let _ = db_jobs::pause_limit(
                             &pool_ls,
                             &jid,
                             &cursor,
                             total as i64,
                             &resume_at,
+                            code.as_deref(),
                             data["reason"].as_str(),
                         )
                         .await;
@@ -979,6 +1035,7 @@ pub async fn list_stream(
                             "__limit_reached__": true,
                             "job_id":    jid,
                             "date":      cursor,
+                            "code":      code,
                             "resume_at": resume_at,
                             "reason":    data["reason"],
                         });
@@ -1043,8 +1100,8 @@ pub async fn list_stream(
 
         let _ = handle.await;
 
-        // Mark job complete in DB (if it was created and no limit was hit)
-        if limit_cursor.is_none() {
+        // Mark job complete in DB (if it was created and no limit/auth error was hit)
+        if limit_cursor.is_none() && !auth_error_hit {
             if let Some(ref jid) = job_id_ls {
                 let _ = db_jobs::complete(&pool_ls, jid, &period_to, total as i64).await;
             }
@@ -1173,6 +1230,16 @@ pub async fn bulk_stream(
                     Bytes::from(format!("data: {line}\n\n"))
                 );
                 continue;
+            }
+
+            // Classified, non-retryable error from classifySatError() (bad FIEL
+            // cert, expired e.firma, ...) — PHP already stopped, forward and end.
+            if line.contains("\"__error__\"") {
+                yield Ok::<Bytes, actix_web::Error>(
+                    Bytes::from(format!("data: {line}\n\n"))
+                );
+                let _ = child.wait().await;
+                return;
             }
 
             // Accumulate final outputJson (may be multi-line from JSON_PRETTY_PRINT)
