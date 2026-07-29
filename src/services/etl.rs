@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const ETL_POLL_SECS: u64 = 120;
+const ETL_POLL_SECS: u64 = 30;
 const BATCH_SIZE: usize = 100;
 const ENRICH_BATCH: i64 = 50;
 /// Max skip cycles before a job is considered permanently unresolvable this session (~24h).

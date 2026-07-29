@@ -92,7 +92,7 @@ async fn try_fiel_auth(
 // ---------------------------------------------------------------------------
 
 /// How often the worker wakes up to check for resumable jobs (seconds).
-const WORKER_POLL_SECS: u64 = 300; // 5 minutes
+const WORKER_POLL_SECS: u64 = 30;
 
 async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>) {
     loop {
