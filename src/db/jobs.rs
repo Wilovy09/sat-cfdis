@@ -246,6 +246,10 @@ const RETRY_BACKOFF_SECS: [u64; 8] = [
 /// SAT rate limits — which re-logs in from scratch, giving the captcha a
 /// fresh attempt — following RETRY_BACKOFF_SECS; once that schedule is
 /// exhausted, fails permanently.
+///
+/// Returns `true` if the job was permanently failed (schedule exhausted) —
+/// callers use this to know when to notify the client — or `false` if a
+/// retry was scheduled instead.
 pub async fn retry_transient_or_fail(
     pool: &PgPool,
     job_id: &str,
@@ -253,7 +257,7 @@ pub async fn retry_transient_or_fail(
     found: i64,
     error_code: Option<&str>,
     error_msg: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let (retry_count,): (i32,) =
         sqlx::query_as(r#"SELECT retry_count FROM pulso.sync_jobs WHERE id = $1"#)
             .bind(job_id)
@@ -261,13 +265,14 @@ pub async fn retry_transient_or_fail(
             .await?;
 
     let Some(&delay_secs) = RETRY_BACKOFF_SECS.get(retry_count as usize) else {
-        return fail(
+        fail(
             pool,
             job_id,
             error_code,
             &format!("{error_msg} (tras {retry_count} reintentos automáticos)"),
         )
-        .await;
+        .await?;
+        return Ok(true);
     };
 
     let resume_at = utc_offset(delay_secs);
@@ -286,7 +291,7 @@ pub async fn retry_transient_or_fail(
     .bind(job_id)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(false)
 }
 
 /// Mark a running job as failed (used on server restart to clean up stale state).

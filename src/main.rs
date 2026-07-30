@@ -525,6 +525,29 @@ async fn run_count_pass(
     total
 }
 
+/// Emails the client when their sync job becomes permanently inaccessible —
+/// exhausted the retry backoff, or hit a non-retryable auth error. Mirrors
+/// the completion-email pattern in run_worker_chunk; best-effort, never
+/// blocks or fails the worker loop.
+async fn notify_sync_failed(
+    pool: &DbPool,
+    cfg: &Config,
+    job_id: &str,
+    rfc: &str,
+    error_code: Option<&str>,
+) {
+    let Some(ref api_key) = cfg.sendgrid_api_key else {
+        return;
+    };
+    let Ok(Some(email)) = crate::db::users::get_email_by_rfc(pool, rfc).await else {
+        return;
+    };
+    match crate::services::email::send_sync_failed(api_key, &cfg.sendgrid_from, &email, rfc, error_code).await {
+        Ok(_) => tracing::info!(job_id = %job_id, "Sent sync-failed email to {email}"),
+        Err(e) => tracing::warn!(job_id = %job_id, "Failed to send sync-failed email: {e}"),
+    }
+}
+
 /// Run one PHP list-stream chunk for a background worker job.
 /// Results go to DB (job_invoices) and S3/local storage.
 /// No SSE — silent background processing.
@@ -788,11 +811,20 @@ async fn run_worker_chunk(
             // credential problem — worth retrying (a fresh login gets a fresh
             // captcha image), unlike invalid_credentials/login_not_registered/
             // fiel_login_failed below, which fail permanently.
-            let _ = db::jobs::retry_transient_or_fail(&pool, &job_id, &cursor, found, Some(&code), &message).await;
-            tracing::warn!(job_id = %job_id, code = %code, "Job failed transiently: captcha OCR miss, will auto-retry");
+            match db::jobs::retry_transient_or_fail(&pool, &job_id, &cursor, found, Some(&code), &message).await {
+                Ok(true) => {
+                    tracing::warn!(job_id = %job_id, code = %code, "Job failed permanently: captcha retries exhausted");
+                    notify_sync_failed(&pool, &cfg, &job_id, &job_rfc, Some(&code)).await;
+                }
+                Ok(false) => {
+                    tracing::warn!(job_id = %job_id, code = %code, "Job failed transiently: captcha OCR miss, will auto-retry");
+                }
+                Err(e) => tracing::error!(job_id = %job_id, "retry_transient_or_fail error: {e}"),
+            }
         } else {
             let _ = db::jobs::fail(&pool, &job_id, Some(&code), &message).await;
             tracing::warn!(job_id = %job_id, code = %code, "Job failed: auth error");
+            notify_sync_failed(&pool, &cfg, &job_id, &job_rfc, Some(&code)).await;
         }
         return;
     }
@@ -807,8 +839,16 @@ async fn run_worker_chunk(
         } else {
             "PHP worker crashed before completion"
         };
-        let _ = db::jobs::retry_transient_or_fail(&pool, &job_id, &cursor, found, None, msg).await;
-        tracing::error!(job_id = %job_id, idle_timeout, "Job failed transiently: PHP worker did not send __done__, will auto-retry");
+        match db::jobs::retry_transient_or_fail(&pool, &job_id, &cursor, found, None, msg).await {
+            Ok(true) => {
+                tracing::error!(job_id = %job_id, "Job failed permanently: retries exhausted");
+                notify_sync_failed(&pool, &cfg, &job_id, &job_rfc, None).await;
+            }
+            Ok(false) => {
+                tracing::error!(job_id = %job_id, idle_timeout, "Job failed transiently: PHP worker did not send __done__, will auto-retry");
+            }
+            Err(e) => tracing::error!(job_id = %job_id, "retry_transient_or_fail error: {e}"),
+        }
         return;
     }
 

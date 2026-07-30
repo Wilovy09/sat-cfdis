@@ -1,5 +1,119 @@
 use serde_json::json;
 
+/// Human-friendly explanation of why a sync stalled, shown in the failure email.
+fn failure_reason_es(error_code: Option<&str>) -> &'static str {
+    match error_code {
+        Some("invalid_credentials") => "la contraseña CIEC no fue aceptada por el SAT",
+        Some("login_not_registered") => {
+            "el RFC no está dado de alta para descargar CFDIs en el portal del SAT"
+        }
+        Some("fiel_login_failed") => "no pudimos iniciar sesión con tu e.firma",
+        Some("captcha_failed") => "el SAT no nos dejó pasar el captcha tras varios intentos",
+        Some("sat_connection_error") | None => "el SAT no respondió tras varios intentos automáticos",
+        _ => "tuvimos un problema técnico al conectar con el SAT",
+    }
+}
+
+/// Sent when a sync job becomes permanently inaccessible — exhausted the
+/// automatic retry backoff, or hit a non-retryable auth error — so the
+/// client knows to check their credentials instead of wondering why their
+/// dashboard is stuck.
+pub async fn send_sync_failed(
+    api_key: &str,
+    from_email: &str,
+    to_email: &str,
+    rfc: &str,
+    error_code: Option<&str>,
+) -> anyhow::Result<()> {
+    let reason = failure_reason_es(error_code);
+
+    let plain_text = format!(
+        "No pudimos completar la descarga de tus facturas del RFC {rfc}: {reason}. \
+        Entra a Pulso y revisa tus credenciales (CIEC o e.firma) en tu perfil, o vuelve a intentar la sincronización."
+    );
+
+    let html_body = format!(
+        r#"<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>No pudimos sincronizar tus facturas — Pulso</title>
+</head>
+<body style="margin:0;padding:0;background:#f4f6f8;font-family:Arial,Helvetica,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f8;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;overflow:hidden;max-width:600px;">
+          <tr>
+            <td style="background:#00004e;padding:32px 40px;">
+              <h1 style="margin:0;color:#ffffff;font-size:24px;font-weight:700;letter-spacing:-0.5px;">Pulso</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:40px;">
+              <h2 style="margin:0 0 16px;color:#b91c1c;font-size:20px;">No pudimos sincronizar tus facturas</h2>
+              <p style="margin:0 0 16px;color:#374151;font-size:16px;line-height:1.6;">
+                Intentamos varias veces descargar tus facturas del RFC <strong>{rfc}</strong>, pero
+                {reason}.
+              </p>
+              <p style="margin:0 0 32px;color:#374151;font-size:16px;line-height:1.6;">
+                Revisa tus credenciales (CIEC o e.firma) en tu perfil de Pulso, o vuelve a intentar la sincronización.
+              </p>
+              <a href="https://pulso.adquiere.co/perfil"
+                 style="display:inline-block;background:#00004e;color:#ffffff;text-decoration:none;
+                        padding:14px 28px;border-radius:6px;font-size:16px;font-weight:600;">
+                Revisar mi perfil
+              </a>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 40px;border-top:1px solid #e5e7eb;">
+              <p style="margin:0;color:#9ca3af;font-size:13px;">
+                Pulso · Adquiere &mdash; Este correo fue enviado automáticamente, no es necesario responderlo.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"#,
+        rfc = rfc,
+        reason = reason,
+    );
+
+    let subject = format!("No pudimos sincronizar tus facturas — RFC {rfc} · Pulso");
+
+    let body = json!({
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": from_email, "name": "Pulso"},
+        "subject": subject,
+        "content": [
+            {"type": "text/plain", "value": plain_text},
+            {"type": "text/html",  "value": html_body}
+        ]
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.sendgrid.com/v3/mail/send")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        anyhow::bail!("SendGrid returned {status}: {text}");
+    }
+
+    Ok(())
+}
+
 /// Notify a user that they've been added as a viewer to an RFC.
 pub async fn send_rfc_invite(
     api_key: &str,
