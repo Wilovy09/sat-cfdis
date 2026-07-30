@@ -783,8 +783,17 @@ async fn run_worker_chunk(
     tokio::task::yield_now().await;
 
     if let Some((code, message)) = auth_error {
-        let _ = db::jobs::fail(&pool, &job_id, Some(&code), &message).await;
-        tracing::warn!(job_id = %job_id, code = %code, "Job failed: auth error");
+        if code == "captcha_failed" {
+            // A captcha OCR miss on this one login attempt, not a persistent
+            // credential problem — worth retrying (a fresh login gets a fresh
+            // captcha image), unlike invalid_credentials/login_not_registered/
+            // fiel_login_failed below, which fail permanently.
+            let _ = db::jobs::retry_transient_or_fail(&pool, &job_id, &cursor, found, Some(&code), &message).await;
+            tracing::warn!(job_id = %job_id, code = %code, "Job failed transiently: captcha OCR miss, will auto-retry");
+        } else {
+            let _ = db::jobs::fail(&pool, &job_id, Some(&code), &message).await;
+            tracing::warn!(job_id = %job_id, code = %code, "Job failed: auth error");
+        }
         return;
     }
 
@@ -798,7 +807,7 @@ async fn run_worker_chunk(
         } else {
             "PHP worker crashed before completion"
         };
-        let _ = db::jobs::retry_transient_or_fail(&pool, &job_id, &cursor, found, msg).await;
+        let _ = db::jobs::retry_transient_or_fail(&pool, &job_id, &cursor, found, None, msg).await;
         tracing::error!(job_id = %job_id, idle_timeout, "Job failed transiently: PHP worker did not send __done__, will auto-retry");
         return;
     }

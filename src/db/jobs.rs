@@ -230,15 +230,20 @@ const MAX_TRANSIENT_RETRIES: i32 = 3;
 /// 24.5h SAT rate-limit pause — this is an infra hiccup, not a SAT-imposed limit.
 const TRANSIENT_RETRY_DELAY_SECS: u64 = 5 * 60;
 
-/// Handle a transient (non-SAT-classified) failure — PHP worker idle timeout,
-/// or crash before sending `__done__`. Retries automatically through the same
-/// paused_limit/resume_worker path already used for real SAT rate limits, up
-/// to MAX_TRANSIENT_RETRIES; beyond that, fails the job permanently.
+/// Handle a transient failure — PHP worker idle timeout, crash before sending
+/// `__done__`, or a `captcha_failed` auth error (an OCR miss on one attempt,
+/// not a persistent credential problem — worth another try, unlike
+/// `invalid_credentials`/`login_not_registered`/`fiel_login_failed`, which
+/// call `fail()` directly and never reach here). Retries automatically
+/// through the same paused_limit/resume_worker path already used for real
+/// SAT rate limits — which re-logs in from scratch, giving the captcha a
+/// fresh attempt — up to MAX_TRANSIENT_RETRIES; beyond that, fails permanently.
 pub async fn retry_transient_or_fail(
     pool: &PgPool,
     job_id: &str,
     cursor_date: &str,
     found: i64,
+    error_code: Option<&str>,
     error_msg: &str,
 ) -> Result<(), sqlx::Error> {
     let (retry_count,): (i32,) =
@@ -251,7 +256,7 @@ pub async fn retry_transient_or_fail(
         return fail(
             pool,
             job_id,
-            None,
+            error_code,
             &format!("{error_msg} (tras {retry_count} reintentos automáticos)"),
         )
         .await;
@@ -261,12 +266,13 @@ pub async fn retry_transient_or_fail(
     sqlx::query(
         r#"UPDATE pulso.sync_jobs
            SET status='paused_limit', cursor_date=$1, found=$2, resume_at=$3,
-               error_msg=$4, retry_count=retry_count+1, updated_at=$5
-           WHERE id=$6"#,
+               error_code=$4, error_msg=$5, retry_count=retry_count+1, updated_at=$6
+           WHERE id=$7"#,
     )
     .bind(cursor_date)
     .bind(found)
     .bind(&resume_at)
+    .bind(error_code)
     .bind(error_msg)
     .bind(now_utc())
     .bind(job_id)
