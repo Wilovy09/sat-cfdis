@@ -67,6 +67,74 @@ fn initial_sync_period() -> (String, String) {
     (period_from, period_to)
 }
 
+/// Parse the year/month from a "YYYY-MM-DD ..." or "YYYY-MM-DDTHH:MM:SSZ" prefix.
+fn year_month_prefix(s: &str) -> Option<(i64, i64)> {
+    if s.len() < 7 {
+        return None;
+    }
+    let y = s[0..4].parse::<i64>().ok()?;
+    let m = s[5..7].parse::<i64>().ok()?;
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    Some((y, m))
+}
+
+/// Per-month progress within [period_from, period_to] — powers the sync
+/// widget's expanded view (one row per year, one dot per month) so the user
+/// can see it's downloading in chronological order and which month it's
+/// currently on. "current" is the cursor's month (or period_from's month if
+/// the job hasn't started yet); everything before is "done", after is "pending".
+fn month_progress(
+    period_from: &str,
+    period_to: &str,
+    cursor_date: Option<&str>,
+    status: &str,
+) -> Vec<serde_json::Value> {
+    let (Some((from_y, from_m)), Some((to_y, to_m))) =
+        (year_month_prefix(period_from), year_month_prefix(period_to))
+    else {
+        return Vec::new();
+    };
+
+    let current_abs = if status == "completed" {
+        i64::MAX
+    } else {
+        match cursor_date.and_then(year_month_prefix) {
+            Some((cy, cm)) => cy * 12 + cm,
+            None => from_y * 12 + from_m,
+        }
+    };
+
+    let mut months = Vec::new();
+    let to_abs = to_y * 12 + to_m;
+    let mut abs = from_y * 12 + from_m;
+    while abs <= to_abs {
+        let year = (abs - 1) / 12;
+        let month = ((abs - 1) % 12) + 1;
+        let month_status = if abs < current_abs {
+            "done"
+        } else if abs == current_abs {
+            "current"
+        } else {
+            "pending"
+        };
+        months.push(serde_json::json!({ "year": year, "month": month, "status": month_status }));
+        abs += 1;
+    }
+    months
+}
+
+/// (year, month) the counting/downloading pass is currently on, for the
+/// frontend's "consultando"/"descargando" indicators — `None` when that
+/// pass hasn't produced a date yet.
+fn current_year_month(date: Option<&str>) -> (Option<i64>, Option<i64>) {
+    match date.and_then(year_month_prefix) {
+        Some((y, m)) => (Some(y), Some(m)),
+        None => (None, None),
+    }
+}
+
 fn days_in_month(y: u32, m: u32) -> u32 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -487,17 +555,33 @@ pub async fn sync_status(
         // so admin-queued jobs and paused syncs are always surfaced correctly.
         match crate::db::jobs::get_active_for_rfc(&pool, rfc).await {
             Ok(Some(active_job)) => {
+                let months = month_progress(
+                    &active_job.period_from,
+                    &active_job.period_to,
+                    active_job.cursor_date.as_deref(),
+                    &active_job.status,
+                );
+                let (counting_year, counting_month) =
+                    current_year_month(active_job.count_cursor_date.as_deref());
+                let (downloading_year, downloading_month) =
+                    current_year_month(active_job.cursor_date.as_deref());
                 return HttpResponse::Ok().json(serde_json::json!({
-                    "status":          active_job.status,
-                    "found":           active_job.found,
-                    "total_expected":  active_job.total_expected,
-                    "count_progress":  active_job.count_progress,
-                    "cursor_date":     active_job.cursor_date,
-                    "job_id":          active_job.id,
-                    "period_from":     active_job.period_from,
-                    "period_to":       active_job.period_to,
-                    "error_code":      active_job.error_code,
-                    "error_msg":       active_job.error_msg,
+                    "status":             active_job.status,
+                    "found":              active_job.found,
+                    "total_expected":     active_job.total_expected,
+                    "count_progress":     active_job.count_progress,
+                    "cursor_date":        active_job.cursor_date,
+                    "count_cursor_date":  active_job.count_cursor_date,
+                    "job_id":             active_job.id,
+                    "period_from":        active_job.period_from,
+                    "period_to":          active_job.period_to,
+                    "error_code":         active_job.error_code,
+                    "error_msg":          active_job.error_msg,
+                    "months":             months,
+                    "counting_year":      counting_year,
+                    "counting_month":     counting_month,
+                    "downloading_year":   downloading_year,
+                    "downloading_month":  downloading_month,
                 }));
             }
             Ok(None) => {
@@ -544,18 +628,36 @@ pub async fn sync_status(
     };
 
     match crate::db::jobs::get_by_id(&pool, &job_id).await {
-        Ok(Some(job)) => HttpResponse::Ok().json(serde_json::json!({
-            "status":         job.status,
-            "found":          job.found,
-            "total_expected": job.total_expected,
-            "count_progress": job.count_progress,
-            "cursor_date":    job.cursor_date,
-            "job_id":         job.id,
-            "period_from":    job.period_from,
-            "period_to":      job.period_to,
-            "error_code":     job.error_code,
-            "error_msg":      job.error_msg,
-        })),
+        Ok(Some(job)) => {
+            let months = month_progress(
+                &job.period_from,
+                &job.period_to,
+                job.cursor_date.as_deref(),
+                &job.status,
+            );
+            let (counting_year, counting_month) =
+                current_year_month(job.count_cursor_date.as_deref());
+            let (downloading_year, downloading_month) =
+                current_year_month(job.cursor_date.as_deref());
+            HttpResponse::Ok().json(serde_json::json!({
+                "status":             job.status,
+                "found":              job.found,
+                "total_expected":     job.total_expected,
+                "count_progress":     job.count_progress,
+                "cursor_date":        job.cursor_date,
+                "count_cursor_date":  job.count_cursor_date,
+                "job_id":             job.id,
+                "period_from":        job.period_from,
+                "period_to":          job.period_to,
+                "error_code":         job.error_code,
+                "error_msg":          job.error_msg,
+                "months":             months,
+                "counting_year":      counting_year,
+                "counting_month":     counting_month,
+                "downloading_year":   downloading_year,
+                "downloading_month":  downloading_month,
+            }))
+        }
         Ok(None) => HttpResponse::Ok().json(serde_json::json!({ "status": "none" })),
         Err(e) => {
             tracing::error!(job_id = %job_id, "Error fetching job: {e}");

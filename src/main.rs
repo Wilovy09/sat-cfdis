@@ -504,13 +504,14 @@ async fn run_count_pass(
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
             if val.get("__keepalive__").and_then(|v| v.as_bool()).unwrap_or(false) {
                 let total_so_far = val["total_so_far"].as_i64().unwrap_or(0);
+                let date = val["date"].as_str().unwrap_or("?");
                 tracing::info!(
                     job_id = %job_id,
-                    date = val["date"].as_str().unwrap_or("?"),
+                    date,
                     total_so_far,
                     "list-count progress"
                 );
-                let _ = db::jobs::update_count_progress(pool, job_id, total_so_far).await;
+                let _ = db::jobs::update_count_progress(pool, job_id, total_so_far, date).await;
                 continue;
             }
             if val.get("__count__").is_some() {

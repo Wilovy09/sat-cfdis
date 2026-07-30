@@ -27,6 +27,9 @@ pub struct SyncJob {
     /// Live running tally while list-count is still counting; None once
     /// total_expected is set (final) or before counting has started.
     pub count_progress: Option<i64>,
+    /// Date (YYYY-MM-DD) the list-count pre-pass is currently scanning —
+    /// mirrors `cursor_date` but for the counting phase, not the download phase.
+    pub count_cursor_date: Option<String>,
     pub status: String,
     /// Machine-readable classification of error_msg, from classifySatError() in
     /// cfdi-scraper: "invalid_credentials" | "captcha_failed" | "login_not_registered"
@@ -308,13 +311,17 @@ pub async fn update_count_progress(
     pool: &PgPool,
     job_id: &str,
     count_so_far: i64,
+    count_date: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(r#"UPDATE pulso.sync_jobs SET count_progress=$1, updated_at=$2 WHERE id=$3"#)
-        .bind(count_so_far)
-        .bind(now_utc())
-        .bind(job_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        r#"UPDATE pulso.sync_jobs SET count_progress=$1, count_cursor_date=$2, updated_at=$3 WHERE id=$4"#,
+    )
+    .bind(count_so_far)
+    .bind(count_date)
+    .bind(now_utc())
+    .bind(job_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
