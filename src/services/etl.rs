@@ -301,7 +301,7 @@ async fn enrich_invoice(
     // 2. If not in storage, try to download from SAT using the job's credentials
     let (xml_bytes, tried_sat) = if xml_bytes.is_none() {
         if let Some(j) = job {
-            let sat_bytes = try_download_from_sat(cfg, s3, j, uuid, metadata).await;
+            let sat_bytes = try_download_from_sat(pool, cfg, s3, j, uuid, metadata).await;
             let tried = sat_bytes.is_none(); // only "tried and failed" if still None
             (sat_bytes, tried)
         } else {
@@ -392,17 +392,35 @@ async fn try_load_xml(cfg: &Config, s3: &S3Client, uuid: &str, metadata: &str) -
 
 /// Try to download a single XML from SAT using the job's stored credentials.
 /// On success, uploads the XML to storage and returns the bytes.
+///
+/// `job.auth_enc` reflects whatever auth the job was *created* with, which is
+/// always the CIEC-shaped payload — RFCs that actually use FIEL never have a
+/// real CIEC password stored, so using it verbatim fails with "Missing CIEC
+/// field: password". `resume_worker`/`run_worker_chunk` already override this
+/// at scrape time via `try_fiel_auth`; this fallback path needs the same
+/// override, since it runs independently, potentially long after the job.
 async fn try_download_from_sat(
+    pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
     job: &db::jobs::SyncJob,
     uuid: &str,
     metadata: &str,
 ) -> Option<Vec<u8>> {
-    // Decrypt auth payload
-    let key = crate::services::crypto::load_key();
-    let auth_json = crate::services::crypto::decrypt(&key, &job.auth_enc).ok()?;
-    let auth: serde_json::Value = serde_json::from_str(&auth_json).ok()?;
+    let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+
+    // If the RFC has FIEL configured, that takes priority over the CIEC
+    // payload the job was created with (same rule as resume_worker).
+    let fiel_override = crate::try_fiel_auth(pool, s3, &bucket, &job.rfc).await;
+    let (auth, _fiel_tmp) = match fiel_override {
+        Some((fiel_auth, tmp)) => (fiel_auth, Some(tmp)),
+        None => {
+            // Decrypt the job's own auth payload (CIEC).
+            let key = crate::services::crypto::load_key();
+            let auth_json = crate::services::crypto::decrypt(&key, &job.auth_enc).ok()?;
+            (serde_json::from_str(&auth_json).ok()?, None)
+        }
+    };
 
     // Determine download_type from RFC ownership
     let (rfc_e, rfc_r, year, month, day) = extract_path_from_meta(metadata);
@@ -447,7 +465,6 @@ async fn try_download_from_sat(
 
     // Upload to S3 so future enrichment rounds find it in storage
     let uuid_lower = uuid.to_lowercase();
-    let bucket = cfg.s3_bucket.clone().unwrap_or_default();
     let _ = storage::upload(s3, &bucket, &rfc_e, &rfc_r, year, month, day, &uuid_lower, bytes.clone()).await;
 
     tracing::info!(uuid = %uuid, download_type, "ETL: downloaded XML from SAT");
