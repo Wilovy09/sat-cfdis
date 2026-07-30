@@ -29,7 +29,9 @@ pub async fn send_sync_failed(
 
     let plain_text = format!(
         "No pudimos completar la descarga de tus facturas del RFC {rfc}: {reason}. \
-        Entra a Pulso y revisa tus credenciales (CIEC o e.firma) en tu perfil, o vuelve a intentar la sincronización."
+        Ya lo intentamos varias veces de forma automática. Entra a Pulso y revisa tus credenciales \
+        (CIEC o e.firma) en tu perfil, o vuelve a intentar la sincronización. \
+        Cualquier duda, escríbenos a soporte@adquiere.co y con gusto te ayudamos."
     );
 
     let html_body = format!(
@@ -57,8 +59,13 @@ pub async fn send_sync_failed(
                 Intentamos varias veces descargar tus facturas del RFC <strong>{rfc}</strong>, pero
                 {reason}.
               </p>
-              <p style="margin:0 0 32px;color:#374151;font-size:16px;line-height:1.6;">
+              <p style="margin:0 0 16px;color:#374151;font-size:16px;line-height:1.6;">
                 Revisa tus credenciales (CIEC o e.firma) en tu perfil de Pulso, o vuelve a intentar la sincronización.
+              </p>
+              <p style="margin:0 0 32px;color:#374151;font-size:16px;line-height:1.6;">
+                ¿Dudas? Escríbenos a
+                <a href="mailto:soporte@adquiere.co" style="color:#00004e;font-weight:700;">soporte@adquiere.co</a>
+                y con gusto te ayudamos.
               </p>
               <a href="https://pulso.adquiere.co/perfil"
                  style="display:inline-block;background:#00004e;color:#ffffff;text-decoration:none;
@@ -70,7 +77,8 @@ pub async fn send_sync_failed(
           <tr>
             <td style="padding:24px 40px;border-top:1px solid #e5e7eb;">
               <p style="margin:0;color:#9ca3af;font-size:13px;">
-                Pulso · Adquiere &mdash; Este correo fue enviado automáticamente, no es necesario responderlo.
+                Pulso · Adquiere &mdash; Este correo fue enviado automáticamente. Si necesitas ayuda,
+                escríbenos a soporte@adquiere.co.
               </p>
             </td>
           </tr>
