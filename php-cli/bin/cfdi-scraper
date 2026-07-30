@@ -537,7 +537,11 @@ switch ($command) {
         foreach ($lcMonths as [$lcMonthStart, $lcMonthEnd]) {
             $lcDay = $lcMonthStart;
             while ($lcDay->format('Y-m-d') <= $lcMonthEnd->format('Y-m-d')) {
-                echo json_encode(['__keepalive__' => true], JSON_UNESCAPED_UNICODE) . "\n";
+                echo json_encode([
+                    '__keepalive__' => true,
+                    'date'          => $lcDay->format('Y-m-d'),
+                    'total_so_far'  => $lcTotal,
+                ], JSON_UNESCAPED_UNICODE) . "\n";
                 flush();
 
                 $lcDayStart = $lcDay->setTime(0, 0, 0);
