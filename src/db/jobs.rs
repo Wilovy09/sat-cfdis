@@ -39,7 +39,7 @@ pub struct SyncJob {
     /// ISO-8601 UTC — when the worker should resume this job
     pub resume_at: Option<String>,
     /// Automatic retries used for transient (non-SAT) failures — see
-    /// `retry_transient_or_fail`. Capped at MAX_TRANSIENT_RETRIES.
+    /// `retry_transient_or_fail`. Index into RETRY_BACKOFF_SECS.
     pub retry_count: i32,
     pub created_at: String,
     pub updated_at: String,
@@ -220,15 +220,22 @@ pub async fn fail(
     Ok(())
 }
 
-/// Max automatic retries for a transient (non-SAT) failure — PHP worker idle
-/// timeout or crash before completion — before giving up and marking the job
-/// permanently 'failed' so the frontend shows "Descarga fallida" and the user
-/// has to re-trigger manually from Perfil.
-const MAX_TRANSIENT_RETRIES: i32 = 3;
-
-/// Delay before the worker retries a transient failure. Short compared to the
-/// 24.5h SAT rate-limit pause — this is an infra hiccup, not a SAT-imposed limit.
-const TRANSIENT_RETRY_DELAY_SECS: u64 = 5 * 60;
+/// Backoff schedule for transient retries, approved by the partners:
+/// 5min → 15min → 1h → 6h → 24h, then 24h again for a few more days before
+/// giving up permanently. Index = current `retry_count`. Total span before
+/// the final give-up is ~4.3 days — long enough to ride out a SAT outage
+/// without hammering its login endpoint every few minutes forever (risk of
+/// looking like abuse and getting the whole scraping IP blocked).
+const RETRY_BACKOFF_SECS: [u64; 8] = [
+    5 * 60,
+    15 * 60,
+    60 * 60,
+    6 * 60 * 60,
+    24 * 60 * 60,
+    24 * 60 * 60,
+    24 * 60 * 60,
+    24 * 60 * 60,
+];
 
 /// Handle a transient failure — PHP worker idle timeout, crash before sending
 /// `__done__`, or a `captcha_failed` auth error (an OCR miss on one attempt,
@@ -237,7 +244,8 @@ const TRANSIENT_RETRY_DELAY_SECS: u64 = 5 * 60;
 /// call `fail()` directly and never reach here). Retries automatically
 /// through the same paused_limit/resume_worker path already used for real
 /// SAT rate limits — which re-logs in from scratch, giving the captcha a
-/// fresh attempt — up to MAX_TRANSIENT_RETRIES; beyond that, fails permanently.
+/// fresh attempt — following RETRY_BACKOFF_SECS; once that schedule is
+/// exhausted, fails permanently.
 pub async fn retry_transient_or_fail(
     pool: &PgPool,
     job_id: &str,
@@ -252,7 +260,7 @@ pub async fn retry_transient_or_fail(
             .fetch_one(pool)
             .await?;
 
-    if retry_count >= MAX_TRANSIENT_RETRIES {
+    let Some(&delay_secs) = RETRY_BACKOFF_SECS.get(retry_count as usize) else {
         return fail(
             pool,
             job_id,
@@ -260,9 +268,9 @@ pub async fn retry_transient_or_fail(
             &format!("{error_msg} (tras {retry_count} reintentos automáticos)"),
         )
         .await;
-    }
+    };
 
-    let resume_at = utc_offset(TRANSIENT_RETRY_DELAY_SECS);
+    let resume_at = utc_offset(delay_secs);
     sqlx::query(
         r#"UPDATE pulso.sync_jobs
            SET status='paused_limit', cursor_date=$1, found=$2, resume_at=$3,
