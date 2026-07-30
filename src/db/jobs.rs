@@ -35,6 +35,9 @@ pub struct SyncJob {
     pub error_msg: Option<String>,
     /// ISO-8601 UTC — when the worker should resume this job
     pub resume_at: Option<String>,
+    /// Automatic retries used for transient (non-SAT) failures — see
+    /// `retry_transient_or_fail`. Capped at MAX_TRANSIENT_RETRIES.
+    pub retry_count: i32,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -206,6 +209,61 @@ pub async fn fail(
         r#"UPDATE pulso.sync_jobs SET status='failed', error_code=$1, error_msg=$2, updated_at=$3 WHERE id=$4"#,
     )
     .bind(error_code)
+    .bind(error_msg)
+    .bind(now_utc())
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Max automatic retries for a transient (non-SAT) failure — PHP worker idle
+/// timeout or crash before completion — before giving up and marking the job
+/// permanently 'failed' so the frontend shows "Descarga fallida" and the user
+/// has to re-trigger manually from Perfil.
+const MAX_TRANSIENT_RETRIES: i32 = 3;
+
+/// Delay before the worker retries a transient failure. Short compared to the
+/// 24.5h SAT rate-limit pause — this is an infra hiccup, not a SAT-imposed limit.
+const TRANSIENT_RETRY_DELAY_SECS: u64 = 5 * 60;
+
+/// Handle a transient (non-SAT-classified) failure — PHP worker idle timeout,
+/// or crash before sending `__done__`. Retries automatically through the same
+/// paused_limit/resume_worker path already used for real SAT rate limits, up
+/// to MAX_TRANSIENT_RETRIES; beyond that, fails the job permanently.
+pub async fn retry_transient_or_fail(
+    pool: &PgPool,
+    job_id: &str,
+    cursor_date: &str,
+    found: i64,
+    error_msg: &str,
+) -> Result<(), sqlx::Error> {
+    let (retry_count,): (i32,) =
+        sqlx::query_as(r#"SELECT retry_count FROM pulso.sync_jobs WHERE id = $1"#)
+            .bind(job_id)
+            .fetch_one(pool)
+            .await?;
+
+    if retry_count >= MAX_TRANSIENT_RETRIES {
+        return fail(
+            pool,
+            job_id,
+            None,
+            &format!("{error_msg} (tras {retry_count} reintentos automáticos)"),
+        )
+        .await;
+    }
+
+    let resume_at = utc_offset(TRANSIENT_RETRY_DELAY_SECS);
+    sqlx::query(
+        r#"UPDATE pulso.sync_jobs
+           SET status='paused_limit', cursor_date=$1, found=$2, resume_at=$3,
+               error_msg=$4, retry_count=retry_count+1, updated_at=$5
+           WHERE id=$6"#,
+    )
+    .bind(cursor_date)
+    .bind(found)
+    .bind(&resume_at)
     .bind(error_msg)
     .bind(now_utc())
     .bind(job_id)

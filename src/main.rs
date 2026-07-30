@@ -787,16 +787,18 @@ async fn run_worker_chunk(
         return;
     }
 
-    // PHP crashed (or was killed after an idle timeout) before sending __done__ —
-    // fail the job so it can be retried instead of leaving it stuck in 'running'.
+    // PHP crashed (or was killed after an idle timeout) before sending __done__.
+    // This is a transient infra issue, not a SAT auth error — retry automatically
+    // (bounded) through the same paused_limit/resume_worker path instead of
+    // leaving the job stuck showing "Descarga fallida" for a network hiccup.
     if !done_received && !php_exit_ok {
         let msg = if idle_timeout {
             "PHP worker idle timeout — killed (no output for too long)"
         } else {
             "PHP worker crashed before completion"
         };
-        let _ = db::jobs::fail(&pool, &job_id, None, msg).await;
-        tracing::error!(job_id = %job_id, idle_timeout, "Job failed: PHP worker did not send __done__");
+        let _ = db::jobs::retry_transient_or_fail(&pool, &job_id, &cursor, found, msg).await;
+        tracing::error!(job_id = %job_id, idle_timeout, "Job failed transiently: PHP worker did not send __done__, will auto-retry");
         return;
     }
 
