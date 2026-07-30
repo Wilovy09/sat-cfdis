@@ -131,6 +131,24 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
             .collect();
 
         for job in all_jobs {
+            // Enforce download order: within the same RFC, `list` jobs run
+            // strictly in creation order (e.g. emitidos fully before
+            // recibidos, per the user's onboarding priority) — skip this one
+            // if an earlier-created list job for the same RFC hasn't reached
+            // a terminal state yet. It'll be picked up automatically once
+            // that earlier job completes or fails.
+            if job.job_type == "list" {
+                match db::jobs::has_earlier_active_list_job(&pool, &job.rfc, &job.created_at).await
+                {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(job_id = %job.id, "Worker: earlier-job check failed: {e}");
+                        continue;
+                    }
+                }
+            }
+
             let label = if job.status == "queued" {
                 "Starting queued job"
             } else {
@@ -1075,6 +1093,10 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::resource("/api/v1/users/rfcs/{rfc}/clave")
                     .route(web::put().to(users_routes::update_rfc_clave_handler)),
+            )
+            .service(
+                web::resource("/api/v1/users/rfcs/{rfc}/priority-analysis")
+                    .route(web::put().to(users_routes::update_priority_analysis_handler)),
             )
             .service(
                 web::resource("/api/v1/users/rfcs/{rfc}/shares")

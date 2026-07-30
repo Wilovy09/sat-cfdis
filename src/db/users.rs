@@ -59,6 +59,7 @@ pub async fn create_pulso_user(
     rfc: &str,
     clave_enc: &str,
     initial_sync_job_id: Option<&str>,
+    priority_analysis: Option<&str>,
 ) -> Result<bool, CreateUserError> {
     let uid = parse_uuid(user_id)?;
     let rfc_upper = rfc.to_uppercase();
@@ -85,11 +86,12 @@ pub async fn create_pulso_user(
     // Restore a previously soft-deleted row if one exists.
     let restored = sqlx::query(
         r#"UPDATE pulso.users
-           SET deleted_at = NULL, clave = $1, initial_sync_job_id = $2
-           WHERE user_id = $3 AND rfc = $4 AND deleted_at IS NOT NULL"#,
+           SET deleted_at = NULL, clave = $1, initial_sync_job_id = $2, priority_analysis = $3
+           WHERE user_id = $4 AND rfc = $5 AND deleted_at IS NOT NULL"#,
     )
     .bind(clave_enc)
     .bind(initial_sync_job_id)
+    .bind(priority_analysis)
     .bind(uid)
     .bind(&rfc_upper)
     .execute(pool)
@@ -102,14 +104,15 @@ pub async fn create_pulso_user(
     // Fresh insert.
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        r#"INSERT INTO pulso.users (id, user_id, rfc, clave, initial_sync_job_id, deleted_at)
-           VALUES ($1, $2, $3, $4, $5, NULL)"#,
+        r#"INSERT INTO pulso.users (id, user_id, rfc, clave, initial_sync_job_id, priority_analysis, deleted_at)
+           VALUES ($1, $2, $3, $4, $5, $6, NULL)"#,
     )
     .bind(id)
     .bind(uid)
     .bind(&rfc_upper)
     .bind(clave_enc)
     .bind(initial_sync_job_id)
+    .bind(priority_analysis)
     .execute(pool)
     .await?;
     Ok(true)
@@ -526,6 +529,41 @@ pub async fn update_rfc_clave(
         "UPDATE pulso.users SET clave = $1 WHERE user_id = $2 AND rfc = $3 AND deleted_at IS NULL",
     )
     .bind(clave_enc)
+    .bind(uid)
+    .bind(rfc.to_uppercase())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Onboarding "priority analysis" answer for an active RFC, if answered.
+pub async fn get_priority_analysis_for_rfc(
+    pool: &PgPool,
+    rfc: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT priority_analysis FROM pulso.users WHERE rfc = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(rfc.to_uppercase())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(v,)| v))
+}
+
+/// Update the "priority analysis" answer for a specific active RFC. Returns
+/// true if a row was found and updated. Note: this only affects future syncs
+/// (e.g. a manual re-trigger) — it doesn't reorder a sync already in progress.
+pub async fn set_priority_analysis(
+    pool: &PgPool,
+    user_id: &str,
+    rfc: &str,
+    priority_analysis: &str,
+) -> Result<bool, sqlx::Error> {
+    let uid = parse_uuid(user_id)?;
+    let result = sqlx::query(
+        "UPDATE pulso.users SET priority_analysis = $1 WHERE user_id = $2 AND rfc = $3 AND deleted_at IS NULL",
+    )
+    .bind(priority_analysis)
     .bind(uid)
     .bind(rfc.to_uppercase())
     .execute(pool)

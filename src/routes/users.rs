@@ -10,6 +10,9 @@ use crate::services::crypto;
 pub struct CompleteProfileDto {
     pub rfc: String,
     pub clave: String,
+    /// Onboarding answer: "ingresos_clientes" | "egresos_proveedores" | "nomina".
+    /// Drives which dl_type downloads first — see `download_order`.
+    pub priority_analysis: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +68,17 @@ fn initial_sync_period() -> (String, String) {
     let period_to = format!("{to_year:04}-{to_month:02}-{last_day:02} 23:59:59");
 
     (period_from, period_to)
+}
+
+/// Maps the onboarding "priority analysis" answer to a download order —
+/// (first, second) dl_type. Ingresos y clientes / Nómina need `emitidos`
+/// fully downloaded first; Egresos y proveedores needs `recibidos` first.
+/// Unanswered (None) defaults to emitidos-first, matching prior behavior.
+fn download_order(priority_analysis: Option<&str>) -> (&'static str, &'static str) {
+    match priority_analysis {
+        Some("egresos_proveedores") => ("recibidos", "emitidos"),
+        _ => ("emitidos", "recibidos"),
+    }
 }
 
 /// Parse the year/month from a "YYYY-MM-DD ..." or "YYYY-MM-DDTHH:MM:SSZ" prefix.
@@ -280,26 +294,33 @@ pub async fn complete_profile(
         }
     };
 
-    // Create the background sync job covering 3 full years + complete months of current year
+    // Create the background sync jobs covering 3 full years + complete months
+    // of current year. Two ordered jobs (not a single "ambos" job) so the
+    // user's priority type fully downloads before the other — enforced by
+    // has_earlier_active_list_job in main.rs's resume_worker.
     let (period_from, period_to) = initial_sync_period();
+    let priority_analysis = body.priority_analysis.as_deref();
+    let (first_type, second_type) = download_order(priority_analysis);
+
+    if let Err(e) = crate::db::jobs::insert_queued(
+        &pool, "list", &rfc, "ciec", &auth_enc, first_type, &period_from, &period_to,
+    )
+    .await
+    {
+        tracing::error!(user_id = %user_id, "Failed to queue initial sync ({first_type}): {e}");
+    }
+
     let sync_job_id = match crate::db::jobs::insert_queued(
-        &pool,
-        "list",
-        &rfc,
-        "ciec",
-        &auth_enc,
-        "ambos",
-        &period_from,
-        &period_to,
+        &pool, "list", &rfc, "ciec", &auth_enc, second_type, &period_from, &period_to,
     )
     .await
     {
         Ok(id) => {
-            tracing::info!(user_id = %user_id, job_id = %id, "Initial sync job queued");
+            tracing::info!(user_id = %user_id, job_id = %id, first_type, second_type, "Initial sync jobs queued");
             Some(id)
         }
         Err(e) => {
-            tracing::error!(user_id = %user_id, "Failed to queue initial sync: {e}");
+            tracing::error!(user_id = %user_id, "Failed to queue initial sync ({second_type}): {e}");
             None
         }
     };
@@ -311,6 +332,7 @@ pub async fn complete_profile(
         &rfc,
         &clave_enc,
         sync_job_id.as_deref(),
+        priority_analysis,
     )
     .await
     {
@@ -473,21 +495,30 @@ pub async fn trigger_sync(
     };
 
     let (period_from, period_to) = initial_sync_period();
+    let priority_analysis = crate::db::users::get_priority_analysis_for_rfc(&pool, &rfc)
+        .await
+        .unwrap_or(None);
+    let (first_type, second_type) = download_order(priority_analysis.as_deref());
+
+    if let Err(e) = crate::db::jobs::insert_queued(
+        &pool, "list", &rfc, "ciec", &auth_enc, first_type, &period_from, &period_to,
+    )
+    .await
+    {
+        tracing::error!(user_id = %user_id, "trigger_sync: insert_queued ({first_type}) failed: {e}");
+        return HttpResponse::InternalServerError().json(ErrorBody {
+            error: "Error al crear el job".to_string(),
+        });
+    }
+
     let job_id = match crate::db::jobs::insert_queued(
-        &pool,
-        "list",
-        &rfc,
-        "ciec",
-        &auth_enc,
-        "ambos",
-        &period_from,
-        &period_to,
+        &pool, "list", &rfc, "ciec", &auth_enc, second_type, &period_from, &period_to,
     )
     .await
     {
         Ok(id) => id,
         Err(e) => {
-            tracing::error!(user_id = %user_id, "trigger_sync: insert_queued failed: {e}");
+            tracing::error!(user_id = %user_id, "trigger_sync: insert_queued ({second_type}) failed: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
                 error: "Error al crear el job".to_string(),
             });
@@ -786,24 +817,28 @@ pub async fn add_rfc(
     };
 
     let (period_from, period_to) = initial_sync_period();
+    let priority_analysis = body.priority_analysis.as_deref();
+    let (first_type, second_type) = download_order(priority_analysis);
+
+    if let Err(e) = crate::db::jobs::insert_queued(
+        &pool, "list", &rfc, "ciec", &auth_enc, first_type, &period_from, &period_to,
+    )
+    .await
+    {
+        tracing::error!(user_id = %user_id, "Failed to queue initial sync ({first_type}): {e}");
+    }
+
     let sync_job_id = match crate::db::jobs::insert_queued(
-        &pool,
-        "list",
-        &rfc,
-        "ciec",
-        &auth_enc,
-        "ambos",
-        &period_from,
-        &period_to,
+        &pool, "list", &rfc, "ciec", &auth_enc, second_type, &period_from, &period_to,
     )
     .await
     {
         Ok(id) => {
-            tracing::info!(user_id = %user_id, job_id = %id, "Initial sync job queued for new RFC");
+            tracing::info!(user_id = %user_id, job_id = %id, first_type, second_type, "Initial sync jobs queued for new RFC");
             Some(id)
         }
         Err(e) => {
-            tracing::error!(user_id = %user_id, "Failed to queue initial sync: {e}");
+            tracing::error!(user_id = %user_id, "Failed to queue initial sync ({second_type}): {e}");
             None
         }
     };
@@ -814,6 +849,7 @@ pub async fn add_rfc(
         &rfc,
         &clave_enc,
         sync_job_id.as_deref(),
+        priority_analysis,
     )
     .await
     {
@@ -921,6 +957,87 @@ pub async fn update_rfc_clave_handler(
         }),
         Err(e) => {
             tracing::error!(user_id = %user_id, rfc = %rfc, "update_rfc_clave: DB error: {e}");
+            HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".to_string(),
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PUT /api/v1/users/rfcs/{rfc}/priority-analysis
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePriorityAnalysisDto {
+    /// "ingresos_clientes" | "egresos_proveedores" | "nomina"
+    pub priority_analysis: String,
+}
+
+/// Saves the onboarding "priority analysis" answer for an RFC. Only affects
+/// future syncs (e.g. the next manual re-trigger) — doesn't reorder a sync
+/// already in progress.
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn update_priority_analysis_handler(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    path: web::Path<String>,
+    body: web::Json<UpdatePriorityAnalysisDto>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".to_string(),
+            });
+        }
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".to_string(),
+            });
+        }
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let rfc = path.into_inner().trim().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+
+    if !matches!(
+        body.priority_analysis.as_str(),
+        "ingresos_clientes" | "egresos_proveedores" | "nomina"
+    ) {
+        return HttpResponse::UnprocessableEntity().json(ErrorBody {
+            error: "priority_analysis debe ser ingresos_clientes, egresos_proveedores o nomina".to_string(),
+        });
+    }
+
+    // Only the owner (or admin) may change this
+    match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
+        Ok(false) => {
+            return HttpResponse::Forbidden().json(ErrorBody {
+                error: "Solo el propietario del RFC puede actualizar esto".to_string(),
+            });
+        }
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "update_priority_analysis: access check error: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".to_string(),
+            });
+        }
+        Ok(true) => {}
+    }
+
+    match crate::db::users::set_priority_analysis(&pool, &user_id, &rfc, &body.priority_analysis).await
+    {
+        Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Ok(false) => HttpResponse::NotFound().json(ErrorBody {
+            error: "RFC no encontrado".to_string(),
+        }),
+        Err(e) => {
+            tracing::error!(user_id = %user_id, rfc = %rfc, "update_priority_analysis: DB error: {e}");
             HttpResponse::InternalServerError().json(ErrorBody {
                 error: "Error de base de datos".to_string(),
             })

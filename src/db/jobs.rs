@@ -421,6 +421,30 @@ pub async fn find_queued(pool: &PgPool) -> Result<Vec<SyncJob>, sqlx::Error> {
     .await
 }
 
+/// True if an earlier-created `list` job for this RFC hasn't reached a
+/// terminal state yet. Used to enforce download order (e.g. emitidos fully
+/// before recibidos, per the user's onboarding priority): the worker must
+/// not start a later-priority job while an earlier one is still queued,
+/// running, or paused — only once it completes/fails does this return false.
+pub async fn has_earlier_active_list_job(
+    pool: &PgPool,
+    rfc: &str,
+    created_at: &str,
+) -> Result<bool, sqlx::Error> {
+    let (exists,): (bool,) = sqlx::query_as(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM pulso.sync_jobs
+               WHERE rfc = $1 AND job_type = 'list' AND created_at < $2
+                 AND status IN ('running', 'queued', 'paused_limit')
+           )"#,
+    )
+    .bind(rfc.to_uppercase())
+    .bind(created_at)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
 /// True if a non-cancelled/non-failed job already covers this exact period for the RFC.
 pub async fn has_job_for_period(
     pool: &PgPool,
