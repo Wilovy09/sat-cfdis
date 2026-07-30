@@ -73,11 +73,47 @@ fn initial_sync_period() -> (String, String) {
 /// Maps the onboarding "priority analysis" answer to a download order —
 /// (first, second) dl_type. Ingresos y clientes / Nómina need `emitidos`
 /// fully downloaded first; Egresos y proveedores needs `recibidos` first.
-/// Unanswered (None) defaults to emitidos-first, matching prior behavior.
-fn download_order(priority_analysis: Option<&str>) -> (&'static str, &'static str) {
+/// The question is optional — `None` (left unanswered) means no preference:
+/// caller should queue a single combined "ambos" job, not split it.
+fn download_order(priority_analysis: Option<&str>) -> Option<(&'static str, &'static str)> {
     match priority_analysis {
-        Some("egresos_proveedores") => ("recibidos", "emitidos"),
-        _ => ("emitidos", "recibidos"),
+        Some("egresos_proveedores") => Some(("recibidos", "emitidos")),
+        Some("ingresos_clientes") | Some("nomina") => Some(("emitidos", "recibidos")),
+        _ => None,
+    }
+}
+
+/// Queues the initial sync job(s) for an RFC and returns the id to track as
+/// the completion signal. If the priority question was answered, queues two
+/// sequential jobs (priority type first — has_earlier_active_list_job in
+/// main.rs enforces the order) and returns the second job's id, since that's
+/// the one that finishes last. Otherwise queues a single combined "ambos"
+/// job, exactly like before this feature existed.
+async fn queue_initial_sync(
+    pool: &DbPool,
+    rfc: &str,
+    auth_enc: &str,
+    period_from: &str,
+    period_to: &str,
+    priority_analysis: Option<&str>,
+) -> Result<String, sqlx::Error> {
+    match download_order(priority_analysis) {
+        Some((first_type, second_type)) => {
+            crate::db::jobs::insert_queued(
+                pool, "list", rfc, "ciec", auth_enc, first_type, period_from, period_to,
+            )
+            .await?;
+            crate::db::jobs::insert_queued(
+                pool, "list", rfc, "ciec", auth_enc, second_type, period_from, period_to,
+            )
+            .await
+        }
+        None => {
+            crate::db::jobs::insert_queued(
+                pool, "list", rfc, "ciec", auth_enc, "ambos", period_from, period_to,
+            )
+            .await
+        }
     }
 }
 
@@ -294,33 +330,22 @@ pub async fn complete_profile(
         }
     };
 
-    // Create the background sync jobs covering 3 full years + complete months
-    // of current year. Two ordered jobs (not a single "ambos" job) so the
-    // user's priority type fully downloads before the other — enforced by
-    // has_earlier_active_list_job in main.rs's resume_worker.
+    // Create the background sync job(s) covering 3 full years + complete
+    // months of current year. If the (optional) priority question was
+    // answered, this queues two ordered jobs instead of one "ambos" job.
     let (period_from, period_to) = initial_sync_period();
     let priority_analysis = body.priority_analysis.as_deref();
-    let (first_type, second_type) = download_order(priority_analysis);
-
-    if let Err(e) = crate::db::jobs::insert_queued(
-        &pool, "list", &rfc, "ciec", &auth_enc, first_type, &period_from, &period_to,
-    )
-    .await
-    {
-        tracing::error!(user_id = %user_id, "Failed to queue initial sync ({first_type}): {e}");
-    }
-
-    let sync_job_id = match crate::db::jobs::insert_queued(
-        &pool, "list", &rfc, "ciec", &auth_enc, second_type, &period_from, &period_to,
+    let sync_job_id = match queue_initial_sync(
+        &pool, &rfc, &auth_enc, &period_from, &period_to, priority_analysis,
     )
     .await
     {
         Ok(id) => {
-            tracing::info!(user_id = %user_id, job_id = %id, first_type, second_type, "Initial sync jobs queued");
+            tracing::info!(user_id = %user_id, job_id = %id, "Initial sync job(s) queued");
             Some(id)
         }
         Err(e) => {
-            tracing::error!(user_id = %user_id, "Failed to queue initial sync ({second_type}): {e}");
+            tracing::error!(user_id = %user_id, "Failed to queue initial sync: {e}");
             None
         }
     };
@@ -498,27 +523,14 @@ pub async fn trigger_sync(
     let priority_analysis = crate::db::users::get_priority_analysis_for_rfc(&pool, &rfc)
         .await
         .unwrap_or(None);
-    let (first_type, second_type) = download_order(priority_analysis.as_deref());
-
-    if let Err(e) = crate::db::jobs::insert_queued(
-        &pool, "list", &rfc, "ciec", &auth_enc, first_type, &period_from, &period_to,
-    )
-    .await
-    {
-        tracing::error!(user_id = %user_id, "trigger_sync: insert_queued ({first_type}) failed: {e}");
-        return HttpResponse::InternalServerError().json(ErrorBody {
-            error: "Error al crear el job".to_string(),
-        });
-    }
-
-    let job_id = match crate::db::jobs::insert_queued(
-        &pool, "list", &rfc, "ciec", &auth_enc, second_type, &period_from, &period_to,
+    let job_id = match queue_initial_sync(
+        &pool, &rfc, &auth_enc, &period_from, &period_to, priority_analysis.as_deref(),
     )
     .await
     {
         Ok(id) => id,
         Err(e) => {
-            tracing::error!(user_id = %user_id, "trigger_sync: insert_queued ({second_type}) failed: {e}");
+            tracing::error!(user_id = %user_id, "trigger_sync: insert_queued failed: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
                 error: "Error al crear el job".to_string(),
             });
@@ -818,27 +830,17 @@ pub async fn add_rfc(
 
     let (period_from, period_to) = initial_sync_period();
     let priority_analysis = body.priority_analysis.as_deref();
-    let (first_type, second_type) = download_order(priority_analysis);
-
-    if let Err(e) = crate::db::jobs::insert_queued(
-        &pool, "list", &rfc, "ciec", &auth_enc, first_type, &period_from, &period_to,
-    )
-    .await
-    {
-        tracing::error!(user_id = %user_id, "Failed to queue initial sync ({first_type}): {e}");
-    }
-
-    let sync_job_id = match crate::db::jobs::insert_queued(
-        &pool, "list", &rfc, "ciec", &auth_enc, second_type, &period_from, &period_to,
+    let sync_job_id = match queue_initial_sync(
+        &pool, &rfc, &auth_enc, &period_from, &period_to, priority_analysis,
     )
     .await
     {
         Ok(id) => {
-            tracing::info!(user_id = %user_id, job_id = %id, first_type, second_type, "Initial sync jobs queued for new RFC");
+            tracing::info!(user_id = %user_id, job_id = %id, "Initial sync job(s) queued for new RFC");
             Some(id)
         }
         Err(e) => {
-            tracing::error!(user_id = %user_id, "Failed to queue initial sync ({second_type}): {e}");
+            tracing::error!(user_id = %user_id, "Failed to queue initial sync: {e}");
             None
         }
     };
