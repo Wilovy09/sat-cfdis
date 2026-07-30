@@ -441,6 +441,7 @@ const PHP_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
 /// Only counts complete calendar months within the period.
 /// Returns None on any failure (count is best-effort; stream will run regardless).
 async fn run_count_pass(
+    pool: &DbPool,
     cfg: &Config,
     job_id: &str,
     auth_payload: &serde_json::Value,
@@ -502,12 +503,14 @@ async fn run_count_pass(
         if line.is_empty() { continue; }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
             if val.get("__keepalive__").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let total_so_far = val["total_so_far"].as_i64().unwrap_or(0);
                 tracing::info!(
                     job_id = %job_id,
                     date = val["date"].as_str().unwrap_or("?"),
-                    total_so_far = val["total_so_far"].as_i64().unwrap_or(0),
+                    total_so_far,
                     "list-count progress"
                 );
+                let _ = db::jobs::update_count_progress(pool, job_id, total_so_far).await;
                 continue;
             }
             if val.get("__count__").is_some() {
@@ -548,7 +551,7 @@ async fn run_worker_chunk(
     // Count pass: only for non-auto_daily jobs where total is still unknown.
     if job_type != "auto_daily" && total_expected.is_none() {
         tracing::info!(job_id = %job_id, "Starting list-count pre-pass");
-        match run_count_pass(&cfg, &job_id, &auth_payload, &full_period_from, &period_to, &dl_type).await {
+        match run_count_pass(&pool, &cfg, &job_id, &auth_payload, &full_period_from, &period_to, &dl_type).await {
             Some(total) => {
                 tracing::info!(job_id = %job_id, total = total, "list-count complete");
                 let _ = db::jobs::set_total_expected(&pool, &job_id, total).await;

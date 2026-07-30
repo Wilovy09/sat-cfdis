@@ -24,6 +24,9 @@ pub struct SyncJob {
     pub found: i64,
     /// Total invoices expected (from list-count pre-pass); None until count completes
     pub total_expected: Option<i64>,
+    /// Live running tally while list-count is still counting; None once
+    /// total_expected is set (final) or before counting has started.
+    pub count_progress: Option<i64>,
     pub status: String,
     /// Machine-readable classification of error_msg, from classifySatError() in
     /// cfdi-scraper: "invalid_credentials" | "captcha_failed" | "login_not_registered"
@@ -236,6 +239,24 @@ pub async fn set_total_expected(
     .bind(job_id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Live running tally while the list-count pre-pass is still in progress —
+/// lets the frontend show a growing count instead of a static spinner while
+/// waiting (a full multi-year range can take hours). Overwritten on every
+/// day the pre-pass processes; irrelevant once `set_total_expected` lands.
+pub async fn update_count_progress(
+    pool: &PgPool,
+    job_id: &str,
+    count_so_far: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE pulso.sync_jobs SET count_progress=$1, updated_at=$2 WHERE id=$3"#)
+        .bind(count_so_far)
+        .bind(now_utc())
+        .bind(job_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
