@@ -1522,8 +1522,61 @@ pub async fn admin_list_rfcs(
 // owner and current viewers — for the admin panel's RFCs tab.
 // ---------------------------------------------------------------------------
 
+/// Shared query params for the admin panel's paginated/searchable tabs.
+#[derive(Debug, Deserialize)]
+pub struct AdminPageQuery {
+    #[serde(default)]
+    pub search: String,
+    #[serde(default = "default_admin_page")]
+    pub page: i64,
+    #[serde(default = "default_admin_page_size")]
+    pub page_size: i64,
+}
+
+fn default_admin_page() -> i64 {
+    1
+}
+
+fn default_admin_page_size() -> i64 {
+    15
+}
+
+/// The RFCs CTE shared between the SELECT and its COUNT — every RFC ever
+/// registered (including soft-deleted), joined to its owner and most recent
+/// nombre_emisor from cfdis.
+const ADMIN_RFCS_BASE_CTE: &str = r#"
+    WITH base AS (
+        SELECT pu.rfc AS rfc,
+               pu.deleted_at IS NOT NULL AS is_deleted,
+               to_char(pu.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+               owner.email AS owner_email,
+               owner.name AS owner_name,
+               lat.nombre AS nombre
+        FROM pulso.users pu
+        JOIN public.users owner ON owner.id = pu.user_id
+        LEFT JOIN LATERAL (
+            SELECT c.nombre_emisor AS nombre
+            FROM pulso.cfdis c
+            WHERE c.rfc_emisor = pu.rfc AND c.nombre_emisor IS NOT NULL
+            ORDER BY c.created_at DESC LIMIT 1
+        ) lat ON true
+    )
+"#;
+
+const ADMIN_RFCS_SEARCH_FILTER: &str = r#"
+    WHERE ($1 = ''
+           OR rfc ILIKE '%' || $1 || '%'
+           OR COALESCE(nombre, '') ILIKE '%' || $1 || '%'
+           OR owner_name ILIKE '%' || $1 || '%'
+           OR owner_email ILIKE '%' || $1 || '%')
+"#;
+
 #[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
-pub async fn admin_list_rfcs_full(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
+pub async fn admin_list_rfcs_full(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    query: web::Query<AdminPageQuery>,
+) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
         None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
@@ -1539,26 +1592,31 @@ pub async fn admin_list_rfcs_full(req: HttpRequest, pool: web::Data<DbPool>) -> 
         return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
     }
 
+    let page = query.page.max(1);
+    let page_size = query.page_size.clamp(1, 100);
+    let search = query.search.trim();
+
+    let count_sql = format!("{ADMIN_RFCS_BASE_CTE} SELECT COUNT(*) FROM base {ADMIN_RFCS_SEARCH_FILTER}");
+    let total: i64 = match sqlx::query_scalar(&count_sql).bind(search).fetch_one(pool.as_ref()).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("admin_list_rfcs_full: count: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let select_sql = format!(
+        "{ADMIN_RFCS_BASE_CTE} SELECT rfc, is_deleted, created_at, owner_email, owner_name, nombre \
+         FROM base {ADMIN_RFCS_SEARCH_FILTER} ORDER BY rfc, created_at LIMIT $2 OFFSET $3"
+    );
+
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(String, bool, String, String, Option<String>, Option<String>)> = match sqlx::query_as(
-        r#"
-        SELECT pu.rfc, pu.deleted_at IS NOT NULL AS is_deleted,
-               to_char(pu.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
-               owner.email AS owner_email, owner.name AS owner_name,
-               lat.nombre
-        FROM pulso.users pu
-        JOIN public.users owner ON owner.id = pu.user_id
-        LEFT JOIN LATERAL (
-            SELECT c.nombre_emisor AS nombre
-            FROM pulso.cfdis c
-            WHERE c.rfc_emisor = pu.rfc AND c.nombre_emisor IS NOT NULL
-            ORDER BY c.created_at DESC LIMIT 1
-        ) lat ON true
-        ORDER BY pu.rfc, pu.created_at
-        "#,
-    )
-    .fetch_all(pool.as_ref())
-    .await
+    let rows: Vec<(String, bool, String, String, Option<String>, Option<String>)> = match sqlx::query_as(&select_sql)
+        .bind(search)
+        .bind(page_size)
+        .bind((page - 1) * page_size)
+        .fetch_all(pool.as_ref())
+        .await
     {
         Ok(r) => r,
         Err(e) => {
@@ -1567,16 +1625,19 @@ pub async fn admin_list_rfcs_full(req: HttpRequest, pool: web::Data<DbPool>) -> 
         }
     };
 
+    let page_rfcs: Vec<String> = rows.iter().map(|(rfc, ..)| rfc.clone()).collect();
+
     let share_rows: Vec<(String, Option<String>, Option<String>, Option<String>, String)> = match sqlx::query_as(
         r#"
         SELECT rs.rfc, viewer.email, viewer.name, rs.invited_email,
                to_char(rs.granted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS granted_at
         FROM pulso.rfc_shares rs
         LEFT JOIN public.users viewer ON viewer.id = rs.shared_with
-        WHERE rs.revoked_at IS NULL
+        WHERE rs.revoked_at IS NULL AND rs.rfc = ANY($1::text[])
         ORDER BY rs.rfc, rs.granted_at
         "#,
     )
+    .bind(&page_rfcs)
     .fetch_all(pool.as_ref())
     .await
     {
@@ -1613,7 +1674,12 @@ pub async fn admin_list_rfcs_full(req: HttpRequest, pool: web::Data<DbPool>) -> 
         })
         .collect();
 
-    HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs }))
+    HttpResponse::Ok().json(serde_json::json!({
+        "rfcs": rfcs,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1622,8 +1688,31 @@ pub async fn admin_list_rfcs_full(req: HttpRequest, pool: web::Data<DbPool>) -> 
 // admin panel's Usuarios tab.
 // ---------------------------------------------------------------------------
 
+/// The Pulso users CTE shared between the SELECT and its COUNT — every
+/// public.users row that owns at least one pulso.users (RFC) row.
+const ADMIN_USERS_BASE_CTE: &str = r#"
+    WITH base AS (
+        SELECT u.id, u.name, u.email,
+               to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+               to_char(u.deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS deleted_at,
+               COALESCE(u.pulso_complete_profile, false) AS pulso_complete_profile,
+               COUNT(pu.id) FILTER (WHERE pu.deleted_at IS NULL) AS active_rfcs
+        FROM public.users u
+        JOIN pulso.users pu ON pu.user_id = u.id
+        GROUP BY u.id, u.name, u.email, u.created_at, u.deleted_at, u.pulso_complete_profile
+    )
+"#;
+
+const ADMIN_USERS_SEARCH_FILTER: &str = r#"
+    WHERE ($1 = '' OR name ILIKE '%' || $1 || '%' OR email ILIKE '%' || $1 || '%')
+"#;
+
 #[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
-pub async fn admin_list_users(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
+pub async fn admin_list_users(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    query: web::Query<AdminPageQuery>,
+) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
         None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
@@ -1639,22 +1728,31 @@ pub async fn admin_list_users(req: HttpRequest, pool: web::Data<DbPool>) -> Http
         return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
     }
 
+    let page = query.page.max(1);
+    let page_size = query.page_size.clamp(1, 100);
+    let search = query.search.trim();
+
+    let count_sql = format!("{ADMIN_USERS_BASE_CTE} SELECT COUNT(*) FROM base {ADMIN_USERS_SEARCH_FILTER}");
+    let total: i64 = match sqlx::query_scalar(&count_sql).bind(search).fetch_one(pool.as_ref()).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("admin_list_users: count: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let select_sql = format!(
+        "{ADMIN_USERS_BASE_CTE} SELECT id::text, name, email, created_at, deleted_at, pulso_complete_profile, active_rfcs \
+         FROM base {ADMIN_USERS_SEARCH_FILTER} ORDER BY created_at DESC LIMIT $2 OFFSET $3"
+    );
+
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(String, String, String, String, Option<String>, bool, i64)> = match sqlx::query_as(
-        r#"
-        SELECT u.id::text, u.name, u.email,
-               to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
-               to_char(u.deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS deleted_at,
-               COALESCE(u.pulso_complete_profile, false) AS pulso_complete_profile,
-               COUNT(pu.id) FILTER (WHERE pu.deleted_at IS NULL) AS active_rfcs
-        FROM public.users u
-        JOIN pulso.users pu ON pu.user_id = u.id
-        GROUP BY u.id, u.name, u.email, u.created_at, u.deleted_at, u.pulso_complete_profile
-        ORDER BY u.created_at DESC
-        "#,
-    )
-    .fetch_all(pool.as_ref())
-    .await
+    let rows: Vec<(String, String, String, String, Option<String>, bool, i64)> = match sqlx::query_as(&select_sql)
+        .bind(search)
+        .bind(page_size)
+        .bind((page - 1) * page_size)
+        .fetch_all(pool.as_ref())
+        .await
     {
         Ok(r) => r,
         Err(e) => {
@@ -1678,5 +1776,10 @@ pub async fn admin_list_users(req: HttpRequest, pool: web::Data<DbPool>) -> Http
         })
         .collect();
 
-    HttpResponse::Ok().json(serde_json::json!({ "users": users }))
+    HttpResponse::Ok().json(serde_json::json!({
+        "users": users,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }))
 }

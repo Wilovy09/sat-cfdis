@@ -384,10 +384,34 @@ pub async fn upsert_invoice(
 // Read operations
 // ---------------------------------------------------------------------------
 
-pub async fn list_all(pool: &PgPool) -> Result<Vec<SyncJob>, sqlx::Error> {
-    sqlx::query_as::<_, SyncJob>(
-        r#"SELECT * FROM pulso.sync_jobs ORDER BY created_at DESC LIMIT 200"#,
+/// Total jobs matching `search` (empty = no filter) — pair with `list_paginated`.
+pub async fn count_all(pool: &PgPool, search: &str) -> Result<i64, sqlx::Error> {
+    let (count,): (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*) FROM pulso.sync_jobs
+           WHERE ($1 = '' OR rfc ILIKE '%' || $1 || '%' OR COALESCE(error_code, '') ILIKE '%' || $1 || '%')"#,
     )
+    .bind(search)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// Paginated job list, newest first. `search` matches rfc or error_code (empty = no filter).
+pub async fn list_paginated(
+    pool: &PgPool,
+    search: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<SyncJob>, sqlx::Error> {
+    sqlx::query_as::<_, SyncJob>(
+        r#"SELECT * FROM pulso.sync_jobs
+           WHERE ($1 = '' OR rfc ILIKE '%' || $1 || '%' OR COALESCE(error_code, '') ILIKE '%' || $1 || '%')
+           ORDER BY created_at DESC
+           LIMIT $2 OFFSET $3"#,
+    )
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
 }

@@ -62,22 +62,63 @@ async fn require_admin(req: &HttpRequest, pool: &DbPool) -> Result<(), AppError>
 // GET /api/v1/queue
 // ---------------------------------------------------------------------------
 
+#[derive(Deserialize)]
+pub struct ListJobsQuery {
+    #[serde(default)]
+    search: String,
+    #[serde(default = "default_page")]
+    page: i64,
+    #[serde(default = "default_page_size")]
+    page_size: i64,
+}
+
+fn default_page() -> i64 {
+    1
+}
+
+fn default_page_size() -> i64 {
+    15
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/queue",
     tag = "Queue",
+    params(
+        ("search" = Option<String>, Query, description = "Filtra por RFC o error_code"),
+        ("page" = Option<i64>, Query, description = "Página (default 1)"),
+        ("page_size" = Option<i64>, Query, description = "Tamaño de página (default 15)"),
+    ),
     responses(
-        (status = 200, description = "Lista de jobs"),
+        (status = 200, description = "Lista de jobs paginada"),
     )
 )]
-#[tracing::instrument(skip_all)]
-pub async fn list_jobs(req: HttpRequest, pool: web::Data<DbPool>) -> Result<HttpResponse, AppError> {
+#[tracing::instrument(skip(pool, query))]
+pub async fn list_jobs(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    query: web::Query<ListJobsQuery>,
+) -> Result<HttpResponse, AppError> {
     require_admin(&req, pool.get_ref()).await?;
-    let jobs = jobs::list_all(pool.get_ref())
+
+    let page = query.page.max(1);
+    let page_size = query.page_size.clamp(1, 100);
+    let search = query.search.trim();
+
+    let total = jobs::count_all(pool.get_ref(), search)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
-    tracing::debug!(count = jobs.len(), "list_jobs");
-    Ok(HttpResponse::Ok().json(json!({ "jobs": jobs })))
+    let items = jobs::list_paginated(pool.get_ref(), search, page_size, (page - 1) * page_size)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    tracing::debug!(count = items.len(), total, "list_jobs");
+    Ok(HttpResponse::Ok().json(json!({
+        "jobs": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    })))
 }
 
 // ---------------------------------------------------------------------------
