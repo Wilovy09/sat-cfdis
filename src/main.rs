@@ -1082,6 +1082,14 @@ async fn main() -> std::io::Result<()> {
                 web::get().to(users_routes::admin_list_rfcs),
             )
             .route(
+                "/api/v1/admin/rfcs/full",
+                web::get().to(users_routes::admin_list_rfcs_full),
+            )
+            .route(
+                "/api/v1/admin/users",
+                web::get().to(users_routes::admin_list_users),
+            )
+            .route(
                 "/api/v1/users/sync-status",
                 web::get().to(users_routes::sync_status),
             )

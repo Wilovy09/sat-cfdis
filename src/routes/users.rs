@@ -1515,3 +1515,168 @@ pub async fn admin_list_rfcs(
 
     HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs }))
 }
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/admin/rfcs/full
+// Admin-only: every RFC ever registered (including soft-deleted), with its
+// owner and current viewers — for the admin panel's RFCs tab.
+// ---------------------------------------------------------------------------
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
+pub async fn admin_list_rfcs_full(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    if !is_admin {
+        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+    }
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(String, bool, String, String, Option<String>, Option<String>)> = match sqlx::query_as(
+        r#"
+        SELECT pu.rfc, pu.deleted_at IS NOT NULL AS is_deleted,
+               to_char(pu.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+               owner.email AS owner_email, owner.name AS owner_name,
+               lat.nombre
+        FROM pulso.users pu
+        JOIN public.users owner ON owner.id = pu.user_id
+        LEFT JOIN LATERAL (
+            SELECT c.nombre_emisor AS nombre
+            FROM pulso.cfdis c
+            WHERE c.rfc_emisor = pu.rfc AND c.nombre_emisor IS NOT NULL
+            ORDER BY c.created_at DESC LIMIT 1
+        ) lat ON true
+        ORDER BY pu.rfc, pu.created_at
+        "#,
+    )
+    .fetch_all(pool.as_ref())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("admin_list_rfcs_full: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let share_rows: Vec<(String, Option<String>, Option<String>, Option<String>, String)> = match sqlx::query_as(
+        r#"
+        SELECT rs.rfc, viewer.email, viewer.name, rs.invited_email,
+               to_char(rs.granted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS granted_at
+        FROM pulso.rfc_shares rs
+        LEFT JOIN public.users viewer ON viewer.id = rs.shared_with
+        WHERE rs.revoked_at IS NULL
+        ORDER BY rs.rfc, rs.granted_at
+        "#,
+    )
+    .fetch_all(pool.as_ref())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("admin_list_rfcs_full: shares query: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let mut shares_by_rfc: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
+    for (rfc, viewer_email, viewer_name, invited_email, granted_at) in share_rows {
+        shares_by_rfc.entry(rfc).or_default().push(serde_json::json!({
+            "email": viewer_email,
+            "name": viewer_name,
+            "invited_email": invited_email,
+            "granted_at": granted_at,
+        }));
+    }
+
+    let rfcs: Vec<_> = rows
+        .into_iter()
+        .map(|(rfc, is_deleted, created_at, owner_email, owner_name, nombre)| {
+            let viewers = shares_by_rfc.get(&rfc).cloned().unwrap_or_default();
+            serde_json::json!({
+                "rfc": rfc,
+                "nombre": nombre,
+                "deleted": is_deleted,
+                "created_at": created_at,
+                "owner_email": owner_email,
+                "owner_name": owner_name,
+                "viewers": viewers,
+            })
+        })
+        .collect();
+
+    HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/admin/users
+// Admin-only: every Pulso user (has at least one pulso.users row), for the
+// admin panel's Usuarios tab.
+// ---------------------------------------------------------------------------
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
+pub async fn admin_list_users(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    if !is_admin {
+        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+    }
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(String, String, String, String, Option<String>, bool, i64)> = match sqlx::query_as(
+        r#"
+        SELECT u.id::text, u.name, u.email,
+               to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at,
+               to_char(u.deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS deleted_at,
+               COALESCE(u.pulso_complete_profile, false) AS pulso_complete_profile,
+               COUNT(pu.id) FILTER (WHERE pu.deleted_at IS NULL) AS active_rfcs
+        FROM public.users u
+        JOIN pulso.users pu ON pu.user_id = u.id
+        GROUP BY u.id, u.name, u.email, u.created_at, u.deleted_at, u.pulso_complete_profile
+        ORDER BY u.created_at DESC
+        "#,
+    )
+    .fetch_all(pool.as_ref())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("admin_list_users: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let users: Vec<_> = rows
+        .into_iter()
+        .map(|(id, name, email, created_at, deleted_at, complete_profile, active_rfcs)| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "email": email,
+                "created_at": created_at,
+                "deleted_at": deleted_at,
+                "pulso_complete_profile": complete_profile,
+                "active_rfcs": active_rfcs,
+            })
+        })
+        .collect();
+
+    HttpResponse::Ok().json(serde_json::json!({ "users": users }))
+}

@@ -5,13 +5,58 @@
 //! GET  /api/v1/queue/{id}/results — paginated invoice metadata for a job
 //! DELETE /api/v1/queue/{id}       — cancel a pending/paused job
 
-use actix_web::{HttpResponse, web};
+use actix_web::{HttpRequest, HttpResponse, web};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::{db::jobs, errors::AppError};
 
 pub type DbPool = crate::db::DbPool;
+
+// ---------------------------------------------------------------------------
+// Admin auth — this whole module is admin-only (raw job/RFC data, cancel power)
+// ---------------------------------------------------------------------------
+
+fn bearer_token(req: &HttpRequest) -> Option<String> {
+    let header = req
+        .headers()
+        .get(actix_web::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let lower = header.to_lowercase();
+    let token = header[lower.find("bearer ")? + 7..].trim();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+fn jwt_user_id(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    json.get("id")
+        .or_else(|| json.get("sub"))?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+async fn require_admin(req: &HttpRequest, pool: &DbPool) -> Result<(), AppError> {
+    let token = bearer_token(req).ok_or_else(|| AppError::unauthorized("Token requerido"))?;
+    let user_id = jwt_user_id(&token).ok_or_else(|| AppError::unauthorized("Token inválido"))?;
+    let is_admin = crate::db::users::is_user_admin(pool, &user_id)
+        .await
+        .unwrap_or(false);
+    if !is_admin {
+        return Err(AppError::forbidden("Acceso denegado"));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // GET /api/v1/queue
@@ -26,7 +71,8 @@ pub type DbPool = crate::db::DbPool;
     )
 )]
 #[tracing::instrument(skip_all)]
-pub async fn list_jobs(pool: web::Data<DbPool>) -> Result<HttpResponse, AppError> {
+pub async fn list_jobs(req: HttpRequest, pool: web::Data<DbPool>) -> Result<HttpResponse, AppError> {
+    require_admin(&req, pool.get_ref()).await?;
     let jobs = jobs::list_all(pool.get_ref())
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -50,9 +96,11 @@ pub async fn list_jobs(pool: web::Data<DbPool>) -> Result<HttpResponse, AppError
 )]
 #[tracing::instrument(skip(pool), fields(id = %path))]
 pub async fn get_job(
+    req: HttpRequest,
     pool: web::Data<DbPool>,
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
+    require_admin(&req, pool.get_ref()).await?;
     let id = path.into_inner();
     match jobs::get_by_id(pool.get_ref(), &id)
         .await
@@ -95,10 +143,12 @@ fn default_limit() -> i64 {
 )]
 #[tracing::instrument(skip(pool, query), fields(id = %path))]
 pub async fn get_job_results(
+    req: HttpRequest,
     pool: web::Data<DbPool>,
     path: web::Path<String>,
     query: web::Query<ResultsQuery>,
 ) -> Result<HttpResponse, AppError> {
+    require_admin(&req, pool.get_ref()).await?;
     let id = path.into_inner();
     let limit = query.limit.clamp(1, 500);
     let offset = query.offset.max(0);
@@ -148,9 +198,11 @@ pub async fn get_job_results(
 )]
 #[tracing::instrument(skip(pool), fields(id = %path))]
 pub async fn cancel_job(
+    req: HttpRequest,
     pool: web::Data<DbPool>,
     path: web::Path<String>,
 ) -> Result<HttpResponse, AppError> {
+    require_admin(&req, pool.get_ref()).await?;
     let id = path.into_inner();
     let job = jobs::get_by_id(pool.get_ref(), &id)
         .await
