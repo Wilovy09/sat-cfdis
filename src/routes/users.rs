@@ -1783,3 +1783,111 @@ pub async fn admin_list_users(
         "page_size": page_size,
     }))
 }
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/admin/rfcs/{rfc}/xml-years
+// Admin-only: distinct years with CFDI data for this RFC (emisor or receptor)
+// — powers the year tabs on the admin panel's per-RFC calendar view.
+// ---------------------------------------------------------------------------
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn admin_rfc_xml_years(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    if !is_admin {
+        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+    }
+
+    let rfc = path.into_inner().trim().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+
+    let rows: Vec<(i64,)> = match sqlx::query_as(
+        r#"SELECT DISTINCT year FROM pulso.cfdis WHERE rfc_emisor = $1 OR rfc_receptor = $1 ORDER BY year"#,
+    )
+    .bind(&rfc)
+    .fetch_all(pool.as_ref())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("admin_rfc_xml_years: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let years: Vec<i64> = rows.into_iter().map(|(y,)| y).collect();
+    HttpResponse::Ok().json(serde_json::json!({ "years": years }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/admin/rfcs/{rfc}/xml-days?year=2024
+// Admin-only: per-day XML count for this RFC in the given year (sparse — only
+// days with at least one CFDI). Powers the admin panel's per-RFC calendar.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct XmlDaysQuery {
+    year: i64,
+}
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn admin_rfc_xml_days(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    path: web::Path<String>,
+    query: web::Query<XmlDaysQuery>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    if !is_admin {
+        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+    }
+
+    let rfc = path.into_inner().trim().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+
+    let rows: Vec<(String, i64)> = match sqlx::query_as(
+        r#"
+        SELECT substring(fecha_emision from 1 for 10) AS day, COUNT(*) AS n
+        FROM pulso.cfdis
+        WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND year = $2
+        GROUP BY day
+        "#,
+    )
+    .bind(&rfc)
+    .bind(query.year)
+    .fetch_all(pool.as_ref())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("admin_rfc_xml_days: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let days: std::collections::HashMap<String, i64> = rows.into_iter().collect();
+    HttpResponse::Ok().json(serde_json::json!({ "year": query.year, "days": days }))
+}
