@@ -1396,9 +1396,11 @@ pub struct AdminReprocessDto {
     pub period_to: Option<String>,   // YYYY-MM  (optional)
 }
 
+// Accepts "YYYY-MM" and "YYYY-MM-DD" (the latter is what <input type="date"> sends) —
+// only year/month are used, any day component is ignored.
 fn parse_ym(s: &str) -> Option<(i32, i32)> {
-    let parts: Vec<&str> = s.splitn(2, '-').collect();
-    if parts.len() != 2 { return None; }
+    let parts: Vec<&str> = s.splitn(3, '-').collect();
+    if parts.len() < 2 { return None; }
     let y = parts[0].parse::<i32>().ok()?;
     let m = parts[1].parse::<i32>().ok()?;
     if m < 1 || m > 12 { return None; }
@@ -1431,15 +1433,28 @@ pub async fn admin_reprocess(
 
     let dl_type = body.dl_type.as_deref().unwrap_or("ambos");
 
-    let (from_year, from_month) = body.period_from.as_deref()
-        .and_then(parse_ym)
-        .map(|(y, m)| (Some(y), Some(m)))
-        .unwrap_or((None, None));
+    // A period that fails to parse must NOT silently fall back to "todo el historial" —
+    // reprocessing resets xml_available and deletes parsed sub-data, so an unbounded
+    // reset triggered by a malformed date string is a real incident, not a no-op.
+    let (from_year, from_month) = match body.period_from.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => match parse_ym(s) {
+            Some((y, m)) => (Some(y), Some(m)),
+            None => return HttpResponse::UnprocessableEntity().json(ErrorBody {
+                error: format!("period_from inválido: '{s}' (se espera YYYY-MM o YYYY-MM-DD)"),
+            }),
+        },
+        None => (None, None),
+    };
 
-    let (to_year, to_month) = body.period_to.as_deref()
-        .and_then(parse_ym)
-        .map(|(y, m)| (Some(y), Some(m)))
-        .unwrap_or((None, None));
+    let (to_year, to_month) = match body.period_to.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => match parse_ym(s) {
+            Some((y, m)) => (Some(y), Some(m)),
+            None => return HttpResponse::UnprocessableEntity().json(ErrorBody {
+                error: format!("period_to inválido: '{s}' (se espera YYYY-MM o YYYY-MM-DD)"),
+            }),
+        },
+        None => (None, None),
+    };
 
     match crate::db::cfdis::reset_for_reprocessing(
         &pool, &rfc, dl_type, from_year, from_month, to_year, to_month,
