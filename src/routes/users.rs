@@ -2001,6 +2001,12 @@ pub async fn admin_rfc_xml_days(
 #[derive(Deserialize)]
 pub struct XmlDayQuery {
     date: String,
+    #[serde(default)]
+    search: String,
+    #[serde(default = "default_admin_page")]
+    page: i64,
+    #[serde(default = "default_admin_page_size")]
+    page_size: i64,
 }
 
 #[derive(sqlx::FromRow, serde::Serialize)]
@@ -2018,6 +2024,26 @@ pub struct AdminXmlDayItem {
     is_cancelled: bool,
     xml_available: i64,
 }
+
+/// The day's CFDIs CTE shared between the SELECT and its COUNT.
+const ADMIN_XML_DAY_BASE_CTE: &str = r#"
+    WITH base AS (
+        SELECT uuid, rfc_emisor, nombre_emisor, rfc_receptor, nombre_receptor, tipo_comprobante,
+               fecha_emision, total, moneda, estado_sat, is_cancelled, xml_available
+        FROM pulso.cfdis
+        WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND fecha_emision LIKE $2 || '%'
+    )
+"#;
+
+const ADMIN_XML_DAY_SEARCH_FILTER: &str = r#"
+    WHERE ($3 = ''
+           OR uuid ILIKE '%' || $3 || '%'
+           OR rfc_emisor ILIKE '%' || $3 || '%'
+           OR COALESCE(nombre_emisor, '') ILIKE '%' || $3 || '%'
+           OR rfc_receptor ILIKE '%' || $3 || '%'
+           OR COALESCE(nombre_receptor, '') ILIKE '%' || $3 || '%'
+           OR tipo_comprobante ILIKE '%' || $3 || '%')
+"#;
 
 #[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
 pub async fn admin_rfc_xml_day(
@@ -2044,20 +2070,39 @@ pub async fn admin_rfc_xml_day(
     let rfc = path.into_inner().trim().to_uppercase();
     tracing::Span::current().record("rfc", &rfc.as_str());
     let date = query.date.trim();
+    let search = query.search.trim();
+    let page = query.page.max(1);
+    let page_size = query.page_size.clamp(1, 100);
 
-    let items: Vec<AdminXmlDayItem> = match sqlx::query_as(
-        r#"
-        SELECT uuid, rfc_emisor, nombre_emisor, rfc_receptor, nombre_receptor, tipo_comprobante,
-               fecha_emision, total, moneda, estado_sat, is_cancelled, xml_available
-        FROM pulso.cfdis
-        WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND fecha_emision LIKE $2 || '%'
-        ORDER BY fecha_emision
-        "#,
-    )
-    .bind(&rfc)
-    .bind(date)
-    .fetch_all(pool.as_ref())
-    .await
+    let count_sql = format!("{ADMIN_XML_DAY_BASE_CTE} SELECT COUNT(*) FROM base {ADMIN_XML_DAY_SEARCH_FILTER}");
+    let total: i64 = match sqlx::query_scalar(&count_sql)
+        .bind(&rfc)
+        .bind(date)
+        .bind(search)
+        .fetch_one(pool.as_ref())
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("admin_rfc_xml_day: count: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let select_sql = format!(
+        "{ADMIN_XML_DAY_BASE_CTE} SELECT uuid, rfc_emisor, nombre_emisor, rfc_receptor, nombre_receptor, tipo_comprobante, \
+         fecha_emision, total, moneda, estado_sat, is_cancelled, xml_available \
+         FROM base {ADMIN_XML_DAY_SEARCH_FILTER} ORDER BY fecha_emision LIMIT $4 OFFSET $5"
+    );
+
+    let items: Vec<AdminXmlDayItem> = match sqlx::query_as(&select_sql)
+        .bind(&rfc)
+        .bind(date)
+        .bind(search)
+        .bind(page_size)
+        .bind((page - 1) * page_size)
+        .fetch_all(pool.as_ref())
+        .await
     {
         Ok(r) => r,
         Err(e) => {
@@ -2066,5 +2111,11 @@ pub async fn admin_rfc_xml_day(
         }
     };
 
-    HttpResponse::Ok().json(serde_json::json!({ "date": date, "xmls": items }))
+    HttpResponse::Ok().json(serde_json::json!({
+        "date": date,
+        "xmls": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }))
 }
