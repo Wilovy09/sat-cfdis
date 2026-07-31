@@ -1090,6 +1090,10 @@ async fn main() -> std::io::Result<()> {
                 web::get().to(users_routes::admin_list_users),
             )
             .route(
+                "/api/v1/admin/users/{user_id}/rfcs",
+                web::get().to(users_routes::admin_user_rfcs),
+            )
+            .route(
                 "/api/v1/admin/rfcs/{rfc}/xml-years",
                 web::get().to(users_routes::admin_rfc_xml_years),
             )

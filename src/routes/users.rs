@@ -1785,6 +1785,106 @@ pub async fn admin_list_users(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/v1/admin/users/{user_id}/rfcs
+// Admin-only: RFCs this user has active access to — owned or shared-as-viewer
+// — for the admin panel's Usuarios tab expand.
+// ---------------------------------------------------------------------------
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, target_user_id = tracing::field::Empty))]
+pub async fn admin_user_rfcs(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    if !is_admin {
+        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+    }
+
+    let target_user_id = path.into_inner();
+    tracing::Span::current().record("target_user_id", &target_user_id.as_str());
+
+    let target_uuid: uuid::Uuid = match target_user_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return HttpResponse::UnprocessableEntity().json(ErrorBody { error: "user_id inválido".into() });
+        }
+    };
+
+    let owned: Vec<(String, Option<String>)> = match sqlx::query_as(
+        r#"
+        SELECT pu.rfc, lat.nombre
+        FROM pulso.users pu
+        LEFT JOIN LATERAL (
+            SELECT c.nombre_emisor AS nombre
+            FROM pulso.cfdis c
+            WHERE c.rfc_emisor = pu.rfc AND c.nombre_emisor IS NOT NULL
+            ORDER BY c.created_at DESC LIMIT 1
+        ) lat ON true
+        WHERE pu.user_id = $1 AND pu.deleted_at IS NULL
+        ORDER BY pu.rfc
+        "#,
+    )
+    .bind(target_uuid)
+    .fetch_all(pool.as_ref())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("admin_user_rfcs: owned query: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let shared: Vec<(String, Option<String>)> = match sqlx::query_as(
+        r#"
+        SELECT rs.rfc, lat.nombre
+        FROM pulso.rfc_shares rs
+        LEFT JOIN LATERAL (
+            SELECT c.nombre_emisor AS nombre
+            FROM pulso.cfdis c
+            WHERE c.rfc_emisor = rs.rfc AND c.nombre_emisor IS NOT NULL
+            ORDER BY c.created_at DESC LIMIT 1
+        ) lat ON true
+        WHERE rs.shared_with = $1 AND rs.revoked_at IS NULL
+        ORDER BY rs.rfc
+        "#,
+    )
+    .bind(target_uuid)
+    .fetch_all(pool.as_ref())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("admin_user_rfcs: shared query: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    let mut rfcs: Vec<_> = owned
+        .into_iter()
+        .map(|(rfc, nombre)| serde_json::json!({ "rfc": rfc, "nombre": nombre, "role": "owner" }))
+        .collect();
+    rfcs.extend(
+        shared
+            .into_iter()
+            .map(|(rfc, nombre)| serde_json::json!({ "rfc": rfc, "nombre": nombre, "role": "viewer" })),
+    );
+
+    HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs }))
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/v1/admin/rfcs/{rfc}/xml-years
 // Admin-only: distinct years with CFDI data for this RFC (emisor or receptor)
 // — powers the year tabs on the admin panel's per-RFC calendar view.
