@@ -1102,6 +1102,10 @@ async fn main() -> std::io::Result<()> {
                 web::get().to(users_routes::admin_rfc_xml_days),
             )
             .route(
+                "/api/v1/admin/rfcs/{rfc}/xml-day",
+                web::get().to(users_routes::admin_rfc_xml_day),
+            )
+            .route(
                 "/api/v1/users/sync-status",
                 web::get().to(users_routes::sync_status),
             )

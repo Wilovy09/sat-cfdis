@@ -1991,3 +1991,80 @@ pub async fn admin_rfc_xml_days(
     let days: std::collections::HashMap<String, i64> = rows.into_iter().collect();
     HttpResponse::Ok().json(serde_json::json!({ "year": query.year, "days": days }))
 }
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/admin/rfcs/{rfc}/xml-day?date=YYYY-MM-DD
+// Admin-only: the parsed CFDIs for this RFC on one exact day — drill-down
+// from a calendar day cell.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct XmlDayQuery {
+    date: String,
+}
+
+#[derive(sqlx::FromRow, serde::Serialize)]
+pub struct AdminXmlDayItem {
+    uuid: String,
+    rfc_emisor: String,
+    nombre_emisor: Option<String>,
+    rfc_receptor: String,
+    nombre_receptor: Option<String>,
+    tipo_comprobante: String,
+    fecha_emision: String,
+    total: Option<f32>,
+    moneda: Option<String>,
+    estado_sat: Option<String>,
+    is_cancelled: bool,
+    xml_available: i64,
+}
+
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn admin_rfc_xml_day(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    path: web::Path<String>,
+    query: web::Query<XmlDayQuery>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    if !is_admin {
+        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+    }
+
+    let rfc = path.into_inner().trim().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    let date = query.date.trim();
+
+    let items: Vec<AdminXmlDayItem> = match sqlx::query_as(
+        r#"
+        SELECT uuid, rfc_emisor, nombre_emisor, rfc_receptor, nombre_receptor, tipo_comprobante,
+               fecha_emision, total, moneda, estado_sat, is_cancelled, xml_available
+        FROM pulso.cfdis
+        WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND fecha_emision LIKE $2 || '%'
+        ORDER BY fecha_emision
+        "#,
+    )
+    .bind(&rfc)
+    .bind(date)
+    .fetch_all(pool.as_ref())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("admin_rfc_xml_day: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+        }
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({ "date": date, "xmls": items }))
+}
