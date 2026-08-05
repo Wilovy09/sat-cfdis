@@ -987,6 +987,12 @@ async fn main() -> std::io::Result<()> {
     {
         tokio::spawn(daily_sync_worker(pool.clone()));
     }
+    {
+        let recheck_pool = pool.clone();
+        let recheck_cfg = Arc::new(cfg.clone());
+        let recheck_s3 = s3_client.clone();
+        tokio::spawn(services::recheck_cancelled::worker(recheck_pool, recheck_cfg, recheck_s3));
+    }
 
     // ── HTTP server ─────────────────────────────────────────────────────────
     let allowed_origins = cfg.allowed_origins.clone();

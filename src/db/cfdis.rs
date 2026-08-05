@@ -670,3 +670,84 @@ pub async fn mark_xml_unavailable_for_job(
     .await?;
     Ok(result.rows_affected())
 }
+
+// ---------------------------------------------------------------------------
+// Cancellation status re-verification
+// ---------------------------------------------------------------------------
+
+/// Candidate invoices for `estado_sat` re-verification: currently flagged
+/// cancelled, and either never checked (one-time historical backlog) or
+/// emitted within `recent_days` and not checked within `min_recheck_hours` —
+/// SAT's cancellation-rejection window is ~72h, so a "Cancelado" status can
+/// revert to "Vigente" without anything else in the pipeline noticing.
+/// Returns `(uuid, rfc_emisor, rfc_receptor)`.
+pub async fn find_cancelled_recheck_candidates(
+    pool: &PgPool,
+    min_recheck_hours: i32,
+    recent_days: i32,
+    limit: i64,
+) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT uuid, rfc_emisor, rfc_receptor
+        FROM pulso.cfdis
+        WHERE is_cancelled
+          AND (
+              estado_sat_checked_at IS NULL
+              OR (
+                  estado_sat_checked_at < NOW() - make_interval(hours => $1)
+                  AND fecha_emision::timestamp > NOW() - make_interval(days => $2)
+              )
+          )
+        ORDER BY estado_sat_checked_at IS NULL DESC, estado_sat_checked_at ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(min_recheck_hours)
+    .bind(recent_days)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let uuid: String = r.try_get("uuid").unwrap_or_default();
+            let rfc_emisor: String = r.try_get("rfc_emisor").unwrap_or_default();
+            let rfc_receptor: String = r.try_get("rfc_receptor").unwrap_or_default();
+            (uuid, rfc_emisor, rfc_receptor)
+        })
+        .collect())
+}
+
+/// Records a fresh SAT status check. Narrower than `upsert_cfdi` on purpose —
+/// a recheck only ever fetches `estadoComprobante`, so it must not clobber
+/// fields (subtotal, receptor name, ...) it never re-fetched.
+pub async fn update_estado_sat(
+    pool: &PgPool,
+    uuid: &str,
+    estado_sat: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE pulso.cfdis SET estado_sat = $1, estado_sat_checked_at = NOW() WHERE uuid = $2",
+    )
+    .bind(estado_sat)
+    .bind(uuid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Bumps `estado_sat_checked_at` without changing `estado_sat` — used when SAT
+/// has no record for the UUID under the RFC/download_type we checked it with
+/// (so it doesn't retry every cycle), or when no tracked RFC can even look it up.
+pub async fn touch_estado_sat_checked(pool: &PgPool, uuids: &[String]) -> Result<(), sqlx::Error> {
+    if uuids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("UPDATE pulso.cfdis SET estado_sat_checked_at = NOW() WHERE uuid = ANY($1::text[])")
+        .bind(uuids)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
