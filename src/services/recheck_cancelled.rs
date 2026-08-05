@@ -163,6 +163,22 @@ async fn recheck_chunk(
         }
     }
 
+    // TEMP diagnostic: confirms whether SAT is actually returning metadata for
+    // these UUIDs at all, vs genuinely reporting them all still Cancelado.
+    // Remove once the mismatch with the reference export is understood.
+    if found.len() < uuids.len() {
+        tracing::warn!(
+            rfc = %owner_rfc, requested = uuids.len(), returned = found.len(),
+            raw = %result, "Recheck-cancelled: SAT returned fewer results than requested"
+        );
+    } else {
+        tracing::info!(
+            rfc = %owner_rfc, requested = uuids.len(), returned = found.len(),
+            estados = ?found.values().collect::<std::collections::HashSet<_>>(),
+            "Recheck-cancelled: SAT response summary"
+        );
+    }
+
     let mut reverted = 0usize;
     for uuid in uuids {
         match found.get(uuid.as_str()) {
