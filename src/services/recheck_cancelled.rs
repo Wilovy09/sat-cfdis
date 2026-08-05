@@ -143,7 +143,7 @@ async fn recheck_chunk(
         }
     });
 
-    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path);
+    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path).with_proxy(cfg.https_proxy.clone());
     let result = cli.run(&payload).await?;
 
     // Metadata::getData() always keys the UUID lowercase (see

@@ -169,7 +169,7 @@ pub async fn xml_content(
         }
     });
 
-    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path);
+    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path).with_proxy(cfg.https_proxy.clone());
     let result = cli.run(&payload).await?;
 
     let files = result["files"]
@@ -444,7 +444,7 @@ pub async fn list_invoices(
         "params":  params,
     });
 
-    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path);
+    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path).with_proxy(cfg.https_proxy.clone());
     let result = cli.run(&payload).await?;
 
     Ok(HttpResponse::Ok().json(result))
@@ -494,7 +494,7 @@ pub async fn download_invoices(
         }
     });
 
-    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path);
+    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path).with_proxy(cfg.https_proxy.clone());
     let cli_result = cli.run(&payload).await?;
 
     // Collect the downloaded files reported by the PHP CLI

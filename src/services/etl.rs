@@ -446,7 +446,7 @@ async fn try_download_from_sat(
         }
     });
 
-    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path);
+    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path).with_proxy(cfg.https_proxy.clone());
     let result = match cli.run(&payload).await {
         Ok(r) => r,
         Err(e) => {

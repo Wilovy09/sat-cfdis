@@ -11,6 +11,7 @@ use tokio::process::Command;
 pub struct PhpCli {
     php_bin: String,
     php_cli_path: String,
+    https_proxy: Option<String>,
 }
 
 impl PhpCli {
@@ -18,7 +19,18 @@ impl PhpCli {
         Self {
             php_bin: php_bin.into(),
             php_cli_path: php_cli_path.into(),
+            https_proxy: None,
         }
+    }
+
+    /// Forwards `HTTPS_PROXY`/`https_proxy` to the PHP subprocess when set —
+    /// needed for any environment where outbound calls to SAT must go through
+    /// an egress proxy. Mirrors the `cmd.env(...)` calls already made by the
+    /// hand-spawned streaming workers in `main.rs`/`routes/invoices.rs`; this
+    /// wrapper was the one path that silently skipped it.
+    pub fn with_proxy(mut self, proxy: Option<String>) -> Self {
+        self.https_proxy = proxy;
+        self
     }
 
     /// Runs the PHP CLI with `payload` as JSON on stdin.
@@ -26,13 +38,15 @@ impl PhpCli {
     pub async fn run(&self, payload: &Value) -> Result<Value> {
         let input_json = serde_json::to_vec(payload).context("Could not serialize CLI payload")?;
 
-        let mut child = Command::new(&self.php_bin)
-            .arg(&self.php_cli_path)
+        let mut cmd = Command::new(&self.php_bin);
+        cmd.arg(&self.php_cli_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Failed to spawn PHP CLI. Is 'php' in PATH?")?;
+            .stderr(Stdio::piped());
+        if let Some(ref proxy) = self.https_proxy {
+            cmd.env("HTTPS_PROXY", proxy).env("https_proxy", proxy);
+        }
+        let mut child = cmd.spawn().context("Failed to spawn PHP CLI. Is 'php' in PATH?")?;
 
         // Write JSON to stdin then close it so PHP's stream_get_contents() can finish
         if let Some(mut stdin) = child.stdin.take() {
