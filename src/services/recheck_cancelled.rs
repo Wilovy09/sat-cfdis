@@ -88,16 +88,24 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
     let key = crypto::load_key();
 
     for ((owner_rfc, download_type), uuids) in groups {
-        let auth_payload = match crate::try_fiel_auth(pool, s3, &bucket, &owner_rfc).await {
-            Some((fiel_auth, _tmp)) => fiel_auth,
+        // _fiel_tmp must stay alive for the whole group — it backs the
+        // cert_pem_path/key_pem_path referenced by auth_payload, and the PHP
+        // subprocess reads those paths later, not during this match. Binding
+        // it only inside the match arm (as `_tmp`) would drop the TempDir —
+        // and delete the cert files — before recheck_chunk ever runs.
+        let (auth_payload, _fiel_tmp) = match crate::try_fiel_auth(pool, s3, &bucket, &owner_rfc).await {
+            Some((fiel_auth, tmp)) => (fiel_auth, Some(tmp)),
             None => {
                 let Some(clave_enc) = creds.get(&owner_rfc) else { continue };
                 match crypto::decrypt(&key, clave_enc) {
-                    Ok(clave) => serde_json::json!({
-                        "type": "ciec",
-                        "rfc": owner_rfc,
-                        "password": clave,
-                    }),
+                    Ok(clave) => (
+                        serde_json::json!({
+                            "type": "ciec",
+                            "rfc": owner_rfc,
+                            "password": clave,
+                        }),
+                        None::<tempfile::TempDir>,
+                    ),
                     Err(e) => {
                         tracing::error!(rfc = %owner_rfc, "Recheck-cancelled: decrypt failed: {e}");
                         continue;
