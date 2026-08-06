@@ -34,6 +34,10 @@ const RECENT_DAYS: i32 = 14;
 const BATCH_LIMIT: i64 = 300;
 /// Max UUIDs sent in a single PHP `list` call.
 const CHUNK_SIZE: usize = 100;
+/// Consecutive inconclusive checks (SAT's response didn't include the UUID)
+/// before giving up and letting the invoice fall under the normal recency
+/// gate — otherwise a UUID SAT genuinely never returns would retry forever.
+const MAX_MISS_ATTEMPTS: i32 = 8;
 
 pub async fn worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
     // Let the other startup workers get a head start.
@@ -193,10 +197,18 @@ async fn recheck_chunk(
                 }
             }
             None => {
-                // SAT no longer lists this UUID under this RFC/download_type
-                // (rare). Leave estado_sat untouched, just bump checked_at so
-                // it doesn't retry every cycle.
-                db::cfdis::touch_estado_sat_checked(pool, std::slice::from_ref(uuid)).await?;
+                // SAT's response didn't include this UUID — inconclusive, not
+                // a confirmation of anything. Keep retrying every cycle
+                // (checked_at stays untouched) until MAX_MISS_ATTEMPTS, so one
+                // empty response can't strand an invoice past the recency gate.
+                let attempts =
+                    db::cfdis::record_estado_sat_miss(pool, uuid, MAX_MISS_ATTEMPTS).await?;
+                if attempts >= MAX_MISS_ATTEMPTS {
+                    tracing::warn!(
+                        uuid = %uuid, rfc = %owner_rfc, attempts,
+                        "Recheck-cancelled: giving up, SAT never returned this UUID after {attempts} attempts"
+                    );
+                }
             }
         }
     }

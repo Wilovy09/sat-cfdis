@@ -720,16 +720,17 @@ pub async fn find_cancelled_recheck_candidates(
         .collect())
 }
 
-/// Records a fresh SAT status check. Narrower than `upsert_cfdi` on purpose —
-/// a recheck only ever fetches `estadoComprobante`, so it must not clobber
-/// fields (subtotal, receptor name, ...) it never re-fetched.
+/// Records a confirmed fresh SAT status check. Narrower than `upsert_cfdi` on
+/// purpose — a recheck only ever fetches `estadoComprobante`, so it must not
+/// clobber fields (subtotal, receptor name, ...) it never re-fetched. Resets
+/// the miss counter — this is a real answer, not an inconclusive one.
 pub async fn update_estado_sat(
     pool: &PgPool,
     uuid: &str,
     estado_sat: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE pulso.cfdis SET estado_sat = $1, estado_sat_checked_at = NOW() WHERE uuid = $2",
+        "UPDATE pulso.cfdis SET estado_sat = $1, estado_sat_checked_at = NOW(), estado_sat_check_attempts = 0 WHERE uuid = $2",
     )
     .bind(estado_sat)
     .bind(uuid)
@@ -738,9 +739,9 @@ pub async fn update_estado_sat(
     Ok(())
 }
 
-/// Bumps `estado_sat_checked_at` without changing `estado_sat` — used when SAT
-/// has no record for the UUID under the RFC/download_type we checked it with
-/// (so it doesn't retry every cycle), or when no tracked RFC can even look it up.
+/// Bumps `estado_sat_checked_at` without changing `estado_sat` — used only
+/// when no tracked RFC can even look the UUID up (no credentials exist to try
+/// again with), so retrying every cycle would be pointless.
 pub async fn touch_estado_sat_checked(pool: &PgPool, uuids: &[String]) -> Result<(), sqlx::Error> {
     if uuids.is_empty() {
         return Ok(());
@@ -750,4 +751,35 @@ pub async fn touch_estado_sat_checked(pool: &PgPool, uuids: &[String]) -> Result
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Records an inconclusive check — SAT's response didn't include this UUID
+/// under the RFC/download_type it was queried with. Does NOT stamp
+/// `estado_sat_checked_at` (so the invoice stays a top-priority candidate and
+/// gets retried next cycle regardless of age) unless `max_attempts` is
+/// reached, at which point it's treated like a real check so it stops being
+/// retried forever. Returns the attempt count after this miss.
+pub async fn record_estado_sat_miss(
+    pool: &PgPool,
+    uuid: &str,
+    max_attempts: i32,
+) -> Result<i32, sqlx::Error> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        r#"
+        UPDATE pulso.cfdis
+        SET estado_sat_check_attempts = estado_sat_check_attempts + 1,
+            estado_sat_checked_at = CASE
+                WHEN estado_sat_check_attempts + 1 >= $2 THEN NOW()
+                ELSE estado_sat_checked_at
+            END
+        WHERE uuid = $1
+        RETURNING estado_sat_check_attempts
+        "#,
+    )
+    .bind(uuid)
+    .bind(max_attempts)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<i32, _>("estado_sat_check_attempts").unwrap_or(0))
 }
