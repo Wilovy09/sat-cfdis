@@ -647,13 +647,22 @@ pub async fn mark_xml_unavailable_for_job(
     pool: &PgPool,
     job_id: &str,
 ) -> Result<u64, sqlx::Error> {
+    // subtotal has no real value to fall back on here — SAT's metadata listing
+    // (see Metadata.php) never exposes SubTotal, only the IVA-inclusive Total.
+    // Approximate with the standard 16% rate rather than using Total outright:
+    // that was migration 013's mistake, fixed once in migration 016, then
+    // silently reintroduced here for every invoice that's failed to download
+    // since (this function runs continuously, unlike the one-time migration —
+    // see migration 039 for the backfill of everything it broke in the
+    // meantime). Under-corrects 0%/8% invoices, but that's a smaller error
+    // than counting the 16% IVA itself as revenue.
     let result = sqlx::query(
         r#"UPDATE pulso.cfdis c
            SET xml_available = -1,
                subtotal  = CASE
                    WHEN c.subtotal IS NULL AND c.total IS NOT NULL
                         AND c.tipo_comprobante NOT IN ('P', 'N')
-                       THEN c.total / NULLIF(COALESCE(c.tipo_cambio, 1.0), 0)
+                       THEN c.total / NULLIF(COALESCE(c.tipo_cambio, 1.0), 0) / 1.16
                    ELSE c.subtotal
                END,
                descuento = CASE
