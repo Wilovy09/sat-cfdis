@@ -41,6 +41,14 @@ pub struct SyncJob {
     /// Automatic retries used for transient (non-SAT) failures — see
     /// `retry_transient_or_fail`. Index into RETRY_BACKOFF_SECS.
     pub retry_count: i32,
+    /// Fresh restarts the gap detector has issued for this job's leftover
+    /// range after it landed on `status='failed'` — see gap_detector.rs.
+    /// Distinct from `retry_count`, which tracks in-place backoff retries of
+    /// the *same* job row before it ever reaches `failed`.
+    pub gap_retry_count: i32,
+    /// Set by the gap detector once it has spawned a continuation job for
+    /// this (failed) job's unfinished range, so it isn't requeued twice.
+    pub superseded_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -574,4 +582,190 @@ pub async fn get_invoices(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Gap detector — failed jobs that never got resumed, and days that ended up
+// empty even inside a job marked 'completed'. See gap_detector.rs.
+// ---------------------------------------------------------------------------
+
+/// Failed jobs whose failure is transient in nature (worth another attempt)
+/// and that haven't already been superseded by a continuation job, capped at
+/// `max_retries` fresh restarts so a permanently broken RFC (revoked
+/// credentials, deleted account) doesn't get requeued forever.
+///
+/// Deliberately excludes `invalid_credentials` / `login_not_registered` /
+/// `fiel_login_failed` — same distinction `retry_transient_or_fail` already
+/// draws: those need a human to fix the credentials, not an automatic retry.
+pub async fn find_failed_retryable(
+    pool: &PgPool,
+    max_retries: i32,
+    limit: i64,
+) -> Result<Vec<SyncJob>, sqlx::Error> {
+    sqlx::query_as::<_, SyncJob>(
+        r#"SELECT * FROM pulso.sync_jobs
+           WHERE status = 'failed'
+             AND superseded_by IS NULL
+             AND gap_retry_count < $1
+             AND (error_code IS NULL OR error_code IN ('captcha_failed', 'sat_connection_error', 'rate_limited', 'unknown_error'))
+           ORDER BY created_at ASC
+           LIMIT $2"#,
+    )
+    .bind(max_retries)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Queues a fresh job covering a failed job's unfinished range, inheriting
+/// `gap_retry_count + 1` so the cap in `find_failed_retryable` eventually
+/// stops it. Returns the new job's id.
+pub async fn insert_gap_continuation(
+    pool: &PgPool,
+    rfc: &str,
+    auth_type: &str,
+    auth_enc: &str,
+    dl_type: &str,
+    period_from: &str,
+    period_to: &str,
+    gap_retry_count: i32,
+) -> Result<String, sqlx::Error> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_utc();
+    sqlx::query(
+        r#"INSERT INTO pulso.sync_jobs
+           (id, job_type, rfc, auth_type, auth_enc, dl_type,
+            period_from, period_to, found, status, gap_retry_count, created_at, updated_at)
+           VALUES ($1, 'list', $2, $3, $4, $5, $6, $7, 0, 'queued', $8, $9, $10)"#,
+    )
+    .bind(&id)
+    .bind(rfc)
+    .bind(auth_type)
+    .bind(auth_enc)
+    .bind(dl_type)
+    .bind(period_from)
+    .bind(period_to)
+    .bind(gap_retry_count)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Marks a failed job as handled — either superseded by a real continuation
+/// job, or (rare) determined to need no continuation because its cursor had
+/// already reached period_to despite the failure. Either way, stops
+/// `find_failed_retryable` from picking it up again.
+pub async fn mark_superseded(pool: &PgPool, job_id: &str, superseded_by: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE pulso.sync_jobs SET superseded_by = $1, updated_at = $2 WHERE id = $3"#)
+        .bind(superseded_by)
+        .bind(now_utc())
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// RFCs with at least one successful historical sync — the population where
+/// a "day inside a completed range but zero rows" gap can actually occur.
+pub async fn distinct_completed_rfcs(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT DISTINCT rfc FROM pulso.sync_jobs WHERE status = 'completed'"#)
+        .fetch_all(pool)
+        .await
+}
+
+/// Where the day-by-day zero-activity scan should resume for this RFC. `None`
+/// means it's never been scanned — the caller starts from that RFC's earliest
+/// completed job.
+pub async fn get_gap_scan_progress(pool: &PgPool, rfc: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT last_scanned_date FROM pulso.gap_scan_progress WHERE rfc = $1"#)
+        .bind(rfc)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn set_gap_scan_progress(pool: &PgPool, rfc: &str, last_scanned_date: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO pulso.gap_scan_progress (rfc, last_scanned_date, updated_at)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (rfc) DO UPDATE SET last_scanned_date = excluded.last_scanned_date, updated_at = excluded.updated_at"#,
+    )
+    .bind(rfc)
+    .bind(last_scanned_date)
+    .bind(now_utc())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Earliest day this RFC has a completed sync for — where a never-before-scanned
+/// RFC's gap scan should start from.
+pub async fn earliest_completed_period_from(pool: &PgPool, rfc: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT MIN(period_from) FROM pulso.sync_jobs WHERE rfc = $1 AND status = 'completed'"#)
+        .bind(rfc)
+        .fetch_one(pool)
+        .await
+}
+
+/// Weekdays in `[start_day, end_day]` that fall inside one of this RFC's
+/// `completed` job ranges yet have zero CFDIs (either side, any type) on
+/// that calendar day. Restricted to weekdays because every confirmed real
+/// gap so far (2023-06-28, 2023-12-29, 2024-10-25, 2024-12-02) landed on one —
+/// B2B invoicing is overwhelmingly a business-day activity for this kind of
+/// RFC, so weekends would otherwise dominate as false positives. Returns
+/// dates as "YYYY-MM-DD".
+pub async fn find_activity_gap_days(
+    pool: &PgPool,
+    rfc: &str,
+    start_day: &str,
+    end_day: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        WITH weekdays AS (
+            SELECT d::date AS day
+            FROM generate_series($2::date, $3::date, interval '1 day') d
+            WHERE EXTRACT(ISODOW FROM d) BETWEEN 1 AND 5
+        ),
+        covered AS (
+            SELECT DISTINCT w.day
+            FROM weekdays w
+            JOIN pulso.sync_jobs j
+              ON j.rfc = $1 AND j.status = 'completed'
+             AND w.day BETWEEN j.period_from::date AND j.period_to::date
+        ),
+        activity AS (
+            SELECT fecha_emision::date AS day, COUNT(*) AS cnt
+            FROM pulso.cfdis
+            WHERE (rfc_emisor = $1 OR rfc_receptor = $1)
+              AND fecha_emision::date BETWEEN $2::date AND $3::date
+            GROUP BY fecha_emision::date
+        )
+        SELECT to_char(c.day, 'YYYY-MM-DD')
+        FROM covered c
+        LEFT JOIN activity a ON a.day = c.day
+        WHERE COALESCE(a.cnt, 0) = 0
+        ORDER BY c.day
+        "#,
+    )
+    .bind(rfc)
+    .bind(start_day)
+    .bind(end_day)
+    .fetch_all(pool)
+    .await
+}
+
+/// How many single-day gap_resync jobs already ran for this RFC+day — caps
+/// re-checking a day that turns out to be a genuine holiday/no-activity day
+/// forever.
+pub async fn count_gap_resync_attempts(pool: &PgPool, rfc: &str, day: &str) -> Result<i64, sqlx::Error> {
+    let (n,): (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*) FROM pulso.sync_jobs WHERE rfc = $1 AND job_type = 'gap_resync' AND period_from = $2"#,
+    )
+    .bind(rfc)
+    .bind(format!("{day} 00:00:00"))
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
 }

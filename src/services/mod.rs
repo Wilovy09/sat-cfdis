@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod email;
 pub mod etl;
 pub mod fiel;
+pub mod gap_detector;
 pub mod php_cli;
 pub mod recheck_cancelled;
 pub mod s3;

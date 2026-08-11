@@ -993,6 +993,12 @@ async fn main() -> std::io::Result<()> {
         let recheck_s3 = s3_client.clone();
         tokio::spawn(services::recheck_cancelled::worker(recheck_pool, recheck_cfg, recheck_s3));
     }
+    {
+        let gap_pool = pool.clone();
+        let gap_cfg = Arc::new(cfg.clone());
+        let gap_s3 = s3_client.clone();
+        tokio::spawn(services::gap_detector::worker(gap_pool, gap_cfg, gap_s3));
+    }
 
     // ── HTTP server ─────────────────────────────────────────────────────────
     let allowed_origins = cfg.allowed_origins.clone();
