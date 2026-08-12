@@ -5,8 +5,9 @@ use crate::{
     db::DbPool,
     errors::AppError,
     services::analytics::{
-        cashflow, concepts, counterparties, fiscal, geography, hallazgos, normalization, payments,
-        payroll, period_comparison, quarterly, recurrence, retention, summary, xml_breakdown, xml_count,
+        cashflow, concepts, counterparties, data_quality, fiscal, geography, hallazgos, normalization,
+        payments, payroll, period_comparison, quarterly, recurrence, retention, summary, xml_breakdown,
+        xml_count,
     },
 };
 
@@ -142,6 +143,32 @@ pub async fn get_summary(
         to: query.to(),
     };
     let result = summary::get(&pool, &rfc, &p)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/data-quality
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/analytics/{rfc}/data-quality",
+    tag = "Analytics",
+    params(("rfc" = String, Path, description = "RFC del contribuyente")),
+    responses((status = 200, description = "Cobertura de XML por sección (emitidas/recibidas/nómina)"))
+)]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
+pub async fn get_data_quality(
+    req: HttpRequest,
+    path: web::Path<String>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let result = data_quality::get(&pool, &rfc)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))

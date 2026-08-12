@@ -1188,6 +1188,10 @@ async fn main() -> std::io::Result<()> {
                 web::scope("/api/v1/analytics/{rfc}")
                     .route("/summary", web::get().to(analytics_routes::get_summary))
                     .route(
+                        "/data-quality",
+                        web::get().to(analytics_routes::get_data_quality),
+                    )
+                    .route(
                         "/counterparties",
                         web::get().to(analytics_routes::get_counterparties),
                     )
