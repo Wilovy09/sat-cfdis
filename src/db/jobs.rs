@@ -185,7 +185,27 @@ pub async fn pause_limit(
     Ok(())
 }
 
-/// Mark a job as completed.
+/// Mark a job as completed — unless the row still carries an `error_code`
+/// from an earlier degraded attempt in this job's history, in which case it's
+/// marked `failed` instead.
+///
+/// Before this guard, a job could hit a transient SAT error mid-run (setting
+/// `error_code` via `pause_limit`/`retry_transient_or_fail`), get resumed,
+/// and reach the end of its period cleanly on the resumed attempt — but
+/// nothing ever cleared the stale `error_code`, so it landed here and got
+/// stamped `completed` anyway. That's PULSO-001: confirmed as the root cause
+/// of Axented's (ADC101206334) historical sync silently building thousands
+/// of rows without their XML while reporting success the whole time — a
+/// `sat_connection_error` sat on the job from the point the session degraded
+/// onward, through a `completed` status, invisible to anything downstream.
+///
+/// This can't tell "the retry that ran after the error genuinely repaired
+/// everything" apart from "the error degraded the session in a way that kept
+/// producing incomplete data even after it 'succeeded'" — so it errs toward
+/// `failed`, which surfaces the job to a human and to
+/// `find_failed_retryable` (gap_detector.rs) instead of hiding it. The cost
+/// is the occasional truly-fine job needing a redundant (idempotent, cheap)
+/// re-verification; the alternative is silent data corruption.
 pub async fn complete(
     pool: &PgPool,
     job_id: &str,
@@ -194,8 +214,15 @@ pub async fn complete(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"UPDATE pulso.sync_jobs
-           SET status='completed', cursor_date=$1, found=$2, error_msg=NULL, updated_at=$3
-           WHERE id=$4"#,
+           SET status = CASE WHEN error_code IS NULL THEN 'completed' ELSE 'failed' END,
+               cursor_date = $1,
+               found = $2,
+               error_msg = CASE
+                   WHEN error_code IS NULL THEN NULL
+                   ELSE COALESCE(error_msg, 'Reached end of period with an unresolved error_code from an earlier attempt (PULSO-001 guard)')
+               END,
+               updated_at = $3
+           WHERE id = $4"#,
     )
     .bind(cursor_date)
     .bind(found)

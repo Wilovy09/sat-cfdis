@@ -250,7 +250,9 @@ fn add_days(date: &str, n: i64) -> String {
     d[..10].to_string()
 }
 
-fn yesterday_ymd() -> String {
+/// "YYYY-MM-DD" for yesterday (UTC) — also used by routes/users.rs's
+/// validate_clave_handler to build a single-day validation job.
+pub(crate) fn yesterday_ymd() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

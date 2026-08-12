@@ -492,13 +492,17 @@ pub fn from_metadata(meta_json: &str, job_id: &str, dl_type: &str) -> Option<Par
         .unwrap_or("I")
         .to_uppercase();
 
-    // Map efectoComprobante (Emitido/Recibido) to tipo
+    // Map efectoComprobante (Emitido/Recibido) to tipo. SAT sends this as
+    // "Nómina" (with the accent) — `.to_uppercase()` above turns that into
+    // "NÓMINA", not "NOMINA", so the unaccented literal never matched and
+    // every metadata-only-parsed payroll CFDI silently fell through to the
+    // `_ => "I"` default, counting salaries as sales revenue.
     let tipo_comprobante = match tipo_comprobante.as_str() {
         "INGRESO" | "I" => "I",
         "EGRESO" | "E" => "E",
         "TRASLADO" | "T" => "T",
         "PAGO" | "P" => "P",
-        "NOMINA" | "N" => "N",
+        "NOMINA" | "NÓMINA" | "N" => "N",
         _ => "I",
     }
     .to_string();

@@ -967,6 +967,118 @@ pub async fn update_rfc_clave_handler(
 }
 
 // ---------------------------------------------------------------------------
+// POST /api/v1/users/rfcs/{rfc}/validate-clave
+// ---------------------------------------------------------------------------
+
+/// Forces an immediate SAT login attempt with the RFC's *currently stored*
+/// CIEC by queuing a one-day sync job, so the UI can confirm a just-entered
+/// password within seconds. Without this, updating the CIEC only writes the
+/// new password to the DB — nothing re-attempts a login, so the "CIEC
+/// inválida" badge (derived from the last sync_jobs row's error_code) stays
+/// stale until whatever job happens to run next, which given
+/// `daily_sync_worker`'s once-per-period gating can be close to 24h away.
+///
+/// Deliberately does NOT reuse `trigger_sync`: that one queues a full
+/// multi-year initial-sync range (`initial_sync_period()`), which is the
+/// right thing for onboarding but far too slow just to test a password.
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn validate_clave_handler(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let token = match bearer_token(&req) {
+        Some(t) => t,
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".to_string(),
+            });
+        }
+    };
+    let user_id = match jwt_user_id(&token) {
+        Some(id) => id,
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".to_string(),
+            });
+        }
+    };
+    tracing::Span::current().record("user_id", &user_id.as_str());
+
+    let rfc = path.into_inner().trim().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+
+    let clave_enc = match crate::db::users::get_credentials_for_rfc(&pool, &user_id, &rfc).await {
+        Ok(Some((clave_enc, _initial_job_id))) => clave_enc,
+        Ok(None) => {
+            return HttpResponse::NotFound().json(ErrorBody {
+                error: "RFC no encontrado".to_string(),
+            });
+        }
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "validate_clave: DB error: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".to_string(),
+            });
+        }
+    };
+
+    let key = crypto::load_key();
+    let clave = match crypto::decrypt(&key, &clave_enc) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "validate_clave: decrypt failed: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error al descifrar credenciales".to_string(),
+            });
+        }
+    };
+    let auth_json = serde_json::json!({
+        "type": "ciec",
+        "rfc":  rfc,
+        "password": clave,
+    })
+    .to_string();
+    let auth_enc = match crypto::encrypt(&key, &auth_json) {
+        Ok(e) => e,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: format!("Error al cifrar auth: {e}"),
+            });
+        }
+    };
+
+    let day = crate::services::gap_detector::yesterday_ymd();
+    let period_from = format!("{day} 00:00:00");
+    let period_to = format!("{day} 23:59:59");
+
+    let job_id = match crate::db::jobs::insert_queued(
+        &pool, "list", &rfc, "ciec", &auth_enc, "ambos", &period_from, &period_to,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(user_id = %user_id, "validate_clave: insert_queued failed: {e}");
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error al crear el job".to_string(),
+            });
+        }
+    };
+    // Point this RFC's status lookup at the validation job so sync-status
+    // reflects the fresh outcome (success or invalid_credentials) once it
+    // finishes, not whatever stale job it pointed at before.
+    let _ = crate::db::users::set_initial_sync_job_for_rfc(&pool, &user_id, &rfc, &job_id).await;
+    tracing::info!(user_id = %user_id, rfc = %rfc, job_id = %job_id, "CIEC validation job triggered");
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "job_id": job_id,
+        "status": "queued",
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // PUT /api/v1/users/rfcs/{rfc}/priority-analysis
 // ---------------------------------------------------------------------------
 

@@ -1131,6 +1131,10 @@ async fn main() -> std::io::Result<()> {
                     .route(web::put().to(users_routes::update_rfc_clave_handler)),
             )
             .service(
+                web::resource("/api/v1/users/rfcs/{rfc}/validate-clave")
+                    .route(web::post().to(users_routes::validate_clave_handler)),
+            )
+            .service(
                 web::resource("/api/v1/users/rfcs/{rfc}/priority-analysis")
                     .route(web::put().to(users_routes::update_priority_analysis_handler)),
             )
