@@ -792,3 +792,65 @@ pub async fn record_estado_sat_miss(
     .await?;
     Ok(row.try_get::<i32, _>("estado_sat_check_attempts").unwrap_or(0))
 }
+
+// ---------------------------------------------------------------------------
+// Bulk XML re-download — rows permanently marked xml_available = -1 (see
+// xml_redownload.rs). Distinct from the estado_sat recheck above: this is
+// about recovering the real subtotal/currency/payroll detail that the
+// metadata-only fallback never had, not about a status that changed later.
+// ---------------------------------------------------------------------------
+
+/// Candidates for re-download: one row per UUID (a UUID can appear in
+/// `job_invoices` more than once if multiple jobs listed it — any one of
+/// those metadata blobs is equivalent for this purpose, since they all
+/// describe the same real CFDI), capped at `max_attempts` prior misses.
+pub async fn find_needing_redownload(
+    pool: &PgPool,
+    max_attempts: i32,
+    limit: i64,
+) -> Result<Vec<(String, String, String, String)>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT ON (c.uuid) c.uuid, c.rfc_emisor, c.rfc_receptor, ji.metadata
+        FROM pulso.cfdis c
+        JOIN pulso.job_invoices ji ON ji.uuid = c.uuid
+        WHERE c.xml_available = -1
+          AND c.xml_redownload_attempts < $1
+        ORDER BY c.uuid, ji.job_id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(max_attempts)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.try_get("uuid").unwrap_or_default(),
+                r.try_get("rfc_emisor").unwrap_or_default(),
+                r.try_get("rfc_receptor").unwrap_or_default(),
+                r.try_get("metadata").unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+/// Records a failed re-download attempt (SAT didn't return this UUID in the
+/// batch — could be a transient miss, or the CFDI is genuinely gone from
+/// SAT's portal). Capped at `max_attempts` so a permanently-unrecoverable
+/// UUID doesn't get retried forever; logged by the caller when the cap hits.
+/// Returns the attempt count after this miss.
+pub async fn record_redownload_miss(pool: &PgPool, uuid: &str) -> Result<i32, sqlx::Error> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        r#"UPDATE pulso.cfdis SET xml_redownload_attempts = xml_redownload_attempts + 1
+           WHERE uuid = $1 RETURNING xml_redownload_attempts"#,
+    )
+    .bind(uuid)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<i32, _>("xml_redownload_attempts").unwrap_or(0))
+}

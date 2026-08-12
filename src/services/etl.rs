@@ -316,54 +316,74 @@ async fn enrich_invoice(
         return (false, tried_sat);
     };
 
+    let ok = apply_xml_bytes(pool, uuid, metadata, &bytes).await;
+    (ok, tried_sat && !ok)
+}
+
+/// Parses real XML bytes for `uuid` and writes the header row plus every
+/// child table (taxes, concepts, payments, relacionados, nomina) — the
+/// "we now have the real XML, make everything correct" step shared by:
+/// - `enrich_invoice` above (single UUID, found via storage or a one-off SAT
+///   download during normal ETL)
+/// - `xml_redownload.rs`'s bulk worker (batched SAT downloads targeting rows
+///   already marked `xml_available = -1`)
+///
+/// Both callers already have `bytes` in hand by the time they call this —
+/// this fn only owns the parse-and-persist step, not acquisition.
+pub(crate) async fn apply_xml_bytes(
+    pool: &DbPool,
+    uuid: &str,
+    metadata: &str,
+    bytes: &[u8],
+) -> bool {
     let estado = extract_estado_from_meta(metadata);
 
     // job_id and dl_type don't affect enrichment (upsert ON CONFLICT preserves originals)
-    let Some(mut cfdi) = xml_parser::parse(&bytes, "", "ambos", &estado) else {
-        tracing::warn!(uuid = %uuid, "ETL enrich: could not parse XML");
-        return (false, tried_sat);
+    let Some(mut cfdi) = xml_parser::parse(bytes, "", "ambos", &estado) else {
+        tracing::warn!(uuid = %uuid, "ETL: could not parse XML");
+        return false;
     };
 
     cfdi.uuid = uuid.to_uppercase();
 
     // Update header row so xml_available flips to true
     if let Err(e) = db::cfdis::upsert_cfdi(pool, &cfdi).await {
-        tracing::warn!(uuid = %uuid, "ETL enrich: upsert_cfdi failed: {e}");
-        return (false, tried_sat);
+        tracing::warn!(uuid = %uuid, "ETL: upsert_cfdi failed: {e}");
+        return false;
     }
 
     if !cfdi.taxes.is_empty() {
         if let Err(e) = db::cfdis::insert_taxes(pool, &cfdi.uuid, &cfdi.taxes).await {
-            tracing::warn!(uuid = %uuid, "ETL enrich: insert_taxes: {e}");
+            tracing::warn!(uuid = %uuid, "ETL: insert_taxes: {e}");
         }
     }
 
     if !cfdi.payments.is_empty() {
         if let Err(e) = db::cfdis::insert_payments(pool, &cfdi.uuid, &cfdi.payments).await {
-            tracing::warn!(uuid = %uuid, "ETL enrich: insert_payments: {e}");
+            tracing::warn!(uuid = %uuid, "ETL: insert_payments: {e}");
         }
     }
 
     if !cfdi.relacionados.is_empty() {
         if let Err(e) = db::cfdis::insert_relacionados(pool, &cfdi.uuid, &cfdi.relacionados).await {
-            tracing::warn!(uuid = %uuid, "ETL enrich: insert_relacionados: {e}");
+            tracing::warn!(uuid = %uuid, "ETL: insert_relacionados: {e}");
         }
     }
 
     if !cfdi.concepts.is_empty() && !db::cfdis::concepts_exist(pool, &cfdi.uuid).await {
         if let Err(e) = db::cfdis::insert_concepts(pool, &cfdi.uuid, &cfdi.concepts).await {
-            tracing::warn!(uuid = %uuid, "ETL enrich: insert_concepts: {e}");
+            tracing::warn!(uuid = %uuid, "ETL: insert_concepts: {e}");
         }
     }
 
     if let Some(nomina) = &cfdi.nomina {
         if let Err(e) = db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await {
-            tracing::warn!(uuid = %uuid, "ETL enrich: insert_nomina: {e}");
+            tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}");
         }
     }
 
-    tracing::debug!(uuid = %uuid, "ETL enrich: enriched from XML");
-    (true, false)
+    tracing::debug!(uuid = %uuid, "ETL: applied real XML");
+    true
 }
 
 /// Attempt to load XML bytes from local storage or S3.
@@ -471,7 +491,7 @@ async fn try_download_from_sat(
     Some(bytes)
 }
 
-fn extract_path_from_meta(metadata: &str) -> (String, String, u32, u32, u32) {
+pub(crate) fn extract_path_from_meta(metadata: &str) -> (String, String, u32, u32, u32) {
     let v: serde_json::Value = serde_json::from_str(metadata).unwrap_or_default();
 
     let rfc_e = v["rfcEmisor"]
