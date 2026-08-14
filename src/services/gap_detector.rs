@@ -105,9 +105,25 @@ async fn requeue_failed_jobs(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client
     let key = crypto::load_key();
 
     for job in failed {
-        let gap_start = match &job.cursor_date {
-            Some(d) => crate::next_day(d),
-            None => job.period_from.clone(),
+        // `cursor_date` is only trustworthy as "completed through this day"
+        // when the job actually made progress. A job that fails before ever
+        // successfully processing a day (found = 0) can still have
+        // cursor_date sitting on its own period_from — the streaming loop
+        // sets it to the day it's *attempting*, not the day it *finished*.
+        // Trusting cursor_date there computed next_day(period_from) >
+        // period_to for every single-day job that failed immediately,
+        // which read as "fully covered" and gave up without ever retrying —
+        // confirmed against 163 jobs platform-wide (129 on ALA2409253U7
+        // alone) that failed with found=0 and were marked superseded despite
+        // covering zero real days. When found = 0, ignore cursor_date
+        // entirely and restart from period_from.
+        let gap_start = if job.found == 0 {
+            job.period_from.clone()
+        } else {
+            match &job.cursor_date {
+                Some(d) => crate::next_day(d),
+                None => job.period_from.clone(),
+            }
         };
         // Same direct string comparison resume_worker already uses for the
         // equivalent "anything left?" check on cursor vs period_to.
@@ -191,7 +207,19 @@ async fn scan_activity_gaps(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>
             );
         }
 
-        for day in &gap_days {
+        for gap in &gap_days {
+            let day = &gap.day;
+            // A day can be a gap on only one side (Nubarium 2024-08-15/22:
+            // 9 and 23 emitidas that day, zero recibidas) — resync just the
+            // missing side instead of "ambos" so a healthy side's real
+            // invoices aren't redundantly re-fetched every time.
+            let dl_type = match (gap.emit_gap, gap.recv_gap) {
+                (true, true) => "ambos",
+                (true, false) => "emitidos",
+                (false, true) => "recibidos",
+                (false, false) => continue, // shouldn't happen — query only returns actual gaps
+            };
+
             let attempts = db::jobs::count_gap_resync_attempts(pool, &rfc, day).await?;
             if attempts >= MAX_GAP_RESYNC_ATTEMPTS {
                 tracing::warn!(
@@ -222,7 +250,7 @@ async fn scan_activity_gaps(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>
                 &rfc,
                 &auth_type_label,
                 &auth_enc,
-                "ambos",
+                dl_type,
                 &period_from,
                 &period_to,
             )

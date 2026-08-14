@@ -742,13 +742,27 @@ pub async fn earliest_completed_period_from(pool: &PgPool, rfc: &str) -> Result<
 /// B2B invoicing is overwhelmingly a business-day activity for this kind of
 /// RFC, so weekends would otherwise dominate as false positives. Returns
 /// dates as "YYYY-MM-DD".
+/// A weekday inside a `completed` job's range where at least one side
+/// (emitidas or recibidas) has zero CFDIs. `emit_gap`/`recv_gap` say which
+/// side(s) — a day can be a gap on only one side, e.g. Nubarium
+/// 2024-08-15/22 had 9 and 23 emitidas that day but zero recibidas.
+/// Checking combined activity (either side present = "not a gap") missed
+/// these entirely; each side needs its own zero-check.
+#[derive(Debug)]
+pub struct ActivityGapDay {
+    pub day: String,
+    pub emit_gap: bool,
+    pub recv_gap: bool,
+}
+
 pub async fn find_activity_gap_days(
     pool: &PgPool,
     rfc: &str,
     start_day: &str,
     end_day: &str,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(
+) -> Result<Vec<ActivityGapDay>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
         r#"
         WITH weekdays AS (
             SELECT d::date AS day
@@ -762,17 +776,28 @@ pub async fn find_activity_gap_days(
               ON j.rfc = $1 AND j.status = 'completed'
              AND w.day BETWEEN j.period_from::date AND j.period_to::date
         ),
-        activity AS (
+        emit_activity AS (
             SELECT fecha_emision::date AS day, COUNT(*) AS cnt
             FROM pulso.cfdis
-            WHERE (rfc_emisor = $1 OR rfc_receptor = $1)
+            WHERE rfc_emisor = $1
+              AND fecha_emision::date BETWEEN $2::date AND $3::date
+            GROUP BY fecha_emision::date
+        ),
+        recv_activity AS (
+            SELECT fecha_emision::date AS day, COUNT(*) AS cnt
+            FROM pulso.cfdis
+            WHERE rfc_receptor = $1
               AND fecha_emision::date BETWEEN $2::date AND $3::date
             GROUP BY fecha_emision::date
         )
-        SELECT to_char(c.day, 'YYYY-MM-DD')
+        SELECT
+            to_char(c.day, 'YYYY-MM-DD') AS day,
+            COALESCE(e.cnt, 0) = 0 AS emit_gap,
+            COALESCE(r.cnt, 0) = 0 AS recv_gap
         FROM covered c
-        LEFT JOIN activity a ON a.day = c.day
-        WHERE COALESCE(a.cnt, 0) = 0
+        LEFT JOIN emit_activity e ON e.day = c.day
+        LEFT JOIN recv_activity r ON r.day = c.day
+        WHERE COALESCE(e.cnt, 0) = 0 OR COALESCE(r.cnt, 0) = 0
         ORDER BY c.day
         "#,
     )
@@ -780,7 +805,15 @@ pub async fn find_activity_gap_days(
     .bind(start_day)
     .bind(end_day)
     .fetch_all(pool)
-    .await
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ActivityGapDay {
+            day: r.try_get("day").unwrap_or_default(),
+            emit_gap: r.try_get("emit_gap").unwrap_or(false),
+            recv_gap: r.try_get("recv_gap").unwrap_or(false),
+        })
+        .collect())
 }
 
 /// How many single-day gap_resync jobs already ran for this RFC+day — caps
