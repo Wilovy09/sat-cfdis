@@ -729,6 +729,52 @@ pub async fn find_cancelled_recheck_candidates(
         .collect())
 }
 
+/// Mirror of `find_cancelled_recheck_candidates` for the opposite direction:
+/// invoices Pulso still thinks are Vigente. Nothing else ever re-polls SAT
+/// for these, so a real cancellation that happens after ingestion (SAT allows
+/// it well past the 72h reversal window) stays invisible forever — inflating
+/// revenue for as long as the invoice keeps getting counted. Scoped to I/E
+/// only: those are the types cancellation actually changes anything for.
+pub async fn find_vigente_recheck_candidates(
+    pool: &PgPool,
+    min_recheck_hours: i32,
+    recent_days: i32,
+    limit: i64,
+) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT uuid, rfc_emisor, rfc_receptor
+        FROM pulso.cfdis
+        WHERE NOT is_cancelled
+          AND tipo_comprobante IN ('I', 'E')
+          AND (
+              estado_sat_checked_at IS NULL
+              OR (
+                  estado_sat_checked_at < NOW() - make_interval(hours => $1)
+                  AND fecha_emision::timestamp > NOW() - make_interval(days => $2)
+              )
+          )
+        ORDER BY estado_sat_checked_at IS NULL DESC, estado_sat_checked_at ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(min_recheck_hours)
+    .bind(recent_days)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let uuid: String = r.try_get("uuid").unwrap_or_default();
+            let rfc_emisor: String = r.try_get("rfc_emisor").unwrap_or_default();
+            let rfc_receptor: String = r.try_get("rfc_receptor").unwrap_or_default();
+            (uuid, rfc_emisor, rfc_receptor)
+        })
+        .collect())
+}
+
 /// Records a confirmed fresh SAT status check. Narrower than `upsert_cfdi` on
 /// purpose — a recheck only ever fetches `estadoComprobante`, so it must not
 /// clobber fields (subtotal, receptor name, ...) it never re-fetched. Resets

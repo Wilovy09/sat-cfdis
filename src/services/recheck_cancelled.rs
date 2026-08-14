@@ -1,15 +1,25 @@
-//! Background worker: periodically re-verifies `estado_sat` for invoices
-//! currently flagged cancelled.
+//! Background worker: periodically re-verifies `estado_sat` against SAT in
+//! both directions.
 //!
-//! SAT lets the receptor reject a cancellation request within ~72h, reverting
-//! the CFDI back to "Vigente". Nothing else in the pipeline ever re-polls SAT
-//! after the initial scrape (`estado_sat` is set once at ingestion from a
-//! frozen `job_invoices.metadata` snapshot and never refreshed), so a rejected
-//! cancellation stays wrongly marked cancelled forever — silently
-//! underreporting revenue every month it recurs. This worker closes that gap
-//! by re-running the same PHP `list` (by UUID) lookup already used for
-//! interactive invoice lookups, and correcting `estado_sat` when it disagrees
-//! with what SAT reports now.
+//! `estado_sat` is set once at ingestion from a frozen `job_invoices.metadata`
+//! snapshot and nothing else in the pipeline ever refreshes it, so either
+//! direction can go stale silently:
+//!
+//! 1. SAT lets the receptor reject a cancellation request within ~72h,
+//!    reverting the CFDI back to "Vigente" — a rejected cancellation stays
+//!    wrongly marked cancelled forever, underreporting revenue.
+//! 2. A CFDI marked Vigente at ingestion can be cancelled later (SAT allows it
+//!    well past the 72h reversal window) — nothing ever looks at it again
+//!    once it's not flagged cancelled, so the cancellation is invisible and
+//!    it keeps inflating revenue for as long as it's counted. Confirmed
+//!    against 5 Nubarium invoices SAT already showed cancelled days before
+//!    this worker's own cancelled-only scan ran — they were never in its
+//!    candidate set to begin with, not a check that failed.
+//!
+//! This worker closes both gaps by re-running the same PHP `list` (by UUID)
+//! lookup already used for interactive invoice lookups, and correcting
+//! `estado_sat` when it disagrees with what SAT reports now — the update path
+//! doesn't care which direction the correction goes.
 
 use crate::{
     config::Config,
@@ -39,6 +49,25 @@ const CHUNK_SIZE: usize = 100;
 /// gate — otherwise a UUID SAT genuinely never returns would retry forever.
 const MAX_MISS_ATTEMPTS: i32 = 8;
 
+/// Vigente-side recheck runs far less often per invoice than the
+/// cancelled-side one: a cancellation reversal has a hard 72h window, so
+/// checking every 12h makes sense there. A Vigente invoice flipping to
+/// cancelled has no such window — checking weekly is enough to catch it
+/// without burning SAT/captcha budget on rows that essentially never change.
+const VIGENTE_MIN_RECHECK_HOURS: i32 = 24 * 7;
+/// Wider than `RECENT_DAYS` on purpose: SAT cancellations for I/E invoices
+/// happen well beyond two weeks after issuance in practice (the reference
+/// audit's example was reissued invoices cancelled months later), so ruling
+/// a Vigente row out of scope needs a longer horizon than the cancelled-side
+/// check does.
+const VIGENTE_RECENT_DAYS: i32 = 180;
+/// Separate budget from `BATCH_LIMIT` — the Vigente universe (tens of
+/// thousands of never-checked I/E rows platform-wide) is much larger than the
+/// cancelled one, but each cycle still only spends a bounded number of SAT
+/// lookups on it; the backlog drains gradually the same way the cancelled
+/// backlog does.
+const VIGENTE_BATCH_LIMIT: i64 = 300;
+
 pub async fn worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
     // Let the other startup workers get a head start.
     tokio::time::sleep(std::time::Duration::from_secs(120)).await;
@@ -52,17 +81,28 @@ pub async fn worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
 }
 
 async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyhow::Result<()> {
-    let candidates = db::cfdis::find_cancelled_recheck_candidates(
+    let mut candidates = db::cfdis::find_cancelled_recheck_candidates(
         pool,
         MIN_RECHECK_HOURS,
         RECENT_DAYS,
         BATCH_LIMIT,
     )
     .await?;
+    let vigente_candidates = db::cfdis::find_vigente_recheck_candidates(
+        pool,
+        VIGENTE_MIN_RECHECK_HOURS,
+        VIGENTE_RECENT_DAYS,
+        VIGENTE_BATCH_LIMIT,
+    )
+    .await?;
+    tracing::info!(
+        cancelled = candidates.len(), vigente = vigente_candidates.len(),
+        "Recheck-cancelled: candidates this cycle"
+    );
+    candidates.extend(vigente_candidates);
     if candidates.is_empty() {
         return Ok(());
     }
-    tracing::info!(count = candidates.len(), "Recheck-cancelled: candidates this cycle");
 
     let creds: HashMap<String, String> =
         db::users::get_all_with_credentials(pool).await?.into_iter().collect();
