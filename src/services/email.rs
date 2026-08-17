@@ -5,7 +5,7 @@ fn failure_reason_es(error_code: Option<&str>) -> &'static str {
     match error_code {
         Some("invalid_credentials") => "la contraseña CIEC no fue aceptada por el SAT",
         Some("login_not_registered") => {
-            "el RFC no está dado de alta para descargar CFDIs en el portal del SAT"
+            "no pudimos confirmar el acceso al portal del SAT tras varios intentos automáticos"
         }
         Some("fiel_login_failed") => "no pudimos iniciar sesión con tu e.firma",
         Some("captcha_failed") => "el SAT no nos dejó pasar el captcha tras varios intentos",

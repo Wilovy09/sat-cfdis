@@ -621,9 +621,18 @@ pub async fn get_invoices(
 /// `max_retries` fresh restarts so a permanently broken RFC (revoked
 /// credentials, deleted account) doesn't get requeued forever.
 ///
-/// Deliberately excludes `invalid_credentials` / `login_not_registered` /
-/// `fiel_login_failed` — same distinction `retry_transient_or_fail` already
-/// draws: those need a human to fix the credentials, not an automatic retry.
+/// `login_not_registered` is included despite `retry_transient_or_fail`
+/// treating it as permanent — that call site can only see one job's outcome,
+/// not the fleet-wide pattern this query can see. On 2026-08-15, ~50
+/// same-minute single-day gap_resync jobs for NUB170623KI3 (fresh process,
+/// fresh cookie jar, fresh login each) hit this code and only ~5 failed —
+/// with the SAT credentials independently confirmed valid by a human login
+/// the same day. A real bad-credential state fails every attempt, not one in
+/// ten; this is `accessPortalMainPage()`'s exact-string check
+/// (`RFC Autenticado: <rfc>`) occasionally missing on an otherwise-successful
+/// login, not the account being unregistered. Still excludes
+/// `invalid_credentials` / `fiel_login_failed`, which the SAT login POST
+/// itself rejects immediately — those really do need a human to fix.
 pub async fn find_failed_retryable(
     pool: &PgPool,
     max_retries: i32,
@@ -634,7 +643,7 @@ pub async fn find_failed_retryable(
            WHERE status = 'failed'
              AND superseded_by IS NULL
              AND gap_retry_count < $1
-             AND (error_code IS NULL OR error_code IN ('captcha_failed', 'sat_connection_error', 'rate_limited', 'unknown_error'))
+             AND (error_code IS NULL OR error_code IN ('captcha_failed', 'sat_connection_error', 'rate_limited', 'unknown_error', 'login_not_registered'))
            ORDER BY created_at ASC
            LIMIT $2"#,
     )
