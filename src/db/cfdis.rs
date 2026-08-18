@@ -684,6 +684,35 @@ pub async fn mark_xml_unavailable_for_job(
 // Cancellation status re-verification
 // ---------------------------------------------------------------------------
 
+/// Calendar months (year, month) that already have at least one CFDI for
+/// this RFC (either side), regardless of which sync job fetched it. Powers
+/// the coverage widget's "done" months — `month_progress()`'s old logic
+/// derived that purely from one active job's own cursor_date, which only
+/// reflects that single job's range. Once gap_detector/H-1 started leaving
+/// several jobs (one big historical `list` plus many one-day `gap_resync`s)
+/// active or paused per RFC, `get_active_for_rfc` could surface a narrow
+/// gap_resync job as "the" job and make already-downloaded months (fetched
+/// by a *different*, already-completed job) look undone — e.g. CES100706U65
+/// showing only Nov–Dec 2023 covered while its financial summary (queried
+/// straight from these same rows) already reflected the full year.
+pub async fn months_with_data(
+    pool: &PgPool,
+    rfc: &str,
+) -> Result<std::collections::HashSet<(i32, i32)>, sqlx::Error> {
+    use sqlx::Row;
+    let rfc = rfc.to_uppercase();
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT year, month FROM pulso.cfdis WHERE rfc_emisor = $1 OR rfc_receptor = $1"#,
+    )
+    .bind(&rfc)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.try_get::<i32, _>("year").unwrap_or(0), r.try_get::<i32, _>("month").unwrap_or(0)))
+        .collect())
+}
+
 /// Candidate invoices for `estado_sat` re-verification: currently flagged
 /// cancelled, and either never checked (one-time historical backlog) or
 /// emitted within `recent_days` and not checked within `min_recheck_hours` —

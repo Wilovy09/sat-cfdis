@@ -133,13 +133,22 @@ fn year_month_prefix(s: &str) -> Option<(i64, i64)> {
 /// Per-month progress within [period_from, period_to] — powers the sync
 /// widget's expanded view (one row per year, one dot per month) so the user
 /// can see it's downloading in chronological order and which month it's
-/// currently on. "current" is the cursor's month (or period_from's month if
-/// the job hasn't started yet); everything before is "done", after is "pending".
+/// currently on. "done" is driven by `months_with_data` — actual CFDI
+/// presence for the RFC — not by comparing to the cursor: an RFC can have
+/// several jobs (one big historical `list` plus scattered single-day
+/// `gap_resync`s from gap_detector), and `period_from`/`period_to`/
+/// `cursor_date` here describe only whichever ONE job the caller picked to
+/// track "current" progress. Trusting that job's own cursor for "done" made
+/// months already covered by a *different*, completed job look undone
+/// whenever the tracked job's range didn't start from the true beginning.
+/// "current" is still that job's cursor month (or its period_from's month if
+/// it hasn't started); anything else is "pending".
 fn month_progress(
     period_from: &str,
     period_to: &str,
     cursor_date: Option<&str>,
     status: &str,
+    months_with_data: &std::collections::HashSet<(i32, i32)>,
 ) -> Vec<serde_json::Value> {
     let (Some((from_y, from_m)), Some((to_y, to_m))) =
         (year_month_prefix(period_from), year_month_prefix(period_to))
@@ -162,7 +171,7 @@ fn month_progress(
     while abs <= to_abs {
         let year = (abs - 1) / 12;
         let month = ((abs - 1) % 12) + 1;
-        let month_status = if abs < current_abs {
+        let month_status = if months_with_data.contains(&(year as i32, month as i32)) {
             "done"
         } else if abs == current_abs {
             "current"
@@ -598,11 +607,20 @@ pub async fn sync_status(
         // so admin-queued jobs and paused syncs are always surfaced correctly.
         match crate::db::jobs::get_active_for_rfc(&pool, rfc).await {
             Ok(Some(active_job)) => {
+                let months_with_data = crate::db::cfdis::months_with_data(&pool, rfc)
+                    .await
+                    .unwrap_or_default();
+                let (range_from, range_to) = crate::db::jobs::rfc_job_range(&pool, rfc)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| (active_job.period_from.clone(), active_job.period_to.clone()));
                 let months = month_progress(
-                    &active_job.period_from,
-                    &active_job.period_to,
+                    &range_from,
+                    &range_to,
                     active_job.cursor_date.as_deref(),
                     &active_job.status,
+                    &months_with_data,
                 );
                 let (counting_year, counting_month) =
                     current_year_month(active_job.count_cursor_date.as_deref());
@@ -616,8 +634,8 @@ pub async fn sync_status(
                     "cursor_date":        active_job.cursor_date,
                     "count_cursor_date":  active_job.count_cursor_date,
                     "job_id":             active_job.id,
-                    "period_from":        active_job.period_from,
-                    "period_to":          active_job.period_to,
+                    "period_from":        range_from,
+                    "period_to":          range_to,
                     "error_code":         active_job.error_code,
                     "error_msg":          active_job.error_msg,
                     "months":             months,
@@ -672,11 +690,20 @@ pub async fn sync_status(
 
     match crate::db::jobs::get_by_id(&pool, &job_id).await {
         Ok(Some(job)) => {
+            let months_with_data = crate::db::cfdis::months_with_data(&pool, &job.rfc)
+                .await
+                .unwrap_or_default();
+            let (range_from, range_to) = crate::db::jobs::rfc_job_range(&pool, &job.rfc)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| (job.period_from.clone(), job.period_to.clone()));
             let months = month_progress(
-                &job.period_from,
-                &job.period_to,
+                &range_from,
+                &range_to,
                 job.cursor_date.as_deref(),
                 &job.status,
+                &months_with_data,
             );
             let (counting_year, counting_month) =
                 current_year_month(job.count_cursor_date.as_deref());
@@ -690,8 +717,8 @@ pub async fn sync_status(
                 "cursor_date":        job.cursor_date,
                 "count_cursor_date":  job.count_cursor_date,
                 "job_id":             job.id,
-                "period_from":        job.period_from,
-                "period_to":          job.period_to,
+                "period_from":        range_from,
+                "period_to":          range_to,
                 "error_code":         job.error_code,
                 "error_msg":          job.error_msg,
                 "months":             months,

@@ -594,6 +594,26 @@ pub async fn get_active_for_rfc(pool: &PgPool, rfc: &str) -> Result<Option<SyncJ
     .await
 }
 
+/// Widest [period_from, period_to] across every job this RFC has ever had,
+/// any status. `sync_status`'s coverage widget used to show a single job's
+/// own period_from/period_to — fine while an RFC had one job at a time, but
+/// gap_detector now leaves many jobs per RFC (one big historical `list` plus
+/// scattered single-day `gap_resync`s), and `get_active_for_rfc` can surface
+/// a narrow one as "the" active job, making the widget's month range collapse
+/// to just that job's few months even though far more has actually synced.
+pub async fn rfc_job_range(pool: &PgPool, rfc: &str) -> Result<Option<(String, String)>, sqlx::Error> {
+    let row: (Option<String>, Option<String>) = sqlx::query_as(
+        r#"SELECT MIN(period_from), MAX(period_to) FROM pulso.sync_jobs WHERE rfc = $1"#,
+    )
+    .bind(rfc.to_uppercase())
+    .fetch_one(pool)
+    .await?;
+    Ok(match row {
+        (Some(from), Some(to)) => Some((from, to)),
+        _ => None,
+    })
+}
+
 pub async fn get_invoices(
     pool: &PgPool,
     job_id: &str,
