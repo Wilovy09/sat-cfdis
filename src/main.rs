@@ -824,18 +824,24 @@ async fn run_worker_chunk(
     tokio::task::yield_now().await;
 
     if let Some((code, message)) = auth_error {
-        if code == "captcha_failed" {
-            // A captcha OCR miss on this one login attempt, not a persistent
-            // credential problem — worth retrying (a fresh login gets a fresh
-            // captcha image), unlike invalid_credentials/login_not_registered/
-            // fiel_login_failed below, which fail permanently.
+        if code == "captcha_failed" || code == "login_not_registered" {
+            // Both are one-attempt flukes, not persistent credential problems:
+            // a captcha OCR miss gets a fresh image next try, and
+            // login_not_registered is accessPortalMainPage()'s exact-string
+            // check occasionally missing on an otherwise-successful login
+            // (evidence: 2026-08-15, ~50 fresh single-day jobs for the same
+            // RFC/credentials in one batch, only ~5 hit this — a real bad
+            // password fails every attempt, not one in ten). Worth retrying
+            // before telling the client anything, unlike invalid_credentials/
+            // fiel_login_failed below, which SAT's login step itself rejects
+            // immediately and really do need a human to fix.
             match db::jobs::retry_transient_or_fail(&pool, &job_id, &cursor, found, Some(&code), &message).await {
                 Ok(true) => {
-                    tracing::warn!(job_id = %job_id, code = %code, "Job failed permanently: captcha retries exhausted");
+                    tracing::warn!(job_id = %job_id, code = %code, "Job failed permanently: retries exhausted");
                     notify_sync_failed(&pool, &cfg, &job_id, &job_rfc, Some(&code)).await;
                 }
                 Ok(false) => {
-                    tracing::warn!(job_id = %job_id, code = %code, "Job failed transiently: captcha OCR miss, will auto-retry");
+                    tracing::warn!(job_id = %job_id, code = %code, "Job failed transiently, will auto-retry");
                 }
                 Err(e) => tracing::error!(job_id = %job_id, "retry_transient_or_fail error: {e}"),
             }
