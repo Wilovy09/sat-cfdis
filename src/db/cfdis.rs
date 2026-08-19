@@ -391,7 +391,7 @@ async fn insert_nomina_percepcion(
         INSERT INTO pulso.cfdi_nomina_percepciones
             (uuid, tipo_percepcion, clave, concepto, importe_gravado, importe_exento)
         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::float8[])
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (uuid, tipo_percepcion, clave, concepto) DO NOTHING
         "#,
     )
     .bind(&uuids)
@@ -433,7 +433,7 @@ async fn insert_nomina_deduccion(
         INSERT INTO pulso.cfdi_nomina_deducciones
             (uuid, tipo_deduccion, clave, concepto, importe)
         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[])
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (uuid, tipo_deduccion, clave, concepto) DO NOTHING
         "#,
     )
     .bind(&uuids)
@@ -474,7 +474,7 @@ async fn insert_nomina_otro_pago(
         INSERT INTO pulso.cfdi_nomina_otros_pagos
             (uuid, tipo_otro_pago, clave, concepto, importe)
         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[])
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (uuid, tipo_otro_pago, clave, concepto) DO NOTHING
         "#,
     )
     .bind(&uuids)

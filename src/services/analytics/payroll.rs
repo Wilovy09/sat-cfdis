@@ -192,9 +192,17 @@ pub struct EmployeeYearRow {
     pub departamento: String,
     pub puesto: String,
     pub year: i64,
-    pub sueldo_bruto: f64,
+    /// Solo la clave P001 — la línea contractual, comparable entre empleados
+    /// y contra el SDI.
+    pub sueldo_base: f64,
+    /// Todas las percepciones menos las seis eventuales (aguinaldo P002, PTU
+    /// P003, prima vacacional P021, prima por antigüedad P022, pagos por
+    /// separación P023, indemnizaciones P025) — el costo recurrente real por
+    /// persona (NOM-2).
+    pub compensacion_ordinaria: f64,
     pub months_active: i64,
-    pub avg_monthly: f64,
+    pub avg_monthly_base: f64,
+    pub avg_monthly_compensacion: f64,
     pub avg_sdi: f64,
 }
 
@@ -808,7 +816,11 @@ pub async fn get(
         })
         .collect();
 
-    // By month ordinaria (tipo_nomina O + E — extraordinary payrolls included to match full payroll spend)
+    // By month ordinaria — SOLO tipo_nomina 'O'. La extraordinaria (aguinaldo,
+    // PTU, finiquitos, indemnizaciones) es su propia serie: son eventos
+    // aislados y mezclarlos distorsiona la lectura del costo recurrente
+    // (NOM-1). El total_pagado sigue sin incluir otros_pagos aquí a propósito
+    // — ver NOM-7, esta serie es la que queda excluida.
     let month_ord_rows = sqlx::query(&format!(
         r#"
         SELECT
@@ -831,7 +843,7 @@ pub async fn get(
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
           AND NOT c.is_cancelled
-          AND n.tipo_nomina IN ('O', 'E')
+          AND n.tipo_nomina = 'O'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
 {NOMINA_EXCL_C}
@@ -1003,7 +1015,11 @@ pub async fn get(
                MAX(n.departamento) AS dpto,
                MAX(n.puesto) AS puesto,
                c.year,
-               SUM(COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) AS sueldo_bruto,
+               SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8)
+                 FILTER (WHERE p.tipo_percepcion = '001')                    AS sueldo_base,
+               SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8)
+                 FILTER (WHERE p.tipo_percepcion NOT IN
+                         ('002','003','021','022','023','025'))              AS compensacion_ordinaria,
                COUNT(DISTINCT c.month) AS months_active,
                AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi
         FROM pulso.cfdi_nomina_percepciones p
@@ -1012,7 +1028,6 @@ pub async fn get(
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
           AND NOT c.is_cancelled
-          AND p.tipo_percepcion = '001'
           AND n.tipo_nomina = 'O'
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
@@ -1028,7 +1043,8 @@ pub async fn get(
     let by_employee_year: Vec<EmployeeYearRow> = emp_year_rows
         .iter()
         .map(|r| {
-            let sueldo_bruto: f64 = r.try_get("sueldo_bruto").unwrap_or(0.0);
+            let sueldo_base: f64 = r.try_get("sueldo_base").unwrap_or(0.0);
+            let compensacion_ordinaria: f64 = r.try_get("compensacion_ordinaria").unwrap_or(0.0);
             let months_active: i64 = r.try_get("months_active").unwrap_or(1);
             EmployeeYearRow {
                 rfc: r.try_get("rfc").unwrap_or_default(),
@@ -1036,9 +1052,11 @@ pub async fn get(
                 departamento: r.try_get("dpto").unwrap_or_default(),
                 puesto: r.try_get("puesto").unwrap_or_default(),
                 year: r.try_get("year").unwrap_or(0),
-                sueldo_bruto,
+                sueldo_base,
+                compensacion_ordinaria,
                 months_active,
-                avg_monthly: sueldo_bruto / months_active.max(1) as f64,
+                avg_monthly_base: sueldo_base / months_active.max(1) as f64,
+                avg_monthly_compensacion: compensacion_ordinaria / months_active.max(1) as f64,
                 avg_sdi: r.try_get("avg_sdi").unwrap_or(0.0),
             }
         })
