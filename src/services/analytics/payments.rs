@@ -115,12 +115,16 @@ pub async fn get(
                 inv.uuid,
                 COALESCE(inv.total_mxn, 0)::float8 AS inv_total,
                 COALESCE((
-                    SELECT SUM(pd.imp_pagado)
+                    SELECT SUM(pd.imp_pagado::float8
+                               / COALESCE(NULLIF(pd.tipo_cambio_dr::float8, 0), 1)
+                               * COALESCE(NULLIF(cp.tipo_cambio_p::float8,  0), 1))
                     FROM pulso.cfdi_payment_docs pd
+                    JOIN pulso.cfdi_payments cp
+                      ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
                     JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
                     WHERE pd.invoice_uuid = inv.uuid
                       AND NOT comp.is_cancelled
-                )::float8, 0) +
+                ), 0) +
                 COALESCE((
                     SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
                     FROM pulso.cfdi_relacionados cr
@@ -260,12 +264,16 @@ pub async fn get(
                 inv.total_mxn,
                 (CURRENT_DATE - inv.fecha_emision::date)::bigint AS days_out,
                 COALESCE((
-                    SELECT SUM(pd.imp_pagado)
+                    SELECT SUM(pd.imp_pagado::float8
+                               / COALESCE(NULLIF(pd.tipo_cambio_dr::float8, 0), 1)
+                               * COALESCE(NULLIF(cp.tipo_cambio_p::float8,  0), 1))
                     FROM pulso.cfdi_payment_docs pd
+                    JOIN pulso.cfdi_payments cp
+                      ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
                     JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
                     WHERE pd.invoice_uuid = inv.uuid
                       AND NOT comp.is_cancelled
-                )::float8, 0) +
+                ), 0) +
                 COALESCE((
                     SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
                     FROM pulso.cfdi_relacionados cr
@@ -315,12 +323,16 @@ pub async fn get(
         SELECT COALESCE(SUM(GREATEST(
             inv.total_mxn -
             COALESCE((
-                SELECT SUM(pd.imp_pagado)
+                SELECT SUM(pd.imp_pagado::float8
+                           / COALESCE(NULLIF(pd.tipo_cambio_dr::float8, 0), 1)
+                           * COALESCE(NULLIF(cp.tipo_cambio_p::float8,  0), 1))
                 FROM pulso.cfdi_payment_docs pd
+                JOIN pulso.cfdi_payments cp
+                  ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
                 JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
                 WHERE pd.invoice_uuid = inv.uuid
                   AND NOT comp.is_cancelled
-            )::float8, 0) -
+            ), 0) -
             COALESCE((
                 SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
                 FROM pulso.cfdi_relacionados cr
@@ -396,9 +408,13 @@ pub async fn get(
         ),
         ppd_paid_by_month AS (
             SELECT inv.year, inv.month,
-                   COALESCE(SUM(pd.imp_pagado)::float8, 0) AS ppd_paid
+                   COALESCE(SUM(pd.imp_pagado::float8
+                                / COALESCE(NULLIF(pd.tipo_cambio_dr::float8, 0), 1)
+                                * COALESCE(NULLIF(cp.tipo_cambio_p::float8,  0), 1)), 0) AS ppd_paid
             FROM pulso.cfdis inv
             JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
+            JOIN pulso.cfdi_payments cp
+              ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
             WHERE inv.{owner_col} = $1
               AND inv.{dl_filter}
               AND inv.tipo_comprobante = 'I'

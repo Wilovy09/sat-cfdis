@@ -210,7 +210,7 @@ pub async fn get(
     // Summary (all tipos, to match full payroll spend)
     let summary_row = sqlx::query(&format!(r#"
         SELECT
-            SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS total_pagado,
+            SUM(COALESCE(n.total_percepciones,0)::float8 + COALESCE(n.total_otros_pagos,0)::float8 - COALESCE(n.total_deducciones,0)::float8) AS total_pagado,
             SUM(COALESCE(n.total_percepciones,0)::float8)                                    AS total_perc,
             SUM(COALESCE(n.total_deducciones,0)::float8)                                     AS total_ded,
             SUM(COALESCE(n.total_otros_pagos,0)::float8)                                     AS total_otros,
@@ -287,7 +287,7 @@ pub async fn get(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
                  c.fecha_emision::date
                ))::bigint AS month,
-               SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
+               SUM(COALESCE(n.total_percepciones,0)::float8 + COALESCE(n.total_otros_pagos,0)::float8 - COALESCE(n.total_deducciones,0)::float8) AS pagado,
                SUM(COALESCE(n.total_percepciones,0)::float8)  AS perc,
                SUM(COALESCE(n.total_deducciones,0)::float8)   AS ded,
                SUM(COALESCE(n.total_otros_pagos,0)::float8) AS otros,
@@ -377,7 +377,7 @@ pub async fn get(
             la.fecha_final_pago,
             COALESCE(ea.sdi_at_first, 0)::float8        AS sdi_at_first,
             ea.fecha_inicio_rel_laboral,
-            SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
+            SUM(COALESCE(n.total_percepciones,0)::float8 + COALESCE(n.total_otros_pagos,0)::float8 - COALESCE(n.total_deducciones,0)::float8) AS pagado,
             SUM(COALESCE(n.total_percepciones,0)::float8)       AS perc,
             SUM(COALESCE(n.total_deducciones,0)::float8)        AS ded,
             AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi,
@@ -770,7 +770,7 @@ pub async fn get(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
                  c.fecha_emision::date
                ))::bigint AS year,
-               SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
+               SUM(COALESCE(n.total_percepciones,0)::float8 + COALESCE(n.total_otros_pagos,0)::float8 - COALESCE(n.total_deducciones,0)::float8) AS pagado,
                SUM(COALESCE(n.total_percepciones,0)::float8) AS perc,
                SUM(COALESCE(n.total_deducciones,0)::float8) AS ded,
                SUM(COALESCE(n.total_otros_pagos,0)::float8) AS otros,

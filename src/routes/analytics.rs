@@ -978,6 +978,16 @@ fn current_month() -> String {
     format!("{ly:04}-{lm:02}")
 }
 
+/// Same cutoff as `current_month()`, as YYYYMM — for callers that compare
+/// against `year*100+month` integers instead of formatted strings (e.g.
+/// `recurrence.rs`, which builds its own window bounds that way).
+pub(crate) fn current_month_yyyymm() -> i64 {
+    let s = current_month();
+    let y: i64 = s[0..4].parse().unwrap_or(0);
+    let m: i64 = s[5..7].parse().unwrap_or(0);
+    y * 100 + m
+}
+
 fn default_from() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

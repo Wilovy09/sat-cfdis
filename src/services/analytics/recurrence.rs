@@ -80,7 +80,11 @@ pub async fn get(
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND NOT is_cancelled"
     );
     let max_row = sqlx::query(&max_q).bind(rfc).fetch_one(pool).await?;
-    let max_period_db: i64 = max_row.try_get("max_period").unwrap_or(0);
+    let max_period_raw: i64 = max_row.try_get("max_period").unwrap_or(0);
+    // Nunca dejar que el mes en curso entre a la ventana: el último periodo
+    // visible es siempre el último mes calendario cerrado.
+    let cutoff = crate::routes::analytics::current_month_yyyymm();
+    let max_period_db: i64 = max_period_raw.min(cutoff);
     if max_period_db == 0 {
         return Ok(RecurrenceResponse {
             window_months: 0,
@@ -93,19 +97,18 @@ pub async fn get(
         });
     }
 
-    let (from_yyyymm, max_period) = if let (Some(f), Some(t)) = (from, to) {
-        // Respect user-selected range, clamped to DB bounds
-        let f_ym = parse_yyyymm(f).max(1);
-        let t_ym = parse_yyyymm(t).min(max_period_db);
-        (f_ym, t_ym)
+    // `to` se respeta aunque `from` no venga (el FE manda solo `to`).
+    let max_period = to.map(|t| parse_yyyymm(t).min(max_period_db)).unwrap_or(max_period_db);
+    let from_yyyymm = if let Some(f) = from {
+        parse_yyyymm(f).max(1)
     } else {
-        let max_year = (max_period_db / 100) as i32;
-        let max_month = (max_period_db % 100) as i32;
+        let max_year = (max_period / 100) as i32;
+        let max_month = (max_period % 100) as i32;
         let max_month_abs = max_year * 12 + max_month - 1;
         let from_month_abs = max_month_abs - (window_months - 1);
         let from_year = from_month_abs / 12;
         let from_month = from_month_abs % 12 + 1;
-        ((from_year * 100 + from_month) as i64, max_period_db)
+        (from_year * 100 + from_month) as i64
     };
 
     let to_year = (max_period / 100) as i32;

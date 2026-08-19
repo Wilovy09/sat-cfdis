@@ -91,7 +91,11 @@ pub async fn insert_taxes(
     let mut is_retenidos: Vec<i64> = Vec::new();
 
     for t in taxes {
-        if t.tasa.is_none() {
+        // Una retención sin TasaOCuota es válida en el CFDI (frecuente en ISR
+        // y en retenciones exentas) — descartarla pierde el renglón completo.
+        // Solo se omite si tampoco trae importe ni base, es decir, no hay nada
+        // que guardar.
+        if t.importe.is_none() && t.base.is_none() {
             continue;
         }
         uuids.push(uuid);
@@ -194,6 +198,20 @@ pub async fn insert_payments(
 
     for (i, p) in payments.iter().enumerate() {
         let idx = i as i64;
+        // TC-3: a payment in foreign currency with tipo_cambio_p missing or
+        // exactly 1 is being valued 1:1 against MXN — same shape of bug
+        // already fixed for invoices (cfdis.tipo_cambio). Too rare (5 cases
+        // platform-wide) to justify rejecting the row outright without first
+        // knowing whether the XML itself omits TipoCambioP or the parser
+        // dropped it, so this only makes it visible instead of silent.
+        if let Some(moneda) = &p.moneda_p {
+            if moneda != "MXN" && p.tipo_cambio_p.unwrap_or(1.0) == 1.0 {
+                tracing::warn!(
+                    payment_uuid = %payment_uuid, pago_num = idx, moneda_p = %moneda,
+                    "TC-3: pago en divisa distinta de MXN con tipo_cambio_p ausente o en 1 — se guarda igual, revisar el XML"
+                );
+            }
+        }
         payment_uuids.push(payment_uuid);
         pago_nums.push(idx);
         fecha_pagos.push(p.fecha_pago.clone());

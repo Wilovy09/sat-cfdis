@@ -505,6 +505,35 @@ pub async fn has_earlier_active_list_job(
 }
 
 /// True if a non-cancelled/non-failed job already covers this exact period for the RFC.
+/// True once this RFC has had at least one `auto_daily` job — `daily_sync_worker`
+/// uses this to know whether it's about to run for the RFC for the very
+/// first time.
+pub async fn has_any_daily_job(pool: &PgPool, rfc: &str) -> Result<bool, sqlx::Error> {
+    let (n,): (i64,) = sqlx::query_as(
+        r#"SELECT count(*) FROM pulso.sync_jobs WHERE rfc = $1 AND job_type = 'auto_daily'"#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
+}
+
+/// Latest `period_to` among this RFC's completed historical jobs (`list` or
+/// `gap_resync`) — SYNC-2: the point daily mode should resume from the first
+/// time it runs. Without this, `daily_sync_worker` only ever asks for
+/// "yesterday", so whatever gap sits between "the historical load ended" and
+/// "the day someone actually enabled daily mode" (Axented: 2026-07-31 →
+/// 2026-08-16, 15 days) never gets requested by anyone.
+pub async fn latest_historical_period_to(pool: &PgPool, rfc: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT MAX(period_to) FROM pulso.sync_jobs
+           WHERE rfc = $1 AND job_type IN ('list', 'gap_resync') AND status = 'completed'"#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await
+}
+
 pub async fn has_job_for_period(
     pool: &PgPool,
     rfc: &str,

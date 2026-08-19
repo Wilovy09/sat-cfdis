@@ -46,14 +46,16 @@ pub async fn get(
         SELECT
             UPPER(TRIM(COALESCE(cc.descripcion, '')))   AS desc,
             COALESCE(cc.clave_prod_serv, '')             AS clave,
-            SUM(COALESCE(cc.importe, 0))                 AS total,
+            SUM(COALESCE(cc.importe::float8, 0)
+                * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)) AS total,
             COUNT(DISTINCT c.uuid)                       AS cnt,
-            AVG(COALESCE(cc.valor_unitario, 0))          AS avg_precio
+            AVG(COALESCE(cc.valor_unitario::float8, 0)
+                * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)) AS avg_precio
         FROM pulso.cfdi_concepts cc
         JOIN pulso.cfdis c ON c.uuid = cc.uuid
         WHERE c.{owner_col} = $1
           AND {dl_filter}
-          AND c.tipo_comprobante NOT IN ('P','N')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
           AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
@@ -96,13 +98,14 @@ pub async fn get(
         r#"
         SELECT
             COALESCE(cc.clave_prod_serv, 'SIN_CLAVE') AS clave,
-            SUM(COALESCE(cc.importe, 0))               AS total,
+            SUM(COALESCE(cc.importe::float8, 0)
+                * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)) AS total,
             COUNT(DISTINCT c.uuid)                     AS cnt
         FROM pulso.cfdi_concepts cc
         JOIN pulso.cfdis c ON c.uuid = cc.uuid
         WHERE c.{owner_col} = $1
           AND {dl_filter}
-          AND c.tipo_comprobante NOT IN ('P','N')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
           AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))

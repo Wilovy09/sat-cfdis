@@ -355,6 +355,23 @@ async fn daily_sync_worker(pool: DbPool) {
                 continue;
             }
 
+            // SYNC-2: first auto_daily run for this RFC — catch up from
+            // where the historical load actually ended instead of just
+            // asking for yesterday, so the gap between "history finished"
+            // and "daily mode got enabled" doesn't go unrequested forever.
+            // Every later cycle finds has_any_daily_job = true and falls
+            // straight through to the normal single-day period below.
+            let effective_period_from = match db::jobs::has_any_daily_job(&pool, &rfc).await {
+                Ok(false) => match db::jobs::latest_historical_period_to(&pool, &rfc).await {
+                    Ok(Some(hist_to)) => {
+                        let gap_start = next_day(&hist_to);
+                        if gap_start < period_from { gap_start } else { period_from.clone() }
+                    }
+                    _ => period_from.clone(),
+                },
+                _ => period_from.clone(),
+            };
+
             let clave = match services::crypto::decrypt(&key, &clave_enc) {
                 Ok(p) => p,
                 Err(e) => {
@@ -385,7 +402,7 @@ async fn daily_sync_worker(pool: DbPool) {
                 "ciec",
                 &auth_enc,
                 "ambos",
-                &period_from,
+                &effective_period_from,
                 &period_to,
             )
             .await
