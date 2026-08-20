@@ -134,7 +134,7 @@ async fn coverage(pool: &DbPool, rfc: &str) -> CoverageInfo {
     while abs <= to_abs {
         let year = (abs - 1) / 12;
         let month = ((abs - 1) % 12) + 1;
-        if !months_with_data.contains(&(year as i32, month as i32)) {
+        if !months_with_data.contains(&(year, month)) {
             empty_months += 1;
         }
         abs += 1;

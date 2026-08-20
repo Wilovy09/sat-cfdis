@@ -716,7 +716,7 @@ pub async fn mark_xml_unavailable_for_job(
 pub async fn months_with_data(
     pool: &PgPool,
     rfc: &str,
-) -> Result<std::collections::HashSet<(i32, i32)>, sqlx::Error> {
+) -> Result<std::collections::HashSet<(i64, i64)>, sqlx::Error> {
     use sqlx::Row;
     let rfc = rfc.to_uppercase();
     let rows = sqlx::query(
@@ -725,9 +725,16 @@ pub async fn months_with_data(
     .bind(&rfc)
     .fetch_all(pool)
     .await?;
+    // year/month are bigint in this table — fetching them as i32 doesn't
+    // truncate, it fails the type check and every row silently fell back to
+    // (0, 0) via unwrap_or, so this set was always effectively empty and
+    // every RFC read as "0 months covered" regardless of real data. That's
+    // the exact bug behind the coverage block firing at 100% for RFCs with
+    // plenty of CFDIs (Nubarium, Axented) and not just the ones with a real
+    // gap (CES100706U65).
     Ok(rows
         .into_iter()
-        .map(|r| (r.try_get::<i32, _>("year").unwrap_or(0), r.try_get::<i32, _>("month").unwrap_or(0)))
+        .map(|r| (r.try_get::<i64, _>("year").unwrap_or(0), r.try_get::<i64, _>("month").unwrap_or(0)))
         .collect())
 }
 

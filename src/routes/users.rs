@@ -148,7 +148,7 @@ fn month_progress(
     period_to: &str,
     cursor_date: Option<&str>,
     status: &str,
-    months_with_data: &std::collections::HashSet<(i32, i32)>,
+    months_with_data: &std::collections::HashSet<(i64, i64)>,
 ) -> Vec<serde_json::Value> {
     let (Some((from_y, from_m)), Some((to_y, to_m))) =
         (year_month_prefix(period_from), year_month_prefix(period_to))
@@ -171,7 +171,7 @@ fn month_progress(
     while abs <= to_abs {
         let year = (abs - 1) / 12;
         let month = ((abs - 1) % 12) + 1;
-        let month_status = if months_with_data.contains(&(year as i32, month as i32)) {
+        let month_status = if months_with_data.contains(&(year, month)) {
             "done"
         } else if abs == current_abs {
             "current"
