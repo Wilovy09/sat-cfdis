@@ -72,13 +72,13 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
             WHERE owner_rfc = $1 AND action = 'exclude'
         )
         SELECT year, month,
-               SUM(CASE WHEN tipo_comprobante = 'I' THEN COALESCE(total_neto_mxn,0) ELSE 0 END)::float8  AS ingreso,
-               SUM(CASE WHEN tipo_comprobante = 'E' THEN -COALESCE(total_neto_mxn,0) ELSE 0 END)::float8 AS egreso,
+               SUM(CASE WHEN tipo_comprobante = 'I' THEN COALESCE(total_neto_mxn_ajustado,0) ELSE 0 END)::float8  AS ingreso,
+               SUM(CASE WHEN tipo_comprobante = 'E' THEN -COALESCE(total_neto_mxn_ajustado,0) ELSE 0 END)::float8 AS egreso,
                SUM(CASE WHEN tipo_comprobante = 'I' THEN COALESCE(total_mxn,0) ELSE 0 END)::float8       AS ingreso_iva,
                SUM(CASE WHEN tipo_comprobante = 'E' THEN COALESCE(total_mxn,0) ELSE 0 END)::float8       AS egreso_iva,
-               SUM(COALESCE(total_neto_mxn,0))::float8 AS total,
+               SUM(COALESCE(total_neto_mxn_ajustado,0))::float8 AS total,
                COUNT(*)                                  AS cnt
-        FROM pulso.cfdis c
+        FROM pulso.cfdis_ajustado c
         LEFT JOIN excluded exc
             ON (exc.cfdi_uuid IS NOT NULL AND UPPER(exc.cfdi_uuid) = UPPER(c.uuid))
             OR (exc.cfdi_uuid IS NULL AND (

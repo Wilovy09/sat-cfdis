@@ -54,10 +54,10 @@ pub async fn get(
                 WHEN month BETWEEN 7 AND 9 THEN 3
                 ELSE 4
             END AS quarter,
-            SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total,
+            SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total,
             COUNT(*) AS cnt,
             COUNT(DISTINCT month) AS months_present
-        FROM pulso.cfdis
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N')

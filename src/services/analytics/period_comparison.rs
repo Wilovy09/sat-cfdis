@@ -116,10 +116,10 @@ pub async fn get(
     let q1 = format!(
         r#"
         SELECT year,
-               SUM(COALESCE(total_neto_mxn, 0)::float8)::float8 AS total,
+               SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS total,
                COUNT(DISTINCT {cp_col}) AS cp_count,
                COUNT(*) AS invoice_count
-        FROM pulso.cfdis
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P', 'N')
@@ -155,8 +155,8 @@ pub async fn get(
     let q2 = format!(
         r#"
         SELECT year,
-               SUM(COALESCE(total_neto_mxn, 0)::float8)::float8 AS fy_total
-        FROM pulso.cfdis
+               SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS fy_total
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P', 'N')
@@ -188,10 +188,10 @@ pub async fn get(
             SELECT year,
                    ({cp_key_expr}) AS cp_rfc,
                    {cp_nombre_expr} AS cp_nombre,
-                   SUM(COALESCE(total_neto_mxn, 0)::float8)::float8 AS total,
+                   SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS total,
                    COUNT(*) AS invoice_count,
-                   ROW_NUMBER() OVER (PARTITION BY year ORDER BY SUM(COALESCE(total_neto_mxn, 0)) DESC) AS rnk
-            FROM pulso.cfdis
+                   ROW_NUMBER() OVER (PARTITION BY year ORDER BY SUM(COALESCE(total_neto_mxn_ajustado, 0)) DESC) AS rnk
+            FROM pulso.cfdis_ajustado
             WHERE {owner_col} = $1
               AND {dl_filter}
               AND tipo_comprobante NOT IN ('P', 'N')
@@ -231,8 +231,8 @@ pub async fn get(
     let q4 = format!(
         r#"
         SELECT year, month,
-               SUM(COALESCE(total_neto_mxn, 0)::float8)::float8 AS total
-        FROM pulso.cfdis
+               SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS total
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P', 'N')
@@ -417,16 +417,16 @@ pub async fn get(
             r#"
             WITH curr AS (
                 SELECT ({cp_key_expr}) AS cp_rfc, {cp_nombre_expr} AS cp_nombre,
-                       SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total
-                FROM pulso.cfdis
+                       SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total
+                FROM pulso.cfdis_ajustado
                 WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
                   AND year = $2 AND month >= $3 AND month <= $4
                 GROUP BY ({cp_key_expr})
             ),
             prev AS (
                 SELECT ({cp_key_expr}) AS cp_rfc, {cp_nombre_expr} AS cp_nombre,
-                       SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total
-                FROM pulso.cfdis
+                       SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total
+                FROM pulso.cfdis_ajustado
                 WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
                   AND year = $5 AND month >= $3 AND month <= $4
                 GROUP BY ({cp_key_expr})

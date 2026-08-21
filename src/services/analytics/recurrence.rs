@@ -143,8 +143,8 @@ pub async fn get(
         WITH cp_months AS (
             SELECT ({cp_key_expr})                               AS cp_key,
                    COUNT(DISTINCT year * 100 + month)::bigint   AS months_active,
-                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8   AS total_mxn
-            FROM pulso.cfdis
+                   SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8   AS total_mxn
+            FROM pulso.cfdis_ajustado
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
             GROUP BY ({cp_key_expr})
@@ -189,8 +189,8 @@ pub async fn get(
         cp_year AS (
             SELECT year, ({cp_key_expr}) AS cp_key,
                    COUNT(DISTINCT month)::float8                                   AS cp_months_in_year,
-                   GREATEST(SUM(COALESCE(total_neto_mxn,0)::float8), 0)::float8   AS year_total
-            FROM pulso.cfdis
+                   GREATEST(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8), 0)::float8   AS year_total
+            FROM pulso.cfdis_ajustado
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
             GROUP BY year, ({cp_key_expr})
@@ -233,17 +233,17 @@ pub async fn get(
             SELECT ({cp_key_expr})                                     AS rfc,
                    MAX({cp_name_col})                                  AS nombre,
                    COUNT(DISTINCT year * 100 + month)::bigint          AS months_active,
-                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8    AS total_mxn,
+                   SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8    AS total_mxn,
                    COUNT(*)::bigint                                    AS invoice_count
-            FROM pulso.cfdis
+            FROM pulso.cfdis_ajustado
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
             GROUP BY ({cp_key_expr})
             HAVING COUNT(DISTINCT year * 100 + month) >= $4
         ),
         wt AS (
-            SELECT GREATEST(SUM(COALESCE(total_neto_mxn,0)::float8), 1) AS total
-            FROM pulso.cfdis
+            SELECT GREATEST(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8), 1) AS total
+            FROM pulso.cfdis_ajustado
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
         )

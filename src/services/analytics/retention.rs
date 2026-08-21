@@ -79,8 +79,8 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
     // Q2: per (year, cp_key) totals — uses XEXX-split key for emitidos
     let q2 = format!(
         "SELECT year, ({cp_key_expr}) AS rfc, MAX({cp_name_col}) AS nombre, \
-                SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total_mxn \
-         FROM pulso.cfdis \
+                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total_mxn \
+         FROM pulso.cfdis_ajustado \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled \
          GROUP BY year, ({cp_key_expr}) \
          ORDER BY year"
@@ -105,8 +105,8 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
 
     // Q3: year totals
     let q3 = format!(
-        "SELECT year, SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total_mxn \
-         FROM pulso.cfdis \
+        "SELECT year, SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total_mxn \
+         FROM pulso.cfdis_ajustado \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled \
          GROUP BY year ORDER BY year"
     );

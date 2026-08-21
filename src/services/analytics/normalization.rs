@@ -617,9 +617,9 @@ pub async fn list_counterparties_for_normalization(
                CASE WHEN c.rfc_emisor = $1 THEN c.rfc_receptor ELSE c.rfc_emisor END AS rfc_cp,
                CASE WHEN c.rfc_emisor = $1 THEN COALESCE(c.nombre_receptor,'') ELSE COALESCE(c.nombre_emisor,'') END AS nombre_cp,
                c.year,
-               SUM(COALESCE(c.total_neto_mxn, c.total_mxn, 0))::float8 AS year_total,
+               SUM(COALESCE(c.total_neto_mxn_ajustado, c.total_mxn, 0))::float8 AS year_total,
                COUNT(*)::bigint AS year_count
-           FROM pulso.cfdis c
+           FROM pulso.cfdis_ajustado c
            WHERE c.{rfc_col} = $1
              AND {dl_filter}
              AND c.tipo_comprobante NOT IN ('P','N','T')
@@ -726,7 +726,7 @@ pub async fn list_cfdis_for_counterparty(
                CASE WHEN c.rfc_emisor = $1 THEN COALESCE(c.nombre_receptor,'') ELSE COALESCE(c.nombre_emisor,'') END AS nombre_contraparte,
                c.tipo_comprobante,
                COALESCE(c.fecha_emision::text, '') AS fecha_emision,
-               COALESCE(c.total_neto_mxn, c.total_mxn, 0)::float8 AS total_mxn,
+               COALESCE(c.total_neto_mxn_ajustado, c.total_mxn, 0)::float8 AS total_mxn,
                c.year::text || '-' || LPAD(c.month::text, 2, '0') AS period,
                COALESCE((SELECT cc.descripcion FROM pulso.cfdi_concepts cc WHERE cc.uuid = c.uuid LIMIT 1), '') AS concepto,
                CASE WHEN nr.id IS NOT NULL THEN true
@@ -734,7 +734,7 @@ pub async fn list_cfdis_for_counterparty(
                     ELSE false END AS is_excluded,
                COALESCE(nr.id, rfc_nr.id) AS rule_id,
                COALESCE(nr.label, rfc_nr.label) AS label
-           FROM pulso.cfdis c
+           FROM pulso.cfdis_ajustado c
            LEFT JOIN pulso.normalization_rules nr
                ON UPPER(nr.cfdi_uuid) = UPPER(c.uuid)
                AND nr.owner_rfc = $1 AND nr.action = 'exclude'

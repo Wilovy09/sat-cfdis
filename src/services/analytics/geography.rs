@@ -56,9 +56,9 @@ pub async fn get(
                 'UNKNOWN'
             )                                                                AS cp,
             CASE WHEN rfc_emisor = $1 THEN rfc_receptor ELSE rfc_emisor END AS counterparty_rfc,
-            SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total,
+            SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total,
             COUNT(*)::bigint                      AS cnt
-        FROM pulso.cfdis
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N','T')

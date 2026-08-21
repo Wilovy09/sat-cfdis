@@ -60,14 +60,14 @@ pub async fn get(
         SELECT
             ({cp_key_expr})                                        AS cp_rfc,
             {cp_nombre_expr}                                       AS cp_nombre,
-            SUM(COALESCE(total_neto_mxn,0)::float8)::float8                          AS total,
+            SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8                          AS total,
             COUNT(*)                                               AS cnt,
             MIN(fecha_emision)                                     AS first_inv,
             MAX(fecha_emision)                                     AS last_inv,
             COUNT(DISTINCT year * 100 + month)                     AS months_active,
-            SUM(SUM(COALESCE(total_neto_mxn,0)::float8)) OVER ()::float8 AS grand_total,
+            SUM(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)) OVER ()::float8 AS grand_total,
             COUNT(*) OVER ()                                       AS cp_count
-        FROM pulso.cfdis
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N')
@@ -185,8 +185,8 @@ pub async fn get_evolution(
         SELECT ({cp_key_expr}) AS cp_rfc,
                {cp_nombre_expr} AS cp_nombre,
                year,
-               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS yr_total
-        FROM pulso.cfdis
+               SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS yr_total
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
@@ -384,10 +384,10 @@ pub async fn get_ltm_comparison(
         r#"
         SELECT ({cp_key_expr}) AS cp_rfc,
                {cp_nombre_expr} AS cp_nombre,
-               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS ltm_total,
+               SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS ltm_total,
                COUNT(DISTINCT year * 100 + month) AS months_active,
                COUNT(*) AS invoice_count
-        FROM pulso.cfdis
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
@@ -407,8 +407,8 @@ pub async fn get_ltm_comparison(
         r#"
         SELECT ({cp_key_expr}) AS cp_rfc,
                {cp_nombre_expr} AS cp_nombre,
-               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS prev_total
-        FROM pulso.cfdis
+               SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS prev_total
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
@@ -731,8 +731,8 @@ pub async fn get_atypical(
             SELECT ({cp_key_expr}) AS cp_rfc, {cp_nombre_expr} AS cp_nombre,
                    year, month,
                    year::text || '-' || LPAD(month::text, 2, '0') AS period,
-                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS mo_total
-            FROM pulso.cfdis
+                   SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS mo_total
+            FROM pulso.cfdis_ajustado
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
               AND NOT is_cancelled
               AND (year > $2 OR (year = $2 AND month >= $3))
@@ -877,9 +877,9 @@ pub async fn get_individual(
     let yearly_rows = sqlx::query(&format!(
         r#"
         SELECT year,
-               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS yr_total,
+               SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS yr_total,
                COUNT(*) AS cnt
-        FROM pulso.cfdis
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
@@ -981,9 +981,9 @@ pub async fn get_individual(
         r#"
         SELECT year, month,
                year::text || '-' || LPAD(month::text, 2, '0') AS period,
-               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS mo_total,
+               SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS mo_total,
                COUNT(*) AS cnt
-        FROM pulso.cfdis
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
@@ -1081,8 +1081,8 @@ pub async fn get_individual(
     let owner_yearly_rows = sqlx::query(&format!(
         r#"
         SELECT year,
-               SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS yr_total
-        FROM pulso.cfdis
+               SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS yr_total
+        FROM pulso.cfdis_ajustado
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
