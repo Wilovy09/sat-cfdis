@@ -30,7 +30,11 @@ pub struct MonthlyTotal {
     pub period: String,
     pub total_mxn: f64,
     pub invoice_count: i64,
-    pub net_mxn: f64, // ingreso minus egreso
+    pub net_mxn: f64, // ingreso minus egreso, pre-IVA (total_neto_mxn)
+    // AUD-006 Step 1: cash-flow measure, con IVA (total_mxn). Not net — the dashboard
+    // needs ingreso and egreso as separate series, each a positive magnitude.
+    pub ingreso_con_iva_mxn: f64,
+    pub egreso_con_iva_mxn: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,6 +44,8 @@ pub struct YearlyTotal {
     pub invoice_count: i64,
     pub ingreso_mxn: f64,
     pub egreso_mxn: f64,
+    pub ingreso_con_iva_mxn: f64,
+    pub egreso_con_iva_mxn: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +74,8 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
         SELECT year, month,
                SUM(CASE WHEN tipo_comprobante = 'I' THEN COALESCE(total_neto_mxn,0) ELSE 0 END)::float8  AS ingreso,
                SUM(CASE WHEN tipo_comprobante = 'E' THEN -COALESCE(total_neto_mxn,0) ELSE 0 END)::float8 AS egreso,
+               SUM(CASE WHEN tipo_comprobante = 'I' THEN COALESCE(total_mxn,0) ELSE 0 END)::float8       AS ingreso_iva,
+               SUM(CASE WHEN tipo_comprobante = 'E' THEN COALESCE(total_mxn,0) ELSE 0 END)::float8       AS egreso_iva,
                SUM(COALESCE(total_neto_mxn,0))::float8 AS total,
                COUNT(*)                                  AS cnt
         FROM pulso.cfdis c
@@ -103,6 +111,8 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
             let month: i64 = r.try_get("month").unwrap_or(0);
             let ingreso: f64 = r.try_get("ingreso").unwrap_or(0.0);
             let egreso: f64 = r.try_get("egreso").unwrap_or(0.0);
+            let ingreso_iva: f64 = r.try_get("ingreso_iva").unwrap_or(0.0);
+            let egreso_iva: f64 = r.try_get("egreso_iva").unwrap_or(0.0);
             let total: f64 = r.try_get("total").unwrap_or(0.0);
             let cnt: i64 = r.try_get("cnt").unwrap_or(0);
             MonthlyTotal {
@@ -112,6 +122,8 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
                 total_mxn: total,
                 invoice_count: cnt,
                 net_mxn: ingreso - egreso,
+                ingreso_con_iva_mxn: ingreso_iva,
+                egreso_con_iva_mxn: egreso_iva,
             }
         })
         .collect();
@@ -222,11 +234,15 @@ fn aggregate_yearly(months: &[MonthlyTotal]) -> Vec<YearlyTotal> {
             invoice_count: 0,
             ingreso_mxn: 0.0,
             egreso_mxn: 0.0,
+            ingreso_con_iva_mxn: 0.0,
+            egreso_con_iva_mxn: 0.0,
         });
         e.total_mxn += m.net_mxn;
         e.invoice_count += m.invoice_count;
         e.ingreso_mxn += m.net_mxn.max(0.0);
         e.egreso_mxn += (-m.net_mxn).max(0.0);
+        e.ingreso_con_iva_mxn += m.ingreso_con_iva_mxn;
+        e.egreso_con_iva_mxn += m.egreso_con_iva_mxn;
     }
     map.into_values().collect()
 }

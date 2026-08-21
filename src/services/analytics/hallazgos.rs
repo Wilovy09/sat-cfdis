@@ -1149,8 +1149,13 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             })
             .collect();
 
-        // Nomina ordinary per year (excluding extraordinary percepciones)
-        let nom_rows = sqlx::query(
+        // Nomina ordinary per year, excluding eventual percepciones (DEC-020, AUD-003)
+        let percepciones_eventuales_sql = super::payroll::PERCEPCIONES_EVENTUALES
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let nom_rows = sqlx::query(&format!(
             r#"
             SELECT c.year, SUM(COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 AS nomina
             FROM pulso.cfdi_nomina_percepciones p
@@ -1159,10 +1164,11 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             WHERE c.rfc_emisor = $1
               AND c.tipo_comprobante = 'N'
               AND NOT c.is_cancelled
-              AND p.tipo_percepcion NOT IN ('002','003','022','038','039','044','045')
+              AND n.tipo_nomina = 'O'
+              AND p.tipo_percepcion NOT IN ({percepciones_eventuales_sql})
             GROUP BY c.year
             "#,
-        )
+        ))
         .bind(rfc)
         .fetch_all(pool)
         .await?;

@@ -42,27 +42,30 @@ pub async fn get(
     let (to_y, to_m) = parse_ym(to);
     let dl_filter = dl_type_filter(dl_type);
     let owner_col = rfc_column(dl_type);
-    let cp_col = if dl_type == "recibidos" {
-        "rfc_emisor"
-    } else {
-        "rfc_receptor"
-    };
 
+    // AUD-005: geographic grouping must reflect the counterparty's location, not the
+    // owner's own lugar_expedicion. Resolved per-row against $1 (not against the
+    // requested dl_type) so 'ambos' rows are each classified by their own direction:
+    // rows where the owner is the emisor use the receptor's domicilio fiscal, rows
+    // where the owner is the receptor use the emisor's lugar_expedicion (unchanged).
     let rows = sqlx::query(&format!(
         r#"
         SELECT
-            COALESCE(lugar_expedicion, 'UNKNOWN') AS cp,
-            {cp_col}                              AS counterparty_rfc,
+            COALESCE(
+                CASE WHEN rfc_emisor = $1 THEN domicilio_fiscal_receptor ELSE lugar_expedicion END,
+                'UNKNOWN'
+            )                                                                AS cp,
+            CASE WHEN rfc_emisor = $1 THEN rfc_receptor ELSE rfc_emisor END AS counterparty_rfc,
             SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total,
             COUNT(*)::bigint                      AS cnt
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N')
+          AND tipo_comprobante NOT IN ('P','N','T')
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT is_cancelled
-        GROUP BY cp, {cp_col}
+        GROUP BY 1, 2
         ORDER BY total DESC
         "#
     ))

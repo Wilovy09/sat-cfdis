@@ -16,6 +16,11 @@ const NOMINA_EXCL_C: &str = "\
 \n              WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'\
 \n                AND nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(c.uuid)\
 \n          )";
+
+/// Percepciones eventuales — se excluyen de toda métrica de costo recurrente (DEC-020).
+/// Claves validadas contra pulso-adquiere/src/utils/nomina.ts::SAT_PERCEPCIONES.
+pub const PERCEPCIONES_EVENTUALES: &[&str] = &["002", "003", "021", "022", "023", "025"];
+
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -1332,7 +1337,13 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
         return Ok(empty());
     }
 
-    // Run-rate LTM: exclude one-off percepciones (002=aguinaldo, 003=PTU, 022=prima vacacional, 038=indemnización)
+    // Run-rate LTM: exclude eventual percepciones (DEC-020, PERCEPCIONES_EVENTUALES) and
+    // extraordinary payroll runs, to match by_employee_year and by_month_ordinaria (NOM-1, AUD-003).
+    let percepciones_eventuales_sql = PERCEPCIONES_EVENTUALES
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(",");
     let rr_row = sqlx::query(&format!(
         r#"
         SELECT COALESCE(SUM(
@@ -1344,7 +1355,8 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
         WHERE c.rfc_emisor = $1
           AND c.tipo_comprobante = 'N'
           AND NOT c.is_cancelled
-          AND p.tipo_percepcion NOT IN ('002', '003', '022', '038')
+          AND n.tipo_nomina = 'O'
+          AND p.tipo_percepcion NOT IN ({percepciones_eventuales_sql})
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
 {NOMINA_EXCL_C}
@@ -1358,7 +1370,33 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     .fetch_one(pool)
     .await?;
     let total_regular: f64 = rr_row.try_get("total_regular").unwrap_or(0.0);
-    let run_rate_mensual_ltm_mxn = total_regular / 12.0;
+
+    // Divisor: months with ordinary payroll data *inside this LTM window*, not the
+    // unwindowed months_of_data (AUD-003 pt.4) — a short LTM history must not be
+    // diluted by /12.
+    let meses_row = sqlx::query(&format!(
+        r#"
+        SELECT COUNT(DISTINCT c.year * 100 + c.month) AS meses
+        FROM pulso.cfdi_nomina n
+        JOIN pulso.cfdis c ON c.uuid = n.uuid
+        WHERE c.rfc_emisor = $1
+          AND c.tipo_comprobante = 'N'
+          AND NOT c.is_cancelled
+          AND n.tipo_nomina = 'O'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+{NOMINA_EXCL_C}
+        "#,
+    ))
+    .bind(rfc)
+    .bind(ltm_from_y)
+    .bind(ltm_from_m)
+    .bind(last_y)
+    .bind(last_m)
+    .fetch_one(pool)
+    .await?;
+    let meses_con_nomina_ltm: i64 = meses_row.try_get("meses").unwrap_or(0);
+    let run_rate_mensual_ltm_mxn = total_regular / (meses_con_nomina_ltm.max(1) as f64);
 
     // YoY masa salarial: total percepciones LTM vs prior 12 months
     let ltm_row = sqlx::query(&format!(
