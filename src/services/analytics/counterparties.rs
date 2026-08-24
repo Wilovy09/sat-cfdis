@@ -91,6 +91,39 @@ pub async fn get(
     let grand_total: f64 = rows.first().map_or(0.0, |r| r.try_get("grand_total").unwrap_or(0.0));
     let cp_count: i64 = rows.first().map_or(0, |r| r.try_get("cp_count").unwrap_or(0));
 
+    // L2-06: HHI over ALL counterparties in the period, not just the `limit`-bounded
+    // rows above (the UI's `limit` param used to silently double as the HHI universe,
+    // understating concentration for fragmented portfolios). Counterparties with a
+    // negative net total (more credit notes than invoices) are excluded from both the
+    // numerator and denominator -- squaring a negative share would inflate the index.
+    let hhi_row = sqlx::query(&format!(
+        r#"
+        WITH per_cp AS (
+            SELECT ({cp_key_expr}) AS cp_rfc,
+                   SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8) AS total
+            FROM pulso.cfdis_ajustado
+            WHERE {owner_col} = $1
+              AND {dl_filter}
+              AND tipo_comprobante NOT IN ('P','N')
+              AND NOT is_cancelled
+              AND (year > $2 OR (year = $2 AND month >= $3))
+              AND (year < $4 OR (year = $4 AND month <= $5))
+            GROUP BY ({cp_key_expr})
+        )
+        SELECT COALESCE(SUM(POWER(total, 2)) / NULLIF(POWER(SUM(total), 2), 0) * 10000, 0)::float8 AS hhi
+        FROM per_cp
+        WHERE total > 0
+        "#
+    ))
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_one(pool)
+    .await?;
+    let hhi: f64 = hhi_row.try_get("hhi").unwrap_or(0.0);
+
     let top: Vec<CounterpartyRow> = rows
         .iter()
         .map(|r| {
@@ -113,13 +146,6 @@ pub async fn get(
             }
         })
         .collect();
-
-    // HHI: sum of (share_i)^2 — use top results as approximation
-    let hhi: f64 = top
-        .iter()
-        .map(|r| (r.pct_of_total / 100.0).powi(2))
-        .sum::<f64>()
-        * 10_000.0;
 
     let top10_total: f64 = top.iter().take(10).map(|r| r.total_mxn).sum();
     let top10_pct = if grand_total > 0.0 {
@@ -566,22 +592,18 @@ pub async fn get_payments_detail(
     let cp_nombre_bare = cp_nombre_expr(cp_col, cp_name_col);
     let cp_key_inv = cp_key_expr(&format!("inv.{cp_col}"), &format!("inv.{cp_name_col}"));
 
-    // CNT05: full universe of ALL invoices (PUE + PPD), no date filter.
-    // PUE invoices are treated as fully paid at emission (matches Python semantics).
-    // PPD invoices: cobrado from payment complements; dias/risk/open counts are PPD-only.
+    // L2-01/L2-03: universe and per-invoice state both come from the shared base
+    // (pulso.cfdi_cobro_estado) instead of re-deriving pagado/saldo here. Full universe
+    // (PUE + PPD), no date filter — cartera is a balance, not a period flow.
     let rows = sqlx::query(&format!(
         r#"
         WITH all_inv AS (
-            SELECT {cp_col},
-                   {cp_name_col},
-                   uuid,
-                   fecha_emision,
-                   COALESCE(total_mxn, 0)::float8 AS inv_total,
-                   metodo_pago
-            FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter}
-              AND tipo_comprobante = 'I'
-              AND NOT is_cancelled
+            SELECT c.{cp_col} AS {cp_col}, c.{cp_name_col} AS {cp_name_col},
+                   b.uuid, b.fecha_emision, b.total_mxn AS inv_total, b.metodo_pago,
+                   b.saldo_mxn, b.dias_antiguedad, b.ultimo_pago_fecha
+            FROM pulso.cfdi_cobro_estado b
+            JOIN pulso.cfdis c ON c.uuid = b.uuid
+            WHERE b.{owner_col} = $1 AND b.{dl_filter}
         ),
         inv_base AS (
             SELECT ({cp_key_bare}) AS cp_rfc,
@@ -591,44 +613,29 @@ pub async fn get_payments_detail(
             FROM all_inv
             GROUP BY ({cp_key_bare})
         ),
-        paid_per_inv AS (
-            SELECT invoice_uuid, SUM(imp_pagado)::float8 AS paid
-            FROM pulso.cfdi_payment_docs
-            GROUP BY invoice_uuid
-        ),
         cobrado_by_cp AS (
-            -- PUE: assumed fully paid at emission; PPD: actual from complements (capped at inv_total)
             SELECT ({cp_key_inv}) AS cp_rfc,
-                   SUM(CASE
-                       WHEN inv.metodo_pago = 'PUE' THEN inv.inv_total
-                       ELSE LEAST(COALESCE(ppi.paid, 0), inv.inv_total)
-                   END)::float8 AS cobrado
+                   SUM(inv.inv_total - inv.saldo_mxn)::float8 AS cobrado
             FROM all_inv inv
-            LEFT JOIN paid_per_inv ppi ON ppi.invoice_uuid = inv.uuid
             GROUP BY ({cp_key_inv})
         ),
         dias_by_cp AS (
-            SELECT ({cp_key_inv})                                             AS cp_rfc,
-                   AVG((cp.fecha_pago::date - inv.fecha_emision::date)::float8) AS dias_cobro
+            SELECT ({cp_key_inv})                                                       AS cp_rfc,
+                   AVG((inv.ultimo_pago_fecha - inv.fecha_emision::date)::float8) AS dias_cobro
             FROM all_inv inv
-            JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
-            JOIN pulso.cfdi_payments cp
-                 ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
-            WHERE inv.metodo_pago = 'PPD' AND cp.fecha_pago IS NOT NULL
+            WHERE inv.metodo_pago = 'PPD' AND inv.ultimo_pago_fecha IS NOT NULL
             GROUP BY ({cp_key_inv})
         ),
         risk_by_cp AS (
             SELECT ({cp_key_inv}) AS cp_rfc,
-                   COUNT(DISTINCT CASE WHEN (inv.inv_total - COALESCE(ppi.paid,0)) > 1.0
-                       THEN inv.uuid END) AS facturas_abiertas,
+                   COUNT(DISTINCT CASE WHEN inv.saldo_mxn > 1.0 THEN inv.uuid END) AS facturas_abiertas,
                    COALESCE(SUM(CASE
-                       WHEN (inv.inv_total - COALESCE(ppi.paid,0)) > 1000.0
-                        AND inv.fecha_emision::date < CURRENT_DATE - INTERVAL '180 days'
-                        AND (inv.inv_total - COALESCE(ppi.paid,0)) / NULLIF(inv.inv_total, 0) >= 0.03
-                       THEN (inv.inv_total - COALESCE(ppi.paid,0))
+                       WHEN inv.saldo_mxn > 1000.0
+                        AND inv.dias_antiguedad > 180
+                        AND inv.saldo_mxn / NULLIF(inv.inv_total, 0) >= 0.03
+                       THEN inv.saldo_mxn
                    END)::float8, 0) AS monto_riesgo
             FROM all_inv inv
-            LEFT JOIN paid_per_inv ppi ON ppi.invoice_uuid = inv.uuid
             WHERE inv.metodo_pago = 'PPD'
             GROUP BY ({cp_key_inv})
         )
@@ -1120,29 +1127,22 @@ pub async fn get_individual(
         })
         .collect();
 
-    // Cobranza for this specific counterparty — full universe (no date filter)
+    // Cobranza for this specific counterparty — full universe (no date filter).
+    // L2-01/L2-03: shared base instead of re-deriving pagado/saldo.
     let cobranza_row = sqlx::query(&format!(
         r#"
-        WITH paid_per_inv AS (
-            SELECT invoice_uuid, SUM(imp_pagado)::float8 AS paid
-            FROM pulso.cfdi_payment_docs
-            GROUP BY invoice_uuid
-        ),
-        ppd_detail AS (
-            SELECT inv.uuid,
-                   COALESCE(inv.total_mxn, 0)::float8 AS inv_total,
-                   COALESCE(ppi.paid, 0)               AS paid_raw
-            FROM pulso.cfdis inv
-            LEFT JOIN paid_per_inv ppi ON ppi.invoice_uuid = inv.uuid
-            WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
-              AND inv.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_inv} = $3)
-              AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
-              AND NOT inv.is_cancelled
+        WITH ppd_detail AS (
+            SELECT b.uuid, b.total_mxn AS inv_total, b.saldo_mxn
+            FROM pulso.cfdi_cobro_estado b
+            JOIN pulso.cfdis inv ON inv.uuid = b.uuid
+            WHERE b.{owner_col} = $1 AND b.{dl_filter}
+              AND b.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_inv} = $3)
+              AND b.metodo_pago = 'PPD'
         )
         SELECT
-            SUM(inv_total)::float8                         AS facturado,
-            SUM(LEAST(paid_raw, inv_total))::float8        AS cobrado,
-            SUM(GREATEST(inv_total - paid_raw, 0))::float8 AS saldo
+            SUM(inv_total)::float8            AS facturado,
+            SUM(inv_total - saldo_mxn)::float8 AS cobrado,
+            SUM(saldo_mxn)::float8             AS saldo
         FROM ppd_detail
         "#
     ))
@@ -1159,15 +1159,13 @@ pub async fn get_individual(
 
     let dias_row = sqlx::query(&format!(
         r#"
-        SELECT AVG((cp.fecha_pago::date - inv.fecha_emision::date)::float8) AS dias
-        FROM pulso.cfdis inv
-        JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
-        JOIN pulso.cfdi_payments cp ON cp.payment_uuid = pd.payment_uuid AND cp.pago_num = pd.pago_num
-        WHERE inv.{owner_col} = $1 AND inv.{dl_filter}
-          AND inv.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_inv} = $3)
-          AND inv.tipo_comprobante = 'I' AND inv.metodo_pago = 'PPD'
-          AND NOT inv.is_cancelled
-          AND cp.fecha_pago IS NOT NULL
+        SELECT AVG((b.ultimo_pago_fecha - b.fecha_emision::date)::float8) AS dias
+        FROM pulso.cfdi_cobro_estado b
+        JOIN pulso.cfdis inv ON inv.uuid = b.uuid
+        WHERE b.{owner_col} = $1 AND b.{dl_filter}
+          AND b.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_inv} = $3)
+          AND b.metodo_pago = 'PPD'
+          AND b.ultimo_pago_fecha IS NOT NULL
         "#
     ))
     .bind(owner_rfc)

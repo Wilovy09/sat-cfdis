@@ -75,11 +75,13 @@ pub async fn get(
     .fetch_all(pool)
     .await?;
 
-    // Monthly payments received/made via complemento P
+    // Monthly payments received/made via complemento P. L2-09: p.monto is in the
+    // complement's own currency (moneda_p) — convert with tipo_cambio_p, same defect
+    // family as COB-1 but one level up (the complement total, not a per-invoice document).
     let pago_rows = sqlx::query(&format!(
         r#"
         SELECT c.year, c.month,
-               SUM(COALESCE(p.monto, 0)::float8) AS total_pagos
+               SUM(COALESCE(p.monto, 0)::float8 * COALESCE(NULLIF(p.tipo_cambio_p::float8, 0), 1)) AS total_pagos
         FROM pulso.cfdi_payments p
         JOIN pulso.cfdis c ON c.uuid = p.payment_uuid
         WHERE c.{owner_col} = $1
@@ -164,19 +166,17 @@ pub async fn get(
         }
     }
 
-    // PPD paid (from payment docs)
+    // PPD paid — L2-01/L2-09: shared base (correct currency conversion, cancelled
+    // complements and '01'/'03' credit notes already resolved there).
     let ppd_paid_row = sqlx::query(&format!(
         r#"
-        SELECT COALESCE(SUM(pd.imp_pagado)::float8, 0) AS paid
-        FROM pulso.cfdi_payment_docs pd
-        JOIN pulso.cfdis inv ON inv.uuid = pd.invoice_uuid
-        WHERE inv.{owner_col} = $1
-          AND inv.{dl_filter}
-          AND inv.tipo_comprobante = 'I'
-          AND inv.metodo_pago = 'PPD'
-          AND NOT inv.is_cancelled
-          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
+        SELECT COALESCE(SUM(c.total_mxn - c.saldo_mxn), 0)::float8 AS paid
+        FROM pulso.cfdi_cobro_estado c
+        WHERE c.{owner_col} = $1
+          AND c.{dl_filter}
+          AND c.metodo_pago = 'PPD'
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
         "#
     ))
     .bind(rfc)
@@ -187,6 +187,31 @@ pub async fn get(
     .fetch_one(pool)
     .await?;
     let ppd_paid: f64 = ppd_paid_row.try_get("paid").unwrap_or(0.0);
+
+    // PPD outstanding — full universe, as_of_cutoff-bounded like payments.rs (AUD-009),
+    // so cashflow's cartera figure matches the Cobranza tab's exactly (L2-09 control).
+    let direccion = if dl_type == "recibidos" { "recibidos" } else { "emitidos" };
+    let ppd_outstanding_row = sqlx::query(&format!(
+        r#"
+        WITH cutoff AS (
+            SELECT COALESCE(
+                (SELECT as_of_ym FROM pulso.rfc_as_of_cutoff WHERE owner_rfc = $1 AND direccion = $2),
+                999912
+            ) AS as_of_ym
+        )
+        SELECT COALESCE(SUM(c.saldo_mxn), 0)::float8 AS outstanding
+        FROM pulso.cfdi_cobro_estado c, cutoff
+        WHERE c.{owner_col} = $1
+          AND c.{dl_filter}
+          AND c.metodo_pago = 'PPD'
+          AND (c.year * 100 + c.month) <= cutoff.as_of_ym
+        "#
+    ))
+    .bind(rfc)
+    .bind(direccion)
+    .fetch_one(pool)
+    .await?;
+    let ppd_outstanding: f64 = ppd_outstanding_row.try_get("outstanding").unwrap_or(0.0);
 
     // Average collection days: AVG(fecha_pago - fecha_emision) for PPD invoices with payments
     let avg_days_row = sqlx::query(&format!(
@@ -259,7 +284,8 @@ pub async fn get(
     // Payment method breakdown from complementos
     let pm_rows = sqlx::query(&format!(
         r#"
-        SELECT p.forma_pago, COUNT(*) AS cnt, SUM(COALESCE(p.monto,0)::float8) AS total
+        SELECT p.forma_pago, COUNT(*) AS cnt,
+               SUM(COALESCE(p.monto,0)::float8 * COALESCE(NULLIF(p.tipo_cambio_p::float8, 0), 1)) AS total
         FROM pulso.cfdi_payments p
         JOIN pulso.cfdis c ON c.uuid = p.payment_uuid
         WHERE c.{owner_col} = $1
@@ -298,7 +324,7 @@ pub async fn get(
         pue_total_mxn: pue_total,
         ppd_invoiced_mxn: ppd_inv,
         ppd_paid_mxn: ppd_paid,
-        ppd_outstanding_mxn: (ppd_inv - ppd_paid).max(0.0),
+        ppd_outstanding_mxn: ppd_outstanding,
         payment_method_breakdown,
     })
 }

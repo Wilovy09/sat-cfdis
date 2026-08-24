@@ -1012,7 +1012,12 @@ pub async fn get(
         })
         .collect();
 
-    // By employee year
+    // By employee year — AUD-003.1: same six keys as PERCEPCIONES_EVENTUALES, via the constant.
+    let percepciones_eventuales_sql = PERCEPCIONES_EVENTUALES
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(",");
     let emp_year_rows = sqlx::query(&format!(
         r#"
         SELECT c.rfc_receptor AS rfc,
@@ -1024,7 +1029,7 @@ pub async fn get(
                  FILTER (WHERE p.tipo_percepcion = '001')                    AS sueldo_base,
                SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8)
                  FILTER (WHERE p.tipo_percepcion NOT IN
-                         ('002','003','021','022','023','025'))              AS compensacion_ordinaria,
+                         ({percepciones_eventuales_sql}))                    AS compensacion_ordinaria,
                COUNT(DISTINCT c.month) AS months_active,
                AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi
         FROM pulso.cfdi_nomina_percepciones p

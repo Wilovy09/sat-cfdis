@@ -732,35 +732,14 @@ async fn compute_h6(
         return Ok(None);
     }
 
-    // Outstanding = sum of PPD invoices - payments received - credit notes
+    // Outstanding = base saldo for PPD invoices (L2-04: shared with payments.rs/counterparties.rs).
     let outstanding_row = sqlx::query(
         r#"
-        SELECT COALESCE(SUM(GREATEST(
-            COALESCE(inv.total_mxn, 0)::float8
-            - COALESCE((
-                SELECT SUM(pd.imp_pagado)
-                FROM pulso.cfdi_payment_docs pd
-                JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
-                WHERE pd.invoice_uuid = inv.uuid
-                  AND NOT comp.is_cancelled
-            ), 0)
-            - COALESCE((
-                SELECT SUM(cr_inv.total_mxn)
-                FROM pulso.cfdi_relacionados cr
-                JOIN pulso.cfdis cr_inv ON cr_inv.uuid = cr.source_uuid
-                WHERE cr.related_uuid = inv.uuid
-                  AND cr.tipo_relacion = '01'
-                  AND cr_inv.tipo_comprobante = 'E'
-                  AND NOT cr_inv.is_cancelled
-            ), 0),
-            0
-        )), 0)::float8 AS outstanding
-        FROM pulso.cfdis inv
-        WHERE inv.rfc_emisor = $1
-          AND inv.dl_type IN ('emitidos','ambos')
-          AND inv.tipo_comprobante = 'I'
-          AND inv.metodo_pago = 'PPD'
-          AND NOT inv.is_cancelled
+        SELECT COALESCE(SUM(c.saldo_mxn), 0)::float8 AS outstanding
+        FROM pulso.cfdi_cobro_estado c
+        WHERE c.rfc_emisor = $1
+          AND c.dl_type IN ('emitidos','ambos')
+          AND c.metodo_pago = 'PPD'
         "#,
     )
     .bind(rfc)
@@ -832,32 +811,11 @@ async fn compute_h7(
 
     let outstanding_row = sqlx::query(
         r#"
-        SELECT COALESCE(SUM(GREATEST(
-            COALESCE(inv.total_mxn, 0)::float8
-            - COALESCE((
-                SELECT SUM(pd.imp_pagado)
-                FROM pulso.cfdi_payment_docs pd
-                JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
-                WHERE pd.invoice_uuid = inv.uuid
-                  AND NOT comp.is_cancelled
-            ), 0)
-            - COALESCE((
-                SELECT SUM(cr_inv.total_mxn)
-                FROM pulso.cfdi_relacionados cr
-                JOIN pulso.cfdis cr_inv ON cr_inv.uuid = cr.source_uuid
-                WHERE cr.related_uuid = inv.uuid
-                  AND cr.tipo_relacion = '01'
-                  AND cr_inv.tipo_comprobante = 'E'
-                  AND NOT cr_inv.is_cancelled
-            ), 0),
-            0
-        )), 0)::float8 AS outstanding
-        FROM pulso.cfdis inv
-        WHERE inv.rfc_receptor = $1
-          AND inv.dl_type IN ('recibidos','ambos')
-          AND inv.tipo_comprobante = 'I'
-          AND inv.metodo_pago = 'PPD'
-          AND NOT inv.is_cancelled
+        SELECT COALESCE(SUM(c.saldo_mxn), 0)::float8 AS outstanding
+        FROM pulso.cfdi_cobro_estado c
+        WHERE c.rfc_receptor = $1
+          AND c.dl_type IN ('recibidos','ambos')
+          AND c.metodo_pago = 'PPD'
         "#,
     )
     .bind(rfc)
@@ -1123,18 +1081,54 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
 
     // H3 — Evolución del flujo visible
     if complete_years.len() >= 2 {
-        // Recibidos per year
-        let rec_rows = sqlx::query(
+        // R-34: H3 aligned to the "Neto facturado" dashboard measures — con IVA (already
+        // was), nómina neta de caja instead of gross percepciones, and normalization
+        // exclusions applied to all three legs (none of the three had them before).
+        let excl_join = r#"
+            LEFT JOIN pulso.normalization_rules exc
+                ON (exc.cfdi_uuid IS NOT NULL AND UPPER(exc.cfdi_uuid) = UPPER(c.uuid))
+                OR (exc.cfdi_uuid IS NULL AND (
+                    (exc.dl_type IN ('emitidos','ambos') AND exc.source_rfc = c.rfc_receptor)
+                    OR (exc.dl_type IN ('recibidos','ambos') AND exc.source_rfc = c.rfc_emisor)
+                ))
+                AND exc.owner_rfc = $1 AND exc.action = 'exclude'
+        "#;
+
+        let ing_rows = sqlx::query(&format!(
             r#"
-            SELECT year, SUM(COALESCE(total_mxn,0))::float8 AS egreso
-            FROM pulso.cfdis
-            WHERE rfc_receptor = $1
-              AND dl_type IN ('recibidos','ambos')
-              AND tipo_comprobante = 'I'
-              AND NOT is_cancelled
-            GROUP BY year
-            "#,
-        )
+            SELECT c.year, SUM(COALESCE(c.total_mxn,0))::float8 AS ingreso
+            FROM pulso.cfdis c
+            {excl_join}
+            WHERE c.rfc_emisor = $1
+              AND c.dl_type IN ('emitidos','ambos')
+              AND c.tipo_comprobante = 'I'
+              AND NOT c.is_cancelled
+              AND exc.cfdi_uuid IS NULL AND exc.source_rfc IS NULL
+            GROUP BY c.year
+            "#
+        ))
+        .bind(rfc)
+        .fetch_all(pool)
+        .await?;
+        let ing_h3_map: std::collections::HashMap<i64, f64> = ing_rows
+            .iter()
+            .map(|r| (r.try_get::<i64, _>("year").unwrap_or(0), r.try_get::<f64, _>("ingreso").unwrap_or(0.0)))
+            .collect();
+
+        // Recibidos per year (con IVA, ya lo era)
+        let rec_rows = sqlx::query(&format!(
+            r#"
+            SELECT c.year, SUM(COALESCE(c.total_mxn,0))::float8 AS egreso
+            FROM pulso.cfdis c
+            {excl_join}
+            WHERE c.rfc_receptor = $1
+              AND c.dl_type IN ('recibidos','ambos')
+              AND c.tipo_comprobante = 'I'
+              AND NOT c.is_cancelled
+              AND exc.cfdi_uuid IS NULL AND exc.source_rfc IS NULL
+            GROUP BY c.year
+            "#
+        ))
         .bind(rfc)
         .fetch_all(pool)
         .await?;
@@ -1149,26 +1143,36 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             })
             .collect();
 
-        // Nomina ordinary per year, excluding eventual percepciones (DEC-020, AUD-003)
-        let percepciones_eventuales_sql = super::payroll::PERCEPCIONES_EVENTUALES
-            .iter()
-            .map(|k| format!("'{k}'"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let nom_rows = sqlx::query(&format!(
+        // Nómina neta de caja (percepciones + otros_pagos - deducciones, NOM-7), todo
+        // tipo_nomina -- matches payroll.by_month.total_pagado, which is what the
+        // dashboard's "Neto facturado" nómina leg reads. No longer excludes eventual
+        // percepciones: that exclusion is a run-rate concept (DEC-020), not a cash one.
+        let nom_rows = sqlx::query(
             r#"
-            SELECT c.year, SUM(COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 AS nomina
-            FROM pulso.cfdi_nomina_percepciones p
-            JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
+            SELECT c.year,
+                   SUM(COALESCE(n.total_percepciones,0)::float8
+                       + COALESCE(n.total_otros_pagos,0)::float8
+                       - COALESCE(n.total_deducciones,0)::float8) AS nomina
+            FROM pulso.cfdi_nomina n
             JOIN pulso.cfdis c ON c.uuid = n.uuid
             WHERE c.rfc_emisor = $1
               AND c.tipo_comprobante = 'N'
               AND NOT c.is_cancelled
-              AND n.tipo_nomina = 'O'
-              AND p.tipo_percepcion NOT IN ({percepciones_eventuales_sql})
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.payroll_normalization_rules pnr
+                  WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
+                    AND pnr.employee_rfc = c.rfc_receptor
+                    AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
+                    AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.normalization_rules nr
+                  WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
+                    AND nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(c.uuid)
+              )
             GROUP BY c.year
             "#,
-        ))
+        )
         .bind(rfc)
         .fetch_all(pool)
         .await?;
@@ -1191,15 +1195,16 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         let year_margins: Vec<YearMargin> = complete_years
             .iter()
             .filter_map(|yd| {
-                if yd.ingreso <= 0.0 {
+                let ingreso = *ing_h3_map.get(&yd.year).unwrap_or(&0.0);
+                if ingreso <= 0.0 {
                     return None;
                 }
                 let egreso = *rec_map.get(&yd.year).unwrap_or(&0.0);
                 let nomina = *nom_map.get(&yd.year).unwrap_or(&0.0);
-                let flujo = yd.ingreso - egreso - nomina;
+                let flujo = ingreso - egreso - nomina;
                 Some(YearMargin {
                     year: yd.year,
-                    margin_pct: flujo / yd.ingreso * 100.0,
+                    margin_pct: flujo / ingreso * 100.0,
                 })
             })
             .collect();
