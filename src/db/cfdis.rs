@@ -181,6 +181,9 @@ pub async fn insert_concepts(
 
 pub async fn insert_payments(
     pool: &PgPool,
+    job_id: &str,
+    rfc_emisor: &str,
+    rfc_receptor: &str,
     payment_uuid: &str,
     payments: &[ParsedPayment],
 ) -> Result<(), sqlx::Error> {
@@ -198,18 +201,33 @@ pub async fn insert_payments(
 
     for (i, p) in payments.iter().enumerate() {
         let idx = i as i64;
-        // TC-3: a payment in foreign currency with tipo_cambio_p missing or
-        // exactly 1 is being valued 1:1 against MXN — same shape of bug
-        // already fixed for invoices (cfdis.tipo_cambio). Too rare (5 cases
-        // platform-wide) to justify rejecting the row outright without first
-        // knowing whether the XML itself omits TipoCambioP or the parser
-        // dropped it, so this only makes it visible instead of silent.
+        // TC-3/DEC-029: a payment in foreign currency with tipo_cambio_p missing or
+        // exactly 1 doesn't necessarily mean the payment is mispriced -- the related
+        // documents decide that (see pulso.cfdi_cobro_estado, migration 055). What must
+        // not happen is for this combination to pass through unrecorded: it's logged to
+        // pulso.data_quality_flags (no UI surface, DEC-022 defers that) so ingestion
+        // leaves a durable trail even though the row is stored as-is either way.
         if let Some(moneda) = &p.moneda_p {
             if moneda != "MXN" && p.tipo_cambio_p.unwrap_or(1.0) == 1.0 {
                 tracing::warn!(
                     payment_uuid = %payment_uuid, pago_num = idx, moneda_p = %moneda,
                     "TC-3: pago en divisa distinta de MXN con tipo_cambio_p ausente o en 1 — se guarda igual, revisar el XML"
                 );
+                if let Err(e) = sqlx::query(
+                    r#"INSERT INTO pulso.data_quality_flags
+                        (job_id, flag_type, payment_uuid, rfc_emisor, rfc_receptor, moneda)
+                       VALUES ($1, 'tc3_moneda_tipo_cambio_1', $2, $3, $4, $5)"#,
+                )
+                .bind(job_id)
+                .bind(payment_uuid)
+                .bind(rfc_emisor)
+                .bind(rfc_receptor)
+                .bind(moneda)
+                .execute(pool)
+                .await
+                {
+                    tracing::warn!(payment_uuid = %payment_uuid, "TC-3: failed to write data_quality_flags row: {e}");
+                }
             }
         }
         payment_uuids.push(payment_uuid);

@@ -65,6 +65,9 @@ pub async fn get(
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT is_cancelled
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+          )
         GROUP BY 1, 2
         ORDER BY total DESC
         "#

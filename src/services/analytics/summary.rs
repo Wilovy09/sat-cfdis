@@ -66,11 +66,6 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
     // Monthly breakdown
     let rows = sqlx::query(
         &format!(r#"
-        WITH excluded AS (
-            SELECT cfdi_uuid, source_rfc, dl_type
-            FROM pulso.normalization_rules
-            WHERE owner_rfc = $1 AND action = 'exclude'
-        )
         SELECT year, month,
                SUM(CASE WHEN tipo_comprobante = 'I' THEN COALESCE(total_neto_mxn_ajustado,0) ELSE 0 END)::float8  AS ingreso,
                SUM(CASE WHEN tipo_comprobante = 'E' THEN -COALESCE(total_neto_mxn_ajustado,0) ELSE 0 END)::float8 AS egreso,
@@ -79,19 +74,16 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
                SUM(COALESCE(total_neto_mxn_ajustado,0))::float8 AS total,
                COUNT(*)                                  AS cnt
         FROM pulso.cfdis_ajustado c
-        LEFT JOIN excluded exc
-            ON (exc.cfdi_uuid IS NOT NULL AND UPPER(exc.cfdi_uuid) = UPPER(c.uuid))
-            OR (exc.cfdi_uuid IS NULL AND (
-                (exc.dl_type IN ('emitidos','ambos') AND exc.source_rfc = c.rfc_receptor)
-                OR (exc.dl_type IN ('recibidos','ambos') AND exc.source_rfc = c.rfc_emisor)
-            ))
         WHERE c.{rfc_col} = $1
           AND c.{dl_filter}
           AND c.tipo_comprobante NOT IN ('P','N','T')
           AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND exc.cfdi_uuid IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex
+              WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         GROUP BY year, month
         ORDER BY year, month
         "#),

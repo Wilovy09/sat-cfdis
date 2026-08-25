@@ -147,6 +147,9 @@ pub async fn get(
             FROM pulso.cfdis_ajustado
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              )
             GROUP BY ({cp_key_expr})
         ),
         wt AS (SELECT GREATEST(SUM(total_mxn), 1) AS total FROM cp_months)
@@ -193,6 +196,9 @@ pub async fn get(
             FROM pulso.cfdis_ajustado
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              )
             GROUP BY year, ({cp_key_expr})
         ),
         year_totals AS (
@@ -238,6 +244,9 @@ pub async fn get(
             FROM pulso.cfdis_ajustado
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              )
             GROUP BY ({cp_key_expr})
             HAVING COUNT(DISTINCT year * 100 + month) >= $4
         ),
@@ -246,6 +255,9 @@ pub async fn get(
             FROM pulso.cfdis_ajustado
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              )
         )
         SELECT rfc, nombre, months_active, total_mxn,
                total_mxn / (SELECT total FROM wt) * 100     AS pct_of_total,

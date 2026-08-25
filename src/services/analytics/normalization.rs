@@ -1,6 +1,6 @@
 /// Normalization rules CRUD: counterparty grouping/exclusion and payroll adjustments.
 use crate::db::DbPool;
-use crate::services::analytics::summary::rfc_column;
+use crate::services::analytics::summary::{cp_key_expr, cp_nombre_expr, rfc_column};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use utoipa::ToSchema;
@@ -128,6 +128,10 @@ pub struct ExcludedCfdi {
     pub fecha_emision: Option<String>,
     pub total_mxn: f64,
     pub period: String,
+    // L3-14: the rules-list keeps showing a rule on a cancelled comprobante (it must stay
+    // visible/deletable), but the frontend needs this to mark it as cancelled rather than
+    // implying it's still live.
+    pub is_cancelled: bool,
 }
 
 pub async fn list_rules(pool: &DbPool, owner_rfc: &str) -> anyhow::Result<Vec<NormalizationRule>> {
@@ -352,46 +356,39 @@ pub async fn list_excluded_cfdis(
     pool: &DbPool,
     owner_rfc: &str,
 ) -> anyhow::Result<Vec<ExcludedCfdi>> {
+    // L3-01: both the counterparty-rule and cfdi_uuid-rule branches now come from the
+    // shared exclusion base (which also carries L3-02's generic-RFC name-key match), then
+    // join back to normalization_rules for the metadata this listing needs.
     let counterparty_rows = sqlx::query(
-        r#"SELECT nr.id AS rule_id, 'counterparty' AS rule_type, nr.rule_name, nr.label,
+        r#"SELECT nr.id AS rule_id,
+                  CASE WHEN nr.cfdi_uuid IS NOT NULL THEN 'cfdi' ELSE 'counterparty' END AS rule_type,
+                  nr.rule_name, nr.label,
                   c.uuid, c.rfc_emisor, c.rfc_receptor, c.nombre_emisor, c.nombre_receptor,
                   c.tipo_comprobante, c.fecha_emision, COALESCE(c.total_mxn, 0)::float8 AS total_mxn,
-                  c.year::text || '-' || LPAD(c.month::text, 2, '0') AS period
-           FROM pulso.normalization_rules nr
-           JOIN pulso.cfdis c ON (
-               (nr.dl_type IN ('emitidos','ambos') AND nr.source_rfc = c.rfc_receptor AND c.rfc_emisor = nr.owner_rfc)
-               OR (nr.dl_type IN ('recibidos','ambos') AND nr.source_rfc = c.rfc_emisor AND c.rfc_receptor = nr.owner_rfc)
-           )
-           WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'"#,
+                  c.year::text || '-' || LPAD(c.month::text, 2, '0') AS period,
+                  c.is_cancelled
+           FROM pulso.cfdi_exclusion ex
+           JOIN pulso.normalization_rules nr ON nr.id = ex.rule_id
+           JOIN pulso.cfdis c ON c.uuid = ex.uuid
+           WHERE ex.owner_rfc = $1"#,
     )
     .bind(owner_rfc)
     .fetch_all(pool)
     .await?;
 
+    // L3-16: which receipts a payroll rule excluded now comes straight from the shared
+    // base's employee_rule_id (populated by the same excl_emp match the base already
+    // computes for is_excluded), instead of re-deriving the owner/employee/period match here.
     let payroll_rows = sqlx::query(
         r#"SELECT pnr.id AS rule_id, 'payroll' AS rule_type, pnr.rule_name, pnr.label,
-                  c.uuid, c.rfc_emisor, c.rfc_receptor, c.nombre_emisor, c.nombre_receptor,
-                  c.tipo_comprobante, c.fecha_emision, COALESCE(c.total_mxn, 0)::float8 AS total_mxn,
-                  c.year::text || '-' || LPAD(c.month::text, 2, '0') AS period
-           FROM pulso.payroll_normalization_rules pnr
-           JOIN pulso.cfdis c ON c.rfc_emisor = pnr.owner_rfc AND c.rfc_receptor = pnr.employee_rfc
-               AND c.tipo_comprobante = 'N'
-               AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-               AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-           WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'"#,
-    )
-    .bind(owner_rfc)
-    .fetch_all(pool)
-    .await?;
-
-    let cfdi_uuid_rows = sqlx::query(
-        r#"SELECT nr.id AS rule_id, 'cfdi' AS rule_type, nr.rule_name, nr.label,
-                  c.uuid, c.rfc_emisor, c.rfc_receptor, c.nombre_emisor, c.nombre_receptor,
-                  c.tipo_comprobante, c.fecha_emision, COALESCE(c.total_mxn, 0)::float8 AS total_mxn,
-                  c.year::text || '-' || LPAD(c.month::text, 2, '0') AS period
-           FROM pulso.normalization_rules nr
-           JOIN pulso.cfdis c ON UPPER(c.uuid) = UPPER(nr.cfdi_uuid)
-           WHERE nr.owner_rfc = $1 AND nr.action = 'exclude' AND nr.cfdi_uuid IS NOT NULL"#,
+                  n.uuid, n.rfc_emisor, n.rfc_receptor, n.nombre_emisor, n.nombre_receptor,
+                  'N' AS tipo_comprobante, n.fecha_emision, n.total_percepciones AS total_mxn,
+                  n.year::text || '-' || LPAD(n.month::text, 2, '0') AS period,
+                  -- pulso.nomina_normalizada already filters out cancelled receipts.
+                  false AS is_cancelled
+           FROM pulso.nomina_normalizada n
+           JOIN pulso.payroll_normalization_rules pnr ON pnr.id = n.employee_rule_id
+           WHERE n.rfc_emisor = $1"#,
     )
     .bind(owner_rfc)
     .fetch_all(pool)
@@ -402,7 +399,6 @@ pub async fn list_excluded_cfdis(
         .map(map_excluded_cfdi_row)
         .collect();
     results.extend(payroll_rows.iter().map(map_excluded_cfdi_row));
-    results.extend(cfdi_uuid_rows.iter().map(map_excluded_cfdi_row));
 
     // A single CFDI can match multiple query paths (e.g. both a counterparty rule
     // and a cfdi_uuid rule). Deduplicate by (uuid, rule_id) to avoid phantom rows.
@@ -431,81 +427,6 @@ pub struct NormCfdiRow {
     pub label: Option<String>,
 }
 
-pub async fn list_cfdis_for_normalization(
-    pool: &DbPool,
-    owner_rfc: &str,
-    dl_type: &str,
-    from_y: i64,
-    from_m: i64,
-    to_y: i64,
-    to_m: i64,
-    limit: i64,
-) -> anyhow::Result<Vec<NormCfdiRow>> {
-    let is_nomina = dl_type == "nomina";
-    let rfc_col = if is_nomina { "rfc_emisor" } else { rfc_column(dl_type) };
-    let dl_filter = match dl_type {
-        "recibidos" => "c.dl_type IN ('recibidos', 'ambos')",
-        "ambos" | "nomina" => "1=1",
-        _ => "c.dl_type IN ('emitidos', 'ambos')",
-    };
-    let tipo_filter = if is_nomina {
-        "c.tipo_comprobante = 'N'"
-    } else {
-        "c.tipo_comprobante NOT IN ('P','N')"
-    };
-
-    let sql = format!(
-        r#"SELECT c.uuid,
-               CASE WHEN c.rfc_emisor = $1 THEN c.rfc_receptor ELSE c.rfc_emisor END AS rfc_contraparte,
-               CASE WHEN c.rfc_emisor = $1 THEN COALESCE(c.nombre_receptor,'') ELSE COALESCE(c.nombre_emisor,'') END AS nombre_contraparte,
-               c.tipo_comprobante,
-               COALESCE(c.fecha_emision::text, '') AS fecha_emision,
-               COALESCE(c.total_mxn, 0)::float8 AS total_mxn,
-               c.year::text || '-' || LPAD(c.month::text, 2, '0') AS period,
-               COALESCE((SELECT cc.descripcion FROM pulso.cfdi_concepts cc WHERE cc.uuid = c.uuid LIMIT 1), '') AS concepto,
-               CASE WHEN nr.id IS NOT NULL THEN true ELSE false END AS is_excluded,
-               nr.id AS rule_id,
-               nr.label
-        FROM pulso.cfdis c
-        LEFT JOIN pulso.normalization_rules nr ON UPPER(nr.cfdi_uuid) = UPPER(c.uuid)
-            AND nr.owner_rfc = $1 AND nr.action = 'exclude'
-        WHERE c.{rfc_col} = $1
-          AND {dl_filter}
-          AND {tipo_filter}
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-        ORDER BY c.fecha_emision DESC
-        LIMIT $6"#
-    );
-
-    let rows = sqlx::query(&sql)
-        .bind(owner_rfc)
-        .bind(from_y)
-        .bind(from_m)
-        .bind(to_y)
-        .bind(to_m)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-
-    Ok(rows
-        .iter()
-        .map(|r| NormCfdiRow {
-            uuid: r.try_get("uuid").unwrap_or_default(),
-            rfc_contraparte: r.try_get("rfc_contraparte").unwrap_or_default(),
-            nombre_contraparte: r.try_get("nombre_contraparte").unwrap_or_default(),
-            tipo_comprobante: r.try_get("tipo_comprobante").unwrap_or_default(),
-            fecha_emision: r.try_get("fecha_emision").unwrap_or_default(),
-            total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
-            period: r.try_get("period").unwrap_or_default(),
-            concepto: r.try_get("concepto").unwrap_or_default(),
-            is_excluded: r.try_get::<bool, _>("is_excluded").unwrap_or(false),
-            rule_id: r.try_get("rule_id").ok(),
-            label: r.try_get("label").ok(),
-        })
-        .collect())
-}
-
 fn map_excluded_cfdi_row(r: &sqlx::postgres::PgRow) -> ExcludedCfdi {
     ExcludedCfdi {
         rule_id: r.try_get("rule_id").unwrap_or_default(),
@@ -521,6 +442,7 @@ fn map_excluded_cfdi_row(r: &sqlx::postgres::PgRow) -> ExcludedCfdi {
         fecha_emision: r.try_get("fecha_emision").ok(),
         total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
         period: r.try_get("period").unwrap_or_default(),
+        is_cancelled: r.try_get::<bool, _>("is_cancelled").unwrap_or(false),
     }
 }
 
@@ -611,11 +533,17 @@ pub async fn list_counterparties_for_normalization(
         "recibidos" => "c.dl_type IN ('recibidos', 'ambos')",
         _ => "c.dl_type IN ('emitidos', 'ambos')",
     };
+    let cp_col = if dl_type == "recibidos" { "c.rfc_emisor" } else { "c.rfc_receptor" };
+    let cp_name_col = if dl_type == "recibidos" { "c.nombre_emisor" } else { "c.nombre_receptor" };
+    // L3-02: group by the same composite RFC||NORMALIZED_NAME key counterparties.rs uses,
+    // so the 24 real companies behind a generic SAT RFC show as 24 rows here too, not one.
+    let cp_key = cp_key_expr(cp_col, cp_name_col);
+    let cp_nombre = cp_nombre_expr(cp_col, cp_name_col);
 
     let sql = format!(
         r#"SELECT
-               CASE WHEN c.rfc_emisor = $1 THEN c.rfc_receptor ELSE c.rfc_emisor END AS rfc_cp,
-               CASE WHEN c.rfc_emisor = $1 THEN COALESCE(c.nombre_receptor,'') ELSE COALESCE(c.nombre_emisor,'') END AS nombre_cp,
+               ({cp_key})    AS rfc_cp,
+               ({cp_nombre}) AS nombre_cp,
                c.year,
                SUM(COALESCE(c.total_neto_mxn_ajustado, c.total_mxn, 0))::float8 AS year_total,
                COUNT(*)::bigint AS year_count
@@ -626,8 +554,8 @@ pub async fn list_counterparties_for_normalization(
              AND NOT c.is_cancelled
              AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
              AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-           GROUP BY rfc_cp, nombre_cp, c.year
-           ORDER BY rfc_cp, c.year"#
+           GROUP BY ({cp_key}), c.year
+           ORDER BY ({cp_key}), c.year"#
     );
 
     let rows = sqlx::query(&sql)
@@ -662,13 +590,19 @@ pub async fn list_counterparties_for_normalization(
         entry.invoice_count += year_count;
     }
 
-    // Look up RFC-level exclusion rules for each counterparty
+    // Look up RFC-level exclusion rules for each counterparty, keyed the same way the
+    // map above is: bare RFC for an ordinary rule, RFC||NAME_KEY for a generic-RFC rule
+    // narrowed by L3-02 (a generic-RFC rule with no name key still matches the bare key,
+    // i.e. every counterparty behind that RFC -- same as before L3-02 existed).
     let dl_rule_filter = match dl_type {
         "recibidos" => "nr.dl_type IN ('recibidos','ambos')",
         _ => "nr.dl_type IN ('emitidos','ambos')",
     };
     let rule_sql = format!(
-        r#"SELECT nr.id, nr.source_rfc
+        r#"SELECT nr.id,
+                  CASE WHEN nr.source_name_key IS NOT NULL
+                       THEN UPPER(nr.source_rfc) || '||' || nr.source_name_key
+                       ELSE UPPER(nr.source_rfc) END AS cp_key
            FROM pulso.normalization_rules nr
            WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
              AND nr.cfdi_uuid IS NULL AND nr.source_rfc IS NOT NULL
@@ -680,9 +614,9 @@ pub async fn list_counterparties_for_normalization(
         .await?;
 
     for r in &rule_rows {
-        let source_rfc: String = r.try_get("source_rfc").unwrap_or_default();
+        let cp_key: String = r.try_get("cp_key").unwrap_or_default();
         let rule_id: String = r.try_get("id").unwrap_or_default();
-        if let Some(entry) = map.get_mut(&source_rfc.to_uppercase()) {
+        if let Some(entry) = map.get_mut(&cp_key) {
             entry.is_excluded = true;
             entry.rule_id = Some(rule_id);
         }
@@ -719,52 +653,60 @@ pub async fn list_cfdis_for_counterparty(
         "recibidos" => "c.rfc_emisor",
         _ => "c.rfc_receptor",
     };
+    let cp_name_col = match dl_type {
+        "recibidos" => "c.nombre_emisor",
+        _ => "c.nombre_receptor",
+    };
+
+    // L3-02: counterparty_rfc may be the composite "GENERIC_RFC||NORMALIZED_NAME" key
+    // list_counterparties_for_normalization now returns for a generic SAT RFC. Split it
+    // back apart so the drill-down narrows to that one real counterparty instead of every
+    // invoice sharing the generic RFC. Ordinary RFCs never contain "||", so name_filter
+    // is empty and the added predicate is a no-op.
+    let (base_rfc, name_filter): (&str, &str) =
+        counterparty_rfc.split_once("||").unwrap_or((counterparty_rfc, ""));
+    let name_filter_expr = crate::services::analytics::summary::normalized_name_expr(cp_name_col);
 
     let sql = format!(
         r#"SELECT c.uuid,
                {cp_col} AS rfc_contraparte,
-               CASE WHEN c.rfc_emisor = $1 THEN COALESCE(c.nombre_receptor,'') ELSE COALESCE(c.nombre_emisor,'') END AS nombre_contraparte,
+               COALESCE({cp_name_col}, '') AS nombre_contraparte,
                c.tipo_comprobante,
                COALESCE(c.fecha_emision::text, '') AS fecha_emision,
                COALESCE(c.total_neto_mxn_ajustado, c.total_mxn, 0)::float8 AS total_mxn,
                c.year::text || '-' || LPAD(c.month::text, 2, '0') AS period,
                COALESCE((SELECT cc.descripcion FROM pulso.cfdi_concepts cc WHERE cc.uuid = c.uuid LIMIT 1), '') AS concepto,
-               CASE WHEN nr.id IS NOT NULL THEN true
-                    WHEN rfc_nr.id IS NOT NULL THEN true
-                    ELSE false END AS is_excluded,
-               COALESCE(nr.id, rfc_nr.id) AS rule_id,
-               COALESCE(nr.label, rfc_nr.label) AS label
+               CASE WHEN ex.rule_id IS NOT NULL THEN true ELSE false END AS is_excluded,
+               ex.rule_id,
+               nr.label
            FROM pulso.cfdis_ajustado c
-           LEFT JOIN pulso.normalization_rules nr
-               ON UPPER(nr.cfdi_uuid) = UPPER(c.uuid)
-               AND nr.owner_rfc = $1 AND nr.action = 'exclude'
-           LEFT JOIN pulso.normalization_rules rfc_nr
-               ON rfc_nr.cfdi_uuid IS NULL
-               AND rfc_nr.source_rfc = $2
-               AND rfc_nr.owner_rfc = $1 AND rfc_nr.action = 'exclude'
-               AND rfc_nr.dl_type IN ({dl_filter_rfc})
+           LEFT JOIN pulso.cfdi_exclusion ex ON ex.owner_rfc = $1 AND ex.uuid = c.uuid
+           LEFT JOIN pulso.normalization_rules nr ON nr.id = ex.rule_id
            WHERE c.{rfc_col} = $1
-             AND {cp_col} = $2
+             AND {cp_col} = $2 AND ($8 = '' OR {name_filter_expr} = $8)
              AND {dl_filter}
              AND c.tipo_comprobante NOT IN ('P','N','T')
+             -- L3-14: this drill-down doubles as the picker for building a per-CFDI rule,
+             -- so a cancelled comprobante (already excluded from every total) is not
+             -- offered as something to build a new rule on. The rules-list endpoint
+             -- (list_excluded_cfdis) is untouched -- an existing rule on a cancelled
+             -- document must stay visible and deletable there.
+             AND NOT c.is_cancelled
              AND (c.year > $3 OR (c.year = $3 AND c.month >= $4))
              AND (c.year < $5 OR (c.year = $5 AND c.month <= $6))
            ORDER BY c.fecha_emision DESC
-           LIMIT $7"#,
-        dl_filter_rfc = match dl_type {
-            "recibidos" => "'recibidos','ambos'",
-            _ => "'emitidos','ambos'",
-        }
+           LIMIT $7"#
     );
 
     let rows = sqlx::query(&sql)
         .bind(owner_rfc)
-        .bind(counterparty_rfc.to_uppercase())
+        .bind(base_rfc.to_uppercase())
         .bind(from_y)
         .bind(from_m)
         .bind(to_y)
         .bind(to_m)
         .bind(limit)
+        .bind(name_filter)
         .fetch_all(pool)
         .await?;
 
@@ -881,6 +823,16 @@ pub async fn list_ebitda_bridge_adjustments(
     to_y: i64,
     to_m: i64,
 ) -> anyhow::Result<Vec<EbitdaBridgeAdjustment>> {
+    // L3-04/L3-05/L3-18: reads the shared exclusion base (owner- and action-scoped,
+    // case-insensitive UUID match, L3-02's generic-RFC name key -- this used to be a
+    // hand-rolled join with none of that, which is how it leaked Adquiere Latam's own
+    // payroll into a rule about receiving invoices from Adquiere Latam) and sums the
+    // net-of-IVA measure (total_neto_mxn_ajustado, same as the resumen) instead of con-IVA.
+    // The sign is L3-18: a comprobante on the owner's emisor side keeps its contribution
+    // to net income and the adjustment is its negative (excluding income lowers EBITDA);
+    // on the receptor side the adjustment is the raw value (excluding an expense raises
+    // EBITDA) -- resolved per comprobante, not per rule, so an 'ambos' rule signs its two
+    // sides independently.
     let rows = sqlx::query(
         r#"
         SELECT
@@ -888,18 +840,20 @@ pub async fn list_ebitda_bridge_adjustments(
             nr.dl_type, nr.capex_estimate_dep, nr.capex_asset_type,
             nr.capex_useful_life_years, nr.capex_annual_dep_mxn,
             c.year,
-            SUM(COALESCE(c.total_mxn, 0))::float8 AS year_total
-        FROM pulso.normalization_rules nr
-        JOIN pulso.cfdis c ON (
-            (nr.cfdi_uuid IS NOT NULL AND c.uuid = nr.cfdi_uuid)
-            OR (nr.source_rfc IS NOT NULL AND c.rfc_emisor = nr.source_rfc AND nr.dl_type IN ('recibidos','ambos'))
-            OR (nr.source_rfc IS NOT NULL AND c.rfc_receptor = nr.source_rfc AND nr.dl_type IN ('emitidos','ambos'))
-        )
-        WHERE nr.owner_rfc = $1
-          AND nr.accounting_line IS NOT NULL
+            SUM(
+                CASE WHEN c.rfc_emisor = nr.owner_rfc THEN -COALESCE(c.total_neto_mxn_ajustado, 0)
+                     ELSE COALESCE(c.total_neto_mxn_ajustado, 0) END
+            )::float8 AS year_total
+        FROM pulso.cfdi_exclusion ex
+        JOIN pulso.normalization_rules nr ON nr.id = ex.rule_id
+        JOIN pulso.cfdis_ajustado c ON c.uuid = ex.uuid
+        WHERE ex.owner_rfc = $1
+          -- L3-13: a rule without an accounting_line still surfaces here (grouped under
+          -- "Sin clasificar" by the frontend) instead of silently vanishing from the bridge.
+          AND c.tipo_comprobante IN ('I', 'E')
+          AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-          AND NOT c.is_cancelled
         GROUP BY nr.id, nr.rule_name, nr.accounting_line, nr.motivo, nr.impacts_ebitda,
                  nr.dl_type, nr.capex_estimate_dep, nr.capex_asset_type,
                  nr.capex_useful_life_years, nr.capex_annual_dep_mxn, c.year

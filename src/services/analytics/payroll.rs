@@ -1,21 +1,13 @@
 use super::summary::parse_ym;
 /// Payroll: employee analytics from CFDI Nómina complements.
-
-// Reusable exclusion filters for payroll queries (alias = table alias for pulso.cfdis, usually "c").
-// Checks both employee-level payroll rules and individual CFDI UUID rules.
-const NOMINA_EXCL_C: &str = "\
-          AND NOT EXISTS (\
-\n              SELECT 1 FROM pulso.payroll_normalization_rules pnr\
-\n              WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'\
-\n                AND pnr.employee_rfc = c.rfc_receptor\
-\n                AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)\
-\n                AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)\
-\n          )\
-\n          AND NOT EXISTS (\
-\n              SELECT 1 FROM pulso.normalization_rules nr\
-\n              WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'\
-\n                AND nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(c.uuid)\
-\n          )";
+///
+/// Money-computing queries here read `pulso.nomina_normalizada` (migration 054, L3-16)
+/// instead of joining `pulso.cfdi_nomina`/`pulso.cfdis` directly: it centralizes the
+/// exclusion rules (exposed as `is_excluded`, which callers must filter with
+/// `AND NOT is_excluded` — rows aren't dropped in the view because a couple of hallazgos
+/// need to see who got excluded) and the scale/adjust factor (exposed as `factor`, already
+/// baked into the view's `total_*` columns, and to be applied by hand when joining the
+/// detail child tables `cfdi_nomina_percepciones`/`_deducciones`/`_otros_pagos`).
 
 /// Percepciones eventuales — se excluyen de toda métrica de costo recurrente (DEC-020).
 /// Claves validadas contra pulso-adquiere/src/utils/nomina.ts::SAT_PERCEPCIONES.
@@ -223,21 +215,18 @@ pub async fn get(
     // Summary (all tipos, to match full payroll spend)
     let summary_row = sqlx::query(&format!(r#"
         SELECT
-            SUM(COALESCE(n.total_percepciones,0)::float8 + COALESCE(n.total_otros_pagos,0)::float8 - COALESCE(n.total_deducciones,0)::float8) AS total_pagado,
-            SUM(COALESCE(n.total_percepciones,0)::float8)                                    AS total_perc,
-            SUM(COALESCE(n.total_deducciones,0)::float8)                                     AS total_ded,
-            SUM(COALESCE(n.total_otros_pagos,0)::float8)                                     AS total_otros,
-            COUNT(DISTINCT c.rfc_receptor)                                                   AS emp_count,
-            AVG(COALESCE(n.salario_diario_integrado,0)::float8)                              AS avg_sdi,
-            COUNT(*)                                                                          AS payrolls_count
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+            SUM(n.total_percepciones + n.total_otros_pagos - n.total_deducciones) AS total_pagado,
+            SUM(n.total_percepciones)                                            AS total_perc,
+            SUM(n.total_deducciones)                                             AS total_ded,
+            SUM(n.total_otros_pagos)                                             AS total_otros,
+            COUNT(DISTINCT n.rfc_receptor)                                       AS emp_count,
+            AVG(COALESCE(n.salario_diario_integrado,0)::float8)                  AS avg_sdi,
+            COUNT(*)                                                              AS payrolls_count
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
     "#))
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
     .fetch_one(pool)
@@ -250,17 +239,14 @@ pub async fn get(
     // ISR retenido = deducciones tipo '002' (SAT clave ISR)
     let isr_row = sqlx::query(&format!(
         r#"
-        SELECT COALESCE(SUM(COALESCE(d.importe, 0)::float8), 0) AS total_isr
+        SELECT COALESCE(SUM(COALESCE(d.importe, 0)::float8 * n.factor), 0) AS total_isr
         FROM pulso.cfdi_nomina_deducciones d
-        JOIN pulso.cfdi_nomina n ON n.uuid = d.uuid
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
+        JOIN pulso.nomina_normalizada n ON n.uuid = d.uuid
+        WHERE n.rfc_emisor = $1
           AND d.tipo_deduccion = '002'
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         "#,
     ))
     .bind(rfc)
@@ -294,26 +280,23 @@ pub async fn get(
         SELECT
                EXTRACT(YEAR FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision::date
+                 n.fecha_emision::date
                ))::bigint AS year,
                EXTRACT(MONTH FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision::date
+                 n.fecha_emision::date
                ))::bigint AS month,
-               SUM(COALESCE(n.total_percepciones,0)::float8 + COALESCE(n.total_otros_pagos,0)::float8 - COALESCE(n.total_deducciones,0)::float8) AS pagado,
-               SUM(COALESCE(n.total_percepciones,0)::float8)  AS perc,
-               SUM(COALESCE(n.total_deducciones,0)::float8)   AS ded,
-               SUM(COALESCE(n.total_otros_pagos,0)::float8) AS otros,
-               COUNT(DISTINCT c.rfc_receptor)          AS emp_count,
-               COUNT(*)                               AS payrolls_count
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+               SUM(n.total_percepciones + n.total_otros_pagos - n.total_deducciones) AS pagado,
+               SUM(n.total_percepciones)               AS perc,
+               SUM(n.total_deducciones)                AS ded,
+               SUM(n.total_otros_pagos)                AS otros,
+               COUNT(DISTINCT n.rfc_receptor)           AS emp_count,
+               COUNT(*)                                AS payrolls_count
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         GROUP BY 1, 2
         ORDER BY 1, 2
     "#,
@@ -378,8 +361,8 @@ pub async fn get(
             ORDER BY c.rfc_receptor, c.fecha_emision ASC
         )
         SELECT
-            c.rfc_receptor                              AS emp_rfc,
-            MAX(c.nombre_receptor)                      AS emp_nombre,
+            n.rfc_receptor                              AS emp_rfc,
+            MAX(n.nombre_receptor)                      AS emp_nombre,
             MAX(n.num_empleado)                         AS num_emp,
             la.departamento                             AS dpto,
             la.puesto                                   AS puesto,
@@ -390,25 +373,22 @@ pub async fn get(
             la.fecha_final_pago,
             COALESCE(ea.sdi_at_first, 0)::float8        AS sdi_at_first,
             ea.fecha_inicio_rel_laboral,
-            SUM(COALESCE(n.total_percepciones,0)::float8 + COALESCE(n.total_otros_pagos,0)::float8 - COALESCE(n.total_deducciones,0)::float8) AS pagado,
-            SUM(COALESCE(n.total_percepciones,0)::float8)       AS perc,
-            SUM(COALESCE(n.total_deducciones,0)::float8)        AS ded,
+            SUM(n.total_percepciones + n.total_otros_pagos - n.total_deducciones) AS pagado,
+            SUM(n.total_percepciones)                   AS perc,
+            SUM(n.total_deducciones)                    AS ded,
             AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi,
             COUNT(*)                                    AS payrolls,
-            COUNT(DISTINCT c.year * 100 + c.month)      AS months_active,
+            COUNT(DISTINCT n.year * 100 + n.month)      AS months_active,
             MIN(n.fecha_pago)                           AS first_pay,
             MAX(n.fecha_pago)                           AS last_pay
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        JOIN latest_attrs la ON la.emp_rfc = c.rfc_receptor
-        LEFT JOIN earliest_attrs ea ON ea.emp_rfc = c.rfc_receptor
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
-        GROUP BY c.rfc_receptor, la.departamento, la.puesto, la.tipo_contrato, la.tipo_jornada, la.tipo_regimen,
+        FROM pulso.nomina_normalizada n
+        JOIN latest_attrs la ON la.emp_rfc = n.rfc_receptor
+        LEFT JOIN earliest_attrs ea ON ea.emp_rfc = n.rfc_receptor
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
+        GROUP BY n.rfc_receptor, la.departamento, la.puesto, la.tipo_contrato, la.tipo_jornada, la.tipo_regimen,
                  la.sdi_latest, la.fecha_final_pago, ea.sdi_at_first, ea.fecha_inicio_rel_laboral
         ORDER BY pagado DESC
         LIMIT 100
@@ -427,34 +407,34 @@ pub async fn get(
     let perc_3m_rows = sqlx::query(&format!(
         r#"
         SELECT
-            c.rfc_receptor                                                              AS emp_rfc,
+            n.rfc_receptor                                                              AS emp_rfc,
             SUM(CASE WHEN p.tipo_percepcion = '001'
-                     THEN COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8
+                     THEN (COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor
                      ELSE 0.0 END)                                                      AS total_001,
             SUM(CASE WHEN p.tipo_percepcion = '046'
-                     THEN COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8
+                     THEN (COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor
                      ELSE 0.0 END)                                                      AS total_046,
             SUM(COALESCE(n.num_dias_pagados,0)::float8)                                 AS total_dias,
-            COUNT(DISTINCT (c.year * 100 + c.month))                                    AS meses_con_dato,
+            COUNT(DISTINCT (n.year * 100 + n.month))                                    AS meses_con_dato,
             BOOL_OR(p.tipo_percepcion = '001')                                          AS has_001,
             BOOL_OR(p.tipo_percepcion = '046')                                          AS has_046
         FROM pulso.cfdi_nomina_percepciones p
-        JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
+        JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid
+        WHERE n.rfc_emisor = $1
           AND n.tipo_nomina = 'O'
-          AND (c.year * 100 + c.month) >= (
-              EXTRACT(YEAR FROM DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months')::int * 100 +
-              EXTRACT(MONTH FROM DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3 months')::int
+          AND NOT n.is_excluded
+          -- AUD-015/DEC-025: anchored to the last COMPLETE calendar month, not CURRENT_DATE,
+          -- so the window is reproducible across runs on different days (same idiom as
+          -- migrations 052's dias_antiguedad / rfc_as_of_cutoff).
+          AND (n.year * 100 + n.month) >= (
+              EXTRACT(YEAR FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date - interval '2 months')::int * 100 +
+              EXTRACT(MONTH FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date - interval '2 months')::int
           )
-          AND (c.year * 100 + c.month) < (
-              EXTRACT(YEAR FROM DATE_TRUNC('month', CURRENT_DATE))::int * 100 +
-              EXTRACT(MONTH FROM DATE_TRUNC('month', CURRENT_DATE))::int
+          AND (n.year * 100 + n.month) <= (
+              EXTRACT(YEAR FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date)::int * 100 +
+              EXTRACT(MONTH FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date)::int
           )
-{NOMINA_EXCL_C}
-        GROUP BY c.rfc_receptor
+        GROUP BY n.rfc_receptor
         "#,
     ))
     .bind(rfc)
@@ -601,15 +581,13 @@ pub async fn get(
     let tipo_rows = sqlx::query(&format!(
         r#"
         SELECT n.tipo_nomina,
-               SUM(COALESCE(n.total_percepciones,0)::float8) AS total,
+               SUM(n.total_percepciones) AS total,
                COUNT(*) AS cnt
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         GROUP BY n.tipo_nomina
     "#,
     ))
@@ -648,28 +626,25 @@ pub async fn get(
     let indem_rows = sqlx::query(&format!(
         r#"
         SELECT
-            c.rfc_receptor                                                               AS emp_rfc,
-            COALESCE(NULLIF(TRIM(c.nombre_receptor), ''), c.rfc_receptor)                AS nombre,
+            n.rfc_receptor                                                               AS emp_rfc,
+            COALESCE(NULLIF(TRIM(n.nombre_receptor), ''), n.rfc_receptor)                AS nombre,
             COALESCE(NULLIF(TRIM(n.puesto), ''), '')                                     AS puesto,
             EXTRACT(YEAR FROM COALESCE(
               NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-              c.fecha_emision::date
+              n.fecha_emision::date
             ))::bigint                                                                   AS year,
             EXTRACT(MONTH FROM COALESCE(
               NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-              c.fecha_emision::date
+              n.fecha_emision::date
             ))::bigint                                                                   AS month,
-            COALESCE(n.total_percepciones, 0)::float8                                   AS total_perc,
+            n.total_percepciones                                                        AS total_perc,
             COALESCE(n.tipo_regimen, '')                                                 AS tipo_regimen
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
           AND TRIM(COALESCE(n.tipo_regimen,'')) LIKE '13%'
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         ORDER BY year, month, total_perc DESC
     "#,
     ))
@@ -699,16 +674,14 @@ pub async fn get(
         r#"
         SELECT d.tipo_deduccion,
                MAX(d.concepto) AS concepto,
-               SUM(COALESCE(d.importe,0)::float8) AS total,
+               SUM(COALESCE(d.importe,0)::float8 * n.factor) AS total,
                COUNT(*) AS cnt
         FROM pulso.cfdi_nomina_deducciones d
-        JOIN pulso.cfdi_nomina n ON n.uuid = d.uuid
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+        JOIN pulso.nomina_normalizada n ON n.uuid = d.uuid
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         GROUP BY d.tipo_deduccion
         ORDER BY total DESC
     "#,
@@ -736,19 +709,17 @@ pub async fn get(
         r#"
         SELECT p.tipo_percepcion,
                MAX(p.concepto) AS concepto,
-               SUM(COALESCE(p.importe_gravado,0)::float8) AS gravado,
-               SUM(COALESCE(p.importe_exento,0)::float8)  AS exento,
+               SUM(COALESCE(p.importe_gravado,0)::float8 * n.factor) AS gravado,
+               SUM(COALESCE(p.importe_exento,0)::float8 * n.factor)  AS exento,
                COUNT(*) AS cnt
         FROM pulso.cfdi_nomina_percepciones p
-        JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+        JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         GROUP BY p.tipo_percepcion
-        ORDER BY SUM(COALESCE(p.importe_gravado,0)::float8) + SUM(COALESCE(p.importe_exento,0)::float8) DESC
+        ORDER BY SUM(COALESCE(p.importe_gravado,0)::float8 * n.factor) + SUM(COALESCE(p.importe_exento,0)::float8 * n.factor) DESC
     "#,
     ))
     .bind(rfc)
@@ -781,25 +752,22 @@ pub async fn get(
         SELECT
                EXTRACT(YEAR FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision::date
+                 n.fecha_emision::date
                ))::bigint AS year,
-               SUM(COALESCE(n.total_percepciones,0)::float8 + COALESCE(n.total_otros_pagos,0)::float8 - COALESCE(n.total_deducciones,0)::float8) AS pagado,
-               SUM(COALESCE(n.total_percepciones,0)::float8) AS perc,
-               SUM(COALESCE(n.total_deducciones,0)::float8) AS ded,
-               SUM(COALESCE(n.total_otros_pagos,0)::float8) AS otros,
-               COUNT(DISTINCT c.rfc_receptor) AS emp_count,
+               SUM(n.total_percepciones + n.total_otros_pagos - n.total_deducciones) AS pagado,
+               SUM(n.total_percepciones) AS perc,
+               SUM(n.total_deducciones) AS ded,
+               SUM(n.total_otros_pagos) AS otros,
+               COUNT(DISTINCT n.rfc_receptor) AS emp_count,
                COUNT(DISTINCT EXTRACT(MONTH FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision::date
+                 n.fecha_emision::date
                ))::int) AS months_count
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         GROUP BY 1
         ORDER BY 1
     "#,
@@ -831,27 +799,24 @@ pub async fn get(
         SELECT
                EXTRACT(YEAR FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision::date
+                 n.fecha_emision::date
                ))::bigint AS year,
                EXTRACT(MONTH FROM COALESCE(
                  NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 c.fecha_emision::date
+                 n.fecha_emision::date
                ))::bigint AS month,
-               SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
-               SUM(COALESCE(n.total_percepciones,0)::float8)  AS perc,
-               SUM(COALESCE(n.total_deducciones,0)::float8)   AS ded,
-               SUM(COALESCE(n.total_otros_pagos,0)::float8)   AS otros,
-               COUNT(DISTINCT c.rfc_receptor)                 AS emp_count,
-               COUNT(*)                                       AS payrolls_count
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
+               SUM(n.total_percepciones - n.total_deducciones) AS pagado,
+               SUM(n.total_percepciones)  AS perc,
+               SUM(n.total_deducciones)   AS ded,
+               SUM(n.total_otros_pagos)   AS otros,
+               COUNT(DISTINCT n.rfc_receptor)             AS emp_count,
+               COUNT(*)                                   AS payrolls_count
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
           AND n.tipo_nomina = 'O'
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         GROUP BY 1, 2
         ORDER BY 1, 2
     "#,
@@ -884,18 +849,16 @@ pub async fn get(
         r#"
         SELECT p.tipo_percepcion,
                MAX(p.concepto) AS concepto,
-               c.year,
-               SUM(COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) AS total
+               n.year,
+               SUM((COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor) AS total
         FROM pulso.cfdi_nomina_percepciones p
-        JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
-        GROUP BY p.tipo_percepcion, c.year
-        ORDER BY c.year, SUM(COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) DESC
+        JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
+        GROUP BY p.tipo_percepcion, n.year
+        ORDER BY n.year, SUM((COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor) DESC
     "#,
     ))
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
@@ -917,18 +880,16 @@ pub async fn get(
         r#"
         SELECT d.tipo_deduccion,
                MAX(d.concepto) AS concepto,
-               c.year,
-               SUM(COALESCE(d.importe,0)::float8) AS total
+               n.year,
+               SUM(COALESCE(d.importe,0)::float8 * n.factor) AS total
         FROM pulso.cfdi_nomina_deducciones d
-        JOIN pulso.cfdi_nomina n ON n.uuid = d.uuid
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
-        GROUP BY d.tipo_deduccion, c.year
-        ORDER BY c.year, SUM(COALESCE(d.importe,0)::float8) DESC
+        JOIN pulso.nomina_normalizada n ON n.uuid = d.uuid
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
+        GROUP BY d.tipo_deduccion, n.year
+        ORDER BY n.year, SUM(COALESCE(d.importe,0)::float8 * n.factor) DESC
     "#,
     ))
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
@@ -950,18 +911,16 @@ pub async fn get(
         r#"
         SELECT op.tipo_otro_pago,
                MAX(op.concepto) AS concepto,
-               c.year,
-               SUM(COALESCE(op.importe,0)::float8) AS total
+               n.year,
+               SUM(COALESCE(op.importe,0)::float8 * n.factor) AS total
         FROM pulso.cfdi_nomina_otros_pagos op
-        JOIN pulso.cfdi_nomina n ON n.uuid = op.uuid
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
-        GROUP BY op.tipo_otro_pago, c.year
-        ORDER BY c.year, SUM(COALESCE(op.importe,0)::float8) DESC
+        JOIN pulso.nomina_normalizada n ON n.uuid = op.uuid
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
+        GROUP BY op.tipo_otro_pago, n.year
+        ORDER BY n.year, SUM(COALESCE(op.importe,0)::float8 * n.factor) DESC
     "#,
     ))
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
@@ -982,20 +941,17 @@ pub async fn get(
     let dept_year_rows = sqlx::query(&format!(
         r#"
         SELECT COALESCE(NULLIF(TRIM(n.departamento),''), 'Sin departamento') AS departamento,
-               c.year,
-               SUM(COALESCE(n.total_percepciones,0)::float8 - COALESCE(n.total_deducciones,0)) AS pagado,
-               COUNT(DISTINCT c.rfc_receptor) AS emp_count
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
+               n.year,
+               SUM(n.total_percepciones - n.total_deducciones) AS pagado,
+               COUNT(DISTINCT n.rfc_receptor) AS emp_count
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
           AND n.tipo_nomina = 'O'
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
-        GROUP BY departamento, c.year
-        ORDER BY c.year, pagado DESC
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
+        GROUP BY departamento, n.year
+        ORDER BY n.year, pagado DESC
     "#,
     ))
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
@@ -1020,30 +976,27 @@ pub async fn get(
         .join(",");
     let emp_year_rows = sqlx::query(&format!(
         r#"
-        SELECT c.rfc_receptor AS rfc,
-               MAX(c.nombre_receptor) AS nombre,
+        SELECT n.rfc_receptor AS rfc,
+               MAX(n.nombre_receptor) AS nombre,
                MAX(n.departamento) AS dpto,
                MAX(n.puesto) AS puesto,
-               c.year,
-               SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8)
+               n.year,
+               SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * n.factor)
                  FILTER (WHERE p.tipo_percepcion = '001')                    AS sueldo_base,
-               SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8)
+               SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * n.factor)
                  FILTER (WHERE p.tipo_percepcion NOT IN
                          ({percepciones_eventuales_sql}))                    AS compensacion_ordinaria,
-               COUNT(DISTINCT c.month) AS months_active,
+               COUNT(DISTINCT n.month) AS months_active,
                AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi
         FROM pulso.cfdi_nomina_percepciones p
-        JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
+        JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid
+        WHERE n.rfc_emisor = $1
           AND n.tipo_nomina = 'O'
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
-        GROUP BY c.rfc_receptor, c.year
-        ORDER BY c.rfc_receptor, c.year
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
+        GROUP BY n.rfc_receptor, n.year
+        ORDER BY n.rfc_receptor, n.year
     "#,
     ))
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
@@ -1077,26 +1030,13 @@ pub async fn get(
         r#"
         SELECT yr AS year, mo AS month, COUNT(*) AS new_emp
         FROM (
-            SELECT rfc_receptor,
-                   (MIN(year * 100 + month) / 100)::bigint AS yr,
-                   (MIN(year * 100 + month) % 100)::bigint AS mo
-            FROM pulso.cfdi_nomina n2
-            JOIN pulso.cfdis c2 ON c2.uuid = n2.uuid
-            WHERE c2.rfc_emisor = $1
-              AND NOT c2.is_cancelled
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.payroll_normalization_rules pnr
-                  WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                    AND pnr.employee_rfc = c2.rfc_receptor
-                    AND (pnr.period_start IS NULL OR (c2.year::text || '-' || LPAD(c2.month::text,2,'0')) >= pnr.period_start)
-                    AND (pnr.period_end IS NULL OR (c2.year::text || '-' || LPAD(c2.month::text,2,'0')) <= pnr.period_end)
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.normalization_rules nr
-                  WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
-                    AND nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(c2.uuid)
-              )
-            GROUP BY rfc_receptor
+            SELECT n2.rfc_receptor,
+                   (MIN(n2.year * 100 + n2.month) / 100)::bigint AS yr,
+                   (MIN(n2.year * 100 + n2.month) % 100)::bigint AS mo
+            FROM pulso.nomina_normalizada n2
+            WHERE n2.rfc_emisor = $1
+              AND NOT n2.is_excluded
+            GROUP BY n2.rfc_receptor
         ) sub
         WHERE (yr > $2 OR (yr = $2 AND mo >= $3))
           AND (yr < $4 OR (yr = $4 AND mo <= $5))
@@ -1124,15 +1064,13 @@ pub async fn get(
     // All (year, month, rfc_receptor) in range — used to compute departures
     let emp_month_rows = sqlx::query(&format!(
         r#"
-        SELECT DISTINCT c.year, c.month, c.rfc_receptor
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
-        ORDER BY c.year, c.month
+        SELECT DISTINCT n.year, n.month, n.rfc_receptor
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
+        ORDER BY n.year, n.month
         "#,
     ))
     .bind(rfc)
@@ -1156,16 +1094,14 @@ pub async fn get(
     // Headcount by month (distinct employees per month)
     let hc_rows = sqlx::query(&format!(
         r#"
-        SELECT c.year, c.month, COUNT(DISTINCT c.rfc_receptor) AS hc
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
-        GROUP BY c.year, c.month
-        ORDER BY c.year, c.month
+        SELECT n.year, n.month, COUNT(DISTINCT n.rfc_receptor) AS hc
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
+        GROUP BY n.year, n.month
+        ORDER BY n.year, n.month
     "#,
     ))
     .bind(rfc)
@@ -1290,13 +1226,10 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     // Most recent period with payroll data
     let period_row = sqlx::query(&format!(
         r#"
-        SELECT MAX(c.year * 100 + c.month) AS last_period
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-{NOMINA_EXCL_C}
+        SELECT MAX(n.year * 100 + n.month) AS last_period
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND NOT n.is_excluded
         "#,
     ))
     .bind(rfc)
@@ -1321,14 +1254,11 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     // Headcount in the most recent period
     let hc_row = sqlx::query(&format!(
         r#"
-        SELECT COUNT(DISTINCT c.rfc_receptor) AS headcount
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND c.year = $2 AND c.month = $3
-{NOMINA_EXCL_C}
+        SELECT COUNT(DISTINCT n.rfc_receptor) AS headcount
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND n.year = $2 AND n.month = $3
+          AND NOT n.is_excluded
         "#,
     ))
     .bind(rfc)
@@ -1352,19 +1282,16 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     let rr_row = sqlx::query(&format!(
         r#"
         SELECT COALESCE(SUM(
-            COALESCE(p.importe_gravado, 0)::float8 + COALESCE(p.importe_exento, 0)::float8
+            (COALESCE(p.importe_gravado, 0)::float8 + COALESCE(p.importe_exento, 0)::float8) * n.factor
         ), 0) AS total_regular
         FROM pulso.cfdi_nomina_percepciones p
-        JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
+        JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid
+        WHERE n.rfc_emisor = $1
           AND n.tipo_nomina = 'O'
           AND p.tipo_percepcion NOT IN ({percepciones_eventuales_sql})
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         "#,
     ))
     .bind(rfc)
@@ -1381,16 +1308,13 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     // diluted by /12.
     let meses_row = sqlx::query(&format!(
         r#"
-        SELECT COUNT(DISTINCT c.year * 100 + c.month) AS meses
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
+        SELECT COUNT(DISTINCT n.year * 100 + n.month) AS meses
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
           AND n.tipo_nomina = 'O'
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         "#,
     ))
     .bind(rfc)
@@ -1406,15 +1330,12 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     // YoY masa salarial: total percepciones LTM vs prior 12 months
     let ltm_row = sqlx::query(&format!(
         r#"
-        SELECT COALESCE(SUM(COALESCE(n.total_percepciones, 0)::float8), 0) AS total
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+        SELECT COALESCE(SUM(n.total_percepciones), 0) AS total
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         "#,
     ))
     .bind(rfc)
@@ -1428,15 +1349,12 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
 
     let prior_row = sqlx::query(&format!(
         r#"
-        SELECT COALESCE(SUM(COALESCE(n.total_percepciones, 0)::float8), 0) AS total
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-{NOMINA_EXCL_C}
+        SELECT COALESCE(SUM(n.total_percepciones), 0) AS total
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
         "#,
     ))
     .bind(rfc)
@@ -1459,38 +1377,24 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     let emp_rows = sqlx::query(&format!(
         r#"
         WITH active_emps AS (
-            SELECT DISTINCT c.rfc_receptor
-            FROM pulso.cfdi_nomina n
-            JOIN pulso.cfdis c ON c.uuid = n.uuid
-            WHERE c.rfc_emisor = $1
-              AND c.tipo_comprobante = 'N'
-              AND NOT c.is_cancelled
-              AND c.year = $2 AND c.month = $3
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.payroll_normalization_rules pnr
-                  WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                    AND pnr.employee_rfc = c.rfc_receptor
-                    AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                    AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.normalization_rules nr
-                  WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
-                    AND nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(c.uuid)
-              )
+            SELECT DISTINCT n.rfc_receptor
+            FROM pulso.nomina_normalizada n
+            WHERE n.rfc_emisor = $1
+              AND n.year = $2 AND n.month = $3
+              AND NOT n.is_excluded
         )
         SELECT
-            c.rfc_receptor,
+            n.rfc_receptor,
             AVG(COALESCE(n.salario_diario_integrado, 0)::float8) AS sdi,
-            COALESCE((CURRENT_DATE - MIN(n.fecha_pago)::date)::integer, 0) AS tenure_days
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND c.rfc_receptor IN (SELECT rfc_receptor FROM active_emps)
-{NOMINA_EXCL_C}
-        GROUP BY c.rfc_receptor
+            -- AUD-015/DEC-025: anchored to the last day of the last COMPLETE calendar month
+            -- (same idiom as migration 052's dias_antiguedad), not CURRENT_DATE directly, so
+            -- tenure is reproducible across runs on different days within the same month.
+            COALESCE((((date_trunc('month', CURRENT_DATE) - interval '1 day')::date) - MIN(n.fecha_pago)::date)::integer, 0) AS tenure_days
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND n.rfc_receptor IN (SELECT rfc_receptor FROM active_emps)
+          AND NOT n.is_excluded
+        GROUP BY n.rfc_receptor
         "#,
     ))
     .bind(rfc)

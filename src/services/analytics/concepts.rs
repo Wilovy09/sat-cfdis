@@ -60,6 +60,9 @@ pub async fn get(
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
           AND cc.descripcion IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         GROUP BY desc, clave
         ORDER BY total DESC
         LIMIT 50
@@ -109,6 +112,9 @@ pub async fn get(
           AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         GROUP BY clave
         ORDER BY total DESC
         LIMIT 30

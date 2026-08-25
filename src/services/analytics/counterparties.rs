@@ -74,6 +74,9 @@ pub async fn get(
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+          )
         GROUP BY ({cp_key_expr})
         ORDER BY total DESC
         LIMIT $6
@@ -108,6 +111,9 @@ pub async fn get(
               AND NOT is_cancelled
               AND (year > $2 OR (year = $2 AND month >= $3))
               AND (year < $4 OR (year = $4 AND month <= $5))
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              )
             GROUP BY ({cp_key_expr})
         )
         SELECT COALESCE(SUM(POWER(total, 2)) / NULLIF(POWER(SUM(total), 2), 0) * 10000, 0)::float8 AS hhi
@@ -217,6 +223,9 @@ pub async fn get_evolution(
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+          )
         GROUP BY ({cp_key_expr}), year
         ORDER BY ({cp_key_expr}), year
         "#
@@ -418,6 +427,9 @@ pub async fn get_ltm_comparison(
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+          )
         GROUP BY ({cp_key_expr})
         "#
     ))
@@ -439,6 +451,9 @@ pub async fn get_ltm_comparison(
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+          )
         GROUP BY ({cp_key_expr})
         "#
     ))
@@ -744,6 +759,9 @@ pub async fn get_atypical(
               AND NOT is_cancelled
               AND (year > $2 OR (year = $2 AND month >= $3))
               AND (year < $4 OR (year = $4 AND month <= $5))
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              )
             GROUP BY ({cp_key_expr}), year, month
         ),
         stats AS (
@@ -892,6 +910,9 @@ pub async fn get_individual(
           AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
           AND (year > $4 OR (year = $4 AND month >= $5))
           AND (year < $6 OR (year = $6 AND month <= $7))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+          )
         GROUP BY year
         ORDER BY year
         "#
@@ -996,6 +1017,9 @@ pub async fn get_individual(
           AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
           AND (year > $4 OR (year = $4 AND month >= $5))
           AND (year < $6 OR (year = $6 AND month <= $7))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+          )
         GROUP BY year, month
         ORDER BY year, month
         "#
@@ -1035,6 +1059,9 @@ pub async fn get_individual(
           AND c.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_c} = $3)
           AND (c.year > $4 OR (c.year = $4 AND c.month >= $5))
           AND (c.year < $6 OR (c.year = $6 AND c.month <= $7))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         GROUP BY SUBSTRING(cc.descripcion, 1, 80), c.year
         "#
     ))
@@ -1094,6 +1121,9 @@ pub async fn get_individual(
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+          )
         GROUP BY year
         "#
     ))

@@ -213,33 +213,22 @@ pub async fn get(
     .await?;
     let ppd_outstanding: f64 = ppd_outstanding_row.try_get("outstanding").unwrap_or(0.0);
 
-    // Average collection days: AVG(fecha_pago - fecha_emision) for PPD invoices with payments
+    // AUD-014: fourth definition of "días de cobro" retired. Reads the same
+    // ultimo_pago_fecha (last non-cancelled payment, per invoice) that payments.rs and
+    // counterparties.rs use, instead of averaging every individual payment-doc row --
+    // which double-counted invoices paid in installments and never excluded cancelled
+    // payment complements.
     let avg_days_row = sqlx::query(&format!(
         r#"
-        SELECT COALESCE(AVG(
-            LEFT(p.fecha_pago, 10)::date - LEFT(inv.fecha_emision, 10)::date
-        )::float8, 0.0) AS avg_days
-        FROM pulso.cfdi_payment_docs pd
-        JOIN pulso.cfdi_payments p ON p.payment_uuid = pd.payment_uuid
-                                   AND p.pago_num    = pd.pago_num
-        JOIN pulso.cfdis inv ON inv.uuid = pd.invoice_uuid
-        WHERE inv.{owner_col} = $1
-          AND inv.{dl_filter}
-          AND inv.tipo_comprobante = 'I'
-          AND inv.metodo_pago = 'PPD'
-          AND NOT inv.is_cancelled
-          AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-          AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
-          AND p.fecha_pago IS NOT NULL
-          AND inv.fecha_emision IS NOT NULL
-          AND LEFT(p.fecha_pago, 10)::date >= LEFT(inv.fecha_emision, 10)::date
+        SELECT COALESCE(AVG((c.ultimo_pago_fecha - c.fecha_emision::date)::float8), 0.0) AS avg_days
+        FROM pulso.cfdi_cobro_estado c
+        WHERE c.{owner_col} = $1
+          AND c.{dl_filter}
+          AND c.metodo_pago = 'PPD'
+          AND c.ultimo_pago_fecha IS NOT NULL
         "#
     ))
     .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
     .fetch_one(pool)
     .await?;
     let avg_collection_days: f64 = avg_days_row.try_get("avg_days").unwrap_or(0.0);

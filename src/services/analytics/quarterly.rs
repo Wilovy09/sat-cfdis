@@ -65,15 +65,8 @@ pub async fn get(
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.normalization_rules nr
-              WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
-                AND (
-                  (nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(uuid))
-                  OR (nr.cfdi_uuid IS NULL AND (
-                      (nr.dl_type IN ('emitidos','ambos') AND nr.source_rfc = rfc_receptor)
-                      OR (nr.dl_type IN ('recibidos','ambos') AND nr.source_rfc = rfc_emisor)
-                  ))
-                )
+              SELECT 1 FROM pulso.cfdi_exclusion ex
+              WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
           )
         GROUP BY year, quarter
         ORDER BY year, quarter

@@ -126,6 +126,9 @@ pub async fn get(
           AND NOT is_cancelled
           AND year = ANY($2)
           AND month >= $3 AND month <= $4
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+          )
         GROUP BY year
         ORDER BY year
         "#
@@ -162,6 +165,9 @@ pub async fn get(
           AND tipo_comprobante NOT IN ('P', 'N')
           AND NOT is_cancelled
           AND year = ANY($2)
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+          )
         GROUP BY year
         "#
     );
@@ -198,6 +204,9 @@ pub async fn get(
           AND NOT is_cancelled
               AND year = ANY($2)
               AND month >= $3 AND month <= $4
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              )
             GROUP BY year, ({cp_key_expr})
         )
         SELECT year, cp_rfc, cp_nombre, total, invoice_count, rnk
@@ -239,6 +248,9 @@ pub async fn get(
           AND NOT is_cancelled
           AND year = ANY($2)
           AND month >= $3 AND month <= $4
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+          )
         GROUP BY year, month
         ORDER BY year, month
         "#
@@ -421,6 +433,9 @@ pub async fn get(
                 FROM pulso.cfdis_ajustado
                 WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
                   AND year = $2 AND month >= $3 AND month <= $4
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+                  )
                 GROUP BY ({cp_key_expr})
             ),
             prev AS (
@@ -429,6 +444,9 @@ pub async fn get(
                 FROM pulso.cfdis_ajustado
                 WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
                   AND year = $5 AND month >= $3 AND month <= $4
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+                  )
                 GROUP BY ({cp_key_expr})
             )
             SELECT COALESCE(c.cp_rfc, p.cp_rfc) AS cp_rfc,

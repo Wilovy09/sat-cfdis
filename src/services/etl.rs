@@ -229,7 +229,7 @@ async fn process_invoice(
 
     // Insert payment complement data
     if !cfdi.payments.is_empty() {
-        if let Err(e) = db::cfdis::insert_payments(pool, &cfdi.uuid, &cfdi.payments).await {
+        if let Err(e) = db::cfdis::insert_payments(pool, job_id, &cfdi.rfc_emisor, &cfdi.rfc_receptor, &cfdi.uuid, &cfdi.payments).await {
             tracing::warn!(uuid = %uuid, "ETL: insert_payments: {e}");
         }
     }
@@ -359,7 +359,7 @@ pub(crate) async fn apply_xml_bytes(
     }
 
     if !cfdi.payments.is_empty() {
-        if let Err(e) = db::cfdis::insert_payments(pool, &cfdi.uuid, &cfdi.payments).await {
+        if let Err(e) = db::cfdis::insert_payments(pool, "", &cfdi.rfc_emisor, &cfdi.rfc_receptor, &cfdi.uuid, &cfdi.payments).await {
             tracing::warn!(uuid = %uuid, "ETL: insert_payments: {e}");
         }
     }

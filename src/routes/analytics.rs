@@ -582,6 +582,14 @@ pub async fn create_normalization(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", &rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
+    // L3-13: accounting_line is now mandatory at creation time. A rule saved without one
+    // used to fall out of the EBITDA bridge silently (it required accounting_line IS NOT
+    // NULL to appear at all) while still cutting money from the P&L -- invisible normalization.
+    if body.accounting_line.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return Err(AppError::bad_request(
+            "accounting_line es obligatorio: selecciona la línea del P&L de la que sale este ajuste",
+        ));
+    }
     let rule = normalization::create_rule(&pool, &rfc, &body)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -727,32 +735,6 @@ pub async fn list_excluded_cfdis(
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(cfdis))
-}
-
-// ---------------------------------------------------------------------------
-// GET /api/v1/analytics/{rfc}/normalization/cfdis
-// ---------------------------------------------------------------------------
-
-pub async fn list_norm_cfdis(
-    req: HttpRequest,
-    path: web::Path<String>,
-    query: web::Query<AnalyticsParams>,
-    pool: web::Data<DbPool>,
-) -> Result<HttpResponse, AppError> {
-    let rfc = path.into_inner().to_uppercase();
-    check_rfc_access(&pool, &req, &rfc).await?;
-    let dl_type = query.dl_type();
-    let from = query.from();
-    let to = query.to();
-    let limit = query.limit();
-    let (from_y, from_m) = crate::services::analytics::summary::parse_ym(&from);
-    let (to_y, to_m) = crate::services::analytics::summary::parse_ym(&to);
-    let rows = normalization::list_cfdis_for_normalization(
-        &pool, &rfc, &dl_type, from_y, from_m, to_y, to_m, limit,
-    )
-    .await
-    .map_err(|e| AppError::internal(&e.to_string()))?;
-    Ok(HttpResponse::Ok().json(rows))
 }
 
 // ---------------------------------------------------------------------------

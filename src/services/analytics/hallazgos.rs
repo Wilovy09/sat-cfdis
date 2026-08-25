@@ -452,15 +452,13 @@ async fn compute_h5a(
     // Per-month distinct employee count in LTM
     let month_rows = sqlx::query(
         r#"
-        SELECT c.year, c.month, COUNT(DISTINCT c.rfc_receptor)::bigint AS hc
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-        GROUP BY c.year, c.month
+        SELECT n.year, n.month, COUNT(DISTINCT n.rfc_receptor)::bigint AS hc
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
+        GROUP BY n.year, n.month
         "#,
     )
     .bind(rfc)
@@ -484,13 +482,11 @@ async fn compute_h5a(
     // Employees active in last period
     let latest_row = sqlx::query(
         r#"
-        SELECT COUNT(DISTINCT c.rfc_receptor)::bigint AS active
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND c.year = $2 AND c.month = $3
+        SELECT COUNT(DISTINCT n.rfc_receptor)::bigint AS active
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND n.year = $2 AND n.month = $3
+          AND NOT n.is_excluded
         "#,
     )
     .bind(rfc)
@@ -505,23 +501,19 @@ async fn compute_h5a(
         r#"
         SELECT COUNT(DISTINCT ltm.rfc_receptor)::bigint AS bajas
         FROM (
-            SELECT DISTINCT c.rfc_receptor
-            FROM pulso.cfdi_nomina n
-            JOIN pulso.cfdis c ON c.uuid = n.uuid
-            WHERE c.rfc_emisor = $1
-              AND c.tipo_comprobante = 'N'
-              AND NOT c.is_cancelled
-              AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-              AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+            SELECT DISTINCT n.rfc_receptor
+            FROM pulso.nomina_normalizada n
+            WHERE n.rfc_emisor = $1
+              AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+              AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+              AND NOT n.is_excluded
         ) ltm
         WHERE NOT EXISTS (
-            SELECT 1 FROM pulso.cfdi_nomina n2
-            JOIN pulso.cfdis c2 ON c2.uuid = n2.uuid
-            WHERE c2.rfc_emisor = $1
-              AND c2.tipo_comprobante = 'N'
-              AND NOT c2.is_cancelled
-              AND c2.rfc_receptor = ltm.rfc_receptor
-              AND c2.year = $4 AND c2.month = $5
+            SELECT 1 FROM pulso.nomina_normalizada n2
+            WHERE n2.rfc_emisor = $1
+              AND n2.rfc_receptor = ltm.rfc_receptor
+              AND n2.year = $4 AND n2.month = $5
+              AND NOT n2.is_excluded
         )
         "#,
     )
@@ -580,20 +572,18 @@ async fn compute_h5b(
     let term_rows = sqlx::query(
         r#"
         SELECT
-            c.rfc_receptor                                                       AS rfc,
-            MAX(COALESCE(n.curp, c.rfc_receptor))                               AS nombre,
-            MIN(c.year * 100 + c.month)::bigint                                 AS first_period,
-            MAX(c.year * 100 + c.month)::bigint                                 AS last_period,
+            n.rfc_receptor                                                       AS rfc,
+            MAX(COALESCE(n.curp, n.rfc_receptor))                               AS nombre,
+            MIN(n.year * 100 + n.month)::bigint                                 AS first_period,
+            MAX(n.year * 100 + n.month)::bigint                                 AS last_period,
             AVG(COALESCE(n.salario_diario_integrado, 0)::float8) * 30           AS sueldo_mensual
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-        GROUP BY c.rfc_receptor
-        HAVING MAX(c.year * 100 + c.month) < $4 * 100 + $5
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
+          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND NOT n.is_excluded
+        GROUP BY n.rfc_receptor
+        HAVING MAX(n.year * 100 + n.month) < $4 * 100 + $5
         "#,
     )
     .bind(rfc)
@@ -732,14 +722,23 @@ async fn compute_h6(
         return Ok(None);
     }
 
-    // Outstanding = base saldo for PPD invoices (L2-04: shared with payments.rs/counterparties.rs).
+    // Outstanding = base saldo for PPD invoices (L2-04: shared with payments.rs/counterparties.rs),
+    // capped at the same as_of_cutoff those two use (AUD-011) -- without it this disagreed
+    // with the Cobranza tab's own saldo for the same RFC.
     let outstanding_row = sqlx::query(
         r#"
+        WITH cutoff AS (
+            SELECT COALESCE(
+                (SELECT as_of_ym FROM pulso.rfc_as_of_cutoff WHERE owner_rfc = $1 AND direccion = 'emitidos'),
+                999912
+            ) AS as_of_ym
+        )
         SELECT COALESCE(SUM(c.saldo_mxn), 0)::float8 AS outstanding
-        FROM pulso.cfdi_cobro_estado c
+        FROM pulso.cfdi_cobro_estado c, cutoff
         WHERE c.rfc_emisor = $1
           AND c.dl_type IN ('emitidos','ambos')
           AND c.metodo_pago = 'PPD'
+          AND (c.year * 100 + c.month) <= cutoff.as_of_ym
         "#,
     )
     .bind(rfc)
@@ -809,13 +808,21 @@ async fn compute_h7(
         return Ok(None);
     }
 
+    // AUD-011: capped at as_of_cutoff, same as H6 and the Cobranza tab.
     let outstanding_row = sqlx::query(
         r#"
+        WITH cutoff AS (
+            SELECT COALESCE(
+                (SELECT as_of_ym FROM pulso.rfc_as_of_cutoff WHERE owner_rfc = $1 AND direccion = 'recibidos'),
+                999912
+            ) AS as_of_ym
+        )
         SELECT COALESCE(SUM(c.saldo_mxn), 0)::float8 AS outstanding
-        FROM pulso.cfdi_cobro_estado c
+        FROM pulso.cfdi_cobro_estado c, cutoff
         WHERE c.rfc_receptor = $1
           AND c.dl_type IN ('recibidos','ambos')
           AND c.metodo_pago = 'PPD'
+          AND (c.year * 100 + c.month) <= cutoff.as_of_ym
         "#,
     )
     .bind(rfc)
@@ -1081,29 +1088,26 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
 
     // H3 — Evolución del flujo visible
     if complete_years.len() >= 2 {
-        // R-34: H3 aligned to the "Neto facturado" dashboard measures — con IVA (already
-        // was), nómina neta de caja instead of gross percepciones, and normalization
-        // exclusions applied to all three legs (none of the three had them before).
-        let excl_join = r#"
-            LEFT JOIN pulso.normalization_rules exc
-                ON (exc.cfdi_uuid IS NOT NULL AND UPPER(exc.cfdi_uuid) = UPPER(c.uuid))
-                OR (exc.cfdi_uuid IS NULL AND (
-                    (exc.dl_type IN ('emitidos','ambos') AND exc.source_rfc = c.rfc_receptor)
-                    OR (exc.dl_type IN ('recibidos','ambos') AND exc.source_rfc = c.rfc_emisor)
-                ))
-                AND exc.owner_rfc = $1 AND exc.action = 'exclude'
-        "#;
-
+        // R-34 + AUD-012 + AUD-013: aligned to the "Neto facturado" dashboard measure —
+        // con IVA, facturas MENOS notas de crédito (the dashboard reads this as
+        // ingreso_con_iva_mxn - egreso_con_iva_mxn from summary.rs, which is exactly
+        // SUM(I) - SUM(E) within one direction), nómina neta de caja, and L3-01's shared
+        // exclusion base instead of a hand-rolled join (AUD-012's broken AND/OR precedence
+        // left the UUID branch of that join with no owner/action guard at all).
         let ing_rows = sqlx::query(&format!(
             r#"
-            SELECT c.year, SUM(COALESCE(c.total_mxn,0))::float8 AS ingreso
+            SELECT c.year,
+                   SUM(CASE WHEN c.tipo_comprobante = 'I' THEN COALESCE(c.total_mxn,0)
+                            WHEN c.tipo_comprobante = 'E' THEN -COALESCE(c.total_mxn,0)
+                            ELSE 0 END)::float8 AS ingreso
             FROM pulso.cfdis c
-            {excl_join}
             WHERE c.rfc_emisor = $1
               AND c.dl_type IN ('emitidos','ambos')
-              AND c.tipo_comprobante = 'I'
+              AND c.tipo_comprobante IN ('I','E')
               AND NOT c.is_cancelled
-              AND exc.cfdi_uuid IS NULL AND exc.source_rfc IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+              )
             GROUP BY c.year
             "#
         ))
@@ -1115,17 +1119,21 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             .map(|r| (r.try_get::<i64, _>("year").unwrap_or(0), r.try_get::<f64, _>("ingreso").unwrap_or(0.0)))
             .collect();
 
-        // Recibidos per year (con IVA, ya lo era)
+        // Recibidos per year (con IVA, menos notas de crédito recibidas)
         let rec_rows = sqlx::query(&format!(
             r#"
-            SELECT c.year, SUM(COALESCE(c.total_mxn,0))::float8 AS egreso
+            SELECT c.year,
+                   SUM(CASE WHEN c.tipo_comprobante = 'I' THEN COALESCE(c.total_mxn,0)
+                            WHEN c.tipo_comprobante = 'E' THEN -COALESCE(c.total_mxn,0)
+                            ELSE 0 END)::float8 AS egreso
             FROM pulso.cfdis c
-            {excl_join}
             WHERE c.rfc_receptor = $1
               AND c.dl_type IN ('recibidos','ambos')
-              AND c.tipo_comprobante = 'I'
+              AND c.tipo_comprobante IN ('I','E')
               AND NOT c.is_cancelled
-              AND exc.cfdi_uuid IS NULL AND exc.source_rfc IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+              )
             GROUP BY c.year
             "#
         ))
@@ -1149,28 +1157,12 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         // percepciones: that exclusion is a run-rate concept (DEC-020), not a cash one.
         let nom_rows = sqlx::query(
             r#"
-            SELECT c.year,
-                   SUM(COALESCE(n.total_percepciones,0)::float8
-                       + COALESCE(n.total_otros_pagos,0)::float8
-                       - COALESCE(n.total_deducciones,0)::float8) AS nomina
-            FROM pulso.cfdi_nomina n
-            JOIN pulso.cfdis c ON c.uuid = n.uuid
-            WHERE c.rfc_emisor = $1
-              AND c.tipo_comprobante = 'N'
-              AND NOT c.is_cancelled
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.payroll_normalization_rules pnr
-                  WHERE pnr.owner_rfc = $1 AND pnr.action = 'exclude'
-                    AND pnr.employee_rfc = c.rfc_receptor
-                    AND (pnr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) >= pnr.period_start)
-                    AND (pnr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text,2,'0')) <= pnr.period_end)
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.normalization_rules nr
-                  WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
-                    AND nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(c.uuid)
-              )
-            GROUP BY c.year
+            SELECT n.year,
+                   SUM(n.total_percepciones + n.total_otros_pagos - n.total_deducciones) AS nomina
+            FROM pulso.nomina_normalizada n
+            WHERE n.rfc_emisor = $1
+              AND NOT n.is_excluded
+            GROUP BY n.year
             "#,
         )
         .bind(rfc)
