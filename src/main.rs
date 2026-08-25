@@ -202,6 +202,7 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                 let _ = db::jobs::complete(
                     &pool,
                     &job.id,
+                    &job.rfc,
                     job.cursor_date.as_deref().unwrap_or(&job.period_to),
                     job.found,
                 )
@@ -909,7 +910,7 @@ async fn run_worker_chunk(
         .await;
         tracing::info!(job_id = %job_id, cursor = %cursor, resume_at = %resume_at, code = ?limit_code, "Job paused (limit)");
     } else {
-        let _ = db::jobs::complete(&pool, &job_id, &period_to, found).await;
+        let _ = db::jobs::complete(&pool, &job_id, &job_rfc, &period_to, found).await;
         tracing::info!(job_id = %job_id, found = found, "Job completed");
 
         // Email 1: initial sync complete (job_type == "list" and this is the user's initial_sync_job_id)

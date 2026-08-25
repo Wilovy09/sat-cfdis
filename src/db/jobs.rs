@@ -1,7 +1,7 @@
 //! CRUD operations for `sync_jobs` and `job_invoices`.
 
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 // ---------------------------------------------------------------------------
 // Models
@@ -209,10 +209,11 @@ pub async fn pause_limit(
 pub async fn complete(
     pool: &PgPool,
     job_id: &str,
+    rfc: &str,
     cursor_date: &str,
     found: i64,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let row = sqlx::query(
         r#"UPDATE pulso.sync_jobs
            SET status = CASE WHEN error_code IS NULL THEN 'completed' ELSE 'failed' END,
                cursor_date = $1,
@@ -222,12 +223,49 @@ pub async fn complete(
                    ELSE COALESCE(error_msg, 'Reached end of period with an unresolved error_code from an earlier attempt (PULSO-001 guard)')
                END,
                updated_at = $3
-           WHERE id = $4"#,
+           WHERE id = $4
+           RETURNING status"#,
     )
     .bind(cursor_date)
     .bind(found)
     .bind(now_utc())
     .bind(job_id)
+    .fetch_one(pool)
+    .await?;
+
+    let final_status: String = row.try_get("status")?;
+    if final_status == "completed" {
+        heal_stale_credential_flag(pool, rfc, job_id).await?;
+    }
+    Ok(())
+}
+
+/// A routine job succeeding proves the stored credential works right now. If
+/// this RFC's "CIEC/e.firma inválida" badge is still anchored to an old failed
+/// job (`pulso.users.initial_sync_job_id`, read by `sync_status`), repoint it
+/// here instead of leaving the badge stuck until someone manually re-enters
+/// the credential through the "Actualizar CIEC" flow. Routine auto_daily/
+/// gap_resync runs never touched this column before — only the initial
+/// onboarding job and the CIEC-update validation flow did — so a credential
+/// that started failing and later recovered on its own (SAT hiccup, retry,
+/// etc.) could show "inválida" indefinitely despite days of clean syncs.
+/// Reported live (Slack, CCO210630GE6 and CES100706U65, 2026-08-24-25).
+async fn heal_stale_credential_flag(
+    pool: &PgPool,
+    rfc: &str,
+    healthy_job_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE pulso.users u
+           SET initial_sync_job_id = $1
+           WHERE u.rfc = $2 AND u.deleted_at IS NULL
+             AND EXISTS (
+                 SELECT 1 FROM pulso.sync_jobs j
+                 WHERE j.id = u.initial_sync_job_id AND j.status = 'failed'
+             )"#,
+    )
+    .bind(healthy_job_id)
+    .bind(rfc.to_uppercase())
     .execute(pool)
     .await?;
     Ok(())

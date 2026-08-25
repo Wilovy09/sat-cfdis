@@ -1103,7 +1103,7 @@ pub async fn list_stream(
         // Mark job complete in DB (if it was created and no limit/auth error was hit)
         if limit_cursor.is_none() && !auth_error_hit {
             if let Some(ref jid) = job_id_ls {
-                let _ = db_jobs::complete(&pool_ls, jid, &period_to, total as i64).await;
+                let _ = db_jobs::complete(&pool_ls, jid, &user_rfc_ls, &period_to, total as i64).await;
             }
         }
 
