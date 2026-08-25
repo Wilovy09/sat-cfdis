@@ -796,6 +796,57 @@ pub async fn list_payroll_employees(
 }
 
 // ---------------------------------------------------------------------------
+// GET /normalization/payroll/employees/{employee_rfc}/receipts
+// ---------------------------------------------------------------------------
+
+// L3-15 familia 4 ("excluir CFDIs específicos"): routed to the mechanism that already
+// exists for every other comprobante -- a cfdi_uuid-level pulso.normalization_rules
+// exclude rule, created the same way the counterparty drill-down creates one (see
+// routes/analytics.rs's create_normalization). This listing exists only so the Nómina
+// module has individual receipt UUIDs to point that existing mechanism at; it does not
+// read or write pulso.payroll_normalization_rules.excluded_cfdi_uuids, which stays unused.
+#[derive(Debug, Serialize)]
+pub struct NomReceiptRow {
+    pub uuid: String,
+    pub period: String,
+    pub fecha_emision: Option<String>,
+    pub total_percepciones: f64,
+    pub is_excluded: bool,
+}
+
+pub async fn list_nomina_receipts_for_employee(
+    pool: &DbPool,
+    owner_rfc: &str,
+    employee_rfc: &str,
+) -> anyhow::Result<Vec<NomReceiptRow>> {
+    let rows = sqlx::query(
+        r#"SELECT uuid,
+                  year::text || '-' || LPAD(month::text, 2, '0') AS period,
+                  fecha_emision::text AS fecha_emision,
+                  total_percepciones,
+                  is_excluded
+           FROM pulso.nomina_normalizada
+           WHERE rfc_emisor = $1 AND rfc_receptor = $2
+           ORDER BY fecha_emision DESC"#,
+    )
+    .bind(owner_rfc)
+    .bind(employee_rfc)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| NomReceiptRow {
+            uuid: r.try_get("uuid").unwrap_or_default(),
+            period: r.try_get("period").unwrap_or_default(),
+            fecha_emision: r.try_get("fecha_emision").ok(),
+            total_percepciones: r.try_get("total_percepciones").unwrap_or(0.0),
+            is_excluded: r.try_get::<bool, _>("is_excluded").unwrap_or(false),
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // GET /normalization/ebitda-bridge
 // ---------------------------------------------------------------------------
 

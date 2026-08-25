@@ -8,7 +8,6 @@ mod services;
 mod state;
 
 use actix_cors::Cors;
-use actix_files::Files;
 use actix_web::{App, HttpServer, web};
 use aws_sdk_s3::Client as S3Client;
 use std::sync::Arc;
@@ -1066,8 +1065,6 @@ async fn main() -> std::io::Result<()> {
                 Scalar::with_url("/docs", api_docs::ApiDoc::openapi())
                     .custom_html(api_docs::SCALAR_HTML),
             )
-            // Static files
-            .service(Files::new("/static", "static").prefer_utf8(true))
             // Health check
             .route("/health", web::get().to(invoices::health))
             // Billing
@@ -1307,6 +1304,13 @@ async fn main() -> std::io::Result<()> {
                             .route(
                                 web::get()
                                     .to(analytics_routes::get_normalization_payroll_employees),
+                            ),
+                    )
+                    .service(
+                        web::resource("/normalization/payroll/employees/{employee_rfc}/receipts")
+                            .route(
+                                web::get()
+                                    .to(analytics_routes::get_normalization_payroll_employee_receipts),
                             ),
                     )
                     .service(

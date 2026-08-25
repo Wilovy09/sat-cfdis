@@ -812,6 +812,24 @@ pub async fn get_normalization_payroll_employees(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/normalization/payroll/employees/{employee_rfc}/receipts
+// ---------------------------------------------------------------------------
+
+pub async fn get_normalization_payroll_employee_receipts(
+    req: HttpRequest,
+    path: web::Path<(String, String)>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let (rfc, employee_rfc) = path.into_inner();
+    let rfc = rfc.to_uppercase();
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let rows = normalization::list_nomina_receipts_for_employee(&pool, &rfc, &employee_rfc.to_uppercase())
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Ok().json(rows))
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/v1/analytics/{rfc}/normalization/ebitda-bridge
 // ---------------------------------------------------------------------------
 
