@@ -92,15 +92,24 @@ async fn resolve_auth(
 // Part 1 — failed jobs that never got resumed
 // ---------------------------------------------------------------------------
 
-async fn requeue_failed_jobs(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyhow::Result<()> {
+async fn requeue_failed_jobs(
+    pool: &DbPool,
+    cfg: &Arc<Config>,
+    s3: &Arc<S3Client>,
+) -> anyhow::Result<()> {
     let failed = db::jobs::find_failed_retryable(pool, MAX_GAP_JOB_RETRIES, GAP_JOB_BATCH).await?;
     if failed.is_empty() {
         return Ok(());
     }
-    tracing::info!(count = failed.len(), "Gap-detector: failed jobs eligible for auto-continuation");
+    tracing::info!(
+        count = failed.len(),
+        "Gap-detector: failed jobs eligible for auto-continuation"
+    );
 
-    let creds: HashMap<String, String> =
-        db::users::get_all_with_credentials(pool).await?.into_iter().collect();
+    let creds: HashMap<String, String> = db::users::get_all_with_credentials(pool)
+        .await?
+        .into_iter()
+        .collect();
     let bucket = cfg.s3_bucket.clone().unwrap_or_default();
     let key = crypto::load_key();
 
@@ -175,13 +184,19 @@ async fn requeue_failed_jobs(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client
 // Part 2 — zero-activity weekdays inside otherwise-"completed" ranges
 // ---------------------------------------------------------------------------
 
-async fn scan_activity_gaps(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyhow::Result<()> {
+async fn scan_activity_gaps(
+    pool: &DbPool,
+    cfg: &Arc<Config>,
+    s3: &Arc<S3Client>,
+) -> anyhow::Result<()> {
     let rfcs = db::jobs::distinct_completed_rfcs(pool).await?;
     if rfcs.is_empty() {
         return Ok(());
     }
-    let creds: HashMap<String, String> =
-        db::users::get_all_with_credentials(pool).await?.into_iter().collect();
+    let creds: HashMap<String, String> = db::users::get_all_with_credentials(pool)
+        .await?
+        .into_iter()
+        .collect();
     let bucket = cfg.s3_bucket.clone().unwrap_or_default();
     let key = crypto::load_key();
     let yesterday = yesterday_ymd();
@@ -229,7 +244,8 @@ async fn scan_activity_gaps(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>
                 continue;
             }
 
-            let Some((auth_payload, _fiel_tmp)) = resolve_auth(pool, s3, &bucket, &rfc, &creds, &key).await
+            let Some((auth_payload, _fiel_tmp)) =
+                resolve_auth(pool, s3, &bucket, &rfc, &creds, &key).await
             else {
                 tracing::warn!(rfc = %rfc, day = %day, "Gap-detector: no credentials available, cannot resync this day");
                 continue;

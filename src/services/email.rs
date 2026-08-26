@@ -9,7 +9,9 @@ fn failure_reason_es(error_code: Option<&str>) -> &'static str {
         }
         Some("fiel_login_failed") => "no pudimos iniciar sesión con tu e.firma",
         Some("captcha_failed") => "el SAT no nos dejó pasar el captcha tras varios intentos",
-        Some("sat_connection_error") | None => "el SAT no respondió tras varios intentos automáticos",
+        Some("sat_connection_error") | None => {
+            "el SAT no respondió tras varios intentos automáticos"
+        }
         _ => "tuvimos un problema técnico al conectar con el SAT",
     }
 }

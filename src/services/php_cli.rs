@@ -46,7 +46,9 @@ impl PhpCli {
         if let Some(ref proxy) = self.https_proxy {
             cmd.env("HTTPS_PROXY", proxy).env("https_proxy", proxy);
         }
-        let mut child = cmd.spawn().context("Failed to spawn PHP CLI. Is 'php' in PATH?")?;
+        let mut child = cmd
+            .spawn()
+            .context("Failed to spawn PHP CLI. Is 'php' in PATH?")?;
 
         // Write JSON to stdin then close it so PHP's stream_get_contents() can finish
         if let Some(mut stdin) = child.stdin.take() {

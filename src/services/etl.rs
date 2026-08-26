@@ -6,9 +6,9 @@ use crate::{
     services::{php_cli::PhpCli, storage, xml_parser},
 };
 use aws_sdk_s3::Client as S3Client;
-use tempfile::TempDir;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tempfile::TempDir;
 
 const ETL_POLL_SECS: u64 = 30;
 const BATCH_SIZE: usize = 100;
@@ -106,7 +106,9 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
                                 );
                             }
                             Ok(_) => {}
-                            Err(e) => tracing::error!(job_id = %job_id, "ETL: mark_xml_unavailable failed: {e}"),
+                            Err(e) => {
+                                tracing::error!(job_id = %job_id, "ETL: mark_xml_unavailable failed: {e}")
+                            }
                         }
                         enrich_skip.remove(&job_id);
                         enrich_fail_rounds.remove(&job_id);
@@ -169,7 +171,11 @@ async fn process_invoice(
         xml_parser::parse(bytes, job_id, dl_type, &estado)
     } else {
         // Fallback: build from metadata JSON (no XML)
-        let preview_end = metadata.char_indices().nth(120).map(|(i,_)| i).unwrap_or(metadata.len());
+        let preview_end = metadata
+            .char_indices()
+            .nth(120)
+            .map(|(i, _)| i)
+            .unwrap_or(metadata.len());
         tracing::warn!(uuid = %uuid, meta_preview = %&metadata[..preview_end], "ETL: no XML in storage, trying from_metadata");
         xml_parser::from_metadata(metadata, job_id, dl_type)
     };
@@ -190,7 +196,9 @@ async fn process_invoice(
     // Override year/month from fecha_final_pago (fallback: fecha_inicial_pago).
     if cfdi.tipo_comprobante == "N" {
         if let Some(ref nom) = cfdi.nomina {
-            let fecha_periodo = nom.fecha_final_pago.as_deref()
+            let fecha_periodo = nom
+                .fecha_final_pago
+                .as_deref()
                 .or(nom.fecha_inicial_pago.as_deref())
                 .unwrap_or("");
             if !fecha_periodo.is_empty() {
@@ -229,7 +237,16 @@ async fn process_invoice(
 
     // Insert payment complement data
     if !cfdi.payments.is_empty() {
-        if let Err(e) = db::cfdis::insert_payments(pool, job_id, &cfdi.rfc_emisor, &cfdi.rfc_receptor, &cfdi.uuid, &cfdi.payments).await {
+        if let Err(e) = db::cfdis::insert_payments(
+            pool,
+            Some(job_id),
+            &cfdi.rfc_emisor,
+            &cfdi.rfc_receptor,
+            &cfdi.uuid,
+            &cfdi.payments,
+        )
+        .await
+        {
             tracing::warn!(uuid = %uuid, "ETL: insert_payments: {e}");
         }
     }
@@ -359,7 +376,18 @@ pub(crate) async fn apply_xml_bytes(
     }
 
     if !cfdi.payments.is_empty() {
-        if let Err(e) = db::cfdis::insert_payments(pool, "", &cfdi.rfc_emisor, &cfdi.rfc_receptor, &cfdi.uuid, &cfdi.payments).await {
+        // L4-06: enrichment isn't driven by a sync job, so this is a genuine "no job" --
+        // pass None rather than an empty string that would misleadingly look like data.
+        if let Err(e) = db::cfdis::insert_payments(
+            pool,
+            None,
+            &cfdi.rfc_emisor,
+            &cfdi.rfc_receptor,
+            &cfdi.uuid,
+            &cfdi.payments,
+        )
+        .await
+        {
             tracing::warn!(uuid = %uuid, "ETL: insert_payments: {e}");
         }
     }
@@ -485,7 +513,18 @@ async fn try_download_from_sat(
 
     // Upload to S3 so future enrichment rounds find it in storage
     let uuid_lower = uuid.to_lowercase();
-    let _ = storage::upload(s3, &bucket, &rfc_e, &rfc_r, year, month, day, &uuid_lower, bytes.clone()).await;
+    let _ = storage::upload(
+        s3,
+        &bucket,
+        &rfc_e,
+        &rfc_r,
+        year,
+        month,
+        day,
+        &uuid_lower,
+        bytes.clone(),
+    )
+    .await;
 
     tracing::info!(uuid = %uuid, download_type, "ETL: downloaded XML from SAT");
     Some(bytes)

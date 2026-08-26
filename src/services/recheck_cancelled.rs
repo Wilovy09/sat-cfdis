@@ -96,7 +96,8 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
     )
     .await?;
     tracing::info!(
-        cancelled = candidates.len(), vigente = vigente_candidates.len(),
+        cancelled = candidates.len(),
+        vigente = vigente_candidates.len(),
         "Recheck-cancelled: candidates this cycle"
     );
     candidates.extend(vigente_candidates);
@@ -104,8 +105,10 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
         return Ok(());
     }
 
-    let creds: HashMap<String, String> =
-        db::users::get_all_with_credentials(pool).await?.into_iter().collect();
+    let creds: HashMap<String, String> = db::users::get_all_with_credentials(pool)
+        .await?
+        .into_iter()
+        .collect();
 
     // Group by (owner_rfc, download_type): the owner is whichever side of the
     // invoice is a tracked Pulso RFC — that's the identity we can log into SAT
@@ -116,15 +119,24 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
     let mut orphaned: Vec<String> = Vec::new();
     for (uuid, rfc_emisor, rfc_receptor) in candidates {
         if creds.contains_key(&rfc_emisor) {
-            groups.entry((rfc_emisor, "emitidos")).or_default().push(uuid);
+            groups
+                .entry((rfc_emisor, "emitidos"))
+                .or_default()
+                .push(uuid);
         } else if creds.contains_key(&rfc_receptor) {
-            groups.entry((rfc_receptor, "recibidos")).or_default().push(uuid);
+            groups
+                .entry((rfc_receptor, "recibidos"))
+                .or_default()
+                .push(uuid);
         } else {
             orphaned.push(uuid);
         }
     }
     if !orphaned.is_empty() {
-        tracing::info!(count = orphaned.len(), "Recheck-cancelled: no tracked RFC owns these, skipped");
+        tracing::info!(
+            count = orphaned.len(),
+            "Recheck-cancelled: no tracked RFC owns these, skipped"
+        );
         db::cfdis::touch_estado_sat_checked(pool, &orphaned).await?;
     }
 
@@ -137,10 +149,14 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
         // subprocess reads those paths later, not during this match. Binding
         // it only inside the match arm (as `_tmp`) would drop the TempDir —
         // and delete the cert files — before recheck_chunk ever runs.
-        let (auth_payload, _fiel_tmp) = match crate::try_fiel_auth(pool, s3, &bucket, &owner_rfc).await {
+        let (auth_payload, _fiel_tmp) = match crate::try_fiel_auth(pool, s3, &bucket, &owner_rfc)
+            .await
+        {
             Some((fiel_auth, tmp)) => (fiel_auth, Some(tmp)),
             None => {
-                let Some(clave_enc) = creds.get(&owner_rfc) else { continue };
+                let Some(clave_enc) = creds.get(&owner_rfc) else {
+                    continue;
+                };
                 match crypto::decrypt(&key, clave_enc) {
                     Ok(clave) => (
                         serde_json::json!({
@@ -196,7 +212,9 @@ async fn recheck_chunk(
     let mut found: HashMap<String, String> = HashMap::new();
     if let Some(invoices) = result.get("invoices").and_then(|v| v.as_array()) {
         for inv in invoices {
-            let Some(uuid) = inv.get("uuid").and_then(|v| v.as_str()) else { continue };
+            let Some(uuid) = inv.get("uuid").and_then(|v| v.as_str()) else {
+                continue;
+            };
             let estado = inv
                 .get("estadoComprobante")
                 .or_else(|| inv.get("EstadoComprobante"))

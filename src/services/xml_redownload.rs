@@ -58,10 +58,15 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
     if candidates.is_empty() {
         return Ok(());
     }
-    tracing::info!(count = candidates.len(), "Xml-redownload: candidates this cycle");
+    tracing::info!(
+        count = candidates.len(),
+        "Xml-redownload: candidates this cycle"
+    );
 
-    let creds: HashMap<String, String> =
-        db::users::get_all_with_credentials(pool).await?.into_iter().collect();
+    let creds: HashMap<String, String> = db::users::get_all_with_credentials(pool)
+        .await?
+        .into_iter()
+        .collect();
 
     // Group by (owner_rfc, download_type) — same ownership rule as
     // recheck_cancelled.rs: whichever side of the CFDI is a tracked Pulso RFC
@@ -70,15 +75,24 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
     let mut orphaned: Vec<String> = Vec::new();
     for (uuid, rfc_emisor, rfc_receptor, metadata) in candidates {
         if creds.contains_key(&rfc_emisor) {
-            groups.entry((rfc_emisor, "emitidos")).or_default().push((uuid, metadata));
+            groups
+                .entry((rfc_emisor, "emitidos"))
+                .or_default()
+                .push((uuid, metadata));
         } else if creds.contains_key(&rfc_receptor) {
-            groups.entry((rfc_receptor, "recibidos")).or_default().push((uuid, metadata));
+            groups
+                .entry((rfc_receptor, "recibidos"))
+                .or_default()
+                .push((uuid, metadata));
         } else {
             orphaned.push(uuid);
         }
     }
     if !orphaned.is_empty() {
-        tracing::info!(count = orphaned.len(), "Xml-redownload: no tracked RFC owns these, counting as a miss");
+        tracing::info!(
+            count = orphaned.len(),
+            "Xml-redownload: no tracked RFC owns these, counting as a miss"
+        );
         for uuid in &orphaned {
             let _ = db::cfdis::record_redownload_miss(pool, uuid).await;
         }
@@ -93,10 +107,14 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
         // later. See recheck_cancelled.rs's identical note; got this wrong
         // once already (dropped inside a match arm), fixed the pattern here
         // from the start.
-        let (auth_payload, _fiel_tmp) = match crate::try_fiel_auth(pool, s3, &bucket, &owner_rfc).await {
+        let (auth_payload, _fiel_tmp) = match crate::try_fiel_auth(pool, s3, &bucket, &owner_rfc)
+            .await
+        {
             Some((fiel_auth, tmp)) => (fiel_auth, Some(tmp)),
             None => {
-                let Some(clave_enc) = creds.get(&owner_rfc) else { continue };
+                let Some(clave_enc) = creds.get(&owner_rfc) else {
+                    continue;
+                };
                 match crypto::decrypt(&key, clave_enc) {
                     Ok(clave) => (
                         serde_json::json!({ "type": "ciec", "rfc": owner_rfc, "password": clave }),
@@ -111,8 +129,17 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
         };
 
         for chunk in items.chunks(CHUNK_SIZE) {
-            if let Err(e) =
-                redownload_chunk(pool, cfg, s3, &bucket, &owner_rfc, download_type, &auth_payload, chunk).await
+            if let Err(e) = redownload_chunk(
+                pool,
+                cfg,
+                s3,
+                &bucket,
+                &owner_rfc,
+                download_type,
+                &auth_payload,
+                chunk,
+            )
+            .await
             {
                 tracing::error!(rfc = %owner_rfc, "Xml-redownload: chunk failed: {e}");
             }
@@ -176,7 +203,18 @@ async fn redownload_chunk(
         };
 
         let (rfc_e, rfc_r, year, month, day) = etl::extract_path_from_meta(metadata);
-        let _ = storage::upload(s3, bucket, &rfc_e, &rfc_r, year, month, day, &uuid.to_lowercase(), bytes.clone()).await;
+        let _ = storage::upload(
+            s3,
+            bucket,
+            &rfc_e,
+            &rfc_r,
+            year,
+            month,
+            day,
+            &uuid.to_lowercase(),
+            bytes.clone(),
+        )
+        .await;
 
         if etl::apply_xml_bytes(pool, uuid, metadata, &bytes).await {
             recovered += 1;

@@ -414,7 +414,12 @@ pub fn parse(
 
     // Require at minimum an RFC emisor
     if cfdi.rfc_emisor.is_empty() {
-        let prefix: String = xml_bytes.iter().take(8).map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+        let prefix: String = xml_bytes
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         tracing::warn!(first_bytes = %prefix, "xml_parser: rfc_emisor empty after parse");
         return None;
     }
@@ -887,4 +892,87 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
         mo += 1;
     }
     (y, mo, rem + 1)
+}
+
+#[cfg(test)]
+mod aud010_retencion_tests {
+    use super::*;
+
+    /// Modeled on a real 2026 comprobante's AUD-010 arithmetic fingerprint:
+    /// subtotal(3000) - descuento(0) + trasladados(480) = 3480, which exceeds
+    /// total(3442.50) by exactly 37.50 -- the ISR retention SAT computed but
+    /// Pulso never stored. RFCs, names, and UUID below are synthetic --
+    /// deliberately not the real comprobante's, which involves a real
+    /// person's tax ID and is not something to carry into source code.
+    ///
+    /// The comprobante-level `<cfdi:Retencion>` here carries only Impuesto
+    /// and Importe -- per the CFDI 4.0 XSD, comprobante-level retentions
+    /// never carry TipoFactor/TasaOCuota/Base (unlike comprobante-level
+    /// Traslado, and unlike concept-level Retencion, both of which require
+    /// the full rate breakdown). That schema asymmetry is why every
+    /// comprobante-level retention row has `tipo_factor: None`.
+    const SAMPLE_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<cfdi:Comprobante Version="4.0" Fecha="2026-08-14T07:43:53" SubTotal="3000.00" Moneda="MXN" Total="3442.50" TipoDeComprobante="I" MetodoPago="PPD" xmlns:cfdi="http://www.sat.gob.mx/cfd/4" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <cfdi:Emisor Rfc="AAAA010101AAA" Nombre="PROVEEDOR DE PRUEBA" RegimenFiscal="626" />
+  <cfdi:Receptor Rfc="BBB010101BB1" Nombre="CLIENTE DE PRUEBA" DomicilioFiscalReceptor="66368" RegimenFiscalReceptor="601" UsoCFDI="G03" />
+  <cfdi:Conceptos>
+    <cfdi:Concepto ClaveProdServ="31211600" Cantidad="2" ClaveUnidad="H87" Descripcion="CURADO DE TINTA UV" ValorUnitario="1500" Importe="3000.000000" ObjetoImp="02">
+      <cfdi:Impuestos>
+        <cfdi:Traslados>
+          <cfdi:Traslado Base="3000.000000" Impuesto="002" TipoFactor="Tasa" TasaOCuota="0.160000" Importe="480.000000" />
+        </cfdi:Traslados>
+        <cfdi:Retenciones>
+          <cfdi:Retencion Base="3000.000000" Impuesto="001" TipoFactor="Tasa" TasaOCuota="0.012500" Importe="37.500000" />
+        </cfdi:Retenciones>
+      </cfdi:Impuestos>
+    </cfdi:Concepto>
+  </cfdi:Conceptos>
+  <cfdi:Impuestos TotalImpuestosTrasladados="480.00" TotalImpuestosRetenidos="37.50">
+    <cfdi:Retenciones>
+      <cfdi:Retencion Impuesto="001" Importe="37.50" />
+    </cfdi:Retenciones>
+    <cfdi:Traslados>
+      <cfdi:Traslado Base="3000.00" Impuesto="002" TipoFactor="Tasa" TasaOCuota="0.160000" Importe="480.00" />
+    </cfdi:Traslados>
+  </cfdi:Impuestos>
+  <cfdi:Complemento>
+    <tfd:TimbreFiscalDigital xmlns:tfd="http://www.sat.gob.mx/TimbreFiscalDigital" Version="1.1" UUID="00000000-0000-0000-0000-000000000001" FechaTimbrado="2026-08-14T07:44:25" />
+  </cfdi:Complemento>
+</cfdi:Comprobante>"#;
+
+    #[test]
+    fn comprobante_level_retencion_without_tipo_factor_is_parsed() {
+        let cfdi =
+            parse(SAMPLE_XML.as_bytes(), "job", "emitidos", "vigente").expect("parse failed");
+
+        let retencion = cfdi
+            .taxes
+            .iter()
+            .find(|t| t.is_retenido == 1)
+            .expect("comprobante-level retencion should be parsed");
+        assert_eq!(retencion.impuesto, Some("001".to_string()));
+        assert_eq!(retencion.importe, Some(37.5));
+        // The CFDI 4.0 XSD doesn't give comprobante-level Retencion a
+        // TipoFactor/TasaOCuota/Base -- this is expected to be None, and
+        // `cfdi_taxes.tipo_factor` must accept it (migration 061).
+        assert_eq!(retencion.tipo_factor, None);
+        assert_eq!(retencion.tasa, None);
+
+        let traslado = cfdi
+            .taxes
+            .iter()
+            .find(|t| t.is_retenido == 0)
+            .expect("comprobante-level traslado should be parsed");
+        assert_eq!(traslado.importe, Some(480.0));
+
+        // The arithmetic fingerprint: subtotal - descuento + trasladados > total,
+        // resolved exactly by the retained amount.
+        let subtotal = cfdi.subtotal.unwrap();
+        let descuento = cfdi.descuento.unwrap_or(0.0);
+        let trasladados = 480.0;
+        let retenidos = 37.5;
+        assert!(
+            (subtotal - descuento + trasladados - retenidos - cfdi.total.unwrap()).abs() < 1e-6
+        );
+    }
 }
