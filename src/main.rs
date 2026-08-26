@@ -20,8 +20,8 @@ use utoipa_scalar::{Scalar, Servable};
 use config::Config;
 use db::DbPool;
 use routes::{
-    analytics as analytics_routes, auth as auth_routes, billing as billing_routes, fiel as fiel_routes,
-    invoices, queue as queue_routes, users as users_routes,
+    analytics as analytics_routes, auth as auth_routes, billing as billing_routes,
+    fiel as fiel_routes, invoices, queue as queue_routes, users as users_routes,
 };
 use services::etl;
 use state::CaptchaMap;
@@ -47,15 +47,19 @@ pub(crate) async fn try_fiel_auth(
         .map_err(|e| tracing::error!(rfc = %rfc, "FIEL check: DB error: {e}"))
         .ok()??;
 
-    let cert_bytes = services::s3::get_fiel(s3, bucket, &row.cert_s3_key).await.or_else(|| {
-        tracing::error!(rfc = %rfc, key = %row.cert_s3_key, "FIEL: S3 cert download failed");
-        None
-    })?;
+    let cert_bytes = services::s3::get_fiel(s3, bucket, &row.cert_s3_key)
+        .await
+        .or_else(|| {
+            tracing::error!(rfc = %rfc, key = %row.cert_s3_key, "FIEL: S3 cert download failed");
+            None
+        })?;
 
-    let key_bytes = services::s3::get_fiel(s3, bucket, &row.key_s3_key).await.or_else(|| {
-        tracing::error!(rfc = %rfc, key = %row.key_s3_key, "FIEL: S3 key download failed");
-        None
-    })?;
+    let key_bytes = services::s3::get_fiel(s3, bucket, &row.key_s3_key)
+        .await
+        .or_else(|| {
+            tracing::error!(rfc = %rfc, key = %row.key_s3_key, "FIEL: S3 key download failed");
+            None
+        })?;
 
     let enc_key = services::crypto::load_key();
     let password = services::crypto::decrypt(&enc_key, &row.password_enc)
@@ -166,7 +170,8 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                 Ok(j) => j,
                 Err(e) => {
                     tracing::error!(job_id = %job.id, "Worker: decrypt failed: {e}");
-                    let _ = db::jobs::fail(&pool, &job.id, None, &format!("Decrypt failed: {e}")).await;
+                    let _ =
+                        db::jobs::fail(&pool, &job.id, None, &format!("Decrypt failed: {e}")).await;
                     continue;
                 }
             };
@@ -174,7 +179,8 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
             let auth_payload: serde_json::Value = match serde_json::from_str(&auth_json) {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = db::jobs::fail(&pool, &job.id, None, &format!("Bad auth JSON: {e}")).await;
+                    let _ =
+                        db::jobs::fail(&pool, &job.id, None, &format!("Bad auth JSON: {e}")).await;
                     continue;
                 }
             };
@@ -312,15 +318,23 @@ async fn daily_sync_worker(pool: DbPool) {
             let mut y = 1970u32;
             let mut d = days as u32;
             loop {
-                let dy = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
-                if d < dy { break; }
+                let dy = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                    366
+                } else {
+                    365
+                };
+                if d < dy {
+                    break;
+                }
                 d -= dy;
                 y += 1;
             }
             let mut m = 1u32;
             loop {
                 let dm = days_in_month(y, m);
-                if d < dm { break; }
+                if d < dm {
+                    break;
+                }
                 d -= dm;
                 m += 1;
             }
@@ -328,7 +342,7 @@ async fn daily_sync_worker(pool: DbPool) {
         };
 
         let period_from = format!("{yy:04}-{ym:02}-{yd:02} 00:00:00");
-        let period_to   = format!("{yy:04}-{ym:02}-{yd:02} 23:59:59");
+        let period_to = format!("{yy:04}-{ym:02}-{yd:02} 23:59:59");
 
         let users = match db::users::get_all_with_credentials(&pool).await {
             Ok(u) => u,
@@ -365,7 +379,11 @@ async fn daily_sync_worker(pool: DbPool) {
                 Ok(false) => match db::jobs::latest_historical_period_to(&pool, &rfc).await {
                     Ok(Some(hist_to)) => {
                         let gap_start = next_day(&hist_to);
-                        if gap_start < period_from { gap_start } else { period_from.clone() }
+                        if gap_start < period_from {
+                            gap_start
+                        } else {
+                            period_from.clone()
+                        }
                     }
                     _ => period_from.clone(),
                 },
@@ -449,8 +467,18 @@ fn is_last_day_of_month(date_str: &str) -> bool {
 /// Build a Spanish month label like "Julio 2026" from "YYYY-MM-DD …".
 fn month_label_es(date_str: &str) -> String {
     const MONTHS: [&str; 12] = [
-        "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-        "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+        "Enero",
+        "Febrero",
+        "Marzo",
+        "Abril",
+        "Mayo",
+        "Junio",
+        "Julio",
+        "Agosto",
+        "Septiembre",
+        "Octubre",
+        "Noviembre",
+        "Diciembre",
     ];
     if date_str.len() < 7 {
         return date_str.to_string();
@@ -535,9 +563,15 @@ async fn run_count_pass(
                 break;
             }
         };
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-            if val.get("__keepalive__").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if val
+                .get("__keepalive__")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 let total_so_far = val["total_so_far"].as_i64().unwrap_or(0);
                 let date = val["date"].as_str().unwrap_or("?");
                 tracing::info!(
@@ -577,7 +611,15 @@ async fn notify_sync_failed(
     let Ok(Some(email)) = crate::db::users::get_email_by_rfc(pool, rfc).await else {
         return;
     };
-    match crate::services::email::send_sync_failed(api_key, &cfg.sendgrid_from, &email, rfc, error_code).await {
+    match crate::services::email::send_sync_failed(
+        api_key,
+        &cfg.sendgrid_from,
+        &email,
+        rfc,
+        error_code,
+    )
+    .await
+    {
         Ok(_) => tracing::info!(job_id = %job_id, "Sent sync-failed email to {email}"),
         Err(e) => tracing::warn!(job_id = %job_id, "Failed to send sync-failed email: {e}"),
     }
@@ -610,7 +652,17 @@ async fn run_worker_chunk(
     // Count pass: only for non-auto_daily jobs where total is still unknown.
     if job_type != "auto_daily" && total_expected.is_none() {
         tracing::info!(job_id = %job_id, "Starting list-count pre-pass");
-        match run_count_pass(&pool, &cfg, &job_id, &auth_payload, &full_period_from, &period_to, &dl_type).await {
+        match run_count_pass(
+            &pool,
+            &cfg,
+            &job_id,
+            &auth_payload,
+            &full_period_from,
+            &period_to,
+            &dl_type,
+        )
+        .await
+        {
             Some(total) => {
                 tracing::info!(job_id = %job_id, total = total, "list-count complete");
                 let _ = db::jobs::set_total_expected(&pool, &job_id, total).await;
@@ -852,7 +904,16 @@ async fn run_worker_chunk(
             // before telling the client anything, unlike invalid_credentials/
             // fiel_login_failed below, which SAT's login step itself rejects
             // immediately and really do need a human to fix.
-            match db::jobs::retry_transient_or_fail(&pool, &job_id, &cursor, found, Some(&code), &message).await {
+            match db::jobs::retry_transient_or_fail(
+                &pool,
+                &job_id,
+                &cursor,
+                found,
+                Some(&code),
+                &message,
+            )
+            .await
+            {
                 Ok(true) => {
                     tracing::warn!(job_id = %job_id, code = %code, "Job failed permanently: retries exhausted");
                     notify_sync_failed(&pool, &cfg, &job_id, &job_rfc, Some(&code)).await;
@@ -895,8 +956,9 @@ async fn run_worker_chunk(
 
     if limit_hit {
         let resume_at = db::jobs::utc_offset(limit_retry_after);
-        let reason = limit_reason
-            .unwrap_or_else(|| "SAT download limit reached — will resume automatically".to_string());
+        let reason = limit_reason.unwrap_or_else(|| {
+            "SAT download limit reached — will resume automatically".to_string()
+        });
         let _ = db::jobs::pause_limit(
             &pool,
             &job_id,
@@ -918,8 +980,8 @@ async fn run_worker_chunk(
             if let Ok(Some(email)) = crate::db::users::get_email_by_rfc(&pool, &job_rfc).await {
                 let send_result = if job_type == "list" {
                     match crate::db::users::is_initial_sync_job(&pool, &job_rfc, &job_id).await {
-                        Ok(true) => {
-                            Some(crate::services::email::send_sync_complete(
+                        Ok(true) => Some(
+                            crate::services::email::send_sync_complete(
                                 api_key,
                                 &cfg.sendgrid_from,
                                 &email,
@@ -927,27 +989,35 @@ async fn run_worker_chunk(
                                 found,
                                 &period_from,
                                 &period_to,
-                            ).await)
-                        }
+                            )
+                            .await,
+                        ),
                         _ => None,
                     }
                 } else if job_type == "auto_daily" && is_last_day_of_month(&period_to) {
                     let month_label = month_label_es(&period_to);
-                    Some(crate::services::email::send_monthly_complete(
-                        api_key,
-                        &cfg.sendgrid_from,
-                        &email,
-                        &job_rfc,
-                        &month_label,
-                    ).await)
+                    Some(
+                        crate::services::email::send_monthly_complete(
+                            api_key,
+                            &cfg.sendgrid_from,
+                            &email,
+                            &job_rfc,
+                            &month_label,
+                        )
+                        .await,
+                    )
                 } else {
                     None
                 };
 
                 match send_result {
-                    Some(Err(e)) => tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}"),
-                    Some(Ok(_))  => tracing::info!(job_id = %job_id, "Sent completion email to {email}"),
-                    None         => {}
+                    Some(Err(e)) => {
+                        tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}")
+                    }
+                    Some(Ok(_)) => {
+                        tracing::info!(job_id = %job_id, "Sent completion email to {email}")
+                    }
+                    None => {}
                 }
             }
         }
@@ -1014,7 +1084,11 @@ async fn main() -> std::io::Result<()> {
         let recheck_pool = pool.clone();
         let recheck_cfg = Arc::new(cfg.clone());
         let recheck_s3 = s3_client.clone();
-        tokio::spawn(services::recheck_cancelled::worker(recheck_pool, recheck_cfg, recheck_s3));
+        tokio::spawn(services::recheck_cancelled::worker(
+            recheck_pool,
+            recheck_cfg,
+            recheck_s3,
+        ));
     }
     {
         let gap_pool = pool.clone();
@@ -1026,7 +1100,9 @@ async fn main() -> std::io::Result<()> {
         let redl_pool = pool.clone();
         let redl_cfg = Arc::new(cfg.clone());
         let redl_s3 = s3_client.clone();
-        tokio::spawn(services::xml_redownload::worker(redl_pool, redl_cfg, redl_s3));
+        tokio::spawn(services::xml_redownload::worker(
+            redl_pool, redl_cfg, redl_s3,
+        ));
     }
 
     // ── HTTP server ─────────────────────────────────────────────────────────
@@ -1253,11 +1329,17 @@ async fn main() -> std::io::Result<()> {
                     .route("/payments", web::get().to(analytics_routes::get_payments))
                     .route("/cashflow", web::get().to(analytics_routes::get_cashflow))
                     .route("/hallazgos", web::get().to(analytics_routes::get_hallazgos))
-                    .route("/payroll/snapshot", web::get().to(analytics_routes::get_payroll_snapshot))
+                    .route(
+                        "/payroll/snapshot",
+                        web::get().to(analytics_routes::get_payroll_snapshot),
+                    )
                     .route("/payroll", web::get().to(analytics_routes::get_payroll))
                     .route("/quarterly", web::get().to(analytics_routes::get_quarterly))
                     .route("/xml-count", web::get().to(analytics_routes::get_xml_count))
-                    .route("/xml-breakdown", web::get().to(analytics_routes::get_xml_breakdown))
+                    .route(
+                        "/xml-breakdown",
+                        web::get().to(analytics_routes::get_xml_breakdown),
+                    )
                     .route(
                         "/period-comparison",
                         web::get().to(analytics_routes::get_period_comparison),
@@ -1299,25 +1381,21 @@ async fn main() -> std::io::Result<()> {
                         web::resource("/normalization/counterparties/{cp_rfc}/cfdis")
                             .route(web::get().to(analytics_routes::list_norm_counterparty_cfdis)),
                     )
-                    .service(
-                        web::resource("/normalization/payroll/employees")
-                            .route(
-                                web::get()
-                                    .to(analytics_routes::get_normalization_payroll_employees),
-                            ),
-                    )
+                    .service(web::resource("/normalization/payroll/employees").route(
+                        web::get().to(analytics_routes::get_normalization_payroll_employees),
+                    ))
                     .service(
                         web::resource("/normalization/payroll/employees/{employee_rfc}/receipts")
                             .route(
-                                web::get()
-                                    .to(analytics_routes::get_normalization_payroll_employee_receipts),
+                                web::get().to(
+                                    analytics_routes::get_normalization_payroll_employee_receipts,
+                                ),
                             ),
                     )
                     .service(
-                        web::resource("/normalization/ebitda-bridge")
-                            .route(
-                                web::get().to(analytics_routes::get_normalization_ebitda_bridge),
-                            ),
+                        web::resource("/normalization/ebitda-bridge").route(
+                            web::get().to(analytics_routes::get_normalization_ebitda_bridge),
+                        ),
                     ),
             )
     })
