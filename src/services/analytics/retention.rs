@@ -80,9 +80,9 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
     let q2 = format!(
         "SELECT year, ({cp_key_expr}) AS rfc, MAX({cp_name_col}) AS nombre, \
                 SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total_mxn \
-         FROM pulso.cfdis_ajustado \
+         FROM pulso.cfdis_ajustado c \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled \
-           AND NOT EXISTS (SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid) \
+           AND NOT EXISTS (SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid) \
          GROUP BY year, ({cp_key_expr}) \
          ORDER BY year"
     );
@@ -107,9 +107,9 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
     // Q3: year totals
     let q3 = format!(
         "SELECT year, SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total_mxn \
-         FROM pulso.cfdis_ajustado \
+         FROM pulso.cfdis_ajustado c \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled \
-           AND NOT EXISTS (SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid) \
+           AND NOT EXISTS (SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid) \
          GROUP BY year ORDER BY year"
     );
     let rows3 = sqlx::query(&q3).bind(rfc).fetch_all(pool).await?;

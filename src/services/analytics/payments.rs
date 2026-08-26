@@ -81,7 +81,11 @@ pub async fn get(
     // counts as "cartera" just because it hasn't finished yet (AUD-009). L2-01: pagado/
     // saldo per invoice comes from the shared base, which also folds in returns ('03',
     // AUD-008) that this query used to miss.
-    let direccion = if dl_type == "recibidos" { "recibidos" } else { "emitidos" };
+    let direccion = if dl_type == "recibidos" {
+        "recibidos"
+    } else {
+        "emitidos"
+    };
     let totals_row = sqlx::query(&format!(
         r#"
         WITH cutoff AS (
@@ -105,8 +109,8 @@ pub async fn get(
     .fetch_one(pool)
     .await?;
     let total_invoiced_mxn: f64 = totals_row.try_get("total_invoiced").unwrap_or(0.0);
-    let total_paid_mxn: f64     = totals_row.try_get("total_paid").unwrap_or(0.0);
-    let total_outstanding: f64  = totals_row.try_get("ppd_outstanding").unwrap_or(0.0);
+    let total_paid_mxn: f64 = totals_row.try_get("total_paid").unwrap_or(0.0);
+    let total_outstanding: f64 = totals_row.try_get("ppd_outstanding").unwrap_or(0.0);
     let collection_rate = if total_invoiced_mxn > 0.0 {
         total_paid_mxn / total_invoiced_mxn * 100.0
     } else {

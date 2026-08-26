@@ -98,9 +98,15 @@ fn h1_nivel(top3_pct: f64) -> &'static str {
 
 fn h1_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "critico" => "Dependencia extrema — la pérdida o renegociación de cualquiera de estas cuentas tiene impacto directo sobre la viabilidad del negocio.",
-        "alto" => "Concentración elevada con riesgo de pérdida material ante churn de las cuentas principales.",
-        "medio" => "Concentración moderada. Revisar recurrencia y antigüedad de las cuentas principales en el módulo de Emitidas.",
+        "critico" => {
+            "Dependencia extrema — la pérdida o renegociación de cualquiera de estas cuentas tiene impacto directo sobre la viabilidad del negocio."
+        }
+        "alto" => {
+            "Concentración elevada con riesgo de pérdida material ante churn de las cuentas principales."
+        }
+        "medio" => {
+            "Concentración moderada. Revisar recurrencia y antigüedad de las cuentas principales en el módulo de Emitidas."
+        }
         _ => "Base de clientes diversificada. Sin concentración crítica observable en LTM.",
     }
 }
@@ -121,8 +127,12 @@ fn h2_nivel(cagr: f64) -> &'static str {
 
 fn h2_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "muy_negativo" | "negativo" => "Caída sostenida de ingresos en el período analizado. Requiere explicación de gestión antes de cualquier ejercicio de valoración.",
-        "neutral" => "Crecimiento marginal. Insuficiente para absorber inflación de costos sin compresión de flujo visible.",
+        "muy_negativo" | "negativo" => {
+            "Caída sostenida de ingresos en el período analizado. Requiere explicación de gestión antes de cualquier ejercicio de valoración."
+        }
+        "neutral" => {
+            "Crecimiento marginal. Insuficiente para absorber inflación de costos sin compresión de flujo visible."
+        }
         "positivo" => "Crecimiento consistente en el período analizado.",
         _ => "Crecimiento sólido y sostenido en el período analizado.",
     }
@@ -144,8 +154,12 @@ fn h3_nivel(delta_pp: f64) -> &'static str {
 
 fn h3_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "muy_negativo" => "Deterioro de flujo visible: los egresos crecen más rápido que los ingresos. Revisar drivers de gasto y masa salarial en detalle.",
-        "negativo" => "Presión creciente sobre el flujo visible. Verificar evolución de egresos y nómina frente a tendencia de ingresos.",
+        "muy_negativo" => {
+            "Deterioro de flujo visible: los egresos crecen más rápido que los ingresos. Revisar drivers de gasto y masa salarial en detalle."
+        }
+        "negativo" => {
+            "Presión creciente sobre el flujo visible. Verificar evolución de egresos y nómina frente a tendencia de ingresos."
+        }
         "neutral" => "Relación ingresos/egresos estable en el período analizado.",
         _ => "Mejora en la relación ingresos vs egresos visibles.",
     }
@@ -167,7 +181,9 @@ fn h4_nivel(ratio_pct: f64) -> &'static str {
 
 fn h4_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "critico" | "alto" => "Pasivo laboral de peso significativo. Requiere análisis detallado de antigüedad, sueldos y estructura de plantilla.",
+        "critico" | "alto" => {
+            "Pasivo laboral de peso significativo. Requiere análisis detallado de antigüedad, sueldos y estructura de plantilla."
+        }
         "medio" => "Pasivo laboral relevante. Considerar en la estructura de la transacción.",
         _ => "Pasivo laboral manejable en relación al nivel de ingresos.",
     }
@@ -189,8 +205,12 @@ fn h5a_nivel(tasa_pct: f64) -> &'static str {
 
 fn h5a_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "critico" | "alto" => "Rotación elevada — señal de inestabilidad operativa o condiciones laborales que requieren validación. Revisar distribución por departamento y nivel salarial en módulo de Nómina.",
-        "medio" => "Rotación moderada. Verificar si se concentra en áreas críticas o corresponde a patrones estacionales.",
+        "critico" | "alto" => {
+            "Rotación elevada — señal de inestabilidad operativa o condiciones laborales que requieren validación. Revisar distribución por departamento y nivel salarial en módulo de Nómina."
+        }
+        "medio" => {
+            "Rotación moderada. Verificar si se concentra en áreas críticas o corresponde a patrones estacionales."
+        }
         _ => "Plantilla estable en el período analizado.",
     }
 }
@@ -211,8 +231,12 @@ fn h6_nivel(ratio_pct: f64) -> &'static str {
 
 fn h6_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "critico" | "alto" => "Cartera material en riesgo. Revisar antigüedad y concentración de saldos en el módulo de Cobranza.",
-        "medio" => "Saldo pendiente relevante. Verificar composición por cliente y buckets de antigüedad.",
+        "critico" | "alto" => {
+            "Cartera material en riesgo. Revisar antigüedad y concentración de saldos en el módulo de Cobranza."
+        }
+        "medio" => {
+            "Saldo pendiente relevante. Verificar composición por cliente y buckets de antigüedad."
+        }
         _ => "Cobranza eficiente. Cartera pendiente dentro de rangos normales.",
     }
 }
@@ -233,7 +257,9 @@ fn h7_nivel(ratio_pct: f64) -> &'static str {
 
 fn h7_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "critico" | "alto" => "Saldo relevante con proveedores. Revisar antigüedad, concentración y posible impacto en relaciones comerciales o liquidez.",
+        "critico" | "alto" => {
+            "Saldo relevante con proveedores. Revisar antigüedad, concentración y posible impacto en relaciones comerciales o liquidez."
+        }
         "medio" => "Saldo moderado. Verificar composición por proveedor y buckets de vencimiento.",
         _ => "Disciplina de pago sólida. Sin pasivo material observable con proveedores.",
     }
@@ -255,8 +281,12 @@ fn h8_nivel(top3_pct: f64) -> Option<&'static str> {
 
 fn h8_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "critico" | "alto" => "Concentración elevada en pocos proveedores. Una interrupción en las relaciones principales tendría impacto material sobre la operación. Revisar condiciones contractuales.",
-        "medio" => "Concentración moderada. Validar diversificación, exclusividad y riesgo de sustitución en el proceso de due diligence.",
+        "critico" | "alto" => {
+            "Concentración elevada en pocos proveedores. Una interrupción en las relaciones principales tendría impacto material sobre la operación. Revisar condiciones contractuales."
+        }
+        "medio" => {
+            "Concentración moderada. Validar diversificación, exclusividad y riesgo de sustitución en el proceso de due diligence."
+        }
         _ => "Gasto distribuido entre proveedores. Sin dependencia crítica observable.",
     }
 }
@@ -277,11 +307,19 @@ fn h9_nivel(delta_pct: f64) -> &'static str {
 
 fn h9_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "muy_negativo" => "Caída material en la ventana más reciente. El CAGR histórico puede enmascarar un deterioro acelerado. Contrastar con CAGR histórico y revisar módulo de Emitidas.",
-        "negativo" => "Desaceleración visible en los últimos 12 meses vs el período anterior. Contrastar con el CAGR histórico para distinguir corrección temporal de deterioro estructural.",
-        "neutral" => "Ingresos recientes en línea con el LTM anterior. Sin aceleración ni deterioro visible en la ventana más reciente.",
+        "muy_negativo" => {
+            "Caída material en la ventana más reciente. El CAGR histórico puede enmascarar un deterioro acelerado. Contrastar con CAGR histórico y revisar módulo de Emitidas."
+        }
+        "negativo" => {
+            "Desaceleración visible en los últimos 12 meses vs el período anterior. Contrastar con el CAGR histórico para distinguir corrección temporal de deterioro estructural."
+        }
+        "neutral" => {
+            "Ingresos recientes en línea con el LTM anterior. Sin aceleración ni deterioro visible en la ventana más reciente."
+        }
         "positivo" => "Ingresos recientes por encima del LTM anterior. Momentum favorable.",
-        _ => "Aceleración de ingresos en la ventana más reciente. Señal positiva de momentum comercial.",
+        _ => {
+            "Aceleración de ingresos en la ventana más reciente. Señal positiva de momentum comercial."
+        }
     }
 }
 
@@ -635,11 +673,13 @@ async fn compute_h5b(
         return Ok(None);
     }
 
-    let nivel = if key_exits.len() >= 2 { "critico" } else { "alto" };
-
-    let fmt_period = |ym: i64| -> String {
-        format!("{}-{:02}", ym / 100, ym % 100)
+    let nivel = if key_exits.len() >= 2 {
+        "critico"
+    } else {
+        "alto"
     };
+
+    let fmt_period = |ym: i64| -> String { format!("{}-{:02}", ym / 100, ym % 100) };
 
     let (cuerpo, datos_tabla) = if key_exits.len() == 1 {
         let emp = key_exits[0];
@@ -874,7 +914,10 @@ async fn compute_h7(
         metrica_principal: Some(ratio_pct),
         cuerpo,
         interpretacion: interp.to_string(),
-        disclaimer: Some("Interpretar como señal analítica, no como saldo de cuentas por pagar definitivo.".to_string()),
+        disclaimer: Some(
+            "Interpretar como señal analítica, no como saldo de cuentas por pagar definitivo."
+                .to_string(),
+        ),
         nota_fija: None,
         datos_tabla: None,
     }))
@@ -934,11 +977,13 @@ async fn compute_h8(
         .collect();
 
     // Exclude regulatory RFCs from concentration calculation
-    let is_regulatory = |rfc: &str| {
-        rfc.starts_with("IMS") || rfc.starts_with("INF") || rfc == "XAXX010101000"
-    };
+    let is_regulatory =
+        |rfc: &str| rfc.starts_with("IMS") || rfc.starts_with("INF") || rfc == "XAXX010101000";
 
-    let identifiable: Vec<&SupRow> = suppliers.iter().filter(|s| !is_regulatory(&s.rfc)).collect();
+    let identifiable: Vec<&SupRow> = suppliers
+        .iter()
+        .filter(|s| !is_regulatory(&s.rfc))
+        .collect();
     if identifiable.is_empty() {
         return Ok(None);
     }
@@ -959,7 +1004,10 @@ async fn compute_h8(
 
     let interp = h8_interpretacion(nivel);
     let top1_nombre = top3.first().map(|s| s.nombre.as_str()).unwrap_or("");
-    let top1_pct = top3.first().map(|s| s.mxn / total_excl * 100.0).unwrap_or(0.0);
+    let top1_pct = top3
+        .first()
+        .map(|s| s.mxn / total_excl * 100.0)
+        .unwrap_or(0.0);
 
     let cuerpo = format!(
         "El Top 3 proveedores representa el {:.1}% del gasto LTM. El mayor proveedor es {} con el {:.1}% del gasto.",
@@ -1003,7 +1051,12 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     let max_ym: Option<i64> = max_ym_row.try_get("max_ym").ok().flatten();
     let (ltm_end_y, ltm_end_m) = match max_ym {
         Some(ym) if ym > 0 => (ym / 100, ym % 100),
-        _ => return Ok(HallazgosResponse { visible: vec![], all: vec![] }),
+        _ => {
+            return Ok(HallazgosResponse {
+                visible: vec![],
+                all: vec![],
+            });
+        }
     };
     let (ltm_start_y, ltm_start_m) = subtract_months(ltm_end_y, ltm_end_m, 11);
 
@@ -1014,9 +1067,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     let mut all: Vec<Hallazgo> = Vec::new();
 
     // H1 — Concentración de clientes
-    if let Some(h) =
-        compute_h1(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?
-    {
+    if let Some(h) = compute_h1(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await? {
         all.push(h);
     }
 
@@ -1116,7 +1167,12 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         .await?;
         let ing_h3_map: std::collections::HashMap<i64, f64> = ing_rows
             .iter()
-            .map(|r| (r.try_get::<i64, _>("year").unwrap_or(0), r.try_get::<f64, _>("ingreso").unwrap_or(0.0)))
+            .map(|r| {
+                (
+                    r.try_get::<i64, _>("year").unwrap_or(0),
+                    r.try_get::<f64, _>("ingreso").unwrap_or(0.0),
+                )
+            })
             .collect();
 
         // Recibidos per year (con IVA, menos notas de crédito recibidas)
@@ -1229,16 +1285,10 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     if let Ok(snap) = super::payroll::get_snapshot(pool, rfc).await {
         if snap.has_data {
             // H4 — Pasivo laboral relativo
-            let ltm_ingreso = compute_ltm_ingreso(
-                pool,
-                rfc,
-                ltm_start_y,
-                ltm_start_m,
-                ltm_end_y,
-                ltm_end_m,
-            )
-            .await
-            .unwrap_or(0.0);
+            let ltm_ingreso =
+                compute_ltm_ingreso(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m)
+                    .await
+                    .unwrap_or(0.0);
             if ltm_ingreso > 0.0 {
                 let ratio_pct = snap.pasivo_laboral_estimado_mxn / ltm_ingreso * 100.0;
                 let meses_equiv = if snap.run_rate_mensual_ltm_mxn > 0.0 {
@@ -1277,15 +1327,8 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             }
 
             // H5A — Rotación
-            if let Some(h) = compute_h5a(
-                pool,
-                rfc,
-                ltm_start_y,
-                ltm_start_m,
-                ltm_end_y,
-                ltm_end_m,
-            )
-            .await?
+            if let Some(h) =
+                compute_h5a(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?
             {
                 all.push(h);
             }
@@ -1298,23 +1341,17 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     }
 
     // H6 — CxC pendiente
-    if let Some(h) =
-        compute_h6(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?
-    {
+    if let Some(h) = compute_h6(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await? {
         all.push(h);
     }
 
     // H7 — CxP pendiente
-    if let Some(h) =
-        compute_h7(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?
-    {
+    if let Some(h) = compute_h7(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await? {
         all.push(h);
     }
 
     // H8 — Concentración de proveedores
-    if let Some(h) =
-        compute_h8(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?
-    {
+    if let Some(h) = compute_h8(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await? {
         all.push(h);
     }
 
@@ -1335,16 +1372,10 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     let total_months: i64 = total_months_row.try_get("cnt").unwrap_or(0);
 
     if total_months >= 24 {
-        let ltm_current = compute_ltm_ingreso(
-            pool,
-            rfc,
-            ltm_start_y,
-            ltm_start_m,
-            ltm_end_y,
-            ltm_end_m,
-        )
-        .await
-        .unwrap_or(0.0);
+        let ltm_current =
+            compute_ltm_ingreso(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m)
+                .await
+                .unwrap_or(0.0);
         let ltm_prev = compute_ltm_ingreso(
             pool,
             rfc,

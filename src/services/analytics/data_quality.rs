@@ -64,7 +64,11 @@ const COVERAGE_MATERIAL_THRESHOLD: f64 = 0.10;
 const MATERIAL_THRESHOLD: f64 = 0.05;
 
 fn section(total: i64, missing: i64) -> DataQualitySection {
-    let missing_ratio = if total > 0 { missing as f64 / total as f64 } else { 0.0 };
+    let missing_ratio = if total > 0 {
+        missing as f64 / total as f64
+    } else {
+        0.0
+    };
     DataQualitySection {
         total,
         missing_xml: missing,
@@ -92,8 +96,14 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<DataQualityResponse
     .await?;
 
     Ok(DataQualityResponse {
-        emitidas: section(row.try_get("emitidas_total")?, row.try_get("emitidas_missing")?),
-        recibidas: section(row.try_get("recibidas_total")?, row.try_get("recibidas_missing")?),
+        emitidas: section(
+            row.try_get("emitidas_total")?,
+            row.try_get("emitidas_missing")?,
+        ),
+        recibidas: section(
+            row.try_get("recibidas_total")?,
+            row.try_get("recibidas_missing")?,
+        ),
         nomina: section(row.try_get("nomina_total")?, row.try_get("nomina_missing")?),
         coverage: coverage(pool, rfc).await,
     })
@@ -122,9 +132,15 @@ async fn coverage(pool: &DbPool, rfc: &str) -> CoverageInfo {
         return empty;
     };
     let (Some((fy, fm)), Some((ty, tm))) = (year_month(&from), year_month(&to)) else {
-        return CoverageInfo { range_from: Some(from), range_to: Some(to), ..empty };
+        return CoverageInfo {
+            range_from: Some(from),
+            range_to: Some(to),
+            ..empty
+        };
     };
-    let months_with_data = crate::db::cfdis::months_with_data(pool, rfc).await.unwrap_or_default();
+    let months_with_data = crate::db::cfdis::months_with_data(pool, rfc)
+        .await
+        .unwrap_or_default();
 
     let from_abs = fy * 12 + fm;
     let to_abs = ty * 12 + tm;

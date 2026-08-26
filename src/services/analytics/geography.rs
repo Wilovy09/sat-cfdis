@@ -18,7 +18,7 @@ pub struct StateRow {
     pub state_name: String,
     pub total_mxn: f64,
     pub invoice_count: i64,
-    pub unique_cp: i64,           // distinct postal codes
+    pub unique_cp: i64,             // distinct postal codes
     pub unique_counterparties: i64, // distinct counterparty RFCs
     pub pct_of_total: f64,
 }
@@ -58,7 +58,7 @@ pub async fn get(
             CASE WHEN rfc_emisor = $1 THEN rfc_receptor ELSE rfc_emisor END AS counterparty_rfc,
             SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total,
             COUNT(*)::bigint                      AS cnt
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N','T')
@@ -66,7 +66,7 @@ pub async fn get(
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT is_cancelled
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY 1, 2
         ORDER BY total DESC
@@ -87,7 +87,8 @@ pub async fn get(
 
     // state_code → (total_mxn, invoice_count, unique_cp_rfcs)
     // state_code → (total_mxn, invoice_count, unique_counterparty_rfcs, unique_postal_codes)
-    let mut state_map: HashMap<String, (f64, i64, HashSet<String>, HashSet<String>)> = Default::default();
+    let mut state_map: HashMap<String, (f64, i64, HashSet<String>, HashSet<String>)> =
+        Default::default();
     let mut by_postal_code = Vec::new();
     let mut unknown_total = 0.0f64;
 

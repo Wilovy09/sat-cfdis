@@ -213,7 +213,8 @@ pub async fn get(
     let (to_y, to_m) = parse_ym(to);
 
     // Summary (all tipos, to match full payroll spend)
-    let summary_row = sqlx::query(&format!(r#"
+    let summary_row = sqlx::query(&format!(
+        r#"
         SELECT
             SUM(n.total_percepciones + n.total_otros_pagos - n.total_deducciones) AS total_pagado,
             SUM(n.total_percepciones)                                            AS total_perc,
@@ -227,8 +228,13 @@ pub async fn get(
           AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
           AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
           AND NOT n.is_excluded
-    "#))
-    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    "#
+    ))
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
     .fetch_one(pool)
     .await?;
 
@@ -379,8 +385,12 @@ pub async fn get(
             AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi,
             COUNT(*)                                    AS payrolls,
             COUNT(DISTINCT n.year * 100 + n.month)      AS months_active,
-            MIN(n.fecha_pago)                           AS first_pay,
-            MAX(n.fecha_pago)                           AS last_pay
+            -- L4-11: the comprobante's own (year, month) -- same attribution the payroll
+            -- rule engine uses (L3-16) -- not fecha_pago, which disagrees with it on 11.8%
+            -- of receipts and used to make the rule form's period picker reject a real
+            -- last month the calculation would have honored.
+            MIN(n.year::text || '-' || LPAD(n.month::text, 2, '0') || '-01') AS first_pay,
+            MAX(n.year::text || '-' || LPAD(n.month::text, 2, '0') || '-01') AS last_pay
         FROM pulso.nomina_normalizada n
         JOIN latest_attrs la ON la.emp_rfc = n.rfc_receptor
         LEFT JOIN earliest_attrs ea ON ea.emp_rfc = n.rfc_receptor
@@ -473,10 +483,19 @@ pub async fn get(
             let tipo_contrato: String = r.try_get("tipo_contrato").unwrap_or_default();
             let last_pay: String = r.try_get("last_pay").unwrap_or_default();
 
-            let (clasificacion, sueldo_mensual_ordinario, pago_mensual_asimilado,
-                 total_mensual_promedio, warning_flags) = match perc_3m_map.get(&emp_rfc) {
+            let (
+                clasificacion,
+                sueldo_mensual_ordinario,
+                pago_mensual_asimilado,
+                total_mensual_promedio,
+                warning_flags,
+            ) = match perc_3m_map.get(&emp_rfc) {
                 Some(p) => {
-                    let mes_equiv = if p.total_dias > 0.0 { p.total_dias / 30.0 } else { 1.0 };
+                    let mes_equiv = if p.total_dias > 0.0 {
+                        p.total_dias / 30.0
+                    } else {
+                        1.0
+                    };
                     let mes_equiv = mes_equiv.max(0.1);
 
                     let smo = if p.has_001 && p.total_001 > 0.0 {
@@ -515,11 +534,14 @@ pub async fn get(
                         }
                     }
                     // Último pago fuera del rango de los 3 meses analizados
-                    let last_pay_ym: i64 = last_pay.get(..7).and_then(|s| {
-                        let yr: i64 = s[..4].parse().ok()?;
-                        let mo: i64 = s[5..7].parse().ok()?;
-                        Some(yr * 100 + mo)
-                    }).unwrap_or(0);
+                    let last_pay_ym: i64 = last_pay
+                        .get(..7)
+                        .and_then(|s| {
+                            let yr: i64 = s[..4].parse().ok()?;
+                            let mo: i64 = s[5..7].parse().ok()?;
+                            Some(yr * 100 + mo)
+                        })
+                        .unwrap_or(0);
                     let cutoff_ym: i64 = {
                         // first month of the 3-month window: current_month - 3
                         // We approximate with to_y/to_m from the request scope
@@ -543,7 +565,8 @@ pub async fn get(
 
             // sin_relacion_laboral para empleados con desglose también
             let mut warning_flags = warning_flags;
-            if tipo_contrato == "09" && !warning_flags.contains(&"sin_relacion_laboral".to_string()) {
+            if tipo_contrato == "09" && !warning_flags.contains(&"sin_relacion_laboral".to_string())
+            {
                 warning_flags.push("sin_relacion_laboral".to_string());
             }
 
@@ -772,7 +795,11 @@ pub async fn get(
         ORDER BY 1
     "#,
     ))
-    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
     .fetch_all(pool)
     .await?;
 
@@ -821,7 +848,11 @@ pub async fn get(
         ORDER BY 1, 2
     "#,
     ))
-    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
     .fetch_all(pool)
     .await?;
 
@@ -892,7 +923,11 @@ pub async fn get(
         ORDER BY n.year, SUM(COALESCE(d.importe,0)::float8 * n.factor) DESC
     "#,
     ))
-    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
     .fetch_all(pool)
     .await?;
 
@@ -923,7 +958,11 @@ pub async fn get(
         ORDER BY n.year, SUM(COALESCE(op.importe,0)::float8 * n.factor) DESC
     "#,
     ))
-    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
     .fetch_all(pool)
     .await?;
 
@@ -954,7 +993,11 @@ pub async fn get(
         ORDER BY n.year, pagado DESC
     "#,
     ))
-    .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
     .fetch_all(pool)
     .await?;
 
@@ -1082,8 +1125,10 @@ pub async fn get(
     .await?;
 
     // Build month → set<rfc> and sorted period list
-    let mut emp_by_period: std::collections::BTreeMap<(i64, i64), std::collections::HashSet<String>> =
-        std::collections::BTreeMap::new();
+    let mut emp_by_period: std::collections::BTreeMap<
+        (i64, i64),
+        std::collections::HashSet<String>,
+    > = std::collections::BTreeMap::new();
     for r in &emp_month_rows {
         let yr: i64 = r.try_get("year").unwrap_or(0);
         let mo: i64 = r.try_get("month").unwrap_or(0);
@@ -1121,11 +1166,7 @@ pub async fn get(
             let month: i64 = r.try_get("month").unwrap_or(0);
             let key = (year, month);
 
-            let prev_key = periods
-                .iter()
-                .rev()
-                .find(|&&k| k < key)
-                .cloned();
+            let prev_key = periods.iter().rev().find(|&&k| k < key).cloned();
 
             let departures = match prev_key {
                 Some(pk) => {
@@ -1168,8 +1209,7 @@ pub async fn get(
     .bind(rfc)
     .fetch_one(pool)
     .await?;
-    let has_payments_without_relacion: bool =
-        relacion_row.try_get("has_without").unwrap_or(false);
+    let has_payments_without_relacion: bool = relacion_row.try_get("has_without").unwrap_or(false);
 
     Ok(PayrollResponse {
         summary,

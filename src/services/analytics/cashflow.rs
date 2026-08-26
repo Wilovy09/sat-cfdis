@@ -190,7 +190,11 @@ pub async fn get(
 
     // PPD outstanding — full universe, as_of_cutoff-bounded like payments.rs (AUD-009),
     // so cashflow's cartera figure matches the Cobranza tab's exactly (L2-09 control).
-    let direccion = if dl_type == "recibidos" { "recibidos" } else { "emitidos" };
+    let direccion = if dl_type == "recibidos" {
+        "recibidos"
+    } else {
+        "emitidos"
+    };
     let ppd_outstanding_row = sqlx::query(&format!(
         r#"
         WITH cutoff AS (

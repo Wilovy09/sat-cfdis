@@ -98,7 +98,9 @@ pub async fn get(
     }
 
     // `to` se respeta aunque `from` no venga (el FE manda solo `to`).
-    let max_period = to.map(|t| parse_yyyymm(t).min(max_period_db)).unwrap_or(max_period_db);
+    let max_period = to
+        .map(|t| parse_yyyymm(t).min(max_period_db))
+        .unwrap_or(max_period_db);
     let from_yyyymm = if let Some(f) = from {
         parse_yyyymm(f).max(1)
     } else {
@@ -144,11 +146,11 @@ pub async fn get(
             SELECT ({cp_key_expr})                               AS cp_key,
                    COUNT(DISTINCT year * 100 + month)::bigint   AS months_active,
                    SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8   AS total_mxn
-            FROM pulso.cfdis_ajustado
+            FROM pulso.cfdis_ajustado c
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
               AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
               )
             GROUP BY ({cp_key_expr})
         ),
@@ -193,11 +195,11 @@ pub async fn get(
             SELECT year, ({cp_key_expr}) AS cp_key,
                    COUNT(DISTINCT month)::float8                                   AS cp_months_in_year,
                    GREATEST(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8), 0)::float8   AS year_total
-            FROM pulso.cfdis_ajustado
+            FROM pulso.cfdis_ajustado c
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
               AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
               )
             GROUP BY year, ({cp_key_expr})
         ),
@@ -241,22 +243,22 @@ pub async fn get(
                    COUNT(DISTINCT year * 100 + month)::bigint          AS months_active,
                    SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8    AS total_mxn,
                    COUNT(*)::bigint                                    AS invoice_count
-            FROM pulso.cfdis_ajustado
+            FROM pulso.cfdis_ajustado c
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
               AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
               )
             GROUP BY ({cp_key_expr})
             HAVING COUNT(DISTINCT year * 100 + month) >= $4
         ),
         wt AS (
             SELECT GREATEST(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8), 1) AS total
-            FROM pulso.cfdis_ajustado
+            FROM pulso.cfdis_ajustado c
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
               AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
               )
         )
         SELECT rfc, nombre, months_active, total_mxn,

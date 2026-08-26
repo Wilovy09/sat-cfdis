@@ -1,6 +1,6 @@
 use super::summary::{
-    cp_key_expr, cp_nombre_expr, dl_type_filter, normalized_name_expr, parse_ym, rfc_column,
     LABEL_EXTRANJERO_GENERICO, LABEL_PUBLICO_GENERAL, RFC_EXTRANJERO_GENERICO, RFC_PUBLICO_GENERAL,
+    cp_key_expr, cp_nombre_expr, dl_type_filter, normalized_name_expr, parse_ym, rfc_column,
 };
 use crate::db::DbPool;
 use serde::Serialize;
@@ -67,7 +67,7 @@ pub async fn get(
             COUNT(DISTINCT year * 100 + month)                     AS months_active,
             SUM(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)) OVER ()::float8 AS grand_total,
             COUNT(*) OVER ()                                       AS cp_count
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N')
@@ -75,7 +75,7 @@ pub async fn get(
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY ({cp_key_expr})
         ORDER BY total DESC
@@ -91,8 +91,12 @@ pub async fn get(
     .fetch_all(pool)
     .await?;
 
-    let grand_total: f64 = rows.first().map_or(0.0, |r| r.try_get("grand_total").unwrap_or(0.0));
-    let cp_count: i64 = rows.first().map_or(0, |r| r.try_get("cp_count").unwrap_or(0));
+    let grand_total: f64 = rows
+        .first()
+        .map_or(0.0, |r| r.try_get("grand_total").unwrap_or(0.0));
+    let cp_count: i64 = rows
+        .first()
+        .map_or(0, |r| r.try_get("cp_count").unwrap_or(0));
 
     // L2-06: HHI over ALL counterparties in the period, not just the `limit`-bounded
     // rows above (the UI's `limit` param used to silently double as the HHI universe,
@@ -104,7 +108,7 @@ pub async fn get(
         WITH per_cp AS (
             SELECT ({cp_key_expr}) AS cp_rfc,
                    SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8) AS total
-            FROM pulso.cfdis_ajustado
+            FROM pulso.cfdis_ajustado c
             WHERE {owner_col} = $1
               AND {dl_filter}
               AND tipo_comprobante NOT IN ('P','N')
@@ -112,7 +116,7 @@ pub async fn get(
               AND (year > $2 OR (year = $2 AND month >= $3))
               AND (year < $4 OR (year = $4 AND month <= $5))
               AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
               )
             GROUP BY ({cp_key_expr})
         )
@@ -218,13 +222,13 @@ pub async fn get_evolution(
                {cp_nombre_expr} AS cp_nombre,
                year,
                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS yr_total
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY ({cp_key_expr}), year
         ORDER BY ({cp_key_expr}), year
@@ -422,13 +426,13 @@ pub async fn get_ltm_comparison(
                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS ltm_total,
                COUNT(DISTINCT year * 100 + month) AS months_active,
                COUNT(*) AS invoice_count
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY ({cp_key_expr})
         "#
@@ -446,13 +450,13 @@ pub async fn get_ltm_comparison(
         SELECT ({cp_key_expr}) AS cp_rfc,
                {cp_nombre_expr} AS cp_nombre,
                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS prev_total
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY ({cp_key_expr})
         "#
@@ -522,8 +526,7 @@ pub async fn get_ltm_comparison(
         .collect();
 
     // Add "Perdida vs LTM previo" entries for counterparties present in prev LTM but not current
-    let ltm_rfcs: std::collections::HashSet<String> =
-        rows.iter().map(|r| r.rfc.clone()).collect();
+    let ltm_rfcs: std::collections::HashSet<String> = rows.iter().map(|r| r.rfc.clone()).collect();
     for (cp_rfc, (cp_nombre, prev_total)) in &prev_map {
         if !ltm_rfcs.contains(cp_rfc) && *prev_total > 0.0 {
             rows.push(LtmRow {
@@ -754,13 +757,13 @@ pub async fn get_atypical(
                    year, month,
                    year::text || '-' || LPAD(month::text, 2, '0') AS period,
                    SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS mo_total
-            FROM pulso.cfdis_ajustado
+            FROM pulso.cfdis_ajustado c
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
               AND NOT is_cancelled
               AND (year > $2 OR (year = $2 AND month >= $3))
               AND (year < $4 OR (year = $4 AND month <= $5))
               AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
               )
             GROUP BY ({cp_key_expr}), year, month
         ),
@@ -904,14 +907,14 @@ pub async fn get_individual(
         SELECT year,
                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS yr_total,
                COUNT(*) AS cnt
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
           AND (year > $4 OR (year = $4 AND month >= $5))
           AND (year < $6 OR (year = $6 AND month <= $7))
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY year
         ORDER BY year
@@ -1011,14 +1014,14 @@ pub async fn get_individual(
                year::text || '-' || LPAD(month::text, 2, '0') AS period,
                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS mo_total,
                COUNT(*) AS cnt
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
           AND (year > $4 OR (year = $4 AND month >= $5))
           AND (year < $6 OR (year = $6 AND month <= $7))
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY year, month
         ORDER BY year, month
@@ -1116,13 +1119,13 @@ pub async fn get_individual(
         r#"
         SELECT year,
                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS yr_total
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY year
         "#
@@ -1183,9 +1186,13 @@ pub async fn get_individual(
     .await?;
 
     let facturado_ppd: f64 = cobranza_row.try_get("facturado").unwrap_or(0.0);
-    let cobrado_mxn: f64   = cobranza_row.try_get("cobrado").unwrap_or(0.0);
-    let saldo: f64         = cobranza_row.try_get("saldo").unwrap_or(0.0);
-    let pct_cobrado = if facturado_ppd > 0.0 { cobrado_mxn / facturado_ppd * 100.0 } else { 0.0 };
+    let cobrado_mxn: f64 = cobranza_row.try_get("cobrado").unwrap_or(0.0);
+    let saldo: f64 = cobranza_row.try_get("saldo").unwrap_or(0.0);
+    let pct_cobrado = if facturado_ppd > 0.0 {
+        cobrado_mxn / facturado_ppd * 100.0
+    } else {
+        0.0
+    };
 
     let dias_row = sqlx::query(&format!(
         r#"

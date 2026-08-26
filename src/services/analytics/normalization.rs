@@ -29,6 +29,10 @@ pub struct NormalizationRule {
     pub capex_asset_type: Option<String>,
     pub capex_useful_life_years: Option<f64>,
     pub capex_annual_dep_mxn: Option<f64>,
+    // DEC-032: optional validity period, "YYYY-MM". NULL on either end = unbounded.
+    // Meaningless (and ignored by pulso.cfdi_exclusion) on a cfdi_uuid-level rule.
+    pub period_start: Option<String>,
+    pub period_end: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -51,6 +55,9 @@ pub struct CreateRuleRequest {
     pub capex_asset_type: Option<String>,
     pub capex_useful_life_years: Option<f64>,
     pub capex_annual_dep_mxn: Option<f64>,
+    // DEC-032
+    pub period_start: Option<String>,
+    pub period_end: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +76,10 @@ pub struct PayrollNormRule {
     pub label: Option<String>,
     pub rule_name: Option<String>,
     pub excluded_cfdi_uuids: Option<Vec<String>>,
+    // DEC-030: same Egresos "Línea del P&L" / Motivo catalog the comprobante-level rules
+    // use, so L4-02's EBITDA bridge has something to group a nómina adjustment by.
+    pub accounting_line: Option<String>,
+    pub motivo: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -87,6 +98,12 @@ pub struct CreatePayrollRuleRequest {
     pub label: Option<String>,
     pub rule_name: Option<String>,
     pub excluded_cfdi_uuids: Option<Vec<String>>,
+    // DEC-030
+    pub accounting_line: Option<String>,
+    pub motivo: Option<String>,
+    // L4-04/L4-12: set true to proceed anyway after a low-factor warning was already
+    // shown once for this same request. Absent/false on the first attempt.
+    pub confirmed: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,8 +157,9 @@ pub async fn list_rules(pool: &DbPool, owner_rfc: &str) -> anyhow::Result<Vec<No
                 rule_name, cfdi_uuid,
                 accounting_line, motivo, impacts_ebitda, capex_estimate_dep,
                 capex_asset_type, capex_useful_life_years, capex_annual_dep_mxn,
+                period_start, period_end,
                 created_at, updated_at
-         FROM pulso.normalization_rules WHERE owner_rfc = $1 ORDER BY created_at DESC"
+         FROM pulso.normalization_rules WHERE owner_rfc = $1 ORDER BY created_at DESC",
     )
     .bind(owner_rfc)
     .fetch_all(pool)
@@ -167,6 +185,8 @@ pub async fn list_rules(pool: &DbPool, owner_rfc: &str) -> anyhow::Result<Vec<No
             capex_asset_type: r.try_get("capex_asset_type").ok(),
             capex_useful_life_years: r.try_get("capex_useful_life_years").ok(),
             capex_annual_dep_mxn: r.try_get("capex_annual_dep_mxn").ok(),
+            period_start: r.try_get("period_start").ok(),
+            period_end: r.try_get("period_end").ok(),
             created_at: r.try_get("created_at").unwrap_or_default(),
             updated_at: r.try_get("updated_at").unwrap_or_default(),
         })
@@ -186,8 +206,8 @@ pub async fn create_rule(
             (id, owner_rfc, dl_type, source_rfc, source_name, group_name, action, label,
              rule_name, cfdi_uuid, accounting_line, motivo, impacts_ebitda,
              capex_estimate_dep, capex_asset_type, capex_useful_life_years,
-             capex_annual_dep_mxn, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)"#
+             capex_annual_dep_mxn, period_start, period_end, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)"#,
     )
     .bind(&id)
     .bind(owner_rfc)
@@ -206,6 +226,8 @@ pub async fn create_rule(
     .bind(&req.capex_asset_type)
     .bind(&req.capex_useful_life_years)
     .bind(&req.capex_annual_dep_mxn)
+    .bind(&req.period_start)
+    .bind(&req.period_end)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -229,6 +251,8 @@ pub async fn create_rule(
         capex_asset_type: req.capex_asset_type.clone(),
         capex_useful_life_years: req.capex_useful_life_years,
         capex_annual_dep_mxn: req.capex_annual_dep_mxn,
+        period_start: req.period_start.clone(),
+        period_end: req.period_end.clone(),
         created_at: now.clone(),
         updated_at: now,
     })
@@ -256,7 +280,7 @@ pub async fn list_payroll_rules(
     let rows = sqlx::query(
         "SELECT id, owner_rfc, rule_family, employee_rfc, employee_name, action,
                 value_pct, value_mxn, period_start, period_end, notes, label, rule_name,
-                excluded_cfdi_uuids, created_at, updated_at
+                excluded_cfdi_uuids, accounting_line, motivo, created_at, updated_at
          FROM pulso.payroll_normalization_rules WHERE owner_rfc = $1 ORDER BY created_at DESC",
     )
     .bind(owner_rfc)
@@ -279,11 +303,139 @@ pub async fn list_payroll_rules(
             notes: r.try_get("notes").ok(),
             label: r.try_get("label").ok(),
             rule_name: r.try_get("rule_name").ok(),
-            excluded_cfdi_uuids: r.try_get::<Option<Vec<String>>, _>("excluded_cfdi_uuids").ok().flatten(),
+            excluded_cfdi_uuids: r
+                .try_get::<Option<Vec<String>>, _>("excluded_cfdi_uuids")
+                .ok()
+                .flatten(),
+            accounting_line: r.try_get("accounting_line").ok(),
+            motivo: r.try_get("motivo").ok(),
             created_at: r.try_get("created_at").unwrap_or_default(),
             updated_at: r.try_get("updated_at").unwrap_or_default(),
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// L4-04 / L4-12: payroll rule value validation
+// ---------------------------------------------------------------------------
+
+/// One month where an `adjust_to_amount_mxn` rule's factor is far enough from 1 to be
+/// worth surfacing to the user before the rule is saved.
+#[derive(Debug, Serialize)]
+pub struct FactorWarning {
+    pub period: String,
+    pub factor: f64,
+    pub real_percepciones: f64,
+}
+
+pub enum PayrollRuleCheck {
+    Ok,
+    /// Hard failure -- the rule cannot be saved as submitted. Message explains why.
+    Rejected(String),
+    /// At least one covered month produces a suspiciously low factor (L4-12). Not an
+    /// error: the caller re-submits with `confirmed: true` to proceed anyway.
+    NeedsConfirmation(Vec<FactorWarning>),
+}
+
+// L4-04's own suggested starting point ("10x", explicitly calibrate later with real
+// data). L4-12 doesn't suggest a number for the low end; a factor below this means the
+// adjustment removes more than half of the month's real cost, which is the point past
+// which "normalizing" starts looking like "erasing an extraordinary payment."
+const FACTOR_REJECT_ABOVE: f64 = 10.0;
+const FACTOR_WARN_BELOW: f64 = 0.5;
+
+/// Validates a payroll rule before it's written: range-checks `value_pct`/`value_mxn`
+/// (L4-04 -- the frontend already does this, the API never did), and for
+/// `adjust_to_amount_mxn`, checks every covered month's resulting factor against real
+/// percepciones. A month with zero percepciones is skipped (factor undefined, "no se
+/// inventa el monto donde no hubo recibo" -- same rule `pulso.nomina_normalizada` already
+/// follows).
+pub async fn check_payroll_rule(
+    pool: &DbPool,
+    owner_rfc: &str,
+    req: &CreatePayrollRuleRequest,
+) -> anyhow::Result<PayrollRuleCheck> {
+    if req.rule_family == "scale_employee_pct" {
+        match req.value_pct {
+            Some(p) if (0.0..=100.0).contains(&p) => {}
+            _ => {
+                return Ok(PayrollRuleCheck::Rejected(
+                    "value_pct debe ser un porcentaje entre 0 y 100".to_string(),
+                ));
+            }
+        }
+    }
+
+    if req.rule_family == "adjust_to_amount_mxn" {
+        let value_mxn = match req.value_mxn {
+            Some(m) if m > 0.0 => m,
+            _ => {
+                return Ok(PayrollRuleCheck::Rejected(
+                    "value_mxn debe ser un monto positivo".to_string(),
+                ));
+            }
+        };
+
+        let Some(employee_rfc) = req.employee_rfc.as_deref() else {
+            return Ok(PayrollRuleCheck::Rejected(
+                "employee_rfc es obligatorio para ajustar a monto".to_string(),
+            ));
+        };
+
+        let rows = sqlx::query(
+            r#"SELECT c.year, c.month, SUM(COALESCE(n.total_percepciones, 0))::float8 AS perc
+               FROM pulso.cfdis c
+               JOIN pulso.cfdi_nomina n ON n.uuid = c.uuid
+               WHERE c.rfc_emisor = $1 AND c.rfc_receptor = $2
+                 AND c.tipo_comprobante = 'N' AND NOT c.is_cancelled
+                 AND ($3::text IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) >= $3)
+                 AND ($4::text IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) <= $4)
+               GROUP BY c.year, c.month"#,
+        )
+        .bind(owner_rfc)
+        .bind(employee_rfc)
+        .bind(&req.period_start)
+        .bind(&req.period_end)
+        .fetch_all(pool)
+        .await?;
+
+        let mut high: Vec<FactorWarning> = Vec::new();
+        let mut low: Vec<FactorWarning> = Vec::new();
+        for r in &rows {
+            let perc: f64 = r.try_get("perc").unwrap_or(0.0);
+            if perc <= 0.0 {
+                continue;
+            }
+            let year: i64 = r.try_get("year").unwrap_or(0);
+            let month: i64 = r.try_get("month").unwrap_or(0);
+            let factor = value_mxn / perc;
+            let warning = FactorWarning {
+                period: format!("{year}-{month:02}"),
+                factor,
+                real_percepciones: perc,
+            };
+            if factor > FACTOR_REJECT_ABOVE {
+                high.push(warning);
+            } else if factor < FACTOR_WARN_BELOW {
+                low.push(warning);
+            }
+        }
+
+        if !high.is_empty() {
+            let months: Vec<String> = high.iter().map(|w| w.period.clone()).collect();
+            return Ok(PayrollRuleCheck::Rejected(format!(
+                "El monto produce un factor mayor a {FACTOR_REJECT_ABOVE}x en: {}. \
+                 Acota el periodo para excluir esos meses o ajusta el monto.",
+                months.join(", ")
+            )));
+        }
+
+        if !low.is_empty() && !req.confirmed.unwrap_or(false) {
+            return Ok(PayrollRuleCheck::NeedsConfirmation(low));
+        }
+    }
+
+    Ok(PayrollRuleCheck::Ok)
 }
 
 pub async fn create_payroll_rule(
@@ -298,8 +450,8 @@ pub async fn create_payroll_rule(
         r#"INSERT INTO pulso.payroll_normalization_rules
             (id, owner_rfc, rule_family, employee_rfc, employee_name, action,
              value_pct, value_mxn, period_start, period_end, notes, label, rule_name,
-             excluded_cfdi_uuids, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
+             excluded_cfdi_uuids, accounting_line, motivo, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"#,
     )
     .bind(&id)
     .bind(owner_rfc)
@@ -315,6 +467,8 @@ pub async fn create_payroll_rule(
     .bind(&req.label)
     .bind(&req.rule_name)
     .bind(&req.excluded_cfdi_uuids)
+    .bind(&req.accounting_line)
+    .bind(&req.motivo)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -335,6 +489,8 @@ pub async fn create_payroll_rule(
         label: req.label.clone(),
         rule_name: req.rule_name.clone(),
         excluded_cfdi_uuids: req.excluded_cfdi_uuids.clone(),
+        accounting_line: req.accounting_line.clone(),
+        motivo: req.motivo.clone(),
         created_at: now.clone(),
         updated_at: now,
     })
@@ -533,8 +689,16 @@ pub async fn list_counterparties_for_normalization(
         "recibidos" => "c.dl_type IN ('recibidos', 'ambos')",
         _ => "c.dl_type IN ('emitidos', 'ambos')",
     };
-    let cp_col = if dl_type == "recibidos" { "c.rfc_emisor" } else { "c.rfc_receptor" };
-    let cp_name_col = if dl_type == "recibidos" { "c.nombre_emisor" } else { "c.nombre_receptor" };
+    let cp_col = if dl_type == "recibidos" {
+        "c.rfc_emisor"
+    } else {
+        "c.rfc_receptor"
+    };
+    let cp_name_col = if dl_type == "recibidos" {
+        "c.nombre_emisor"
+    } else {
+        "c.nombre_receptor"
+    };
     // L3-02: group by the same composite RFC||NORMALIZED_NAME key counterparties.rs uses,
     // so the 24 real companies behind a generic SAT RFC show as 24 rows here too, not one.
     let cp_key = cp_key_expr(cp_col, cp_name_col);
@@ -568,7 +732,8 @@ pub async fn list_counterparties_for_normalization(
         .await?;
 
     // Aggregate per counterparty RFC
-    let mut map: std::collections::HashMap<String, NormCounterpartyRow> = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, NormCounterpartyRow> =
+        std::collections::HashMap::new();
     for r in &rows {
         let rfc: String = r.try_get("rfc_cp").unwrap_or_default();
         let nombre: String = r.try_get("nombre_cp").unwrap_or_default();
@@ -576,15 +741,17 @@ pub async fn list_counterparties_for_normalization(
         let year_total: f64 = r.try_get("year_total").unwrap_or(0.0);
         let year_count: i64 = r.try_get("year_count").unwrap_or(0);
 
-        let entry = map.entry(rfc.clone()).or_insert_with(|| NormCounterpartyRow {
-            rfc: rfc.clone(),
-            nombre: nombre.clone(),
-            year_amounts: std::collections::HashMap::new(),
-            total_mxn: 0.0,
-            invoice_count: 0,
-            is_excluded: false,
-            rule_id: None,
-        });
+        let entry = map
+            .entry(rfc.clone())
+            .or_insert_with(|| NormCounterpartyRow {
+                rfc: rfc.clone(),
+                nombre: nombre.clone(),
+                year_amounts: std::collections::HashMap::new(),
+                total_mxn: 0.0,
+                invoice_count: 0,
+                is_excluded: false,
+                rule_id: None,
+            });
         entry.year_amounts.insert(year.to_string(), year_total);
         entry.total_mxn += year_total;
         entry.invoice_count += year_count;
@@ -623,7 +790,11 @@ pub async fn list_counterparties_for_normalization(
     }
 
     let mut result: Vec<NormCounterpartyRow> = map.into_values().collect();
-    result.sort_by(|a, b| b.total_mxn.partial_cmp(&a.total_mxn).unwrap_or(std::cmp::Ordering::Equal));
+    result.sort_by(|a, b| {
+        b.total_mxn
+            .partial_cmp(&a.total_mxn)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(result)
 }
 
@@ -663,8 +834,9 @@ pub async fn list_cfdis_for_counterparty(
     // back apart so the drill-down narrows to that one real counterparty instead of every
     // invoice sharing the generic RFC. Ordinary RFCs never contain "||", so name_filter
     // is empty and the added predicate is a no-op.
-    let (base_rfc, name_filter): (&str, &str) =
-        counterparty_rfc.split_once("||").unwrap_or((counterparty_rfc, ""));
+    let (base_rfc, name_filter): (&str, &str) = counterparty_rfc
+        .split_once("||")
+        .unwrap_or((counterparty_rfc, ""));
     let name_filter_expr = crate::services::analytics::summary::normalized_name_expr(cp_name_col);
 
     let sql = format!(
@@ -919,21 +1091,169 @@ pub async fn list_ebitda_bridge_adjustments(
     .fetch_all(pool)
     .await?;
 
+    // L4-02: nómina is always a cost from the owner's perspective -- unlike a comprobante-
+    // level rule (which can sit on either the income or the expense side depending on
+    // dl_type), there's no "which side" ambiguity, so every nómina-sourced row below enters
+    // straight positive when it REDUCES cost (raises EBITDA) and negative when it increases
+    // cost. Three sources, each a separate query because each attributes to a different
+    // rule table / join shape; merged into the same `map` as the comprobante-level rows
+    // above via `merge_bridge_row`, keyed by rule id exactly like they are.
+
+    // Source 1: employee-level exclusion (`exclude_employee`, via nomina_normalizada's
+    // employee_rule_id). The excluded receipt's cost disappears from the P&L entirely, so
+    // it's added back positive. Uses the RAW (pre-factor) cost from cfdi_nomina, not
+    // nomina_normalizada's already-factored total_percepciones/total_otros_pagos/
+    // total_deducciones -- an excluded receipt's factor is irrelevant, its whole cost comes
+    // back.
+    let employee_excl_rows = sqlx::query(
+        r#"
+        SELECT
+            pr.id, pr.rule_name, pr.accounting_line, pr.motivo,
+            nn.year,
+            SUM(
+                cn.total_percepciones::float8 + cn.total_otros_pagos::float8
+                - cn.total_deducciones::float8
+            ) AS year_total
+        FROM pulso.nomina_normalizada nn
+        JOIN pulso.payroll_normalization_rules pr ON pr.id = nn.employee_rule_id
+        JOIN pulso.cfdi_nomina cn ON cn.uuid = nn.uuid
+        WHERE nn.rfc_emisor = $1
+          AND (nn.year > $2 OR (nn.year = $2 AND nn.month >= $3))
+          AND (nn.year < $4 OR (nn.year = $4 AND nn.month <= $5))
+        GROUP BY pr.id, pr.rule_name, pr.accounting_line, pr.motivo, nn.year
+        "#,
+    )
+    .bind(owner_rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    // Source 2: a comprobante-level rule (pulso.normalization_rules, via cfdi_exclusion)
+    // that happens to target a tipo_comprobante='N' receipt -- reachable via NominaView's
+    // "Excluir un recibo específico". These already carry accounting_line (that form
+    // requires it) but are invisible to the query above because it filters
+    // tipo_comprobante IN ('I','E'). Same raw-cost measure as source 1 (total_neto_mxn_
+    // ajustado is meaningless for a payroll complement), no sign flip (nómina has no
+    // "side").
+    let receipt_excl_rows = sqlx::query(
+        r#"
+        SELECT
+            nr.id, nr.rule_name, nr.accounting_line, nr.motivo, nr.dl_type,
+            nr.impacts_ebitda, nr.capex_estimate_dep, nr.capex_asset_type,
+            nr.capex_useful_life_years, nr.capex_annual_dep_mxn,
+            c.year,
+            SUM(
+                n.total_percepciones::float8 + n.total_otros_pagos::float8
+                - n.total_deducciones::float8
+            ) AS year_total
+        FROM pulso.cfdi_exclusion ex
+        JOIN pulso.normalization_rules nr ON nr.id = ex.rule_id
+        JOIN pulso.cfdis c ON c.uuid = ex.uuid
+        JOIN pulso.cfdi_nomina n ON n.uuid = ex.uuid
+        WHERE ex.owner_rfc = $1
+          AND c.tipo_comprobante = 'N'
+          AND NOT c.is_cancelled
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+        GROUP BY nr.id, nr.rule_name, nr.accounting_line, nr.motivo, nr.dl_type,
+                 nr.impacts_ebitda, nr.capex_estimate_dep, nr.capex_asset_type,
+                 nr.capex_useful_life_years, nr.capex_annual_dep_mxn, c.year
+        "#,
+    )
+    .bind(owner_rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    // Source 3: the scale/adjust factor difference. `costo real - costo normalizado` per
+    // receipt (cfdi_nomina's raw total_percepciones minus nomina_normalizada's already-
+    // factored total_percepciones) sums linearly to the same per-employee-month difference
+    // the `factors` CTE computes, because `factor` is constant across every receipt of that
+    // employee-month -- no separate month-level aggregation needed here. Attributed to
+    // whichever rule produced the factor via migration 058's factor_rule_id. Signed
+    // correctly by construction: factor < 1 (scale down, or adjust-to-amount below real)
+    // makes this positive (cost went down, EBITDA up); factor > 1 makes it negative.
+    let factor_diff_rows = sqlx::query(
+        r#"
+        SELECT
+            pr.id, pr.rule_name, pr.accounting_line, pr.motivo,
+            nn.year,
+            SUM(cn.total_percepciones::float8 - nn.total_percepciones)::float8 AS year_total
+        FROM pulso.nomina_normalizada nn
+        JOIN pulso.payroll_normalization_rules pr ON pr.id = nn.factor_rule_id
+        JOIN pulso.cfdi_nomina cn ON cn.uuid = nn.uuid
+        WHERE nn.rfc_emisor = $1
+          AND (nn.year > $2 OR (nn.year = $2 AND nn.month >= $3))
+          AND (nn.year < $4 OR (nn.year = $4 AND nn.month <= $5))
+        GROUP BY pr.id, pr.rule_name, pr.accounting_line, pr.motivo, nn.year
+        "#,
+    )
+    .bind(owner_rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
     let mut map: std::collections::HashMap<String, EbitdaBridgeAdjustment> =
         std::collections::HashMap::new();
 
+    // dl_type has no natural value for a nómina-sourced row (nómina is always a cost, never
+    // "emitidos"/"recibidos"/"ambos") -- "nomina" is a fixed sentinel the frontend renders
+    // as a small mono tag under the rule name, same spot dl_type shows for comprobante rows.
     for row in &rows {
-        let rule_id: String = row.try_get("id").unwrap_or_default();
-        let year: i64 = row.try_get("year").unwrap_or(0);
-        let year_total: f64 = row.try_get("year_total").unwrap_or(0.0);
+        merge_bridge_row(&mut map, row, "id", None);
+    }
+    for row in &employee_excl_rows {
+        merge_bridge_row(&mut map, row, "id", Some("nomina"));
+    }
+    for row in &receipt_excl_rows {
+        merge_bridge_row(&mut map, row, "id", None);
+    }
+    for row in &factor_diff_rows {
+        merge_bridge_row(&mut map, row, "id", Some("nomina"));
+    }
 
-        let entry = map.entry(rule_id.clone()).or_insert_with(|| EbitdaBridgeAdjustment {
+    let mut result: Vec<EbitdaBridgeAdjustment> = map.into_values().collect();
+    result.sort_by(|a, b| a.rule_id.cmp(&b.rule_id));
+    Ok(result)
+}
+
+/// Merges one grouped (rule, year) row into the bridge's accumulator map. `dl_type_default`
+/// is used when the row's own query has no dl_type column (the three nómina sources above);
+/// pass None to read it from the row instead (the comprobante-level query). Accumulates
+/// rather than overwrites amounts_by_year/total_mxn so a rule id that legitimately appears
+/// in more than one source query (e.g. a counterparty rule broad enough to also match a
+/// tipo_comprobante='N' receipt) doesn't lose one source's contribution to the other.
+fn merge_bridge_row(
+    map: &mut std::collections::HashMap<String, EbitdaBridgeAdjustment>,
+    row: &sqlx::postgres::PgRow,
+    id_col: &str,
+    dl_type_default: Option<&str>,
+) {
+    let rule_id: String = row.try_get(id_col).unwrap_or_default();
+    let year: i64 = row.try_get("year").unwrap_or(0);
+    let year_total: f64 = row.try_get("year_total").unwrap_or(0.0);
+
+    let entry = map
+        .entry(rule_id.clone())
+        .or_insert_with(|| EbitdaBridgeAdjustment {
             rule_id: rule_id.clone(),
             rule_name: row.try_get("rule_name").ok(),
             accounting_line: row.try_get("accounting_line").ok(),
             motivo: row.try_get("motivo").ok(),
             impacts_ebitda: row.try_get("impacts_ebitda").ok(),
-            dl_type: row.try_get("dl_type").unwrap_or_default(),
+            dl_type: dl_type_default
+                .map(|d| d.to_string())
+                .or_else(|| row.try_get("dl_type").ok())
+                .unwrap_or_default(),
             capex_estimate_dep: row.try_get("capex_estimate_dep").ok(),
             capex_asset_type: row.try_get("capex_asset_type").ok(),
             capex_useful_life_years: row.try_get("capex_useful_life_years").ok(),
@@ -942,11 +1262,6 @@ pub async fn list_ebitda_bridge_adjustments(
             total_mxn: 0.0,
         });
 
-        entry.amounts_by_year.insert(year.to_string(), year_total);
-        entry.total_mxn += year_total;
-    }
-
-    let mut result: Vec<EbitdaBridgeAdjustment> = map.into_values().collect();
-    result.sort_by(|a, b| a.rule_id.cmp(&b.rule_id));
-    Ok(result)
+    *entry.amounts_by_year.entry(year.to_string()).or_insert(0.0) += year_total;
+    entry.total_mxn += year_total;
 }

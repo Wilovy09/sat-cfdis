@@ -119,7 +119,7 @@ pub async fn get(
                SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS total,
                COUNT(DISTINCT {cp_col}) AS cp_count,
                COUNT(*) AS invoice_count
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P', 'N')
@@ -127,7 +127,7 @@ pub async fn get(
           AND year = ANY($2)
           AND month >= $3 AND month <= $4
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY year
         ORDER BY year
@@ -159,14 +159,14 @@ pub async fn get(
         r#"
         SELECT year,
                SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS fy_total
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P', 'N')
           AND NOT is_cancelled
           AND year = ANY($2)
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY year
         "#
@@ -197,7 +197,7 @@ pub async fn get(
                    SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS total,
                    COUNT(*) AS invoice_count,
                    ROW_NUMBER() OVER (PARTITION BY year ORDER BY SUM(COALESCE(total_neto_mxn_ajustado, 0)) DESC) AS rnk
-            FROM pulso.cfdis_ajustado
+            FROM pulso.cfdis_ajustado c
             WHERE {owner_col} = $1
               AND {dl_filter}
               AND tipo_comprobante NOT IN ('P', 'N')
@@ -205,7 +205,7 @@ pub async fn get(
               AND year = ANY($2)
               AND month >= $3 AND month <= $4
               AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
               )
             GROUP BY year, ({cp_key_expr})
         )
@@ -241,7 +241,7 @@ pub async fn get(
         r#"
         SELECT year, month,
                SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS total
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P', 'N')
@@ -249,7 +249,7 @@ pub async fn get(
           AND year = ANY($2)
           AND month >= $3 AND month <= $4
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY year, month
         ORDER BY year, month
@@ -430,22 +430,22 @@ pub async fn get(
             WITH curr AS (
                 SELECT ({cp_key_expr}) AS cp_rfc, {cp_nombre_expr} AS cp_nombre,
                        SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total
-                FROM pulso.cfdis_ajustado
+                FROM pulso.cfdis_ajustado c
                 WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
                   AND year = $2 AND month >= $3 AND month <= $4
                   AND NOT EXISTS (
-                      SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+                      SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
                   )
                 GROUP BY ({cp_key_expr})
             ),
             prev AS (
                 SELECT ({cp_key_expr}) AS cp_rfc, {cp_nombre_expr} AS cp_nombre,
                        SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total
-                FROM pulso.cfdis_ajustado
+                FROM pulso.cfdis_ajustado c
                 WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
                   AND year = $5 AND month >= $3 AND month <= $4
                   AND NOT EXISTS (
-                      SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+                      SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
                   )
                 GROUP BY ({cp_key_expr})
             )

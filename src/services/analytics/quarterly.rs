@@ -13,17 +13,17 @@ pub struct QuarterlyResponse {
 #[derive(Debug, Serialize)]
 pub struct QuarterRow {
     pub year: i64,
-    pub quarter: i64,       // 1–4
-    pub period: String,     // e.g. "2024-Q1"
+    pub quarter: i64,   // 1–4
+    pub period: String, // e.g. "2024-Q1"
     pub total_mxn: f64,
     pub invoice_count: i64,
-    pub is_complete: bool,  // all 3 months present in data
+    pub is_complete: bool, // all 3 months present in data
 }
 
 #[derive(Debug, Serialize)]
 pub struct QuarterYoyRow {
     pub quarter: i64,
-    pub period: String,     // e.g. "Q1"
+    pub period: String, // e.g. "Q1"
     pub current_year: i64,
     pub prior_year: i64,
     pub current_mxn: f64,
@@ -57,7 +57,7 @@ pub async fn get(
             SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total,
             COUNT(*) AS cnt,
             COUNT(DISTINCT month) AS months_present
-        FROM pulso.cfdis_ajustado
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
           AND tipo_comprobante NOT IN ('P','N')
@@ -66,7 +66,7 @@ pub async fn get(
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (
               SELECT 1 FROM pulso.cfdi_exclusion ex
-              WHERE ex.owner_rfc = $1 AND ex.uuid = uuid
+              WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY year, quarter
         ORDER BY year, quarter

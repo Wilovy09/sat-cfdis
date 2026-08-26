@@ -128,7 +128,8 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
     let ltm_start_abs = ltm_total_months - 11; // 12-month window inclusive
     let ltm_start_y = (ltm_start_abs - 1) / 12;
     let ltm_start_m = ((ltm_start_abs - 1) % 12) + 1;
-    let ltm_slice: Vec<&MonthlyTotal> = by_month.iter()
+    let ltm_slice: Vec<&MonthlyTotal> = by_month
+        .iter()
         .filter(|m| (m.year, m.month) >= (ltm_start_y, ltm_start_m))
         .collect();
     let ltm_total_mxn: f64 = ltm_slice.iter().map(|m| m.net_mxn).sum();

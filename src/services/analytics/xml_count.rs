@@ -28,7 +28,8 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<XmlC
              SELECT xml_available FROM pulso.cfdis \
              WHERE rfc_receptor = $1 AND dl_type IN ('recibidos','ambos') \
                AND NOT is_cancelled \
-         ) u".to_string()
+         ) u"
+        .to_string()
     } else {
         let owner_col = rfc_column(dl_type);
         let dl_filter = dl_type_filter(dl_type);
