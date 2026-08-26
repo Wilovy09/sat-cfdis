@@ -100,17 +100,38 @@ async fn queue_initial_sync(
     match download_order(priority_analysis) {
         Some((first_type, second_type)) => {
             crate::db::jobs::insert_queued(
-                pool, "list", rfc, "ciec", auth_enc, first_type, period_from, period_to,
+                pool,
+                "list",
+                rfc,
+                "ciec",
+                auth_enc,
+                first_type,
+                period_from,
+                period_to,
             )
             .await?;
             crate::db::jobs::insert_queued(
-                pool, "list", rfc, "ciec", auth_enc, second_type, period_from, period_to,
+                pool,
+                "list",
+                rfc,
+                "ciec",
+                auth_enc,
+                second_type,
+                period_from,
+                period_to,
             )
             .await
         }
         None => {
             crate::db::jobs::insert_queued(
-                pool, "list", rfc, "ciec", auth_enc, "ambos", period_from, period_to,
+                pool,
+                "list",
+                rfc,
+                "ciec",
+                auth_enc,
+                "ambos",
+                period_from,
+                period_to,
             )
             .await
         }
@@ -345,7 +366,12 @@ pub async fn complete_profile(
     let (period_from, period_to) = initial_sync_period();
     let priority_analysis = body.priority_analysis.as_deref();
     let sync_job_id = match queue_initial_sync(
-        &pool, &rfc, &auth_enc, &period_from, &period_to, priority_analysis,
+        &pool,
+        &rfc,
+        &auth_enc,
+        &period_from,
+        &period_to,
+        priority_analysis,
     )
     .await
     {
@@ -533,7 +559,12 @@ pub async fn trigger_sync(
         .await
         .unwrap_or(None);
     let job_id = match queue_initial_sync(
-        &pool, &rfc, &auth_enc, &period_from, &period_to, priority_analysis.as_deref(),
+        &pool,
+        &rfc,
+        &auth_enc,
+        &period_from,
+        &period_to,
+        priority_analysis.as_deref(),
     )
     .await
     {
@@ -614,7 +645,9 @@ pub async fn sync_status(
                     .await
                     .ok()
                     .flatten()
-                    .unwrap_or_else(|| (active_job.period_from.clone(), active_job.period_to.clone()));
+                    .unwrap_or_else(|| {
+                        (active_job.period_from.clone(), active_job.period_to.clone())
+                    });
                 let months = month_progress(
                     &range_from,
                     &range_to,
@@ -767,7 +800,9 @@ pub async fn get_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> Result<HttpR
         .map_err(|e| AppError::internal(&e.to_string()))?;
     let rfcs: Vec<_> = rows
         .into_iter()
-        .map(|(rfc, nombre, role)| serde_json::json!({ "rfc": rfc, "nombre": nombre, "role": role }))
+        .map(
+            |(rfc, nombre, role)| serde_json::json!({ "rfc": rfc, "nombre": nombre, "role": role }),
+        )
         .collect();
     Ok(HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs })))
 }
@@ -858,7 +893,12 @@ pub async fn add_rfc(
     let (period_from, period_to) = initial_sync_period();
     let priority_analysis = body.priority_analysis.as_deref();
     let sync_job_id = match queue_initial_sync(
-        &pool, &rfc, &auth_enc, &period_from, &period_to, priority_analysis,
+        &pool,
+        &rfc,
+        &auth_enc,
+        &period_from,
+        &period_to,
+        priority_analysis,
     )
     .await
     {
@@ -967,9 +1007,11 @@ pub async fn update_rfc_clave_handler(
 
     // Only the owner (or admin) may change the CIEC
     match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
-        Ok(false) => return HttpResponse::Forbidden().json(ErrorBody {
-            error: "Solo el propietario del RFC puede actualizar la CIEC".to_string(),
-        }),
+        Ok(false) => {
+            return HttpResponse::Forbidden().json(ErrorBody {
+                error: "Solo el propietario del RFC puede actualizar la CIEC".to_string(),
+            });
+        }
         Err(e) => {
             tracing::error!(user_id = %user_id, "update_rfc_clave: access check error: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
@@ -1080,7 +1122,14 @@ pub async fn validate_clave_handler(
     let period_to = format!("{day} 23:59:59");
 
     let job_id = match crate::db::jobs::insert_queued(
-        &pool, "list", &rfc, "ciec", &auth_enc, "ambos", &period_from, &period_to,
+        &pool,
+        "list",
+        &rfc,
+        "ciec",
+        &auth_enc,
+        "ambos",
+        &period_from,
+        &period_to,
     )
     .await
     {
@@ -1151,7 +1200,8 @@ pub async fn update_priority_analysis_handler(
         "ingresos_clientes" | "egresos_proveedores" | "nomina"
     ) {
         return HttpResponse::UnprocessableEntity().json(ErrorBody {
-            error: "priority_analysis debe ser ingresos_clientes, egresos_proveedores o nomina".to_string(),
+            error: "priority_analysis debe ser ingresos_clientes, egresos_proveedores o nomina"
+                .to_string(),
         });
     }
 
@@ -1171,7 +1221,8 @@ pub async fn update_priority_analysis_handler(
         Ok(true) => {}
     }
 
-    match crate::db::users::set_priority_analysis(&pool, &user_id, &rfc, &body.priority_analysis).await
+    match crate::db::users::set_priority_analysis(&pool, &user_id, &rfc, &body.priority_analysis)
+        .await
     {
         Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
         Ok(false) => HttpResponse::NotFound().json(ErrorBody {
@@ -1215,9 +1266,11 @@ pub async fn delete_rfc_handler(
 
     // Only the owner may delete
     match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
-        Ok(false) => return HttpResponse::Forbidden().json(ErrorBody {
-            error: "Solo el propietario del RFC puede eliminarlo".to_string(),
-        }),
+        Ok(false) => {
+            return HttpResponse::Forbidden().json(ErrorBody {
+                error: "Solo el propietario del RFC puede eliminarlo".to_string(),
+            });
+        }
         Err(e) => {
             tracing::error!(user_id = %user_id, "delete_rfc: access check error: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
@@ -1281,11 +1334,19 @@ pub async fn list_rfc_shares_handler(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
@@ -1294,10 +1355,16 @@ pub async fn list_rfc_shares_handler(
 
     // Only owner can list shares
     match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
-        Ok(false) => return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() }),
+        Ok(false) => {
+            return HttpResponse::Forbidden().json(ErrorBody {
+                error: "Acceso denegado".into(),
+            });
+        }
         Err(e) => {
             tracing::error!(user_id = %user_id, "list_rfc_shares: access check error: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
         Ok(true) => {}
     }
@@ -1306,7 +1373,9 @@ pub async fn list_rfc_shares_handler(
         Ok(shares) => HttpResponse::Ok().json(serde_json::json!({ "shares": shares })),
         Err(e) => {
             tracing::error!(user_id = %user_id, rfc = %rfc, "list_rfc_shares: DB error: {e}");
-            HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() })
+            HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            })
         }
     }
 }
@@ -1321,11 +1390,19 @@ pub async fn share_rfc_handler(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
@@ -1334,15 +1411,23 @@ pub async fn share_rfc_handler(
 
     let email = body.email.trim().to_lowercase();
     if email.is_empty() {
-        return HttpResponse::UnprocessableEntity().json(ErrorBody { error: "Email requerido".into() });
+        return HttpResponse::UnprocessableEntity().json(ErrorBody {
+            error: "Email requerido".into(),
+        });
     }
 
     // Only owner can share
     match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
-        Ok(false) => return HttpResponse::Forbidden().json(ErrorBody { error: "Solo el propietario puede compartir este RFC".into() }),
+        Ok(false) => {
+            return HttpResponse::Forbidden().json(ErrorBody {
+                error: "Solo el propietario puede compartir este RFC".into(),
+            });
+        }
         Err(e) => {
             tracing::error!(user_id = %user_id, "share_rfc: access check error: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
         Ok(true) => {}
     }
@@ -1358,7 +1443,9 @@ pub async fn share_rfc_handler(
             }
             Err(e) => {
                 tracing::error!(user_id = %user_id, "share_rfc: lookup error: {e}");
-                return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+                return HttpResponse::InternalServerError().json(ErrorBody {
+                    error: "Error de base de datos".into(),
+                });
             }
         };
 
@@ -1369,13 +1456,18 @@ pub async fn share_rfc_handler(
         });
     }
 
-    let share_id = match crate::db::users::create_rfc_share(&pool, &rfc, &user_id, &target_id, Some(&email)).await {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::error!(user_id = %user_id, rfc = %rfc, "share_rfc: insert error: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error al compartir RFC".into() });
-        }
-    };
+    let share_id =
+        match crate::db::users::create_rfc_share(&pool, &rfc, &user_id, &target_id, Some(&email))
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!(user_id = %user_id, rfc = %rfc, "share_rfc: insert error: {e}");
+                return HttpResponse::InternalServerError().json(ErrorBody {
+                    error: "Error al compartir RFC".into(),
+                });
+            }
+        };
 
     // Mark the invited user's profile as complete.
     if let Err(e) = crate::db::users::set_profile_complete(&pool, &target_id).await {
@@ -1413,11 +1505,19 @@ pub async fn revoke_rfc_share_handler(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
@@ -1427,20 +1527,30 @@ pub async fn revoke_rfc_share_handler(
 
     // Only owner can revoke
     match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
-        Ok(false) => return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() }),
+        Ok(false) => {
+            return HttpResponse::Forbidden().json(ErrorBody {
+                error: "Acceso denegado".into(),
+            });
+        }
         Err(e) => {
             tracing::error!(user_id = %user_id, "revoke_share: access check error: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
         Ok(true) => {}
     }
 
     match crate::db::users::revoke_rfc_share(&pool, &share_id, &user_id).await {
         Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
-        Ok(false) => HttpResponse::NotFound().json(ErrorBody { error: "Acceso compartido no encontrado".into() }),
+        Ok(false) => HttpResponse::NotFound().json(ErrorBody {
+            error: "Acceso compartido no encontrado".into(),
+        }),
         Err(e) => {
             tracing::error!(user_id = %user_id, "revoke_share: DB error: {e}");
-            HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() })
+            HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            })
         }
     }
 }
@@ -1466,17 +1576,29 @@ pub async fn admin_download(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
     if !is_admin {
-        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+        return HttpResponse::Forbidden().json(ErrorBody {
+            error: "Acceso denegado".into(),
+        });
     }
 
     let rfc = body.rfc.trim().to_uppercase();
@@ -1484,10 +1606,16 @@ pub async fn admin_download(
 
     let clave_enc = match crate::db::users::get_clave_for_rfc(&pool, &rfc).await {
         Ok(Some(c)) => c,
-        Ok(None) => return HttpResponse::NotFound().json(ErrorBody { error: "RFC no encontrado o sin credenciales".into() }),
+        Ok(None) => {
+            return HttpResponse::NotFound().json(ErrorBody {
+                error: "RFC no encontrado o sin credenciales".into(),
+            });
+        }
         Err(e) => {
             tracing::error!("admin_download: DB error: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
     };
 
@@ -1496,24 +1624,42 @@ pub async fn admin_download(
         Ok(p) => p,
         Err(e) => {
             tracing::error!("admin_download: decrypt failed: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error al descifrar credenciales".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error al descifrar credenciales".into(),
+            });
         }
     };
 
-    let auth_json = serde_json::json!({ "type": "ciec", "rfc": rfc, "password": clave }).to_string();
+    let auth_json =
+        serde_json::json!({ "type": "ciec", "rfc": rfc, "password": clave }).to_string();
     let auth_enc = match crypto::encrypt(&key, &auth_json) {
         Ok(e) => e,
-        Err(e) => return HttpResponse::InternalServerError().json(ErrorBody { error: format!("Error al cifrar auth: {e}") }),
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: format!("Error al cifrar auth: {e}"),
+            });
+        }
     };
 
     let dl_type = body.dl_type.as_deref().unwrap_or("ambos");
     let job_id = match crate::db::jobs::insert_queued(
-        &pool, "list", &rfc, "ciec", &auth_enc, dl_type, &body.period_from, &body.period_to,
-    ).await {
+        &pool,
+        "list",
+        &rfc,
+        "ciec",
+        &auth_enc,
+        dl_type,
+        &body.period_from,
+        &body.period_to,
+    )
+    .await
+    {
         Ok(id) => id,
         Err(e) => {
             tracing::error!("admin_download: insert_queued failed: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error al crear el job".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error al crear el job".into(),
+            });
         }
     };
 
@@ -1530,19 +1676,23 @@ pub async fn admin_download(
 #[derive(Debug, Deserialize)]
 pub struct AdminReprocessDto {
     pub rfc: String,
-    pub dl_type: Option<String>,   // emitidos|recibidos|ambos  (default: ambos)
+    pub dl_type: Option<String>, // emitidos|recibidos|ambos  (default: ambos)
     pub period_from: Option<String>, // YYYY-MM  (optional — omit to reprocess all)
-    pub period_to: Option<String>,   // YYYY-MM  (optional)
+    pub period_to: Option<String>, // YYYY-MM  (optional)
 }
 
 // Accepts "YYYY-MM" and "YYYY-MM-DD" (the latter is what <input type="date"> sends) —
 // only year/month are used, any day component is ignored.
 fn parse_ym(s: &str) -> Option<(i32, i32)> {
     let parts: Vec<&str> = s.splitn(3, '-').collect();
-    if parts.len() < 2 { return None; }
+    if parts.len() < 2 {
+        return None;
+    }
     let y = parts[0].parse::<i32>().ok()?;
     let m = parts[1].parse::<i32>().ok()?;
-    if m < 1 || m > 12 { return None; }
+    if m < 1 || m > 12 {
+        return None;
+    }
     Some((y, m))
 }
 
@@ -1554,17 +1704,29 @@ pub async fn admin_reprocess(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
     if !is_admin {
-        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+        return HttpResponse::Forbidden().json(ErrorBody {
+            error: "Acceso denegado".into(),
+        });
     }
 
     let rfc = body.rfc.trim().to_uppercase();
@@ -1578,9 +1740,11 @@ pub async fn admin_reprocess(
     let (from_year, from_month) = match body.period_from.as_deref().filter(|s| !s.is_empty()) {
         Some(s) => match parse_ym(s) {
             Some((y, m)) => (Some(y), Some(m)),
-            None => return HttpResponse::UnprocessableEntity().json(ErrorBody {
-                error: format!("period_from inválido: '{s}' (se espera YYYY-MM o YYYY-MM-DD)"),
-            }),
+            None => {
+                return HttpResponse::UnprocessableEntity().json(ErrorBody {
+                    error: format!("period_from inválido: '{s}' (se espera YYYY-MM o YYYY-MM-DD)"),
+                });
+            }
         },
         None => (None, None),
     };
@@ -1588,16 +1752,20 @@ pub async fn admin_reprocess(
     let (to_year, to_month) = match body.period_to.as_deref().filter(|s| !s.is_empty()) {
         Some(s) => match parse_ym(s) {
             Some((y, m)) => (Some(y), Some(m)),
-            None => return HttpResponse::UnprocessableEntity().json(ErrorBody {
-                error: format!("period_to inválido: '{s}' (se espera YYYY-MM o YYYY-MM-DD)"),
-            }),
+            None => {
+                return HttpResponse::UnprocessableEntity().json(ErrorBody {
+                    error: format!("period_to inválido: '{s}' (se espera YYYY-MM o YYYY-MM-DD)"),
+                });
+            }
         },
         None => (None, None),
     };
 
     match crate::db::cfdis::reset_for_reprocessing(
         &pool, &rfc, dl_type, from_year, from_month, to_year, to_month,
-    ).await {
+    )
+    .await
+    {
         Ok(count) => {
             tracing::info!(rfc = %rfc, count, "Admin reprocess queued");
             HttpResponse::Ok().json(serde_json::json!({
@@ -1608,7 +1776,9 @@ pub async fn admin_reprocess(
         }
         Err(e) => {
             tracing::error!("admin_reprocess: {e}");
-            HttpResponse::InternalServerError().json(ErrorBody { error: "Error al marcar CFDIs".into() })
+            HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error al marcar CFDIs".into(),
+            })
         }
     }
 }
@@ -1619,23 +1789,32 @@ pub async fn admin_reprocess(
 // ---------------------------------------------------------------------------
 
 #[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
-pub async fn admin_list_rfcs(
-    req: HttpRequest,
-    pool: web::Data<DbPool>,
-) -> HttpResponse {
+pub async fn admin_list_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
     if !is_admin {
-        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+        return HttpResponse::Forbidden().json(ErrorBody {
+            error: "Acceso denegado".into(),
+        });
     }
 
     let rows: Vec<(String, Option<String>)> = match sqlx::query_as(
@@ -1658,7 +1837,9 @@ pub async fn admin_list_rfcs(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("admin_list_rfcs: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
     };
 
@@ -1733,29 +1914,48 @@ pub async fn admin_list_rfcs_full(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
     if !is_admin {
-        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+        return HttpResponse::Forbidden().json(ErrorBody {
+            error: "Acceso denegado".into(),
+        });
     }
 
     let page = query.page.max(1);
     let page_size = query.page_size.clamp(1, 100);
     let search = query.search.trim();
 
-    let count_sql = format!("{ADMIN_RFCS_BASE_CTE} SELECT COUNT(*) FROM base {ADMIN_RFCS_SEARCH_FILTER}");
-    let total: i64 = match sqlx::query_scalar(&count_sql).bind(search).fetch_one(pool.as_ref()).await {
+    let count_sql =
+        format!("{ADMIN_RFCS_BASE_CTE} SELECT COUNT(*) FROM base {ADMIN_RFCS_SEARCH_FILTER}");
+    let total: i64 = match sqlx::query_scalar(&count_sql)
+        .bind(search)
+        .fetch_one(pool.as_ref())
+        .await
+    {
         Ok(n) => n,
         Err(e) => {
             tracing::error!("admin_list_rfcs_full: count: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
     };
 
@@ -1765,23 +1965,32 @@ pub async fn admin_list_rfcs_full(
     );
 
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(String, bool, String, String, Option<String>, Option<String>)> = match sqlx::query_as(&select_sql)
-        .bind(search)
-        .bind(page_size)
-        .bind((page - 1) * page_size)
-        .fetch_all(pool.as_ref())
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("admin_list_rfcs_full: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
-        }
-    };
+    let rows: Vec<(String, bool, String, String, Option<String>, Option<String>)> =
+        match sqlx::query_as(&select_sql)
+            .bind(search)
+            .bind(page_size)
+            .bind((page - 1) * page_size)
+            .fetch_all(pool.as_ref())
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("admin_list_rfcs_full: {e}");
+                return HttpResponse::InternalServerError().json(ErrorBody {
+                    error: "Error de base de datos".into(),
+                });
+            }
+        };
 
     let page_rfcs: Vec<String> = rows.iter().map(|(rfc, ..)| rfc.clone()).collect();
 
-    let share_rows: Vec<(String, Option<String>, Option<String>, Option<String>, String)> = match sqlx::query_as(
+    let share_rows: Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    )> = match sqlx::query_as(
         r#"
         SELECT rs.rfc, viewer.email, viewer.name, rs.invited_email,
                to_char(rs.granted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS granted_at
@@ -1798,34 +2007,42 @@ pub async fn admin_list_rfcs_full(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("admin_list_rfcs_full: shares query: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
     };
 
-    let mut shares_by_rfc: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
+    let mut shares_by_rfc: std::collections::HashMap<String, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
     for (rfc, viewer_email, viewer_name, invited_email, granted_at) in share_rows {
-        shares_by_rfc.entry(rfc).or_default().push(serde_json::json!({
-            "email": viewer_email,
-            "name": viewer_name,
-            "invited_email": invited_email,
-            "granted_at": granted_at,
-        }));
+        shares_by_rfc
+            .entry(rfc)
+            .or_default()
+            .push(serde_json::json!({
+                "email": viewer_email,
+                "name": viewer_name,
+                "invited_email": invited_email,
+                "granted_at": granted_at,
+            }));
     }
 
     let rfcs: Vec<_> = rows
         .into_iter()
-        .map(|(rfc, is_deleted, created_at, owner_email, owner_name, nombre)| {
-            let viewers = shares_by_rfc.get(&rfc).cloned().unwrap_or_default();
-            serde_json::json!({
-                "rfc": rfc,
-                "nombre": nombre,
-                "deleted": is_deleted,
-                "created_at": created_at,
-                "owner_email": owner_email,
-                "owner_name": owner_name,
-                "viewers": viewers,
-            })
-        })
+        .map(
+            |(rfc, is_deleted, created_at, owner_email, owner_name, nombre)| {
+                let viewers = shares_by_rfc.get(&rfc).cloned().unwrap_or_default();
+                serde_json::json!({
+                    "rfc": rfc,
+                    "nombre": nombre,
+                    "deleted": is_deleted,
+                    "created_at": created_at,
+                    "owner_email": owner_email,
+                    "owner_name": owner_name,
+                    "viewers": viewers,
+                })
+            },
+        )
         .collect();
 
     HttpResponse::Ok().json(serde_json::json!({
@@ -1869,29 +2086,48 @@ pub async fn admin_list_users(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
     if !is_admin {
-        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+        return HttpResponse::Forbidden().json(ErrorBody {
+            error: "Acceso denegado".into(),
+        });
     }
 
     let page = query.page.max(1);
     let page_size = query.page_size.clamp(1, 100);
     let search = query.search.trim();
 
-    let count_sql = format!("{ADMIN_USERS_BASE_CTE} SELECT COUNT(*) FROM base {ADMIN_USERS_SEARCH_FILTER}");
-    let total: i64 = match sqlx::query_scalar(&count_sql).bind(search).fetch_one(pool.as_ref()).await {
+    let count_sql =
+        format!("{ADMIN_USERS_BASE_CTE} SELECT COUNT(*) FROM base {ADMIN_USERS_SEARCH_FILTER}");
+    let total: i64 = match sqlx::query_scalar(&count_sql)
+        .bind(search)
+        .fetch_one(pool.as_ref())
+        .await
+    {
         Ok(n) => n,
         Err(e) => {
             tracing::error!("admin_list_users: count: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
     };
 
@@ -1901,33 +2137,38 @@ pub async fn admin_list_users(
     );
 
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(String, String, String, String, Option<String>, bool, i64)> = match sqlx::query_as(&select_sql)
-        .bind(search)
-        .bind(page_size)
-        .bind((page - 1) * page_size)
-        .fetch_all(pool.as_ref())
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("admin_list_users: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
-        }
-    };
+    let rows: Vec<(String, String, String, String, Option<String>, bool, i64)> =
+        match sqlx::query_as(&select_sql)
+            .bind(search)
+            .bind(page_size)
+            .bind((page - 1) * page_size)
+            .fetch_all(pool.as_ref())
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("admin_list_users: {e}");
+                return HttpResponse::InternalServerError().json(ErrorBody {
+                    error: "Error de base de datos".into(),
+                });
+            }
+        };
 
     let users: Vec<_> = rows
         .into_iter()
-        .map(|(id, name, email, created_at, deleted_at, complete_profile, active_rfcs)| {
-            serde_json::json!({
-                "id": id,
-                "name": name,
-                "email": email,
-                "created_at": created_at,
-                "deleted_at": deleted_at,
-                "pulso_complete_profile": complete_profile,
-                "active_rfcs": active_rfcs,
-            })
-        })
+        .map(
+            |(id, name, email, created_at, deleted_at, complete_profile, active_rfcs)| {
+                serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "email": email,
+                    "created_at": created_at,
+                    "deleted_at": deleted_at,
+                    "pulso_complete_profile": complete_profile,
+                    "active_rfcs": active_rfcs,
+                })
+            },
+        )
         .collect();
 
     HttpResponse::Ok().json(serde_json::json!({
@@ -1952,17 +2193,29 @@ pub async fn admin_user_rfcs(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
     if !is_admin {
-        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+        return HttpResponse::Forbidden().json(ErrorBody {
+            error: "Acceso denegado".into(),
+        });
     }
 
     let target_user_id = path.into_inner();
@@ -1971,7 +2224,9 @@ pub async fn admin_user_rfcs(
     let target_uuid: uuid::Uuid = match target_user_id.parse() {
         Ok(id) => id,
         Err(_) => {
-            return HttpResponse::UnprocessableEntity().json(ErrorBody { error: "user_id inválido".into() });
+            return HttpResponse::UnprocessableEntity().json(ErrorBody {
+                error: "user_id inválido".into(),
+            });
         }
     };
 
@@ -1996,7 +2251,9 @@ pub async fn admin_user_rfcs(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("admin_user_rfcs: owned query: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
     };
 
@@ -2021,7 +2278,9 @@ pub async fn admin_user_rfcs(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("admin_user_rfcs: shared query: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
     };
 
@@ -2029,11 +2288,9 @@ pub async fn admin_user_rfcs(
         .into_iter()
         .map(|(rfc, nombre)| serde_json::json!({ "rfc": rfc, "nombre": nombre, "role": "owner" }))
         .collect();
-    rfcs.extend(
-        shared
-            .into_iter()
-            .map(|(rfc, nombre)| serde_json::json!({ "rfc": rfc, "nombre": nombre, "role": "viewer" })),
-    );
+    rfcs.extend(shared.into_iter().map(
+        |(rfc, nombre)| serde_json::json!({ "rfc": rfc, "nombre": nombre, "role": "viewer" }),
+    ));
 
     HttpResponse::Ok().json(serde_json::json!({ "rfcs": rfcs }))
 }
@@ -2052,17 +2309,29 @@ pub async fn admin_rfc_xml_years(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
     if !is_admin {
-        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+        return HttpResponse::Forbidden().json(ErrorBody {
+            error: "Acceso denegado".into(),
+        });
     }
 
     let rfc = path.into_inner().trim().to_uppercase();
@@ -2106,17 +2375,29 @@ pub async fn admin_rfc_xml_days(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
     if !is_admin {
-        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+        return HttpResponse::Forbidden().json(ErrorBody {
+            error: "Acceso denegado".into(),
+        });
     }
 
     let rfc = path.into_inner().trim().to_uppercase();
@@ -2138,7 +2419,9 @@ pub async fn admin_rfc_xml_days(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("admin_rfc_xml_days: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
     };
 
@@ -2208,17 +2491,29 @@ pub async fn admin_rfc_xml_day(
 ) -> HttpResponse {
     let token = match bearer_token(&req) {
         Some(t) => t,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token requerido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token requerido".into(),
+            });
+        }
     };
     let user_id = match jwt_user_id(&token) {
         Some(id) => id,
-        None => return HttpResponse::Unauthorized().json(ErrorBody { error: "Token inválido".into() }),
+        None => {
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Token inválido".into(),
+            });
+        }
     };
     tracing::Span::current().record("user_id", &user_id.as_str());
 
-    let is_admin = crate::db::users::is_user_admin(&pool, &user_id).await.unwrap_or(false);
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
     if !is_admin {
-        return HttpResponse::Forbidden().json(ErrorBody { error: "Acceso denegado".into() });
+        return HttpResponse::Forbidden().json(ErrorBody {
+            error: "Acceso denegado".into(),
+        });
     }
 
     let rfc = path.into_inner().trim().to_uppercase();
@@ -2228,7 +2523,8 @@ pub async fn admin_rfc_xml_day(
     let page = query.page.max(1);
     let page_size = query.page_size.clamp(1, 100);
 
-    let count_sql = format!("{ADMIN_XML_DAY_BASE_CTE} SELECT COUNT(*) FROM base {ADMIN_XML_DAY_SEARCH_FILTER}");
+    let count_sql =
+        format!("{ADMIN_XML_DAY_BASE_CTE} SELECT COUNT(*) FROM base {ADMIN_XML_DAY_SEARCH_FILTER}");
     let total: i64 = match sqlx::query_scalar(&count_sql)
         .bind(&rfc)
         .bind(date)
@@ -2239,7 +2535,9 @@ pub async fn admin_rfc_xml_day(
         Ok(n) => n,
         Err(e) => {
             tracing::error!("admin_rfc_xml_day: count: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
     };
 
@@ -2261,7 +2559,9 @@ pub async fn admin_rfc_xml_day(
         Ok(r) => r,
         Err(e) => {
             tracing::error!("admin_rfc_xml_day: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody { error: "Error de base de datos".into() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error de base de datos".into(),
+            });
         }
     };
 

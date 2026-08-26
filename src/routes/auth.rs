@@ -262,10 +262,7 @@ fn bearer_token_auth(req: &HttpRequest) -> Option<String> {
 }
 
 /// Exchange a Google authorization code for the user's profile.
-async fn exchange_google_code(
-    cfg: &Config,
-    code: &str,
-) -> Result<GoogleIdTokenClaims, String> {
+async fn exchange_google_code(cfg: &Config, code: &str) -> Result<GoogleIdTokenClaims, String> {
     let client = reqwest::Client::new();
 
     let token_resp = client
@@ -353,8 +350,9 @@ pub async fn google_login(
             Ok(u) => u,
             Err(e) => {
                 tracing::error!("DB error finding user by email: {e}");
-                return HttpResponse::InternalServerError()
-                    .json(ErrorBody { error: e.to_string() });
+                return HttpResponse::InternalServerError().json(ErrorBody {
+                    error: e.to_string(),
+                });
             }
         },
     };
@@ -369,9 +367,7 @@ pub async fn google_login(
     };
 
     // Link google_id if not yet set
-    if let Err(e) =
-        crate::db::users::set_google_id(&pool, &user_id, &google_user.sub).await
-    {
+    if let Err(e) = crate::db::users::set_google_id(&pool, &user_id, &google_user.sub).await {
         tracing::warn!("Could not set google_id for {user_id}: {e}");
     }
 
@@ -401,16 +397,18 @@ pub async fn google_link(
     let token = match bearer_token_auth(&req) {
         Some(t) => t,
         None => {
-            return HttpResponse::Unauthorized()
-                .json(ErrorBody { error: "Missing token".to_string() });
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Missing token".to_string(),
+            });
         }
     };
 
     let user_id = match jwt_sub(&token) {
         Some(id) => id,
         None => {
-            return HttpResponse::Unauthorized()
-                .json(ErrorBody { error: "Invalid token".to_string() });
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Invalid token".to_string(),
+            });
         }
     };
 
@@ -430,17 +428,17 @@ pub async fn google_link(
             });
         }
         Err(e) => {
-            return HttpResponse::InternalServerError()
-                .json(ErrorBody { error: e.to_string() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: e.to_string(),
+            });
         }
         _ => {}
     }
 
-    if let Err(e) =
-        crate::db::users::set_google_id(&pool, &user_id, &google_user.sub).await
-    {
-        return HttpResponse::InternalServerError()
-            .json(ErrorBody { error: e.to_string() });
+    if let Err(e) = crate::db::users::set_google_id(&pool, &user_id, &google_user.sub).await {
+        return HttpResponse::InternalServerError().json(ErrorBody {
+            error: e.to_string(),
+        });
     }
 
     tracing::info!(user_id = %user_id, "Google account linked");
@@ -448,30 +446,30 @@ pub async fn google_link(
 }
 
 /// Returns whether the current user has a Google account linked.
-pub async fn google_status(
-    req: HttpRequest,
-    pool: web::Data<DbPool>,
-) -> HttpResponse {
+pub async fn google_status(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
     let token = match bearer_token_auth(&req) {
         Some(t) => t,
         None => {
-            return HttpResponse::Unauthorized()
-                .json(ErrorBody { error: "Missing token".to_string() });
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Missing token".to_string(),
+            });
         }
     };
     let user_id = match jwt_sub(&token) {
         Some(id) => id,
         None => {
-            return HttpResponse::Unauthorized()
-                .json(ErrorBody { error: "Invalid token".to_string() });
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Invalid token".to_string(),
+            });
         }
     };
 
     let linked = match crate::db::users::find_by_google_id_linked(&pool, &user_id).await {
         Ok(v) => v,
         Err(e) => {
-            return HttpResponse::InternalServerError()
-                .json(ErrorBody { error: e.to_string() });
+            return HttpResponse::InternalServerError().json(ErrorBody {
+                error: e.to_string(),
+            });
         }
     };
 
@@ -479,28 +477,28 @@ pub async fn google_status(
 }
 
 /// Unlink Google from the current user's account.
-pub async fn google_unlink(
-    req: HttpRequest,
-    pool: web::Data<DbPool>,
-) -> HttpResponse {
+pub async fn google_unlink(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
     let token = match bearer_token_auth(&req) {
         Some(t) => t,
         None => {
-            return HttpResponse::Unauthorized()
-                .json(ErrorBody { error: "Missing token".to_string() });
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Missing token".to_string(),
+            });
         }
     };
     let user_id = match jwt_sub(&token) {
         Some(id) => id,
         None => {
-            return HttpResponse::Unauthorized()
-                .json(ErrorBody { error: "Invalid token".to_string() });
+            return HttpResponse::Unauthorized().json(ErrorBody {
+                error: "Invalid token".to_string(),
+            });
         }
     };
 
     if let Err(e) = crate::db::users::clear_google_id(&pool, &user_id).await {
-        return HttpResponse::InternalServerError()
-            .json(ErrorBody { error: e.to_string() });
+        return HttpResponse::InternalServerError().json(ErrorBody {
+            error: e.to_string(),
+        });
     }
 
     tracing::info!(user_id = %user_id, "Google account unlinked");

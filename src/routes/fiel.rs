@@ -58,8 +58,7 @@ pub async fn upload(
     let user_id = match bearer_token(&req).and_then(|t| jwt_user_id(&t)) {
         Some(id) => id,
         None => {
-            return HttpResponse::Unauthorized()
-                .json(serde_json::json!({"error": "Unauthorized"}))
+            return HttpResponse::Unauthorized().json(serde_json::json!({"error": "Unauthorized"}));
         }
     };
 
@@ -67,7 +66,7 @@ pub async fn upload(
         Ok(Some(_)) => {}
         Ok(None) => {
             return HttpResponse::Forbidden()
-                .json(serde_json::json!({"error": "RFC not found or not yours"}))
+                .json(serde_json::json!({"error": "RFC not found or not yours"}));
         }
         Err(e) => {
             tracing::error!(rfc = %rfc, "FIEL upload: ownership check failed: {e}");
@@ -84,8 +83,7 @@ pub async fn upload(
         let mut field = match item {
             Ok(f) => f,
             Err(e) => {
-                return HttpResponse::BadRequest()
-                    .json(serde_json::json!({"error": e.to_string()}))
+                return HttpResponse::BadRequest().json(serde_json::json!({"error": e.to_string()}));
             }
         };
 
@@ -96,7 +94,7 @@ pub async fn upload(
                 Ok(bytes) => data.extend_from_slice(&bytes),
                 Err(e) => {
                     return HttpResponse::BadRequest()
-                        .json(serde_json::json!({"error": e.to_string()}))
+                        .json(serde_json::json!({"error": e.to_string()}));
                 }
             }
         }
@@ -113,14 +111,14 @@ pub async fn upload(
         Some(b) if !b.is_empty() => b,
         _ => {
             return HttpResponse::BadRequest()
-                .json(serde_json::json!({"error": "Missing or empty cert field"}))
+                .json(serde_json::json!({"error": "Missing or empty cert field"}));
         }
     };
     let key = match key_bytes {
         Some(b) if !b.is_empty() => b,
         _ => {
             return HttpResponse::BadRequest()
-                .json(serde_json::json!({"error": "Missing or empty key field"}))
+                .json(serde_json::json!({"error": "Missing or empty key field"}));
         }
     };
 
@@ -154,8 +152,7 @@ pub async fn upload(
         crate::db::fiel::upsert(&pool, &rfc, &cert_s3_key, &key_s3_key, &password_enc).await
     {
         tracing::error!(rfc = %rfc, "FIEL upload: DB upsert failed: {e}");
-        return HttpResponse::InternalServerError()
-            .json(serde_json::json!({"error": "DB error"}));
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": "DB error"}));
     }
 
     tracing::info!(rfc = %rfc, "FIEL credentials stored");
@@ -173,8 +170,7 @@ pub async fn get_status(
     let user_id = match bearer_token(&req).and_then(|t| jwt_user_id(&t)) {
         Some(id) => id,
         None => {
-            return HttpResponse::Unauthorized()
-                .json(serde_json::json!({"error": "Unauthorized"}))
+            return HttpResponse::Unauthorized().json(serde_json::json!({"error": "Unauthorized"}));
         }
     };
 
@@ -182,7 +178,7 @@ pub async fn get_status(
         Ok(Some(_)) => {}
         Ok(None) => {
             return HttpResponse::Forbidden()
-                .json(serde_json::json!({"error": "RFC not found or not yours"}))
+                .json(serde_json::json!({"error": "RFC not found or not yours"}));
         }
         Err(e) => {
             tracing::error!(rfc = %rfc, "FIEL status: DB error: {e}");
@@ -220,8 +216,7 @@ pub async fn delete(
     let user_id = match bearer_token(&req).and_then(|t| jwt_user_id(&t)) {
         Some(id) => id,
         None => {
-            return HttpResponse::Unauthorized()
-                .json(serde_json::json!({"error": "Unauthorized"}))
+            return HttpResponse::Unauthorized().json(serde_json::json!({"error": "Unauthorized"}));
         }
     };
 
@@ -229,7 +224,7 @@ pub async fn delete(
         Ok(Some(_)) => {}
         Ok(None) => {
             return HttpResponse::Forbidden()
-                .json(serde_json::json!({"error": "RFC not found or not yours"}))
+                .json(serde_json::json!({"error": "RFC not found or not yours"}));
         }
         Err(e) => {
             tracing::error!(rfc = %rfc, "FIEL delete: ownership check failed: {e}");

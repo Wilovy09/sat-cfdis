@@ -5,9 +5,9 @@ use crate::{
     db::DbPool,
     errors::AppError,
     services::analytics::{
-        cashflow, concepts, counterparties, data_quality, fiscal, geography, hallazgos, normalization,
-        payments, payroll, period_comparison, quarterly, recurrence, retention, summary, xml_breakdown,
-        xml_count,
+        cashflow, concepts, counterparties, data_quality, fiscal, geography, hallazgos,
+        normalization, payments, payroll, period_comparison, quarterly, recurrence, retention,
+        summary, xml_breakdown, xml_count,
     },
 };
 
@@ -247,7 +247,7 @@ pub async fn get_recurrence(
         .unwrap_or(24)
         .clamp(6, 60);
     let from = query.get("from").map(|s| s.as_str());
-    let to   = query.get("to").map(|s| s.as_str());
+    let to = query.get("to").map(|s| s.as_str());
     let result = recurrence::get(&pool, &rfc, dl_type, window_months, from, to)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -585,7 +585,13 @@ pub async fn create_normalization(
     // L3-13: accounting_line is now mandatory at creation time. A rule saved without one
     // used to fall out of the EBITDA bridge silently (it required accounting_line IS NOT
     // NULL to appear at all) while still cutting money from the P&L -- invisible normalization.
-    if body.accounting_line.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if body
+        .accounting_line
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         return Err(AppError::bad_request(
             "accounting_line es obligatorio: selecciona la línea del P&L de la que sale este ajuste",
         ));
@@ -672,6 +678,21 @@ pub async fn create_payroll_normalization(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", &rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
+
+    match normalization::check_payroll_rule(&pool, &rfc, &body)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?
+    {
+        normalization::PayrollRuleCheck::Rejected(msg) => return Err(AppError::bad_request(msg)),
+        normalization::PayrollRuleCheck::NeedsConfirmation(warnings) => {
+            return Ok(HttpResponse::UnprocessableEntity().json(serde_json::json!({
+                "needs_confirmation": true,
+                "warnings": warnings,
+            })));
+        }
+        normalization::PayrollRuleCheck::Ok => {}
+    }
+
     let rule = normalization::create_payroll_rule(&pool, &rfc, &body)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -782,7 +803,15 @@ pub async fn list_norm_counterparty_cfdis(
     let (from_y, from_m) = crate::services::analytics::summary::parse_ym(&from);
     let (to_y, to_m) = crate::services::analytics::summary::parse_ym(&to);
     let rows = normalization::list_cfdis_for_counterparty(
-        &pool, &rfc, &cp_rfc.to_uppercase(), &dl_type, from_y, from_m, to_y, to_m, limit,
+        &pool,
+        &rfc,
+        &cp_rfc.to_uppercase(),
+        &dl_type,
+        from_y,
+        from_m,
+        to_y,
+        to_m,
+        limit,
     )
     .await
     .map_err(|e| AppError::internal(&e.to_string()))?;
@@ -823,9 +852,10 @@ pub async fn get_normalization_payroll_employee_receipts(
     let (rfc, employee_rfc) = path.into_inner();
     let rfc = rfc.to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let rows = normalization::list_nomina_receipts_for_employee(&pool, &rfc, &employee_rfc.to_uppercase())
-        .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+    let rows =
+        normalization::list_nomina_receipts_for_employee(&pool, &rfc, &employee_rfc.to_uppercase())
+            .await
+            .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(rows))
 }
 
@@ -1111,7 +1141,10 @@ pub async fn get_xml_count(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", &rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let dl_type = query.get("dl_type").map(|s| s.as_str()).unwrap_or("emitidos");
+    let dl_type = query
+        .get("dl_type")
+        .map(|s| s.as_str())
+        .unwrap_or("emitidos");
     let result = xml_count::get(&pool, &rfc, dl_type)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;

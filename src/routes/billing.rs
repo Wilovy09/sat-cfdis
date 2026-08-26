@@ -48,8 +48,7 @@ pub async fn get_status(
     req: HttpRequest,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
-    let (_, uid) = parse_user(&req)
-        .ok_or_else(|| AppError::unauthorized("Token requerido"))?;
+    let (_, uid) = parse_user(&req).ok_or_else(|| AppError::unauthorized("Token requerido"))?;
 
     let status = crate::db::subscriptions::get_pulso_status(pool.get_ref(), uid)
         .await
