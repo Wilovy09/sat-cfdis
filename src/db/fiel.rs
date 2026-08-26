@@ -18,13 +18,15 @@ pub async fn get(pool: &PgPool, rfc: &str) -> Result<Option<FielRow>, sqlx::Erro
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|(rfc, cert_s3_key, key_s3_key, password_enc, uploaded_at)| FielRow {
-        rfc,
-        cert_s3_key,
-        key_s3_key,
-        password_enc,
-        uploaded_at,
-    }))
+    Ok(row.map(
+        |(rfc, cert_s3_key, key_s3_key, password_enc, uploaded_at)| FielRow {
+            rfc,
+            cert_s3_key,
+            key_s3_key,
+            password_enc,
+            uploaded_at,
+        },
+    ))
 }
 
 pub async fn upsert(

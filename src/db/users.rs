@@ -261,12 +261,10 @@ pub async fn get_user_rfcs_with_role(
 /// True if user has the 'admin' role via public.user_roles → catalogs.roles.
 pub async fn count_user_rfcs(pool: &PgPool, user_id: &str) -> Result<i64, sqlx::Error> {
     let uid = parse_uuid(user_id)?;
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pulso.users WHERE user_id = $1 AND deleted_at IS NULL",
-    )
-    .bind(uid)
-    .fetch_one(pool)
-    .await
+    sqlx::query_scalar("SELECT COUNT(*) FROM pulso.users WHERE user_id = $1 AND deleted_at IS NULL")
+        .bind(uid)
+        .fetch_one(pool)
+        .await
 }
 
 pub async fn is_user_admin(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {
@@ -346,11 +344,7 @@ pub async fn user_owns_rfc_or_admin(
 
 /// Grant a viewer their own `pulso.users` row for the shared RFC (no clave, no sync job).
 /// Idempotent: restores soft-deleted row or skips if already active.
-pub async fn add_viewer_rfc(
-    pool: &PgPool,
-    user_id: &str,
-    rfc: &str,
-) -> Result<(), sqlx::Error> {
+pub async fn add_viewer_rfc(pool: &PgPool, user_id: &str, rfc: &str) -> Result<(), sqlx::Error> {
     let uid = parse_uuid(user_id)?;
     let rfc_upper = rfc.to_uppercase();
 
@@ -418,10 +412,7 @@ pub async fn create_rfc_share(
     Ok(share_id.0.to_string())
 }
 
-pub async fn list_rfc_shares(
-    pool: &PgPool,
-    rfc: &str,
-) -> Result<Vec<RfcShare>, sqlx::Error> {
+pub async fn list_rfc_shares(pool: &PgPool, rfc: &str) -> Result<Vec<RfcShare>, sqlx::Error> {
     let rfc_upper = rfc.to_uppercase();
     // Fetch granted_at as ISO-8601 string directly from Postgres
     let rows: Vec<(Uuid, String, Uuid, Option<String>, String)> = sqlx::query_as(
@@ -436,13 +427,15 @@ pub async fn list_rfc_shares(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, rfc, shared_with, invited_email, granted_at)| RfcShare {
-            id: id.to_string(),
-            rfc,
-            shared_with: shared_with.to_string(),
-            invited_email,
-            granted_at,
-        })
+        .map(
+            |(id, rfc, shared_with, invited_email, granted_at)| RfcShare {
+                id: id.to_string(),
+                rfc,
+                shared_with: shared_with.to_string(),
+                invited_email,
+                granted_at,
+            },
+        )
         .collect())
 }
 
@@ -489,7 +482,10 @@ pub async fn find_user_by_email_for_share(
     Ok(row.map(|(id, email)| (id.to_string(), email)))
 }
 
-pub async fn get_email_by_user_id(pool: &PgPool, user_id: &str) -> Result<Option<String>, sqlx::Error> {
+pub async fn get_email_by_user_id(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
     let uid = parse_uuid(user_id)?;
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT email FROM public.users WHERE id = $1 AND deleted_at IS NULL LIMIT 1",
@@ -591,12 +587,11 @@ pub async fn find_by_google_id(
     pool: &PgPool,
     google_id: &str,
 ) -> Result<Option<(String, String, String)>, sqlx::Error> {
-    let row: Option<(uuid::Uuid, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, email, name FROM public.users WHERE google_id = $1 LIMIT 1",
-    )
-    .bind(google_id)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(uuid::Uuid, String, Option<String>)> =
+        sqlx::query_as("SELECT id, email, name FROM public.users WHERE google_id = $1 LIMIT 1")
+            .bind(google_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.map(|(id, email, name)| (id.to_string(), email, name.unwrap_or_default())))
 }
 
@@ -630,10 +625,7 @@ pub async fn set_google_id(
 }
 
 /// Returns true if the given user_id has a non-null google_id.
-pub async fn find_by_google_id_linked(
-    pool: &PgPool,
-    user_id: &str,
-) -> Result<bool, sqlx::Error> {
+pub async fn find_by_google_id_linked(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::Error> {
     let uid = parse_uuid(user_id)?;
     let row: Option<(Option<String>,)> =
         sqlx::query_as("SELECT google_id FROM public.users WHERE id = $1 LIMIT 1")
@@ -667,7 +659,11 @@ pub async fn find_user_id_by_google_id(
 }
 
 /// Returns true if job_id is the initial_sync_job_id for the given RFC.
-pub async fn is_initial_sync_job(pool: &PgPool, rfc: &str, job_id: &str) -> Result<bool, sqlx::Error> {
+pub async fn is_initial_sync_job(
+    pool: &PgPool,
+    rfc: &str,
+    job_id: &str,
+) -> Result<bool, sqlx::Error> {
     let (exists,): (bool,) = sqlx::query_as(
         "SELECT EXISTS(SELECT 1 FROM pulso.users WHERE rfc = $1 AND initial_sync_job_id = $2 AND deleted_at IS NULL)"
     )

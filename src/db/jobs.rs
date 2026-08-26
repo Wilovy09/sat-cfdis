@@ -384,14 +384,12 @@ pub async fn set_total_expected(
     job_id: &str,
     total: i64,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"UPDATE pulso.sync_jobs SET total_expected=$1, updated_at=$2 WHERE id=$3"#,
-    )
-    .bind(total)
-    .bind(now_utc())
-    .bind(job_id)
-    .execute(pool)
-    .await?;
+    sqlx::query(r#"UPDATE pulso.sync_jobs SET total_expected=$1, updated_at=$2 WHERE id=$3"#)
+        .bind(total)
+        .bind(now_utc())
+        .bind(job_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -562,7 +560,10 @@ pub async fn has_any_daily_job(pool: &PgPool, rfc: &str) -> Result<bool, sqlx::E
 /// "yesterday", so whatever gap sits between "the historical load ended" and
 /// "the day someone actually enabled daily mode" (Axented: 2026-07-31 →
 /// 2026-08-16, 15 days) never gets requested by anyone.
-pub async fn latest_historical_period_to(pool: &PgPool, rfc: &str) -> Result<Option<String>, sqlx::Error> {
+pub async fn latest_historical_period_to(
+    pool: &PgPool,
+    rfc: &str,
+) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(
         r#"SELECT MAX(period_to) FROM pulso.sync_jobs
            WHERE rfc = $1 AND job_type IN ('list', 'gap_resync') AND status = 'completed'"#,
@@ -668,7 +669,10 @@ pub async fn get_active_for_rfc(pool: &PgPool, rfc: &str) -> Result<Option<SyncJ
 /// scattered single-day `gap_resync`s), and `get_active_for_rfc` can surface
 /// a narrow one as "the" active job, making the widget's month range collapse
 /// to just that job's few months even though far more has actually synced.
-pub async fn rfc_job_range(pool: &PgPool, rfc: &str) -> Result<Option<(String, String)>, sqlx::Error> {
+pub async fn rfc_job_range(
+    pool: &PgPool,
+    rfc: &str,
+) -> Result<Option<(String, String)>, sqlx::Error> {
     let row: (Option<String>, Option<String>) = sqlx::query_as(
         r#"SELECT MIN(period_from), MAX(period_to) FROM pulso.sync_jobs WHERE rfc = $1"#,
     )
@@ -780,7 +784,11 @@ pub async fn insert_gap_continuation(
 /// job, or (rare) determined to need no continuation because its cursor had
 /// already reached period_to despite the failure. Either way, stops
 /// `find_failed_retryable` from picking it up again.
-pub async fn mark_superseded(pool: &PgPool, job_id: &str, superseded_by: &str) -> Result<(), sqlx::Error> {
+pub async fn mark_superseded(
+    pool: &PgPool,
+    job_id: &str,
+    superseded_by: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(r#"UPDATE pulso.sync_jobs SET superseded_by = $1, updated_at = $2 WHERE id = $3"#)
         .bind(superseded_by)
         .bind(now_utc())
@@ -801,14 +809,21 @@ pub async fn distinct_completed_rfcs(pool: &PgPool) -> Result<Vec<String>, sqlx:
 /// Where the day-by-day zero-activity scan should resume for this RFC. `None`
 /// means it's never been scanned — the caller starts from that RFC's earliest
 /// completed job.
-pub async fn get_gap_scan_progress(pool: &PgPool, rfc: &str) -> Result<Option<String>, sqlx::Error> {
+pub async fn get_gap_scan_progress(
+    pool: &PgPool,
+    rfc: &str,
+) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(r#"SELECT last_scanned_date FROM pulso.gap_scan_progress WHERE rfc = $1"#)
         .bind(rfc)
         .fetch_optional(pool)
         .await
 }
 
-pub async fn set_gap_scan_progress(pool: &PgPool, rfc: &str, last_scanned_date: &str) -> Result<(), sqlx::Error> {
+pub async fn set_gap_scan_progress(
+    pool: &PgPool,
+    rfc: &str,
+    last_scanned_date: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"INSERT INTO pulso.gap_scan_progress (rfc, last_scanned_date, updated_at)
            VALUES ($1, $2, $3)
@@ -824,11 +839,16 @@ pub async fn set_gap_scan_progress(pool: &PgPool, rfc: &str, last_scanned_date: 
 
 /// Earliest day this RFC has a completed sync for — where a never-before-scanned
 /// RFC's gap scan should start from.
-pub async fn earliest_completed_period_from(pool: &PgPool, rfc: &str) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar(r#"SELECT MIN(period_from) FROM pulso.sync_jobs WHERE rfc = $1 AND status = 'completed'"#)
-        .bind(rfc)
-        .fetch_one(pool)
-        .await
+pub async fn earliest_completed_period_from(
+    pool: &PgPool,
+    rfc: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT MIN(period_from) FROM pulso.sync_jobs WHERE rfc = $1 AND status = 'completed'"#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await
 }
 
 /// Weekdays in `[start_day, end_day]` that fall inside one of this RFC's
@@ -915,7 +935,11 @@ pub async fn find_activity_gap_days(
 /// How many single-day gap_resync jobs already ran for this RFC+day — caps
 /// re-checking a day that turns out to be a genuine holiday/no-activity day
 /// forever.
-pub async fn count_gap_resync_attempts(pool: &PgPool, rfc: &str, day: &str) -> Result<i64, sqlx::Error> {
+pub async fn count_gap_resync_attempts(
+    pool: &PgPool,
+    rfc: &str,
+    day: &str,
+) -> Result<i64, sqlx::Error> {
     let (n,): (i64,) = sqlx::query_as(
         r#"SELECT COUNT(*) FROM pulso.sync_jobs WHERE rfc = $1 AND job_type = 'gap_resync' AND period_from = $2"#,
     )

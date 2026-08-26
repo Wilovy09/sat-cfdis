@@ -1,7 +1,6 @@
 use crate::services::xml_parser::{
     ParsedCfdi, ParsedConcept, ParsedNomina, ParsedNominaDeduccion, ParsedNominaOtroPago,
-    ParsedNominaPercepcion,
-    ParsedPayment, ParsedPaymentDoc, ParsedRelacionado, ParsedTax,
+    ParsedNominaPercepcion, ParsedPayment, ParsedPaymentDoc, ParsedRelacionado, ParsedTax,
 };
 use sqlx::PgPool;
 
@@ -181,7 +180,7 @@ pub async fn insert_concepts(
 
 pub async fn insert_payments(
     pool: &PgPool,
-    job_id: &str,
+    job_id: Option<&str>,
     rfc_emisor: &str,
     rfc_receptor: &str,
     payment_uuid: &str,
@@ -213,10 +212,13 @@ pub async fn insert_payments(
                     payment_uuid = %payment_uuid, pago_num = idx, moneda_p = %moneda,
                     "TC-3: pago en divisa distinta de MXN con tipo_cambio_p ausente o en 1 — se guarda igual, revisar el XML"
                 );
+                // L4-06: unique on (flag_type, payment_uuid) -- a redownload/enrichment
+                // reprocess of the same complement must not inflate the count.
                 if let Err(e) = sqlx::query(
                     r#"INSERT INTO pulso.data_quality_flags
                         (job_id, flag_type, payment_uuid, rfc_emisor, rfc_receptor, moneda)
-                       VALUES ($1, 'tc3_moneda_tipo_cambio_1', $2, $3, $4, $5)"#,
+                       VALUES ($1, 'tc3_moneda_tipo_cambio_1', $2, $3, $4, $5)
+                       ON CONFLICT (flag_type, payment_uuid) DO NOTHING"#,
                 )
                 .bind(job_id)
                 .bind(payment_uuid)
@@ -624,7 +626,7 @@ pub async fn concepts_exist(pool: &PgPool, uuid: &str) -> bool {
 pub async fn reset_for_reprocessing(
     pool: &PgPool,
     rfc: &str,
-    dl_type: &str,       // "emitidos" | "recibidos" | "ambos"
+    dl_type: &str, // "emitidos" | "recibidos" | "ambos"
     from_year: Option<i32>,
     from_month: Option<i32>,
     to_year: Option<i32>,
@@ -637,8 +639,10 @@ pub async fn reset_for_reprocessing(
         (Some(fy), Some(ty)) => format!(
             "AND (c.year > {fy} OR (c.year = {fy} AND c.month >= {fm})) \
              AND (c.year < {ty} OR (c.year = {ty} AND c.month <= {tm}))",
-            fy = fy, fm = from_month.unwrap_or(1),
-            ty = ty, tm = to_month.unwrap_or(12)
+            fy = fy,
+            fm = from_month.unwrap_or(1),
+            ty = ty,
+            tm = to_month.unwrap_or(12)
         ),
         _ => String::new(),
     };
@@ -679,10 +683,7 @@ pub async fn reset_for_reprocessing(
 /// Mark all xml_available=0 CFDIs in a job as permanently unavailable (xml_available=-1).
 /// Also backfills subtotal from total when subtotal is NULL so that the STORED GENERATED
 /// column total_neto_mxn has a meaningful value instead of 0 for analytics.
-pub async fn mark_xml_unavailable_for_job(
-    pool: &PgPool,
-    job_id: &str,
-) -> Result<u64, sqlx::Error> {
+pub async fn mark_xml_unavailable_for_job(pool: &PgPool, job_id: &str) -> Result<u64, sqlx::Error> {
     // subtotal has no real value to fall back on here — SAT's metadata listing
     // (see Metadata.php) never exposes SubTotal, only the IVA-inclusive Total.
     // Approximate with the standard 16% rate rather than using Total outright:
@@ -752,7 +753,12 @@ pub async fn months_with_data(
     // gap (CES100706U65).
     Ok(rows
         .into_iter()
-        .map(|r| (r.try_get::<i64, _>("year").unwrap_or(0), r.try_get::<i64, _>("month").unwrap_or(0)))
+        .map(|r| {
+            (
+                r.try_get::<i64, _>("year").unwrap_or(0),
+                r.try_get::<i64, _>("month").unwrap_or(0),
+            )
+        })
         .collect())
 }
 
@@ -873,10 +879,12 @@ pub async fn touch_estado_sat_checked(pool: &PgPool, uuids: &[String]) -> Result
     if uuids.is_empty() {
         return Ok(());
     }
-    sqlx::query("UPDATE pulso.cfdis SET estado_sat_checked_at = NOW() WHERE uuid = ANY($1::text[])")
-        .bind(uuids)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE pulso.cfdis SET estado_sat_checked_at = NOW() WHERE uuid = ANY($1::text[])",
+    )
+    .bind(uuids)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -908,7 +916,9 @@ pub async fn record_estado_sat_miss(
     .bind(max_attempts)
     .fetch_one(pool)
     .await?;
-    Ok(row.try_get::<i32, _>("estado_sat_check_attempts").unwrap_or(0))
+    Ok(row
+        .try_get::<i32, _>("estado_sat_check_attempts")
+        .unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -970,5 +980,7 @@ pub async fn record_redownload_miss(pool: &PgPool, uuid: &str) -> Result<i32, sq
     .bind(uuid)
     .fetch_one(pool)
     .await?;
-    Ok(row.try_get::<i32, _>("xml_redownload_attempts").unwrap_or(0))
+    Ok(row
+        .try_get::<i32, _>("xml_redownload_attempts")
+        .unwrap_or(0))
 }
