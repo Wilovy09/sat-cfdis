@@ -3,7 +3,7 @@
 -- produces "NÓMINA", which never matched the unaccented "NOMINA" literal in
 -- the match arm — every payroll CFDI parsed from metadata only (no XML)
 -- silently fell through to the `_ => "I"` default, counting salaries as
--- sales revenue. Confirmed against Axented (ADC101206334): 1,893 rows,
+-- sales revenue. Confirmed against a foreign-owned client RFC: 1,893 rows,
 -- ~$1.8-3.6M MXN/year misclassified into Ingresos.
 --
 -- The correct classification (`efectoComprobante = 'Nómina'`) is still

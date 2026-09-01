@@ -3,11 +3,12 @@
 -- insert_nomina() has nothing to collide against — every re-run of the ETL
 -- over the same UUID inserts the same rows again. NRS04's "Otros pagos por
 -- clave SAT" table was showing exactly double the real total in every year
--- of Axented's data.
+-- of the foreign-owned client's data.
 --
 -- Verified before deleting anything: every duplicate group platform-wide
--- (ADC101206334, ALA2409253U7, CCO210630GE6, CES100706U65 — NUB170623KI3 has
--- none) appears exactly twice, never 3+ times — consistent with "the ETL ran
+-- (the foreign-owned client plus two other affected RFCs and the large RFC
+-- — the test RFC has none) appears exactly twice, never 3+ times —
+-- consistent with "the ETL ran
 -- an extra time on the same UUID", not a coincidental pair of genuinely
 -- distinct rows that happen to share every column.
 DELETE FROM pulso.cfdi_nomina_otros_pagos a

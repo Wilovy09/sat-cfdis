@@ -2,7 +2,7 @@
 -- cfdi_nomina_deducciones también tiene solo un PK surrogate (BIGSERIAL id,
 -- nunca colisiona) y ON CONFLICT DO NOTHING sin target real. Encontrada al
 -- corregir la tabla vecina cfdi_nomina_percepciones (NOM-6) — mismo alcance
--- exacto: solo CES100706U65 (59,513 filas / 43,482 firmas), y cada grupo
+-- exacto: solo el RFC grande (59,513 filas / 43,482 firmas), y cada grupo
 -- duplicado aparece exactamente 2 veces, nunca 3+.
 DELETE FROM pulso.cfdi_nomina_deducciones a
 USING pulso.cfdi_nomina_deducciones b

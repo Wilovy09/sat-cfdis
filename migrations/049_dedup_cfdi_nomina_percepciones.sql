@@ -2,7 +2,7 @@
 -- already has a BIGSERIAL `id` PRIMARY KEY, but that's a surrogate — it
 -- never collides, so `ON CONFLICT DO NOTHING` in insert_nomina() has never
 -- actually protected against a re-run duplicating the same percepcion row.
--- Only CES100706U65 is affected (razón 1.751); every other RFC's table is
+-- Only the large RFC is affected (razón 1.751); every other RFC's table is
 -- already 1:1 clean. Verified every duplicate group here is exactly 2 deep
 -- (never 3+) before deleting anything — the ETL ran twice, not a
 -- coincidental pair of genuinely distinct rows.

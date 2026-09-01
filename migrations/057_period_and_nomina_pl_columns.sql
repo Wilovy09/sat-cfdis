@@ -13,7 +13,7 @@ ALTER TABLE pulso.normalization_rules
 
 -- DEC-030: nómina rules get their own P&L line + motivo (same Egresos catalog the
 -- comprobante-level rules use), so L4-02's bridge integration has something to group by.
--- The one rule that exists today (SOUJ690625KR2) gets neither -- it falls under "Sin
+-- The one rule that exists today gets neither -- it falls under "Sin
 -- clasificar" once L4-02 wires the bridge, matching L3-13's precedent for old rules with
 -- no line: not backfilled with an invented value.
 ALTER TABLE pulso.payroll_normalization_rules

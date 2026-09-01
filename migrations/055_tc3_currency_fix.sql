@@ -5,11 +5,11 @@
 -- parser gap (835 other USD payments in the same dataset carry a correct rate). Per
 -- PULSO_Correcciones_Lote3 (TC-3), the fix is NOT "always apply a rate": the related
 -- documents decide. Two populations exist today (7 complements total):
---   - Group A (3 complements, HTR200709GP5 -> CES100706U65): moneda_p says USD but every
---     related document is in MXN with its own rate of 1. The payment really is in pesos,
---     mislabeled -- multiplying by a real exchange rate here would manufacture tens of
+--   - Group A (3 complements, a counterparty paying into the large RFC): moneda_p says USD
+--     but every related document is in MXN with its own rate of 1. The payment really is in
+--     pesos, mislabeled -- multiplying by a real exchange rate here would manufacture tens of
 --     millions of pesos that don't exist. Leave as 1:1.
---   - Group B (4 complements, ADC101206334 -> the generic foreign RFC): moneda_p says USD
+--   - Group B (4 complements, the foreign-owned client -> the generic foreign RFC): moneda_p says USD
 --     AND the related documents are also in USD, each carrying its own invoice-level
 --     tipo_cambio from issuance. Value with THAT rate instead of the complement's own
 --     (missing) one.

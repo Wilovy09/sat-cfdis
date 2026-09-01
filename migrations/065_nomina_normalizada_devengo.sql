@@ -1,29 +1,25 @@
--- Migration 063: live incident, continued -- pulso.nomina_normalizada's factor lookup.
+-- Lote 5, L5-04: una sola definicion de mes de devengo.
 --
--- After 062 fixed cfdi_exclusion's plan, the large RFC's payroll queries were STILL
--- taking 500+ seconds. EXPLAIN ANALYZE showed why: the `factors` CTE pre-aggregates
--- month_percepciones for every (owner, employee, year, month) combination the owner
--- has ANY nómina for, then LEFT JOINs that whole relation back onto every receipt by
--- (rfc_receptor, year, month) -- a condition Postgres can't hash/index because the left
--- side is a computed aggregate, not a table. The planner fell back to a nested loop:
--- for CES (10,684 nómina receipts x ~10,926 factor rows) that's ~29,400,000 row
--- comparisons, re-running two payroll_normalization_rules probes on every single one.
+-- DEC-034 fija el mes de un recibo de nomina como el mes de FechaFinalPago (con
+-- respaldo a fecha de emision cuando viene vacio). payroll.rs ya implementa ese
+-- calculo en 13 consultas -- inline, repetido caracter por caracter -- pero
+-- by_month/by_year/by_month_ordinaria lo usan solo para el GROUP BY y siguen
+-- filtrando la ventana WHERE por mes de EMISION. Un recibo timbrado en enero por
+-- trabajo de diciembre entra por la ventana de enero y se agrupa en diciembre: el
+-- total de un mes cambia segun la ventana consultada.
 --
--- Fixed by dropping the pre-aggregated `factors`/`monthly` relation entirely and
--- replacing it with two LATERAL subqueries evaluated per receipt, correlated directly
--- against pulso.payroll_normalization_rules -- a tiny table (rule count, not receipt
--- count; 2 rows platform-wide today) -- instead of joining a large derived relation.
--- For an owner with zero scale/adjust rules (every RFC except the test RFC today),
--- each LATERAL probe is now a near-instant no-match lookup against ~2 rows, run once
--- per receipt, instead of a cross join against thousands of precomputed factor rows.
--- The adjust-to-amount factor's own month_percepciones sum is now computed inline,
--- scoped to the one employee-month it actually needs -- only paid when a matching rule
--- exists at all, which is the rare case.
+-- Se agrega year_devengo/month_devengo a la vista, con el MISMO calculo que ya usa
+-- payroll.rs (COALESCE de fecha_final_pago normalizada a fecha_emision), para que
+-- exista una sola definicion y los consumidores dejen de repetirla inline. Los
+-- consumidores que deben seguir en mes de emision (first_pay/last_pay, headcount,
+-- la ventana de 92 dias de plantilla vigente, la vigencia de reglas) no cambian --
+-- siguen usando year/month, que conserva su significado de emision sin tocar.
 --
--- Same columns, same semantics (adjust wins over scale, per L3-15; a month with zero
--- percepciones leaves the adjust factor undefined via NULLIF, falling through to scale
--- or 1.0, per DEC-028/"no se inventa el monto donde no hubo recibo"); only the
--- evaluation strategy changed. factor_rule_id (migration 058) is preserved.
+-- pulso.cfdi_exclusion NO lleva devengo (ver L5-04 del documento): se construye
+-- sobre normalization_rules x cfdis y no ve cfdi_nomina; ademas nomina_normalizada
+-- la consume, asi que meterle devengo seria una dependencia circular. La vigencia
+-- de una regla de comprobante sobre un recibo de nomina se evalua aqui, donde ya
+-- hay devengo.
 CREATE OR REPLACE VIEW pulso.nomina_normalizada AS
 WITH excl_emp AS (
     SELECT id AS rule_id, owner_rfc, employee_rfc, period_start, period_end
@@ -60,7 +56,15 @@ SELECT
           AND (e.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) <= e.period_end)
         LIMIT 1
     ) AS employee_rule_id,
-    COALESCE(adj.rule_id, scl.rule_id) AS factor_rule_id
+    COALESCE(adj.rule_id, scl.rule_id) AS factor_rule_id,
+    EXTRACT(YEAR FROM COALESCE(
+        NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago, '')), ''), '0000-00-00')::date,
+        c.fecha_emision::date
+    ))::bigint AS year_devengo,
+    EXTRACT(MONTH FROM COALESCE(
+        NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago, '')), ''), '0000-00-00')::date,
+        c.fecha_emision::date
+    ))::bigint AS month_devengo
 FROM pulso.cfdis c
 JOIN pulso.cfdi_nomina n ON n.uuid = c.uuid
 LEFT JOIN LATERAL (

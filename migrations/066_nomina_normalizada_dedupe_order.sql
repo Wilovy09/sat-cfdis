@@ -1,29 +1,17 @@
--- Migration 063: live incident, continued -- pulso.nomina_normalizada's factor lookup.
+-- Lote 5, L5-07 y C7.
 --
--- After 062 fixed cfdi_exclusion's plan, the large RFC's payroll queries were STILL
--- taking 500+ seconds. EXPLAIN ANALYZE showed why: the `factors` CTE pre-aggregates
--- month_percepciones for every (owner, employee, year, month) combination the owner
--- has ANY nómina for, then LEFT JOINs that whole relation back onto every receipt by
--- (rfc_receptor, year, month) -- a condition Postgres can't hash/index because the left
--- side is a computed aggregate, not a table. The planner fell back to a nested loop:
--- for CES (10,684 nómina receipts x ~10,926 factor rows) that's ~29,400,000 row
--- comparisons, re-running two payroll_normalization_rules probes on every single one.
+-- L5-07: pulso.cfdi_exclusion tiene una fila por regla y por comprobante. El LEFT
+-- JOIN plano que nomina_normalizada usaba para resolver la exclusion por
+-- comprobante duplica el recibo si dos reglas cubren el mismo UUID. Hoy los 145
+-- pares son unicos (cero sintoma), pero es una regla de distancia. Cambiado a
+-- LEFT JOIN LATERAL ... LIMIT 1: como el factor de exclusion es booleano
+-- (is_excluded), cualquier regla que matchee basta -- no hace falta agregar todas,
+-- solo impedir que multipliquen filas.
 --
--- Fixed by dropping the pre-aggregated `factors`/`monthly` relation entirely and
--- replacing it with two LATERAL subqueries evaluated per receipt, correlated directly
--- against pulso.payroll_normalization_rules -- a tiny table (rule count, not receipt
--- count; 2 rows platform-wide today) -- instead of joining a large derived relation.
--- For an owner with zero scale/adjust rules (every RFC except the test RFC today),
--- each LATERAL probe is now a near-instant no-match lookup against ~2 rows, run once
--- per receipt, instead of a cross join against thousands of precomputed factor rows.
--- The adjust-to-amount factor's own month_percepciones sum is now computed inline,
--- scoped to the one employee-month it actually needs -- only paid when a matching rule
--- exists at all, which is the rare case.
---
--- Same columns, same semantics (adjust wins over scale, per L3-15; a month with zero
--- percepciones leaves the adjust factor undefined via NULLIF, falling through to scale
--- or 1.0, per DEC-028/"no se inventa el monto donde no hubo recibo"); only the
--- evaluation strategy changed. factor_rule_id (migration 058) is preserved.
+-- C7: las dos busquedas laterales de factor (adj/scl) usaban LIMIT 1 sin ORDER BY
+-- -- el resultado no era determinista si alguna vez existiera mas de una regla
+-- vigente para el mismo empleado-mes. Se agrega ORDER BY created_at DESC: si por
+-- cualquier razon hay dos reglas vigentes, gana la mas reciente.
 CREATE OR REPLACE VIEW pulso.nomina_normalizada AS
 WITH excl_emp AS (
     SELECT id AS rule_id, owner_rfc, employee_rfc, period_start, period_end
@@ -60,7 +48,15 @@ SELECT
           AND (e.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) <= e.period_end)
         LIMIT 1
     ) AS employee_rule_id,
-    COALESCE(adj.rule_id, scl.rule_id) AS factor_rule_id
+    COALESCE(adj.rule_id, scl.rule_id) AS factor_rule_id,
+    EXTRACT(YEAR FROM COALESCE(
+        NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago, '')), ''), '0000-00-00')::date,
+        c.fecha_emision::date
+    ))::bigint AS year_devengo,
+    EXTRACT(MONTH FROM COALESCE(
+        NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago, '')), ''), '0000-00-00')::date,
+        c.fecha_emision::date
+    ))::bigint AS month_devengo
 FROM pulso.cfdis c
 JOIN pulso.cfdi_nomina n ON n.uuid = c.uuid
 LEFT JOIN LATERAL (
@@ -78,6 +74,7 @@ LEFT JOIN LATERAL (
       AND ar.rule_family = 'adjust_to_amount_mxn' AND ar.value_mxn IS NOT NULL
       AND (ar.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) >= ar.period_start)
       AND (ar.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) <= ar.period_end)
+    ORDER BY ar.created_at DESC
     LIMIT 1
 ) adj ON true
 LEFT JOIN LATERAL (
@@ -87,8 +84,13 @@ LEFT JOIN LATERAL (
       AND sr.rule_family = 'scale_employee_pct' AND sr.value_pct IS NOT NULL
       AND (sr.period_start IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) >= sr.period_start)
       AND (sr.period_end IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) <= sr.period_end)
+    ORDER BY sr.created_at DESC
     LIMIT 1
 ) scl ON true
-LEFT JOIN pulso.cfdi_exclusion ex
-    ON ex.owner_rfc = c.rfc_emisor AND ex.uuid = c.uuid
+LEFT JOIN LATERAL (
+    SELECT ex1.rule_id
+    FROM pulso.cfdi_exclusion ex1
+    WHERE ex1.owner_rfc = c.rfc_emisor AND ex1.uuid = c.uuid
+    LIMIT 1
+) ex ON true
 WHERE c.tipo_comprobante = 'N' AND NOT c.is_cancelled;

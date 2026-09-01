@@ -5,7 +5,7 @@
 -- download failures — kept using the uncorrected formula the whole time, so
 -- every invoice that failed download after 016 ran got the same ~16%
 -- overstatement again. Confirmed against a fresh SAT reference export for
--- RFC ADC101206334 (Axented): 546 invoices inflated by exactly 1.16x, all with
+-- a foreign-owned client RFC: 546 invoices inflated by exactly 1.16x, all with
 -- xml_available = -1 and subtotal == total. Platform-wide this fingerprint
 -- matches 3,685 rows across ~$13.1M MXN of overstated net revenue.
 --

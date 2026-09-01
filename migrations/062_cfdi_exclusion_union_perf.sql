@@ -1,8 +1,8 @@
 -- Migration 062: L4-03 / live incident -- pulso.cfdi_exclusion's OR-joined query plan.
 --
 -- Production incident (2026-08-28): every payroll/hallazgos query against
--- pulso.nomina_normalizada was taking 50-300+ seconds for CES100706U65 (a large
--- client), exhausting the connection pool and starving requests for every RFC.
+-- pulso.nomina_normalizada was taking 50-300+ seconds for the large RFC, exhausting
+-- the connection pool and starving requests for every RFC.
 --
 -- Root cause found via EXPLAIN: cfdi_exclusion's single JOIN condition is a
 -- disjunction across two unrelated match strategies --
@@ -18,8 +18,8 @@
 -- (few rows) using idx_cfdis_rfc_emisor/idx_cfdis_rfc_receptor, instead of a full
 -- scan gated by a filter. Semantics are unchanged -- same three cases the old OR
 -- covered, verified against the exact same control values L3-01/L3-02 were
--- verified against originally (66/15 comprobantes for NUB170623KI3, Advance
--- Intelligence's 63/4,308,030).
+-- verified against originally (66/15 comprobantes for the test RFC, the foreign-owned
+-- client's 63/4,308,030).
 CREATE OR REPLACE VIEW pulso.cfdi_exclusion AS
 SELECT nr.id AS rule_id, nr.owner_rfc, c.uuid
 FROM pulso.normalization_rules nr
