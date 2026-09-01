@@ -286,6 +286,30 @@ pub fn dl_type_filter(dl_type: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// L5-01: f64 column reads that don't silently swallow a decode failure
+// ---------------------------------------------------------------------------
+// sqlx's Rust `f64` only decodes a Postgres FLOAT8/double precision value -- a raw
+// NUMERIC or REAL/FLOAT4 column read as f64 fails to decode. Every SELECT in this
+// codebase is expected to `::float8`-cast such a column, but a `try_get` can still fail
+// for other reasons, and a bare `.unwrap_or(0.0)`/`.ok()` used to turn any of those
+// failures into a silent zero/null with nothing in the logs. These wrap the fallback
+// with a warning naming the column, so a future case like this surfaces instead of
+// shipping a wrong number to the frontend unnoticed.
+pub fn get_f64_opt(row: &sqlx::postgres::PgRow, col: &str) -> Option<f64> {
+    match row.try_get::<f64, _>(col) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(column = col, error = %e, "failed to decode f64 column, falling back");
+            None
+        }
+    }
+}
+
+pub fn get_f64(row: &sqlx::postgres::PgRow, col: &str) -> f64 {
+    get_f64_opt(row, col).unwrap_or(0.0)
+}
+
+// ---------------------------------------------------------------------------
 // Generic SAT RFCs (XAXX/XEXX) — counterparty grouping
 // ---------------------------------------------------------------------------
 // SAT overloads a handful of RFCs to mean "no real RFC available": XAXX010101000

@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, parse_ym, rfc_column};
+use super::summary::{dl_type_filter, get_f64, parse_ym, rfc_column};
 /// Cashflow: timeline of invoiced vs paid amounts, net cash position.
 use crate::db::DbPool;
 use serde::Serialize;
@@ -114,7 +114,7 @@ pub async fn get(
         let y: i64 = r.try_get("year").unwrap_or(0);
         let m: i64 = r.try_get("month").unwrap_or(0);
         let tipo: String = r.try_get("tipo_comprobante").unwrap_or_default();
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total");
         match tipo.as_str() {
             "I" => {
                 *ingreso_map.entry((y, m)).or_insert(0.0) += total;
@@ -129,7 +129,7 @@ pub async fn get(
     for r in &pago_rows {
         let y: i64 = r.try_get("year").unwrap_or(0);
         let m: i64 = r.try_get("month").unwrap_or(0);
-        let t: f64 = r.try_get("total_pagos").unwrap_or(0.0);
+        let t: f64 = get_f64(r, "total_pagos");
         *pago_map.entry((y, m)).or_insert(0.0) += t;
     }
 
@@ -158,7 +158,7 @@ pub async fn get(
 
     for r in &metodo_row {
         let m: String = r.try_get("metodo_pago").unwrap_or_default();
-        let t: f64 = r.try_get("total").unwrap_or(0.0);
+        let t: f64 = get_f64(r, "total");
         match m.as_str() {
             "PUE" => pue_total += t,
             "PPD" => ppd_inv += t,
@@ -186,7 +186,7 @@ pub async fn get(
     .bind(to_m)
     .fetch_one(pool)
     .await?;
-    let ppd_paid: f64 = ppd_paid_row.try_get("paid").unwrap_or(0.0);
+    let ppd_paid: f64 = get_f64(&ppd_paid_row, "paid");
 
     // PPD outstanding — full universe, as_of_cutoff-bounded like payments.rs (AUD-009),
     // so cashflow's cartera figure matches the Cobranza tab's exactly (L2-09 control).
@@ -215,7 +215,7 @@ pub async fn get(
     .bind(direccion)
     .fetch_one(pool)
     .await?;
-    let ppd_outstanding: f64 = ppd_outstanding_row.try_get("outstanding").unwrap_or(0.0);
+    let ppd_outstanding: f64 = get_f64(&ppd_outstanding_row, "outstanding");
 
     // AUD-014: fourth definition of "días de cobro" retired. Reads the same
     // ultimo_pago_fecha (last non-cancelled payment, per invoice) that payments.rs and
@@ -235,7 +235,7 @@ pub async fn get(
     .bind(rfc)
     .fetch_one(pool)
     .await?;
-    let avg_collection_days: f64 = avg_days_row.try_get("avg_days").unwrap_or(0.0);
+    let avg_collection_days: f64 = get_f64(&avg_days_row, "avg_days");
 
     // Build timeline
     let mut all_yms: std::collections::BTreeSet<Ym> = Default::default();
@@ -304,7 +304,7 @@ pub async fn get(
             PaymentMethodRow {
                 label: super::payments::forma_label_str(&forma),
                 forma_pago: forma,
-                total_mxn: r.try_get("total").unwrap_or(0.0),
+                total_mxn: get_f64(r, "total"),
                 count: r.try_get("cnt").unwrap_or(0),
             }
         })

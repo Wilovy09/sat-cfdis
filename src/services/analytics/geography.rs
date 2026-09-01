@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, parse_ym, rfc_column};
+use super::summary::{dl_type_filter, get_f64, parse_ym, rfc_column};
 /// Geography: breakdown by lugar_expedicion (postal code) and state.
 use crate::db::DbPool;
 use serde::Serialize;
@@ -80,10 +80,7 @@ pub async fn get(
     .fetch_all(pool)
     .await?;
 
-    let grand_total: f64 = rows
-        .iter()
-        .map(|r| r.try_get::<f64, _>("total").unwrap_or(0.0))
-        .sum();
+    let grand_total: f64 = rows.iter().map(|r| get_f64(r, "total")).sum();
 
     // state_code → (total_mxn, invoice_count, unique_cp_rfcs)
     // state_code → (total_mxn, invoice_count, unique_counterparty_rfcs, unique_postal_codes)
@@ -95,7 +92,7 @@ pub async fn get(
     for r in &rows {
         let cp: String = r.try_get("cp").unwrap_or_default();
         let counterparty_rfc: String = r.try_get("counterparty_rfc").unwrap_or_default();
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total");
         let cnt: i64 = r.try_get("cnt").unwrap_or(0);
 
         if cp == "UNKNOWN" {

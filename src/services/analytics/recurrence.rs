@@ -1,4 +1,4 @@
-use super::summary::{cp_key_expr, dl_type_filter, rfc_column};
+use super::summary::{cp_key_expr, dl_type_filter, get_f64, rfc_column};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -173,8 +173,8 @@ pub async fn get(
         .map(|r| ActiveMonthsBucket {
             months_active: r.try_get("months_active").unwrap_or(0),
             cp_count: r.try_get("cp_count").unwrap_or(0),
-            total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
-            pct_of_total: r.try_get::<f64, _>("pct_of_total").unwrap_or(0.0),
+            total_mxn: get_f64(r, "total_mxn"),
+            pct_of_total: get_f64(r, "pct_of_total"),
         })
         .collect();
 
@@ -229,7 +229,7 @@ pub async fn get(
         .iter()
         .map(|r| YearScore {
             year: r.try_get::<i64, _>("year").unwrap_or(0) as i32,
-            score: r.try_get("score").unwrap_or(0.0),
+            score: get_f64(r, "score"),
         })
         .collect();
 
@@ -283,9 +283,9 @@ pub async fn get(
             rfc: r.try_get("rfc").unwrap_or_default(),
             nombre: r.try_get("nombre").unwrap_or_default(),
             months_active: r.try_get("months_active").unwrap_or(0),
-            total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
-            pct_of_total: r.try_get::<f64, _>("pct_of_total").unwrap_or(0.0),
-            avg_monthly_mxn: r.try_get("avg_monthly_mxn").unwrap_or(0.0),
+            total_mxn: get_f64(r, "total_mxn"),
+            pct_of_total: get_f64(r, "pct_of_total"),
+            avg_monthly_mxn: get_f64(r, "avg_monthly_mxn"),
             invoice_count: r.try_get("invoice_count").unwrap_or(0),
         })
         .collect();

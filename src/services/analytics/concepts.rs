@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, parse_ym, rfc_column};
+use super::summary::{dl_type_filter, get_f64, parse_ym, rfc_column};
 /// Concepts: top products/services by clave_prod_serv and descripcion.
 use crate::db::DbPool;
 use serde::Serialize;
@@ -79,14 +79,14 @@ pub async fn get(
     let top_by_amount: Vec<ConceptRow> = desc_rows
         .iter()
         .map(|r| {
-            let total: f64 = r.try_get("total").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "total");
             let cnt: i64 = r.try_get("cnt").unwrap_or(0);
             ConceptRow {
                 descripcion: r.try_get("desc").unwrap_or_default(),
                 clave_prod_serv: r.try_get("clave").unwrap_or_default(),
                 total_importe: total,
                 invoice_count: cnt,
-                avg_precio: r.try_get("avg_precio").unwrap_or(0.0),
+                avg_precio: get_f64(r, "avg_precio"),
             }
         })
         .collect();
@@ -128,15 +128,12 @@ pub async fn get(
     .fetch_all(pool)
     .await?;
 
-    let grand_total: f64 = clave_rows
-        .iter()
-        .map(|r| r.try_get::<f64, _>("total").unwrap_or(0.0))
-        .sum();
+    let grand_total: f64 = clave_rows.iter().map(|r| get_f64(r, "total")).sum();
 
     let by_clave: Vec<ClaveRow> = clave_rows
         .iter()
         .map(|r| {
-            let total: f64 = r.try_get("total").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "total");
             ClaveRow {
                 clave_prod_serv: r.try_get("clave").unwrap_or_default(),
                 total_importe: total,

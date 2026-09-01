@@ -1,4 +1,4 @@
-use super::summary::{cp_key_expr, dl_type_filter, rfc_column};
+use super::summary::{cp_key_expr, dl_type_filter, get_f64, rfc_column};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -94,7 +94,7 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
         let cp_rfc: String = r.try_get("rfc").unwrap_or_default();
         let nombre: String = r.try_get("nombre").unwrap_or_default();
-        let total_mxn: f64 = r.try_get("total_mxn").unwrap_or(0.0);
+        let total_mxn: f64 = get_f64(r, "total_mxn");
         year_clients
             .entry(year)
             .or_default()
@@ -116,7 +116,7 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
     let mut year_totals: HashMap<i32, f64> = HashMap::new();
     for r in &rows3 {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
-        let total: f64 = r.try_get("total_mxn").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total_mxn");
         year_totals.insert(year, total);
     }
 

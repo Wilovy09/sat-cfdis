@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, parse_ym, rfc_column};
+use super::summary::{dl_type_filter, get_f64, parse_ym, rfc_column};
 /// Payments: payment complement analysis — collection (emitidos) and payables (recibidos).
 use crate::db::DbPool;
 use serde::Serialize;
@@ -108,9 +108,9 @@ pub async fn get(
     .bind(direccion)
     .fetch_one(pool)
     .await?;
-    let total_invoiced_mxn: f64 = totals_row.try_get("total_invoiced").unwrap_or(0.0);
-    let total_paid_mxn: f64 = totals_row.try_get("total_paid").unwrap_or(0.0);
-    let total_outstanding: f64 = totals_row.try_get("ppd_outstanding").unwrap_or(0.0);
+    let total_invoiced_mxn: f64 = get_f64(&totals_row, "total_invoiced");
+    let total_paid_mxn: f64 = get_f64(&totals_row, "total_paid");
+    let total_outstanding: f64 = get_f64(&totals_row, "ppd_outstanding");
     let collection_rate = if total_invoiced_mxn > 0.0 {
         total_paid_mxn / total_invoiced_mxn * 100.0
     } else {
@@ -147,7 +147,7 @@ pub async fn get(
         .iter()
         .map(|r| {
             let forma: String = r.try_get("forma").unwrap_or_default();
-            let total: f64 = r.try_get("total").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "total");
             FormaRow {
                 label: forma_label(&forma).to_string(),
                 pct_of_total: if total_invoiced_mxn > 0.0 {
@@ -195,7 +195,7 @@ pub async fn get(
                 label: metodo_label(&metodo).to_string(),
                 metodo_pago: metodo,
                 invoice_count: r.try_get("cnt").unwrap_or(0),
-                total_mxn: r.try_get("total").unwrap_or(0.0),
+                total_mxn: get_f64(r, "total"),
             }
         })
         .collect();
@@ -230,8 +230,8 @@ pub async fn get(
     let outstanding_invoices: Vec<OutstandingInvoice> = outstanding_rows
         .iter()
         .map(|r| {
-            let total: f64 = r.try_get("total_mxn").unwrap_or(0.0);
-            let paid: f64 = r.try_get("paid").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "total_mxn");
+            let paid: f64 = get_f64(r, "paid");
             OutstandingInvoice {
                 uuid: r.try_get("uuid").unwrap_or_default(),
                 rfc_cp: r.try_get("cp_rfc").unwrap_or_default(),
@@ -259,7 +259,7 @@ pub async fn get(
     .bind(rfc)
     .fetch_one(pool)
     .await?;
-    let exposure_180d_mxn: f64 = exposure_row.try_get("exposure").unwrap_or(0.0);
+    let exposure_180d_mxn: f64 = get_f64(&exposure_row, "exposure");
 
     // Average days to pay — PPD invoices only, using the base's ultimo_pago_fecha (already
     // guarded against fecha_pago < fecha_emision data errors).
@@ -276,6 +276,9 @@ pub async fn get(
     .bind(rfc)
     .fetch_one(pool)
     .await?;
+    // Not get_f64 on purpose: an empty PPD population (no rows to average) makes AVG
+    // return SQL NULL, which is a normal outcome here, not an f64 decode failure -- the
+    // cast is already correct, so wrapping it would log a spurious warning every request.
     let avg_days_to_pay: f64 = avg_days_row.try_get("avg_days").unwrap_or(0.0);
 
     // Monthly timeline: invoiced = PUE+PPD emitted; paid = PUE (immediate) + PPD DR payments
@@ -331,8 +334,8 @@ pub async fn get(
             let month: i64 = r.try_get("month").unwrap_or(0);
             PaymentMonth {
                 period: format!("{year}-{month:02}"),
-                invoiced_mxn: r.try_get("invoiced").unwrap_or(0.0),
-                paid_mxn: r.try_get("paid").unwrap_or(0.0),
+                invoiced_mxn: get_f64(r, "invoiced"),
+                paid_mxn: get_f64(r, "paid"),
             }
         })
         .collect();

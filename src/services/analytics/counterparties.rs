@@ -1,6 +1,7 @@
 use super::summary::{
     LABEL_EXTRANJERO_GENERICO, LABEL_PUBLICO_GENERAL, RFC_EXTRANJERO_GENERICO, RFC_PUBLICO_GENERAL,
-    cp_key_expr, cp_nombre_expr, dl_type_filter, normalized_name_expr, parse_ym, rfc_column,
+    cp_key_expr, cp_nombre_expr, dl_type_filter, get_f64, get_f64_opt, normalized_name_expr,
+    parse_ym, rfc_column,
 };
 use crate::db::DbPool;
 use serde::Serialize;
@@ -91,9 +92,7 @@ pub async fn get(
     .fetch_all(pool)
     .await?;
 
-    let grand_total: f64 = rows
-        .first()
-        .map_or(0.0, |r| r.try_get("grand_total").unwrap_or(0.0));
+    let grand_total: f64 = rows.first().map_or(0.0, |r| get_f64(r, "grand_total"));
     let cp_count: i64 = rows
         .first()
         .map_or(0, |r| r.try_get("cp_count").unwrap_or(0));
@@ -132,12 +131,12 @@ pub async fn get(
     .bind(to_m)
     .fetch_one(pool)
     .await?;
-    let hhi: f64 = hhi_row.try_get("hhi").unwrap_or(0.0);
+    let hhi: f64 = get_f64(&hhi_row, "hhi");
 
     let top: Vec<CounterpartyRow> = rows
         .iter()
         .map(|r| {
-            let total: f64 = r.try_get("total").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "total");
             let cnt: i64 = r.try_get("cnt").unwrap_or(0);
             CounterpartyRow {
                 rfc: r.try_get("cp_rfc").unwrap_or_default(),
@@ -250,7 +249,7 @@ pub async fn get_evolution(
         let cp_rfc: String = row.try_get("cp_rfc").unwrap_or_default();
         let cp_nombre: String = row.try_get("cp_nombre").unwrap_or_default();
         let year: i32 = row.try_get::<i64, _>("year").unwrap_or(0) as i32;
-        let yr_total: f64 = row.try_get("yr_total").unwrap_or(0.0);
+        let yr_total: f64 = get_f64(row, "yr_total");
 
         all_years.insert(year);
         let entry = cp_map
@@ -474,14 +473,11 @@ pub async fn get_ltm_comparison(
     for row in &prev_rows {
         let cp_rfc: String = row.try_get("cp_rfc").unwrap_or_default();
         let cp_nombre: String = row.try_get("cp_nombre").unwrap_or_default();
-        let prev_total: f64 = row.try_get("prev_total").unwrap_or(0.0);
+        let prev_total: f64 = get_f64(row, "prev_total");
         prev_map.insert(cp_rfc, (cp_nombre, prev_total));
     }
 
-    let ltm_grand_total: f64 = ltm_rows
-        .iter()
-        .map(|r| r.try_get::<f64, _>("ltm_total").unwrap_or(0.0))
-        .sum();
+    let ltm_grand_total: f64 = ltm_rows.iter().map(|r| get_f64(r, "ltm_total")).sum();
     let prev_grand_total: f64 = prev_map.values().map(|(_, v)| *v).sum();
 
     let mut rows: Vec<LtmRow> = ltm_rows
@@ -489,7 +485,7 @@ pub async fn get_ltm_comparison(
         .map(|r| {
             let cp_rfc: String = r.try_get("cp_rfc").unwrap_or_default();
             let cp_nombre: String = r.try_get("cp_nombre").unwrap_or_default();
-            let ltm_mxn: f64 = r.try_get("ltm_total").unwrap_or(0.0);
+            let ltm_mxn: f64 = get_f64(r, "ltm_total");
             let prev_ltm_mxn: f64 = prev_map.get(&cp_rfc).map(|(_, v)| *v).unwrap_or(0.0);
             let delta_mxn = ltm_mxn - prev_ltm_mxn;
             let delta_pct = if prev_ltm_mxn > 0.0 {
@@ -680,8 +676,8 @@ pub async fn get_payments_detail(
     let payment_rows: Vec<CpPaymentRow> = rows
         .iter()
         .map(|r| {
-            let facturado: f64 = r.try_get("facturado").unwrap_or(0.0);
-            let cobrado: f64 = r.try_get("cobrado").unwrap_or(0.0);
+            let facturado: f64 = get_f64(r, "facturado");
+            let cobrado: f64 = get_f64(r, "cobrado");
             let saldo_pendiente = facturado - cobrado;
             let pct_cobrado = if facturado > 0.0 {
                 cobrado / facturado * 100.0
@@ -697,8 +693,8 @@ pub async fn get_payments_detail(
                 pct_cobrado,
                 facturas_ppd: r.try_get("facturas_ppd").unwrap_or(0),
                 facturas_abiertas: r.try_get("facturas_abiertas").unwrap_or(0),
-                dias_cobro_ppd: r.try_get("dias_cobro").unwrap_or(0.0),
-                monto_riesgo_180d: r.try_get("monto_riesgo").unwrap_or(0.0),
+                dias_cobro_ppd: get_f64(r, "dias_cobro"),
+                monto_riesgo_180d: get_f64(r, "monto_riesgo"),
             }
         })
         .collect();
@@ -797,8 +793,8 @@ pub async fn get_atypical(
     let atypical_rows: Vec<AtypicalRow> = rows
         .iter()
         .map(|r| {
-            let mo_total: f64 = r.try_get("mo_total").unwrap_or(0.0);
-            let cp_total: f64 = r.try_get("cp_total").unwrap_or(0.0);
+            let mo_total: f64 = get_f64(r, "mo_total");
+            let cp_total: f64 = get_f64(r, "cp_total");
             let pct_of_cp_total = if cp_total > 0.0 {
                 mo_total / cp_total * 100.0
             } else {
@@ -809,8 +805,8 @@ pub async fn get_atypical(
                 nombre: r.try_get("cp_nombre").unwrap_or_default(),
                 period: r.try_get("period").unwrap_or_default(),
                 total_mxn: mo_total,
-                median_mxn: r.try_get("median_amt").unwrap_or(0.0),
-                multiple: r.try_get("multiple").unwrap_or(0.0),
+                median_mxn: get_f64(r, "median_amt"),
+                multiple: get_f64(r, "multiple"),
                 pct_of_cp_total,
             }
         })
@@ -962,7 +958,7 @@ pub async fn get_individual(
         .iter()
         .map(|r| {
             let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
-            let total: f64 = r.try_get("yr_total").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "yr_total");
             let cnt: i64 = r.try_get("cnt").unwrap_or(0);
             (year, total, cnt)
         })
@@ -1043,7 +1039,7 @@ pub async fn get_individual(
             year: r.try_get::<i64, _>("year").unwrap_or(0) as i32,
             month: r.try_get::<i64, _>("month").unwrap_or(0) as i32,
             period: r.try_get("period").unwrap_or_default(),
-            total_mxn: r.try_get("mo_total").unwrap_or(0.0),
+            total_mxn: get_f64(r, "mo_total"),
             invoice_count: r.try_get("cnt").unwrap_or(0),
         })
         .collect();
@@ -1084,7 +1080,7 @@ pub async fn get_individual(
     for row in &concept_rows {
         let desc: String = row.try_get("desc_key").unwrap_or_default();
         let year: i32 = row.try_get::<i64, _>("year").unwrap_or(0) as i32;
-        let yr_amount: f64 = row.try_get("yr_amount").unwrap_or(0.0);
+        let yr_amount: f64 = get_f64(row, "yr_amount");
         let yr_count: i64 = row.try_get("yr_count").unwrap_or(0);
         let year_key = year.to_string();
 
@@ -1142,7 +1138,7 @@ pub async fn get_individual(
         .iter()
         .map(|r| {
             let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
-            let total: f64 = r.try_get("yr_total").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "yr_total");
             (year, total)
         })
         .collect();
@@ -1185,9 +1181,9 @@ pub async fn get_individual(
     .fetch_one(pool)
     .await?;
 
-    let facturado_ppd: f64 = cobranza_row.try_get("facturado").unwrap_or(0.0);
-    let cobrado_mxn: f64 = cobranza_row.try_get("cobrado").unwrap_or(0.0);
-    let saldo: f64 = cobranza_row.try_get("saldo").unwrap_or(0.0);
+    let facturado_ppd: f64 = get_f64(&cobranza_row, "facturado");
+    let cobrado_mxn: f64 = get_f64(&cobranza_row, "cobrado");
+    let saldo: f64 = get_f64(&cobranza_row, "saldo");
     let pct_cobrado = if facturado_ppd > 0.0 {
         cobrado_mxn / facturado_ppd * 100.0
     } else {
@@ -1211,7 +1207,7 @@ pub async fn get_individual(
     .fetch_one(pool)
     .await?;
 
-    let dias_cobro_ppd: Option<f64> = dias_row.try_get("dias").unwrap_or(None);
+    let dias_cobro_ppd: Option<f64> = get_f64_opt(&dias_row, "dias");
 
     Ok(CpIndividualResponse {
         rfc: cp_rfc.to_string(),

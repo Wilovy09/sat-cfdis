@@ -1,6 +1,8 @@
 /// Normalization rules CRUD: counterparty grouping/exclusion and payroll adjustments.
 use crate::db::DbPool;
-use crate::services::analytics::summary::{cp_key_expr, cp_nombre_expr, rfc_column};
+use crate::services::analytics::summary::{
+    cp_key_expr, cp_nombre_expr, get_f64, get_f64_opt, rfc_column,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use utoipa::ToSchema;
@@ -78,10 +80,17 @@ pub struct PayrollNormRule {
     pub excluded_cfdi_uuids: Option<Vec<String>>,
     // DEC-030: same Egresos "Línea del P&L" / Motivo catalog the comprobante-level rules
     // use, so L4-02's EBITDA bridge has something to group a nómina adjustment by.
+    // L5-12: motivo no longer reuses that catalog -- see PAYROLL_MOTIVOS -- but the field
+    // itself is still shared storage for both rule families.
     pub accounting_line: Option<String>,
     pub motivo: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    // L5-14: re-evaluated at list time (not just at creation) against whatever real
+    // percepciones exist now -- empty means the factor is still in range. Informational
+    // only, never blocks. Only ever non-empty for rule_family = adjust_to_amount_mxn,
+    // the only family whose factor can drift as new receipts arrive.
+    pub factor_warnings: Vec<FactorWarning>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -110,12 +119,18 @@ pub struct CreatePayrollRuleRequest {
 pub struct PayrollEmployeeRow {
     pub employee_rfc: String,
     pub employee_name: Option<String>,
+    // L5-02: the employee's REAL first-to-last devengo month, never clamped/truncated by
+    // whatever date window the caller happens to have selected elsewhere in the app --
+    // this is the one place the rule-creation form's period picker reads its bounds from.
     pub first_month: Option<String>,
     pub last_month: Option<String>,
     pub active_months: i64,
     pub historical_cost_mxn: f64,
     pub run_rate_mensual_mxn: f64,
     pub cfdi_count: i64,
+    // L5-02: this catalog is no longer filtered by exclusion -- an excluded employee still
+    // appears here (it's the only screen that can undo their exclusion), just marked.
+    pub is_excluded: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,10 +168,14 @@ pub struct ExcludedCfdi {
 
 pub async fn list_rules(pool: &DbPool, owner_rfc: &str) -> anyhow::Result<Vec<NormalizationRule>> {
     let rows = sqlx::query(
+        // L5-01: capex_useful_life_years/capex_annual_dep_mxn are NUMERIC -- sqlx's f64
+        // only decodes FLOAT8, so an uncast read here silently failed and .ok() turned it
+        // into a null the frontend could never tell apart from "not captured".
         "SELECT id, owner_rfc, dl_type, source_rfc, source_name, group_name, action, label,
                 rule_name, cfdi_uuid,
                 accounting_line, motivo, impacts_ebitda, capex_estimate_dep,
-                capex_asset_type, capex_useful_life_years, capex_annual_dep_mxn,
+                capex_asset_type, capex_useful_life_years::float8 AS capex_useful_life_years,
+                capex_annual_dep_mxn::float8 AS capex_annual_dep_mxn,
                 period_start, period_end,
                 created_at, updated_at
          FROM pulso.normalization_rules WHERE owner_rfc = $1 ORDER BY created_at DESC",
@@ -183,8 +202,8 @@ pub async fn list_rules(pool: &DbPool, owner_rfc: &str) -> anyhow::Result<Vec<No
             impacts_ebitda: r.try_get("impacts_ebitda").ok(),
             capex_estimate_dep: r.try_get("capex_estimate_dep").ok(),
             capex_asset_type: r.try_get("capex_asset_type").ok(),
-            capex_useful_life_years: r.try_get("capex_useful_life_years").ok(),
-            capex_annual_dep_mxn: r.try_get("capex_annual_dep_mxn").ok(),
+            capex_useful_life_years: get_f64_opt(r, "capex_useful_life_years"),
+            capex_annual_dep_mxn: get_f64_opt(r, "capex_annual_dep_mxn"),
             period_start: r.try_get("period_start").ok(),
             period_end: r.try_get("period_end").ok(),
             created_at: r.try_get("created_at").unwrap_or_default(),
@@ -269,6 +288,82 @@ pub async fn delete_rule(pool: &DbPool, id: &str, owner_rfc: &str) -> anyhow::Re
     Ok(result.rows_affected() > 0)
 }
 
+// L5-10: same fields, same validations as create_rule (enforced by the route handler,
+// which runs the same accounting_line/motivo checks for both verbs) -- this used to be
+// delete + recreate only, which loses the rule's created_at and its id (every consumer
+// that keyed off the id, e.g. an EBITDA bridge row, would silently start from zero).
+pub async fn update_rule(
+    pool: &DbPool,
+    id: &str,
+    owner_rfc: &str,
+    req: &CreateRuleRequest,
+) -> anyhow::Result<Option<NormalizationRule>> {
+    let now = utc_now();
+
+    let row = sqlx::query(
+        r#"UPDATE pulso.normalization_rules
+           SET dl_type = $1, source_rfc = $2, source_name = $3, group_name = $4,
+               action = $5, label = $6, rule_name = $7, cfdi_uuid = $8,
+               accounting_line = $9, motivo = $10, impacts_ebitda = $11,
+               capex_estimate_dep = $12, capex_asset_type = $13,
+               capex_useful_life_years = $14, capex_annual_dep_mxn = $15,
+               period_start = $16, period_end = $17, updated_at = $18
+           WHERE id = $19 AND owner_rfc = $20
+           RETURNING created_at"#,
+    )
+    .bind(&req.dl_type)
+    .bind(&req.source_rfc)
+    .bind(&req.source_name)
+    .bind(&req.group_name)
+    .bind(&req.action)
+    .bind(&req.label)
+    .bind(&req.rule_name)
+    .bind(&req.cfdi_uuid)
+    .bind(&req.accounting_line)
+    .bind(&req.motivo)
+    .bind(&req.impacts_ebitda)
+    .bind(&req.capex_estimate_dep)
+    .bind(&req.capex_asset_type)
+    .bind(&req.capex_useful_life_years)
+    .bind(&req.capex_annual_dep_mxn)
+    .bind(&req.period_start)
+    .bind(&req.period_end)
+    .bind(&now)
+    .bind(id)
+    .bind(owner_rfc)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let created_at: String = row.try_get("created_at").unwrap_or_default();
+
+    Ok(Some(NormalizationRule {
+        id: id.to_string(),
+        owner_rfc: owner_rfc.to_string(),
+        dl_type: req.dl_type.clone(),
+        source_rfc: req.source_rfc.clone(),
+        source_name: req.source_name.clone(),
+        group_name: req.group_name.clone(),
+        action: req.action.clone(),
+        label: req.label.clone(),
+        rule_name: req.rule_name.clone(),
+        cfdi_uuid: req.cfdi_uuid.clone(),
+        accounting_line: req.accounting_line.clone(),
+        motivo: req.motivo.clone(),
+        impacts_ebitda: req.impacts_ebitda,
+        capex_estimate_dep: req.capex_estimate_dep,
+        capex_asset_type: req.capex_asset_type.clone(),
+        capex_useful_life_years: req.capex_useful_life_years,
+        capex_annual_dep_mxn: req.capex_annual_dep_mxn,
+        period_start: req.period_start.clone(),
+        period_end: req.period_end.clone(),
+        created_at,
+        updated_at: now,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Payroll normalization
 // ---------------------------------------------------------------------------
@@ -278,8 +373,11 @@ pub async fn list_payroll_rules(
     owner_rfc: &str,
 ) -> anyhow::Result<Vec<PayrollNormRule>> {
     let rows = sqlx::query(
+        // L5-01: value_pct/value_mxn are NUMERIC -- see list_rules' comment above on the
+        // same sqlx/f64 decode gap (this is one of the two columns the audit confirmed).
         "SELECT id, owner_rfc, rule_family, employee_rfc, employee_name, action,
-                value_pct, value_mxn, period_start, period_end, notes, label, rule_name,
+                value_pct::float8 AS value_pct, value_mxn::float8 AS value_mxn,
+                period_start, period_end, notes, label, rule_name,
                 excluded_cfdi_uuids, accounting_line, motivo, created_at, updated_at
          FROM pulso.payroll_normalization_rules WHERE owner_rfc = $1 ORDER BY created_at DESC",
     )
@@ -287,19 +385,45 @@ pub async fn list_payroll_rules(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .iter()
-        .map(|r| PayrollNormRule {
+    let mut result = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let rule_family: String = r.try_get("rule_family").unwrap_or_default();
+        let employee_rfc: Option<String> = r.try_get("employee_rfc").ok();
+        let value_mxn = get_f64_opt(r, "value_mxn");
+        let period_start: Option<String> = r.try_get("period_start").ok();
+        let period_end: Option<String> = r.try_get("period_end").ok();
+
+        // L5-14: the same factor check that gates creation, re-run here against whatever
+        // real percepciones exist now -- a rule saved as reasonable can drift out of range
+        // as new receipts arrive, and nothing used to re-check it after the fact. Purely
+        // informational: it marks the row, it never removes it from the list.
+        let factor_warnings = match (rule_family.as_str(), employee_rfc.as_deref(), value_mxn) {
+            ("adjust_to_amount_mxn", Some(employee_rfc), Some(value_mxn)) => {
+                let (high, low) = compute_adjust_factor_warnings(
+                    pool,
+                    owner_rfc,
+                    employee_rfc,
+                    value_mxn,
+                    period_start.as_deref(),
+                    period_end.as_deref(),
+                )
+                .await?;
+                high.into_iter().chain(low).collect()
+            }
+            _ => Vec::new(),
+        };
+
+        result.push(PayrollNormRule {
             id: r.try_get("id").unwrap_or_default(),
             owner_rfc: r.try_get("owner_rfc").unwrap_or_default(),
-            rule_family: r.try_get("rule_family").unwrap_or_default(),
-            employee_rfc: r.try_get("employee_rfc").ok(),
+            rule_family,
+            employee_rfc,
             employee_name: r.try_get("employee_name").ok(),
             action: r.try_get("action").unwrap_or_default(),
-            value_pct: r.try_get("value_pct").ok(),
-            value_mxn: r.try_get("value_mxn").ok(),
-            period_start: r.try_get("period_start").ok(),
-            period_end: r.try_get("period_end").ok(),
+            value_pct: get_f64_opt(r, "value_pct"),
+            value_mxn,
+            period_start,
+            period_end,
             notes: r.try_get("notes").ok(),
             label: r.try_get("label").ok(),
             rule_name: r.try_get("rule_name").ok(),
@@ -311,16 +435,20 @@ pub async fn list_payroll_rules(
             motivo: r.try_get("motivo").ok(),
             created_at: r.try_get("created_at").unwrap_or_default(),
             updated_at: r.try_get("updated_at").unwrap_or_default(),
-        })
-        .collect())
+            factor_warnings,
+        });
+    }
+
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
-// L4-04 / L4-12: payroll rule value validation
+// L4-04 / L4-12 / L5-08 / L5-12 / L5-14: payroll rule validation
 // ---------------------------------------------------------------------------
 
 /// One month where an `adjust_to_amount_mxn` rule's factor is far enough from 1 to be
-/// worth surfacing to the user before the rule is saved.
+/// worth surfacing: at creation/edit time (L4-12, before the rule is saved) and again at
+/// list time (L5-14, re-evaluated against whatever real percepciones exist now).
 #[derive(Debug, Serialize)]
 pub struct FactorWarning {
     pub period: String,
@@ -344,17 +472,223 @@ pub enum PayrollRuleCheck {
 const FACTOR_REJECT_ABOVE: f64 = 10.0;
 const FACTOR_WARN_BELOW: f64 = 0.5;
 
-/// Validates a payroll rule before it's written: range-checks `value_pct`/`value_mxn`
-/// (L4-04 -- the frontend already does this, the API never did), and for
-/// `adjust_to_amount_mxn`, checks every covered month's resulting factor against real
-/// percepciones. A month with zero percepciones is skipped (factor undefined, "no se
-/// inventa el monto donde no hubo recibo" -- same rule `pulso.nomina_normalizada` already
-/// follows).
+/// L5-12 / DEC-033: nómina's own reason catalog. It used to share Egresos' ("escalar o
+/// ajustar un sueldo no es excluirlo" -- the one real rule captured so far had to pick
+/// "Otro" because nothing else applied). Frontend catalog to match:
+/// pulso-adquiere/src/constants/normalizationCatalogs.ts.
+pub const PAYROLL_MOTIVOS: &[&str] = &[
+    "Sueldo por encima de mercado",
+    "Sueldo del dueño o accionista",
+    "Puesto que no continúa tras la transacción",
+    "Plaza vacante o no reemplazada",
+    "Compensación extraordinaria",
+    "Gasto personal del accionista",
+    "Otro",
+];
+
+/// An "active exclusion" per `excl_emp` in the `pulso.nomina_normalizada` view definition
+/// (migration 066): rule_family in the exclusion family AND action = 'exclude'. Checked
+/// the same way here so C1 rejects exactly the combinations the view would actually treat
+/// as an exclusion, not a superset or subset of it.
+fn is_active_exclusion(rule_family: &str, action: &str) -> bool {
+    (rule_family == "exclude_employee" || rule_family == "exclusion") && action == "exclude"
+}
+
+fn is_dimensioning_family(rule_family: &str) -> bool {
+    // L5-08 C2 note: the future concepts family (L5-17) is deliberately NOT dimensioning
+    // -- it coexists with a scale/adjust rule by design -- so it must never be added here.
+    rule_family == "scale_employee_pct" || rule_family == "adjust_to_amount_mxn"
+}
+
+/// Do periods `[a_start, a_end]` and `[b_start, b_end]` overlap? NULL on either end of
+/// either period means unbounded in that direction -- mirrors the frontend's own
+/// `periodsOverlap` (PayrollRuleForm.vue) so "vigente" means the same thing server-side
+/// as it already does in the capture form.
+fn periods_overlap(
+    a_start: Option<&str>,
+    a_end: Option<&str>,
+    b_start: Option<&str>,
+    b_end: Option<&str>,
+) -> bool {
+    let a_s = a_start.unwrap_or("0000-00");
+    let a_e = a_end.unwrap_or("9999-99");
+    let b_s = b_start.unwrap_or("0000-00");
+    let b_e = b_end.unwrap_or("9999-99");
+    a_s <= b_e && b_s <= a_e
+}
+
+/// L5-08 C1/C2, enforced server-side: a candidate rule (`rule_family`/`period_start`/
+/// `period_end`) for `employee_rfc` is checked against every other ACTIVE rule that
+/// employee already has (i.e. one whose period overlaps -- C3's spirit: non-overlapping
+/// periods are always allowed, no friction). `exclude_rule_id` is the rule's own id on an
+/// update, so it doesn't conflict with itself.
+///
+/// C1: an employee with an active exclusion admits no other rule, in either direction.
+/// C2: at most one scale-or-adjust rule active per employee-period, across BOTH families
+/// (today they can silently overlap and the more recently created one wins at read time --
+/// this closes that at the write layer instead).
+async fn check_payroll_rule_locks(
+    pool: &DbPool,
+    owner_rfc: &str,
+    employee_rfc: &str,
+    req: &CreatePayrollRuleRequest,
+    exclude_rule_id: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let rows = sqlx::query(
+        r#"SELECT id, rule_family, action, period_start, period_end
+           FROM pulso.payroll_normalization_rules
+           WHERE owner_rfc = $1 AND employee_rfc = $2"#,
+    )
+    .bind(owner_rfc)
+    .bind(employee_rfc)
+    .fetch_all(pool)
+    .await?;
+
+    let new_is_exclusion = is_active_exclusion(&req.rule_family, &req.action);
+    let new_is_dimensioning = is_dimensioning_family(&req.rule_family);
+
+    for r in &rows {
+        let existing_id: String = r.try_get("id").unwrap_or_default();
+        if Some(existing_id.as_str()) == exclude_rule_id {
+            continue;
+        }
+        let existing_family: String = r.try_get("rule_family").unwrap_or_default();
+        let existing_action: String = r.try_get("action").unwrap_or_default();
+        let existing_start: Option<String> = r.try_get("period_start").ok();
+        let existing_end: Option<String> = r.try_get("period_end").ok();
+        if !periods_overlap(
+            req.period_start.as_deref(),
+            req.period_end.as_deref(),
+            existing_start.as_deref(),
+            existing_end.as_deref(),
+        ) {
+            continue;
+        }
+
+        let existing_is_exclusion = is_active_exclusion(&existing_family, &existing_action);
+        let existing_is_dimensioning = is_dimensioning_family(&existing_family);
+
+        if new_is_exclusion && !existing_is_exclusion {
+            return Ok(Some(
+                "C1: este empleado ya tiene una regla activa en un periodo que se traslapa. \
+                 Un empleado excluido no admite ninguna otra regla."
+                    .to_string(),
+            ));
+        }
+        if !new_is_exclusion && existing_is_exclusion {
+            return Ok(Some(
+                "C1: este empleado ya tiene una regla de exclusión activa en un periodo que \
+                 se traslapa. Un empleado excluido no admite ninguna otra regla."
+                    .to_string(),
+            ));
+        }
+        if new_is_dimensioning && existing_is_dimensioning {
+            return Ok(Some(
+                "C2: ya existe una regla de escala o ajuste vigente para este empleado en un \
+                 periodo que se traslapa. Solo puede haber una regla de dimensionamiento \
+                 activa por periodo, sin importar la familia."
+                    .to_string(),
+            ));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Per-month factor for a (would-be or already-saved) `adjust_to_amount_mxn` rule against
+/// real percepciones, split into months above `FACTOR_REJECT_ABOVE` and below
+/// `FACTOR_WARN_BELOW`. Shared by `check_payroll_rule` (a candidate value, before the rule
+/// is written) and `list_payroll_rules` (L5-14: the rule's own saved value, re-evaluated
+/// against whatever real percepciones exist now). A month with zero percepciones is
+/// skipped -- factor is undefined, "no se inventa el monto donde no hubo recibo", same
+/// rule `pulso.nomina_normalizada` already follows.
+async fn compute_adjust_factor_warnings(
+    pool: &DbPool,
+    owner_rfc: &str,
+    employee_rfc: &str,
+    value_mxn: f64,
+    period_start: Option<&str>,
+    period_end: Option<&str>,
+) -> anyhow::Result<(Vec<FactorWarning>, Vec<FactorWarning>)> {
+    let rows = sqlx::query(
+        r#"SELECT c.year, c.month, SUM(COALESCE(n.total_percepciones, 0))::float8 AS perc
+           FROM pulso.cfdis c
+           JOIN pulso.cfdi_nomina n ON n.uuid = c.uuid
+           WHERE c.rfc_emisor = $1 AND c.rfc_receptor = $2
+             AND c.tipo_comprobante = 'N' AND NOT c.is_cancelled
+             AND ($3::text IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) >= $3)
+             AND ($4::text IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) <= $4)
+           GROUP BY c.year, c.month"#,
+    )
+    .bind(owner_rfc)
+    .bind(employee_rfc)
+    .bind(period_start)
+    .bind(period_end)
+    .fetch_all(pool)
+    .await?;
+
+    let mut high: Vec<FactorWarning> = Vec::new();
+    let mut low: Vec<FactorWarning> = Vec::new();
+    for r in &rows {
+        let perc = get_f64(r, "perc");
+        if perc <= 0.0 {
+            continue;
+        }
+        let year: i64 = r.try_get("year").unwrap_or(0);
+        let month: i64 = r.try_get("month").unwrap_or(0);
+        let factor = value_mxn / perc;
+        let warning = FactorWarning {
+            period: format!("{year}-{month:02}"),
+            factor,
+            real_percepciones: perc,
+        };
+        if factor > FACTOR_REJECT_ABOVE {
+            high.push(warning);
+        } else if factor < FACTOR_WARN_BELOW {
+            low.push(warning);
+        }
+    }
+    Ok((high, low))
+}
+
+/// Validates a payroll rule before it's written: required fields and the nómina motivo
+/// catalog (L5-12), the C1/C2 mutual-exclusivity and single-dimensioning-rule locks
+/// (L5-08, `exclude_rule_id` is Some on an update so the rule doesn't conflict with
+/// itself), range-checks on `value_pct`/`value_mxn` (L4-04), and for
+/// `adjust_to_amount_mxn`, the factor-vs-real-percepciones check (L4-12).
 pub async fn check_payroll_rule(
     pool: &DbPool,
     owner_rfc: &str,
     req: &CreatePayrollRuleRequest,
+    exclude_rule_id: Option<&str>,
 ) -> anyhow::Result<PayrollRuleCheck> {
+    if req
+        .accounting_line
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        return Ok(PayrollRuleCheck::Rejected(
+            "accounting_line es obligatorio: selecciona la línea del P&L de la que sale este \
+             ajuste"
+                .to_string(),
+        ));
+    }
+    let motivo = req.motivo.as_deref().map(str::trim).unwrap_or("");
+    if motivo.is_empty() {
+        return Ok(PayrollRuleCheck::Rejected(
+            "motivo es obligatorio: documenta por qué se ajusta o excluye a este empleado"
+                .to_string(),
+        ));
+    }
+    if !PAYROLL_MOTIVOS.contains(&motivo) {
+        return Ok(PayrollRuleCheck::Rejected(format!(
+            "motivo inválido: debe ser uno de: {}",
+            PAYROLL_MOTIVOS.join(", ")
+        )));
+    }
+
     if req.rule_family == "scale_employee_pct" {
         match req.value_pct {
             Some(p) if (0.0..=100.0).contains(&p) => {}
@@ -366,60 +700,43 @@ pub async fn check_payroll_rule(
         }
     }
 
-    if req.rule_family == "adjust_to_amount_mxn" {
-        let value_mxn = match req.value_mxn {
-            Some(m) if m > 0.0 => m,
+    let value_mxn = if req.rule_family == "adjust_to_amount_mxn" {
+        match req.value_mxn {
+            Some(m) if m > 0.0 => Some(m),
             _ => {
                 return Ok(PayrollRuleCheck::Rejected(
                     "value_mxn debe ser un monto positivo".to_string(),
                 ));
             }
-        };
+        }
+    } else {
+        None
+    };
 
+    if let Some(employee_rfc) = req.employee_rfc.as_deref() {
+        if let Some(reason) =
+            check_payroll_rule_locks(pool, owner_rfc, employee_rfc, req, exclude_rule_id).await?
+        {
+            return Ok(PayrollRuleCheck::Rejected(reason));
+        }
+    }
+
+    if let Some(value_mxn) = value_mxn {
         let Some(employee_rfc) = req.employee_rfc.as_deref() else {
             return Ok(PayrollRuleCheck::Rejected(
                 "employee_rfc es obligatorio para ajustar a monto".to_string(),
             ));
         };
 
-        let rows = sqlx::query(
-            r#"SELECT c.year, c.month, SUM(COALESCE(n.total_percepciones, 0))::float8 AS perc
-               FROM pulso.cfdis c
-               JOIN pulso.cfdi_nomina n ON n.uuid = c.uuid
-               WHERE c.rfc_emisor = $1 AND c.rfc_receptor = $2
-                 AND c.tipo_comprobante = 'N' AND NOT c.is_cancelled
-                 AND ($3::text IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) >= $3)
-                 AND ($4::text IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) <= $4)
-               GROUP BY c.year, c.month"#,
+        let (high, low) = compute_adjust_factor_warnings(
+            pool,
+            owner_rfc,
+            employee_rfc,
+            value_mxn,
+            req.period_start.as_deref(),
+            req.period_end.as_deref(),
         )
-        .bind(owner_rfc)
-        .bind(employee_rfc)
-        .bind(&req.period_start)
-        .bind(&req.period_end)
-        .fetch_all(pool)
         .await?;
-
-        let mut high: Vec<FactorWarning> = Vec::new();
-        let mut low: Vec<FactorWarning> = Vec::new();
-        for r in &rows {
-            let perc: f64 = r.try_get("perc").unwrap_or(0.0);
-            if perc <= 0.0 {
-                continue;
-            }
-            let year: i64 = r.try_get("year").unwrap_or(0);
-            let month: i64 = r.try_get("month").unwrap_or(0);
-            let factor = value_mxn / perc;
-            let warning = FactorWarning {
-                period: format!("{year}-{month:02}"),
-                factor,
-                real_percepciones: perc,
-            };
-            if factor > FACTOR_REJECT_ABOVE {
-                high.push(warning);
-            } else if factor < FACTOR_WARN_BELOW {
-                low.push(warning);
-            }
-        }
 
         if !high.is_empty() {
             let months: Vec<String> = high.iter().map(|w| w.period.clone()).collect();
@@ -493,6 +810,9 @@ pub async fn create_payroll_rule(
         motivo: req.motivo.clone(),
         created_at: now.clone(),
         updated_at: now,
+        // L5-14: nothing to re-evaluate yet -- check_payroll_rule already validated this
+        // exact value against current data as a precondition for this INSERT running.
+        factor_warnings: Vec::new(),
     })
 }
 
@@ -506,6 +826,74 @@ pub async fn delete_payroll_rule(pool: &DbPool, id: &str, owner_rfc: &str) -> an
     .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+// L5-10: same fields/validations as create_payroll_rule (the route handler runs the same
+// check_payroll_rule -- including the new C1/C2 locks and the L5-12 motivo catalog --
+// against this update, passing this rule's own id so it doesn't conflict with itself).
+pub async fn update_payroll_rule(
+    pool: &DbPool,
+    id: &str,
+    owner_rfc: &str,
+    req: &CreatePayrollRuleRequest,
+) -> anyhow::Result<Option<PayrollNormRule>> {
+    let now = utc_now();
+
+    let row = sqlx::query(
+        r#"UPDATE pulso.payroll_normalization_rules
+           SET rule_family = $1, employee_rfc = $2, employee_name = $3, action = $4,
+               value_pct = $5, value_mxn = $6, period_start = $7, period_end = $8,
+               notes = $9, label = $10, rule_name = $11, excluded_cfdi_uuids = $12,
+               accounting_line = $13, motivo = $14, updated_at = $15
+           WHERE id = $16 AND owner_rfc = $17
+           RETURNING created_at"#,
+    )
+    .bind(&req.rule_family)
+    .bind(&req.employee_rfc)
+    .bind(&req.employee_name)
+    .bind(&req.action)
+    .bind(&req.value_pct)
+    .bind(&req.value_mxn)
+    .bind(&req.period_start)
+    .bind(&req.period_end)
+    .bind(&req.notes)
+    .bind(&req.label)
+    .bind(&req.rule_name)
+    .bind(&req.excluded_cfdi_uuids)
+    .bind(&req.accounting_line)
+    .bind(&req.motivo)
+    .bind(&now)
+    .bind(id)
+    .bind(owner_rfc)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let created_at: String = row.try_get("created_at").unwrap_or_default();
+
+    Ok(Some(PayrollNormRule {
+        id: id.to_string(),
+        owner_rfc: owner_rfc.to_string(),
+        rule_family: req.rule_family.clone(),
+        employee_rfc: req.employee_rfc.clone(),
+        employee_name: req.employee_name.clone(),
+        action: req.action.clone(),
+        value_pct: req.value_pct,
+        value_mxn: req.value_mxn,
+        period_start: req.period_start.clone(),
+        period_end: req.period_end.clone(),
+        notes: req.notes.clone(),
+        label: req.label.clone(),
+        rule_name: req.rule_name.clone(),
+        excluded_cfdi_uuids: req.excluded_cfdi_uuids.clone(),
+        accounting_line: req.accounting_line.clone(),
+        motivo: req.motivo.clone(),
+        created_at,
+        updated_at: now,
+        factor_warnings: Vec::new(),
+    }))
 }
 
 pub async fn list_excluded_cfdis(
@@ -596,7 +984,7 @@ fn map_excluded_cfdi_row(r: &sqlx::postgres::PgRow) -> ExcludedCfdi {
         nombre_receptor: r.try_get("nombre_receptor").ok(),
         tipo_comprobante: r.try_get("tipo_comprobante").unwrap_or_default(),
         fecha_emision: r.try_get("fecha_emision").ok(),
-        total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
+        total_mxn: get_f64(r, "total_mxn"),
         period: r.try_get("period").unwrap_or_default(),
         is_cancelled: r.try_get::<bool, _>("is_cancelled").unwrap_or(false),
     }
@@ -738,7 +1126,7 @@ pub async fn list_counterparties_for_normalization(
         let rfc: String = r.try_get("rfc_cp").unwrap_or_default();
         let nombre: String = r.try_get("nombre_cp").unwrap_or_default();
         let year: i32 = r.try_get("year").unwrap_or(0);
-        let year_total: f64 = r.try_get("year_total").unwrap_or(0.0);
+        let year_total: f64 = get_f64(r, "year_total");
         let year_count: i64 = r.try_get("year_count").unwrap_or(0);
 
         let entry = map
@@ -890,7 +1278,7 @@ pub async fn list_cfdis_for_counterparty(
             nombre_contraparte: r.try_get("nombre_contraparte").unwrap_or_default(),
             tipo_comprobante: r.try_get("tipo_comprobante").unwrap_or_default(),
             fecha_emision: r.try_get("fecha_emision").unwrap_or_default(),
-            total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
+            total_mxn: get_f64(r, "total_mxn"),
             period: r.try_get("period").unwrap_or_default(),
             concepto: r.try_get("concepto").unwrap_or_default(),
             is_excluded: r.try_get::<bool, _>("is_excluded").unwrap_or(false),
@@ -904,31 +1292,32 @@ pub async fn list_cfdis_for_counterparty(
 // GET /normalization/payroll/employees
 // ---------------------------------------------------------------------------
 
+// L5-02: this is the employee catalog for the payroll rule-creation selector and its
+// "periodo real del empleado" -- it used to filter `NOT is_excluded` (so excluding an
+// employee made them vanish from the only screen that could undo it) and was windowed by
+// the caller's dashboard date range (so a 3-year employee could offer a 1-month period if
+// that's what the dashboard happened to be showing). Neither applies here anymore: no
+// exclusion filter (is_excluded is returned instead, per row), no date-range parameters
+// (first_month/last_month is always this employee's REAL full history), and grouped by
+// devengo (year_devengo/month_devengo, L5-04) rather than emisión.
 pub async fn list_payroll_employees(
     pool: &DbPool,
     owner_rfc: &str,
-    from_y: i64,
-    from_m: i64,
-    to_y: i64,
-    to_m: i64,
 ) -> anyhow::Result<Vec<PayrollEmployeeRow>> {
     let rows = sqlx::query(
         r#"
         WITH monthly AS (
             SELECT
-                c.rfc_receptor                                          AS employee_rfc,
-                MAX(c.nombre_receptor)                                  AS employee_name,
-                c.year::text || '-' || LPAD(c.month::text, 2, '0')     AS month_key,
-                SUM(COALESCE(c.total_mxn, 0))                           AS month_total
-            FROM pulso.cfdis c
-            WHERE c.rfc_emisor = $1
-              AND c.tipo_comprobante = 'N'
-              AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-              AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-              AND NOT c.is_cancelled
-              AND c.rfc_receptor IS NOT NULL
-              AND c.rfc_receptor != ''
-            GROUP BY c.rfc_receptor, month_key
+                n.rfc_receptor                                              AS employee_rfc,
+                MAX(n.nombre_receptor)                                      AS employee_name,
+                n.year_devengo::text || '-' || LPAD(n.month_devengo::text, 2, '0') AS month_key,
+                SUM(n.total_percepciones)                                   AS month_total,
+                BOOL_OR(n.is_excluded)                                      AS month_excluded
+            FROM pulso.nomina_normalizada n
+            WHERE n.rfc_emisor = $1
+              AND n.rfc_receptor IS NOT NULL
+              AND n.rfc_receptor != ''
+            GROUP BY n.rfc_receptor, month_key
         )
         SELECT
             employee_rfc,
@@ -938,17 +1327,14 @@ pub async fn list_payroll_employees(
             COUNT(DISTINCT month_key)               AS active_months,
             SUM(month_total)                        AS historical_cost_mxn,
             AVG(month_total)                        AS run_rate_mensual_mxn,
-            COUNT(*)                                AS cfdi_count
+            COUNT(*)                                AS cfdi_count,
+            BOOL_OR(month_excluded)                 AS is_excluded
         FROM monthly
         GROUP BY employee_rfc
         ORDER BY historical_cost_mxn DESC NULLS LAST
         "#,
     )
     .bind(owner_rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
     .fetch_all(pool)
     .await?;
 
@@ -960,9 +1346,10 @@ pub async fn list_payroll_employees(
             first_month: r.try_get("first_month").ok(),
             last_month: r.try_get("last_month").ok(),
             active_months: r.try_get::<i64, _>("active_months").unwrap_or(0),
-            historical_cost_mxn: r.try_get::<f64, _>("historical_cost_mxn").unwrap_or(0.0),
-            run_rate_mensual_mxn: r.try_get::<f64, _>("run_rate_mensual_mxn").unwrap_or(0.0),
+            historical_cost_mxn: get_f64(r, "historical_cost_mxn"),
+            run_rate_mensual_mxn: get_f64(r, "run_rate_mensual_mxn"),
             cfdi_count: r.try_get::<i64, _>("cfdi_count").unwrap_or(0),
+            is_excluded: r.try_get::<bool, _>("is_excluded").unwrap_or(false),
         })
         .collect())
 }
@@ -1012,7 +1399,7 @@ pub async fn list_nomina_receipts_for_employee(
             uuid: r.try_get("uuid").unwrap_or_default(),
             period: r.try_get("period").unwrap_or_default(),
             fecha_emision: r.try_get("fecha_emision").ok(),
-            total_percepciones: r.try_get("total_percepciones").unwrap_or(0.0),
+            total_percepciones: get_f64(r, "total_percepciones"),
             is_excluded: r.try_get::<bool, _>("is_excluded").unwrap_or(false),
         })
         .collect())
@@ -1061,7 +1448,10 @@ pub async fn list_ebitda_bridge_adjustments(
         SELECT
             nr.id, nr.rule_name, nr.accounting_line, nr.motivo, nr.impacts_ebitda,
             nr.dl_type, nr.capex_estimate_dep, nr.capex_asset_type,
-            nr.capex_useful_life_years, nr.capex_annual_dep_mxn,
+            -- L5-01: these are NUMERIC; without the cast, decoding as f64 silently failed
+            -- and .ok() turned a captured capex value into a null on the bridge.
+            nr.capex_useful_life_years::float8 AS capex_useful_life_years,
+            nr.capex_annual_dep_mxn::float8 AS capex_annual_dep_mxn,
             c.year,
             SUM(
                 CASE WHEN c.rfc_emisor = nr.owner_rfc THEN -COALESCE(c.total_neto_mxn_ajustado, 0)
@@ -1102,18 +1492,17 @@ pub async fn list_ebitda_bridge_adjustments(
     // Source 1: employee-level exclusion (`exclude_employee`, via nomina_normalizada's
     // employee_rule_id). The excluded receipt's cost disappears from the P&L entirely, so
     // it's added back positive. Uses the RAW (pre-factor) cost from cfdi_nomina, not
-    // nomina_normalizada's already-factored total_percepciones/total_otros_pagos/
-    // total_deducciones -- an excluded receipt's factor is irrelevant, its whole cost comes
-    // back.
+    // nomina_normalizada's already-factored total_percepciones -- an excluded receipt's
+    // factor is irrelevant, its whole cost comes back. L5-03: nómina cost is
+    // total_percepciones alone -- deducciones are withheld on the employee's behalf, still
+    // the employer's cost, not a discount to it; otros_pagos is immaterial and mostly the
+    // generic SAT bucket, not an employer cost.
     let employee_excl_rows = sqlx::query(
         r#"
         SELECT
             pr.id, pr.rule_name, pr.accounting_line, pr.motivo,
             nn.year,
-            SUM(
-                cn.total_percepciones::float8 + cn.total_otros_pagos::float8
-                - cn.total_deducciones::float8
-            ) AS year_total
+            SUM(cn.total_percepciones::float8) AS year_total
         FROM pulso.nomina_normalizada nn
         JOIN pulso.payroll_normalization_rules pr ON pr.id = nn.employee_rule_id
         JOIN pulso.cfdi_nomina cn ON cn.uuid = nn.uuid
@@ -1137,25 +1526,30 @@ pub async fn list_ebitda_bridge_adjustments(
     // requires it) but are invisible to the query above because it filters
     // tipo_comprobante IN ('I','E'). Same raw-cost measure as source 1 (total_neto_mxn_
     // ajustado is meaningless for a payroll complement), no sign flip (nómina has no
-    // "side").
+    // "side"). L5-03: total_percepciones only, same reasoning as source 1.
+    // L5-06: a receipt covered by BOTH an employee-level rule and a comprobante-level rule
+    // is excluded via nomina_normalizada.employee_rule_id already (source 1) -- joining
+    // back to the view and requiring employee_rule_id IS NULL keeps this source from
+    // double-counting it.
     let receipt_excl_rows = sqlx::query(
         r#"
         SELECT
             nr.id, nr.rule_name, nr.accounting_line, nr.motivo, nr.dl_type,
             nr.impacts_ebitda, nr.capex_estimate_dep, nr.capex_asset_type,
-            nr.capex_useful_life_years, nr.capex_annual_dep_mxn,
+            -- L5-01: see the analogous cast on the source-1 query above.
+            nr.capex_useful_life_years::float8 AS capex_useful_life_years,
+            nr.capex_annual_dep_mxn::float8 AS capex_annual_dep_mxn,
             c.year,
-            SUM(
-                n.total_percepciones::float8 + n.total_otros_pagos::float8
-                - n.total_deducciones::float8
-            ) AS year_total
+            SUM(n.total_percepciones::float8) AS year_total
         FROM pulso.cfdi_exclusion ex
         JOIN pulso.normalization_rules nr ON nr.id = ex.rule_id
         JOIN pulso.cfdis c ON c.uuid = ex.uuid
         JOIN pulso.cfdi_nomina n ON n.uuid = ex.uuid
+        JOIN pulso.nomina_normalizada nn ON nn.uuid = ex.uuid AND nn.rfc_emisor = ex.owner_rfc
         WHERE ex.owner_rfc = $1
           AND c.tipo_comprobante = 'N'
           AND NOT c.is_cancelled
+          AND nn.employee_rule_id IS NULL
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
         GROUP BY nr.id, nr.rule_name, nr.accounting_line, nr.motivo, nr.dl_type,
@@ -1179,6 +1573,9 @@ pub async fn list_ebitda_bridge_adjustments(
     // whichever rule produced the factor via migration 058's factor_rule_id. Signed
     // correctly by construction: factor < 1 (scale down, or adjust-to-amount below real)
     // makes this positive (cost went down, EBITDA up); factor > 1 makes it negative.
+    // L5-05: an employee who is both excluded and has a scale/adjust rule must not also
+    // contribute a factor difference here -- their cost is already fully out of the P&L
+    // via the exclusion (source 1), so this would be a phantom adjustment on top of it.
     let factor_diff_rows = sqlx::query(
         r#"
         SELECT
@@ -1189,6 +1586,7 @@ pub async fn list_ebitda_bridge_adjustments(
         JOIN pulso.payroll_normalization_rules pr ON pr.id = nn.factor_rule_id
         JOIN pulso.cfdi_nomina cn ON cn.uuid = nn.uuid
         WHERE nn.rfc_emisor = $1
+          AND NOT nn.is_excluded
           AND (nn.year > $2 OR (nn.year = $2 AND nn.month >= $3))
           AND (nn.year < $4 OR (nn.year = $4 AND nn.month <= $5))
         GROUP BY pr.id, pr.rule_name, pr.accounting_line, pr.motivo, nn.year
@@ -1240,7 +1638,7 @@ fn merge_bridge_row(
 ) {
     let rule_id: String = row.try_get(id_col).unwrap_or_default();
     let year: i64 = row.try_get("year").unwrap_or(0);
-    let year_total: f64 = row.try_get("year_total").unwrap_or(0.0);
+    let year_total: f64 = get_f64(row, "year_total");
 
     let entry = map
         .entry(rule_id.clone())
@@ -1256,6 +1654,11 @@ fn merge_bridge_row(
                 .unwrap_or_default(),
             capex_estimate_dep: row.try_get("capex_estimate_dep").ok(),
             capex_asset_type: row.try_get("capex_asset_type").ok(),
+            // Not L5-01's get_f64_opt here on purpose: two of this fn's four callers
+            // (the nómina-sourced queries) never select these columns at all -- that's an
+            // expected "column absent by query shape", not a decode failure, and logging a
+            // warning on every such row would be noise, not signal. The two callers that DO
+            // select these columns now cast them (`::float8`) at the SQL level instead.
             capex_useful_life_years: row.try_get("capex_useful_life_years").ok(),
             capex_annual_dep_mxn: row.try_get("capex_annual_dep_mxn").ok(),
             amounts_by_year: std::collections::HashMap::new(),
@@ -1264,4 +1667,68 @@ fn merge_bridge_row(
 
     *entry.amounts_by_year.entry(year.to_string()).or_insert(0.0) += year_total;
     entry.total_mxn += year_total;
+}
+
+#[cfg(test)]
+mod payroll_lock_tests {
+    use super::*;
+
+    #[test]
+    fn periods_overlap_detects_overlap() {
+        assert!(periods_overlap(
+            Some("2026-01"),
+            Some("2026-06"),
+            Some("2026-06"),
+            Some("2026-12")
+        ));
+    }
+
+    #[test]
+    fn periods_overlap_rejects_adjacent_non_overlap() {
+        // C3's spirit: genuinely non-overlapping periods must never be flagged.
+        assert!(!periods_overlap(
+            Some("2026-01"),
+            Some("2026-03"),
+            Some("2026-04"),
+            Some("2026-06")
+        ));
+    }
+
+    #[test]
+    fn periods_overlap_unbounded_end_always_overlaps_later_start() {
+        assert!(periods_overlap(
+            Some("2026-01"),
+            None,
+            Some("2030-01"),
+            Some("2030-06")
+        ));
+    }
+
+    #[test]
+    fn periods_overlap_both_fully_unbounded() {
+        assert!(periods_overlap(None, None, None, None));
+    }
+
+    #[test]
+    fn is_active_exclusion_requires_both_family_and_action() {
+        assert!(is_active_exclusion("exclude_employee", "exclude"));
+        assert!(is_active_exclusion("exclusion", "exclude"));
+        assert!(!is_active_exclusion("exclude_employee", "normalize"));
+        assert!(!is_active_exclusion("scale_employee_pct", "exclude"));
+    }
+
+    #[test]
+    fn is_dimensioning_family_covers_scale_and_adjust_only() {
+        assert!(is_dimensioning_family("scale_employee_pct"));
+        assert!(is_dimensioning_family("adjust_to_amount_mxn"));
+        assert!(!is_dimensioning_family("exclude_employee"));
+        // L5-17's future concepts family must never become dimensioning (C2 note).
+        assert!(!is_dimensioning_family("nonrecurring_concept"));
+    }
+
+    #[test]
+    fn payroll_motivos_has_exactly_the_seven_dec_033_values() {
+        assert_eq!(PAYROLL_MOTIVOS.len(), 7);
+        assert!(PAYROLL_MOTIVOS.contains(&"Otro"));
+    }
 }

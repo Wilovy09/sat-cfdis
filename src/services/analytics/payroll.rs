@@ -1,4 +1,4 @@
-use super::summary::parse_ym;
+use super::summary::{get_f64, parse_ym};
 /// Payroll: employee analytics from CFDI Nómina complements.
 ///
 /// Money-computing queries here read `pulso.nomina_normalizada` (migration 054, L3-16)
@@ -61,6 +61,10 @@ pub struct PayrollMonth {
     pub total_otros_pagos: f64,
     pub employee_count: i64,
     pub payrolls_count: i64,
+    // L5-04: this devengo month can still grow after the window that reported it, if a
+    // receipt for this month's work is stamped (emisión) later. True when at least one
+    // receipt in the group has emisión strictly after its own devengo month.
+    pub has_late_receipts: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,7 +220,7 @@ pub async fn get(
     let summary_row = sqlx::query(&format!(
         r#"
         SELECT
-            SUM(n.total_percepciones + n.total_otros_pagos - n.total_deducciones) AS total_pagado,
+            SUM(n.total_percepciones)                                            AS total_pagado,
             SUM(n.total_percepciones)                                            AS total_perc,
             SUM(n.total_deducciones)                                             AS total_ded,
             SUM(n.total_otros_pagos)                                             AS total_otros,
@@ -238,7 +242,7 @@ pub async fn get(
     .fetch_one(pool)
     .await?;
 
-    let total_pagado: f64 = summary_row.try_get("total_pagado").unwrap_or(0.0);
+    let total_pagado: f64 = get_f64(&summary_row, "total_pagado");
     let emp_count: i64 = summary_row.try_get("emp_count").unwrap_or(0);
     let payrolls: i64 = summary_row.try_get("payrolls_count").unwrap_or(0);
 
@@ -262,13 +266,13 @@ pub async fn get(
     .bind(to_m)
     .fetch_one(pool)
     .await?;
-    let total_isr_retenido: f64 = isr_row.try_get("total_isr").unwrap_or(0.0);
+    let total_isr_retenido: f64 = get_f64(&isr_row, "total_isr");
 
     let summary = PayrollSummary {
         total_pagado_mxn: total_pagado,
-        total_percepciones_mxn: summary_row.try_get("total_perc").unwrap_or(0.0),
-        total_deducciones_mxn: summary_row.try_get("total_ded").unwrap_or(0.0),
-        total_otros_pagos_mxn: summary_row.try_get("total_otros").unwrap_or(0.0),
+        total_percepciones_mxn: get_f64(&summary_row, "total_perc"),
+        total_deducciones_mxn: get_f64(&summary_row, "total_ded"),
+        total_otros_pagos_mxn: get_f64(&summary_row, "total_otros"),
         total_isr_retenido,
         total_employees: emp_count,
         avg_salary_mxn: if emp_count > 0 {
@@ -276,32 +280,31 @@ pub async fn get(
         } else {
             0.0
         },
-        avg_sdi: summary_row.try_get("avg_sdi").unwrap_or(0.0),
+        avg_sdi: get_f64(&summary_row, "avg_sdi"),
         payrolls_count: payrolls,
     };
 
-    // By month
+    // By month — L5-04: grouped AND filtered by devengo (n.year_devengo/n.month_devengo),
+    // consistently. Filtering by emisión while grouping by devengo used to let a receipt
+    // stamped after its own accrual month enter through a window that didn't include the
+    // month it actually landed in, so a month's total changed depending on the window
+    // requested.
     let month_rows = sqlx::query(&format!(
         r#"
         SELECT
-               EXTRACT(YEAR FROM COALESCE(
-                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 n.fecha_emision::date
-               ))::bigint AS year,
-               EXTRACT(MONTH FROM COALESCE(
-                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 n.fecha_emision::date
-               ))::bigint AS month,
-               SUM(n.total_percepciones + n.total_otros_pagos - n.total_deducciones) AS pagado,
+               n.year_devengo  AS year,
+               n.month_devengo AS month,
+               SUM(n.total_percepciones) AS pagado,
                SUM(n.total_percepciones)               AS perc,
                SUM(n.total_deducciones)                AS ded,
                SUM(n.total_otros_pagos)                AS otros,
                COUNT(DISTINCT n.rfc_receptor)           AS emp_count,
-               COUNT(*)                                AS payrolls_count
+               COUNT(*)                                AS payrolls_count,
+               BOOL_OR(n.year > n.year_devengo OR (n.year = n.year_devengo AND n.month > n.month_devengo)) AS has_late_receipts
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         GROUP BY 1, 2
         ORDER BY 1, 2
@@ -324,12 +327,13 @@ pub async fn get(
                 period: format!("{year}-{month:02}"),
                 year,
                 month,
-                total_pagado: r.try_get("pagado").unwrap_or(0.0),
-                total_percepciones: r.try_get("perc").unwrap_or(0.0),
-                total_deducciones: r.try_get("ded").unwrap_or(0.0),
-                total_otros_pagos: r.try_get("otros").unwrap_or(0.0),
+                total_pagado: get_f64(r, "pagado"),
+                total_percepciones: get_f64(r, "perc"),
+                total_deducciones: get_f64(r, "ded"),
+                total_otros_pagos: get_f64(r, "otros"),
                 employee_count: r.try_get("emp_count").unwrap_or(0),
                 payrolls_count: r.try_get("payrolls_count").unwrap_or(0),
+                has_late_receipts: r.try_get("has_late_receipts").unwrap_or(false),
             }
         })
         .collect();
@@ -379,7 +383,7 @@ pub async fn get(
             la.fecha_final_pago,
             COALESCE(ea.sdi_at_first, 0)::float8        AS sdi_at_first,
             ea.fecha_inicio_rel_laboral,
-            SUM(n.total_percepciones + n.total_otros_pagos - n.total_deducciones) AS pagado,
+            SUM(n.total_percepciones)                   AS pagado,
             SUM(n.total_percepciones)                   AS perc,
             SUM(n.total_deducciones)                    AS ded,
             AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi,
@@ -464,9 +468,9 @@ pub async fn get(
         .map(|r| {
             let k: String = r.try_get("emp_rfc").unwrap_or_default();
             let v = Perc3m {
-                total_001: r.try_get("total_001").unwrap_or(0.0),
-                total_046: r.try_get("total_046").unwrap_or(0.0),
-                total_dias: r.try_get("total_dias").unwrap_or(0.0),
+                total_001: get_f64(r, "total_001"),
+                total_046: get_f64(r, "total_046"),
+                total_dias: get_f64(r, "total_dias"),
                 meses_con_dato: r.try_get("meses_con_dato").unwrap_or(0),
                 has_001: r.try_get("has_001").unwrap_or(false),
                 has_046: r.try_get("has_046").unwrap_or(false),
@@ -479,7 +483,7 @@ pub async fn get(
         .iter()
         .map(|r| {
             let emp_rfc: String = r.try_get("emp_rfc").unwrap_or_default();
-            let sdi_latest: f64 = r.try_get("sdi_latest").unwrap_or(0.0);
+            let sdi_latest: f64 = get_f64(r, "sdi_latest");
             let tipo_contrato: String = r.try_get("tipo_contrato").unwrap_or_default();
             let last_pay: String = r.try_get("last_pay").unwrap_or_default();
 
@@ -576,18 +580,18 @@ pub async fn get(
                 num_empleado: r.try_get("num_emp").unwrap_or_default(),
                 departamento: r.try_get("dpto").unwrap_or_default(),
                 puesto: r.try_get("puesto").unwrap_or_default(),
-                total_pagado_mxn: r.try_get("pagado").unwrap_or(0.0),
-                total_percepciones: r.try_get("perc").unwrap_or(0.0),
-                total_deducciones: r.try_get("ded").unwrap_or(0.0),
-                avg_sdi: r.try_get("avg_sdi").unwrap_or(0.0),
+                total_pagado_mxn: get_f64(r, "pagado"),
+                total_percepciones: get_f64(r, "perc"),
+                total_deducciones: get_f64(r, "ded"),
+                avg_sdi: get_f64(r, "avg_sdi"),
                 payrolls_count: r.try_get("payrolls").unwrap_or(0),
                 months_active: r.try_get("months_active").unwrap_or(0),
                 first_payroll: r.try_get("first_pay").unwrap_or_default(),
                 last_payroll: r.try_get("last_pay").unwrap_or_default(),
                 fecha_inicio_rel_laboral: r.try_get("fecha_inicio_rel_laboral").ok(),
                 fecha_final_pago: r.try_get("fecha_final_pago").ok(),
-                sdi_at_first: r.try_get("sdi_at_first").unwrap_or(0.0),
-                sdi_latest: r.try_get("sdi_latest").unwrap_or(0.0),
+                sdi_at_first: get_f64(r, "sdi_at_first"),
+                sdi_latest: get_f64(r, "sdi_latest"),
                 tipo_contrato,
                 tipo_jornada: r.try_get("tipo_jornada").unwrap_or_default(),
                 tipo_regimen: r.try_get("tipo_regimen").unwrap_or_default(),
@@ -622,15 +626,12 @@ pub async fn get(
     .fetch_all(pool)
     .await?;
 
-    let grand_tipo_total: f64 = tipo_rows
-        .iter()
-        .map(|r| r.try_get::<f64, _>("total").unwrap_or(0.0))
-        .sum();
+    let grand_tipo_total: f64 = tipo_rows.iter().map(|r| get_f64(r, "total")).sum();
     let by_tipo_nomina: Vec<TipoNominaRow> = tipo_rows
         .iter()
         .map(|r| {
             let tipo: String = r.try_get("tipo_nomina").unwrap_or_default();
-            let total: f64 = r.try_get("total").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "total");
             TipoNominaRow {
                 label: tipo_nomina_label(&tipo).to_string(),
                 tipo_nomina: tipo,
@@ -687,7 +688,7 @@ pub async fn get(
             puesto: r.try_get("puesto").unwrap_or_default(),
             year: r.try_get("year").unwrap_or(0),
             month: r.try_get("month").unwrap_or(0),
-            total_percepciones: r.try_get("total_perc").unwrap_or(0.0),
+            total_percepciones: get_f64(r, "total_perc"),
             tipo_regimen: r.try_get("tipo_regimen").unwrap_or_default(),
         })
         .collect();
@@ -722,7 +723,7 @@ pub async fn get(
         .map(|r| DeduccionRow {
             tipo_deduccion: r.try_get("tipo_deduccion").unwrap_or_default(),
             concepto: r.try_get("concepto").unwrap_or_default(),
-            total_importe: r.try_get("total").unwrap_or(0.0),
+            total_importe: get_f64(r, "total"),
             count: r.try_get("cnt").unwrap_or(0),
         })
         .collect();
@@ -756,8 +757,8 @@ pub async fn get(
     let by_percepcion: Vec<PercepcionRow> = per_rows
         .iter()
         .map(|r| {
-            let grav: f64 = r.try_get("gravado").unwrap_or(0.0);
-            let exen: f64 = r.try_get("exento").unwrap_or(0.0);
+            let grav: f64 = get_f64(r, "gravado");
+            let exen: f64 = get_f64(r, "exento");
             PercepcionRow {
                 tipo_percepcion: r.try_get("tipo_percepcion").unwrap_or_default(),
                 concepto: r.try_get("concepto").unwrap_or_default(),
@@ -769,27 +770,21 @@ pub async fn get(
         })
         .collect();
 
-    // By year
+    // By year — L5-04: grouped and filtered by devengo, same as by_month.
     let year_rows = sqlx::query(&format!(
         r#"
         SELECT
-               EXTRACT(YEAR FROM COALESCE(
-                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 n.fecha_emision::date
-               ))::bigint AS year,
-               SUM(n.total_percepciones + n.total_otros_pagos - n.total_deducciones) AS pagado,
+               n.year_devengo AS year,
+               SUM(n.total_percepciones) AS pagado,
                SUM(n.total_percepciones) AS perc,
                SUM(n.total_deducciones) AS ded,
                SUM(n.total_otros_pagos) AS otros,
                COUNT(DISTINCT n.rfc_receptor) AS emp_count,
-               COUNT(DISTINCT EXTRACT(MONTH FROM COALESCE(
-                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 n.fecha_emision::date
-               ))::int) AS months_count
+               COUNT(DISTINCT n.month_devengo) AS months_count
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         GROUP BY 1
         ORDER BY 1
@@ -807,10 +802,10 @@ pub async fn get(
         .iter()
         .map(|r| PayrollYearRow {
             year: r.try_get("year").unwrap_or(0),
-            total_pagado: r.try_get("pagado").unwrap_or(0.0),
-            total_percepciones: r.try_get("perc").unwrap_or(0.0),
-            total_deducciones: r.try_get("ded").unwrap_or(0.0),
-            total_otros_pagos: r.try_get("otros").unwrap_or(0.0),
+            total_pagado: get_f64(r, "pagado"),
+            total_percepciones: get_f64(r, "perc"),
+            total_deducciones: get_f64(r, "ded"),
+            total_otros_pagos: get_f64(r, "otros"),
             employee_count: r.try_get("emp_count").unwrap_or(0),
             months_with_data: r.try_get("months_count").unwrap_or(0),
         })
@@ -818,31 +813,25 @@ pub async fn get(
 
     // By month ordinaria — SOLO tipo_nomina 'O'. La extraordinaria (aguinaldo,
     // PTU, finiquitos, indemnizaciones) es su propia serie: son eventos
-    // aislados y mezclarlos distorsiona la lectura del costo recurrente
-    // (NOM-1). El total_pagado sigue sin incluir otros_pagos aquí a propósito
-    // — ver NOM-7, esta serie es la que queda excluida.
+    // aislados y mezclarlos distorsiona la lectura del costo recurrente (NOM-1).
+    // L5-04: grouped and filtered by devengo, same as by_month.
     let month_ord_rows = sqlx::query(&format!(
         r#"
         SELECT
-               EXTRACT(YEAR FROM COALESCE(
-                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 n.fecha_emision::date
-               ))::bigint AS year,
-               EXTRACT(MONTH FROM COALESCE(
-                 NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-                 n.fecha_emision::date
-               ))::bigint AS month,
-               SUM(n.total_percepciones - n.total_deducciones) AS pagado,
+               n.year_devengo  AS year,
+               n.month_devengo AS month,
+               SUM(n.total_percepciones) AS pagado,
                SUM(n.total_percepciones)  AS perc,
                SUM(n.total_deducciones)   AS ded,
                SUM(n.total_otros_pagos)   AS otros,
                COUNT(DISTINCT n.rfc_receptor)             AS emp_count,
-               COUNT(*)                                   AS payrolls_count
+               COUNT(*)                                   AS payrolls_count,
+               BOOL_OR(n.year > n.year_devengo OR (n.year = n.year_devengo AND n.month > n.month_devengo)) AS has_late_receipts
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
           AND n.tipo_nomina = 'O'
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         GROUP BY 1, 2
         ORDER BY 1, 2
@@ -865,12 +854,13 @@ pub async fn get(
                 period: format!("{year}-{month:02}"),
                 year,
                 month,
-                total_pagado: r.try_get("pagado").unwrap_or(0.0),
-                total_percepciones: r.try_get("perc").unwrap_or(0.0),
-                total_deducciones: r.try_get("ded").unwrap_or(0.0),
-                total_otros_pagos: r.try_get("otros").unwrap_or(0.0),
+                total_pagado: get_f64(r, "pagado"),
+                total_percepciones: get_f64(r, "perc"),
+                total_deducciones: get_f64(r, "ded"),
+                total_otros_pagos: get_f64(r, "otros"),
                 employee_count: r.try_get("emp_count").unwrap_or(0),
                 payrolls_count: r.try_get("payrolls_count").unwrap_or(0),
+                has_late_receipts: r.try_get("has_late_receipts").unwrap_or(false),
             }
         })
         .collect();
@@ -902,7 +892,7 @@ pub async fn get(
             tipo_percepcion: r.try_get("tipo_percepcion").unwrap_or_default(),
             concepto: r.try_get("concepto").unwrap_or_default(),
             year: r.try_get("year").unwrap_or(0),
-            total: r.try_get("total").unwrap_or(0.0),
+            total: get_f64(r, "total"),
         })
         .collect();
 
@@ -937,7 +927,7 @@ pub async fn get(
             tipo_deduccion: r.try_get("tipo_deduccion").unwrap_or_default(),
             concepto: r.try_get("concepto").unwrap_or_default(),
             year: r.try_get("year").unwrap_or(0),
-            total: r.try_get("total").unwrap_or(0.0),
+            total: get_f64(r, "total"),
         })
         .collect();
 
@@ -972,7 +962,7 @@ pub async fn get(
             tipo_otro_pago: r.try_get("tipo_otro_pago").unwrap_or_default(),
             concepto: r.try_get("concepto").unwrap_or_default(),
             year: r.try_get("year").unwrap_or(0),
-            total: r.try_get("total").unwrap_or(0.0),
+            total: get_f64(r, "total"),
         })
         .collect();
 
@@ -981,7 +971,7 @@ pub async fn get(
         r#"
         SELECT COALESCE(NULLIF(TRIM(n.departamento),''), 'Sin departamento') AS departamento,
                n.year,
-               SUM(n.total_percepciones - n.total_deducciones) AS pagado,
+               SUM(n.total_percepciones) AS pagado,
                COUNT(DISTINCT n.rfc_receptor) AS emp_count
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
@@ -1006,7 +996,7 @@ pub async fn get(
         .map(|r| DepartmentYearRow {
             departamento: r.try_get("departamento").unwrap_or_default(),
             year: r.try_get("year").unwrap_or(0),
-            total_pagado: r.try_get("pagado").unwrap_or(0.0),
+            total_pagado: get_f64(r, "pagado"),
             employee_count: r.try_get("emp_count").unwrap_or(0),
         })
         .collect();
@@ -1049,8 +1039,8 @@ pub async fn get(
     let by_employee_year: Vec<EmployeeYearRow> = emp_year_rows
         .iter()
         .map(|r| {
-            let sueldo_base: f64 = r.try_get("sueldo_base").unwrap_or(0.0);
-            let compensacion_ordinaria: f64 = r.try_get("compensacion_ordinaria").unwrap_or(0.0);
+            let sueldo_base: f64 = get_f64(r, "sueldo_base");
+            let compensacion_ordinaria: f64 = get_f64(r, "compensacion_ordinaria");
             let months_active: i64 = r.try_get("months_active").unwrap_or(1);
             EmployeeYearRow {
                 rfc: r.try_get("rfc").unwrap_or_default(),
@@ -1063,7 +1053,7 @@ pub async fn get(
                 months_active,
                 avg_monthly_base: sueldo_base / months_active.max(1) as f64,
                 avg_monthly_compensacion: compensacion_ordinaria / months_active.max(1) as f64,
-                avg_sdi: r.try_get("avg_sdi").unwrap_or(0.0),
+                avg_sdi: get_f64(r, "avg_sdi"),
             }
         })
         .collect();
@@ -1341,7 +1331,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     .bind(last_m)
     .fetch_one(pool)
     .await?;
-    let total_regular: f64 = rr_row.try_get("total_regular").unwrap_or(0.0);
+    let total_regular: f64 = get_f64(&rr_row, "total_regular");
 
     // Divisor: months with ordinary payroll data *inside this LTM window*, not the
     // unwindowed months_of_data (AUD-003 pt.4) — a short LTM history must not be
@@ -1385,7 +1375,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     .bind(last_m)
     .fetch_one(pool)
     .await?;
-    let ltm_masa: f64 = ltm_row.try_get("total").unwrap_or(0.0);
+    let ltm_masa: f64 = get_f64(&ltm_row, "total");
 
     let prior_row = sqlx::query(&format!(
         r#"
@@ -1404,7 +1394,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     .bind(prior_to_m)
     .fetch_one(pool)
     .await?;
-    let prior_masa: f64 = prior_row.try_get("total").unwrap_or(0.0);
+    let prior_masa: f64 = get_f64(&prior_row, "total");
     let yoy_masa_salarial_pct = if prior_masa > 0.0 {
         Some((ltm_masa - prior_masa) / prior_masa * 100.0)
     } else {
@@ -1449,7 +1439,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     let pasivo_laboral_estimado_mxn: f64 = emp_rows
         .iter()
         .map(|r| {
-            let sdi: f64 = r.try_get("sdi").unwrap_or(0.0);
+            let sdi: f64 = get_f64(r, "sdi");
             let tenure_days: i32 = r.try_get("tenure_days").unwrap_or(0);
             if sdi <= 0.0 {
                 return 0.0;

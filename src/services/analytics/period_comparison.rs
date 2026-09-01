@@ -1,4 +1,4 @@
-use super::summary::{cp_key_expr, cp_nombre_expr, dl_type_filter, rfc_column};
+use super::summary::{cp_key_expr, cp_nombre_expr, dl_type_filter, get_f64, rfc_column};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -146,7 +146,7 @@ pub async fn get(
     let mut period_map: HashMap<i32, (f64, i64, i64)> = HashMap::new();
     for r in &period_rows {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total");
         let cp_count: i64 = r.try_get("cp_count").unwrap_or(0);
         let invoice_count: i64 = r.try_get("invoice_count").unwrap_or(0);
         period_map.insert(year, (total, cp_count, invoice_count));
@@ -181,7 +181,7 @@ pub async fn get(
     let mut fy_map: HashMap<i32, f64> = HashMap::new();
     for r in &fy_rows {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
-        let fy_total: f64 = r.try_get("fy_total").unwrap_or(0.0);
+        let fy_total: f64 = get_f64(r, "fy_total");
         fy_map.insert(year, fy_total);
     }
 
@@ -230,7 +230,7 @@ pub async fn get(
     for r in &top_rows {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
         let cp_rfc: String = r.try_get("cp_rfc").unwrap_or_default();
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total");
         top_by_year.entry(year).or_default().push((cp_rfc, total));
     }
 
@@ -270,7 +270,7 @@ pub async fn get(
     for r in &matrix_raw {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
         let month: i32 = r.try_get::<i64, _>("month").unwrap_or(0) as i32;
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total");
         let cum = cumulative_by_year.entry(year).or_insert(0.0);
         *cum += total;
         monthly_matrix.push(MonthMatrixRow {
@@ -353,7 +353,7 @@ pub async fn get(
     for r in &top_rows {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
         let cp_rfc: String = r.try_get("cp_rfc").unwrap_or_default();
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total");
         year_cp_totals
             .entry(year)
             .or_default()
@@ -366,7 +366,7 @@ pub async fn get(
         let rank: i64 = r.try_get("rnk").unwrap_or(0);
         let cp_rfc: String = r.try_get("cp_rfc").unwrap_or_default();
         let cp_nombre: String = r.try_get("cp_nombre").unwrap_or_default();
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total");
         let invoice_count: i64 = r.try_get("invoice_count").unwrap_or(0);
 
         let (period_total, _, _) = period_map.get(&year).copied().unwrap_or((0.0, 0, 0));
@@ -474,8 +474,8 @@ pub async fn get(
         for r in &bridge_raw {
             let cp_rfc: String = r.try_get("cp_rfc").unwrap_or_default();
             let cp_nombre: String = r.try_get("cp_nombre").unwrap_or_default();
-            let curr_total: f64 = r.try_get("curr_total").unwrap_or(0.0);
-            let prev_total: f64 = r.try_get("prev_total").unwrap_or(0.0);
+            let curr_total: f64 = get_f64(r, "curr_total");
+            let prev_total: f64 = get_f64(r, "prev_total");
             let delta_mxn = curr_total - prev_total;
 
             let status = if prev_total == 0.0 {

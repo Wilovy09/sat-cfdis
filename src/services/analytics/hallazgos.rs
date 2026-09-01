@@ -1,3 +1,4 @@
+use super::summary::get_f64;
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -354,7 +355,7 @@ async fn compute_ltm_ingreso(
     .bind(to_m)
     .fetch_one(pool)
     .await?;
-    Ok(row.try_get::<f64, _>("total").unwrap_or(0.0))
+    Ok(get_f64(&row, "total"))
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +408,7 @@ async fn compute_h1(
         .map(|r| ClientRow {
             rfc: r.try_get("rfc_receptor").unwrap_or_default(),
             nombre: r.try_get("nombre").unwrap_or_default(),
-            mxn: r.try_get("ltm_mxn").unwrap_or(0.0),
+            mxn: get_f64(r, "ltm_mxn"),
         })
         .collect();
 
@@ -652,7 +653,7 @@ async fn compute_h5b(
             nombre: r.try_get("nombre").unwrap_or_default(),
             first_period: r.try_get::<i64, _>("first_period").unwrap_or(0),
             last_period: r.try_get::<i64, _>("last_period").unwrap_or(0),
-            sueldo: r.try_get("sueldo_mensual").unwrap_or(0.0),
+            sueldo: get_f64(r, "sueldo_mensual"),
         })
         .collect();
 
@@ -784,7 +785,7 @@ async fn compute_h6(
     .bind(rfc)
     .fetch_one(pool)
     .await?;
-    let outstanding: f64 = outstanding_row.try_get("outstanding").unwrap_or(0.0);
+    let outstanding: f64 = get_f64(&outstanding_row, "outstanding");
 
     let ltm_ingreso =
         compute_ltm_ingreso(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?;
@@ -868,7 +869,7 @@ async fn compute_h7(
     .bind(rfc)
     .fetch_one(pool)
     .await?;
-    let outstanding: f64 = outstanding_row.try_get("outstanding").unwrap_or(0.0);
+    let outstanding: f64 = get_f64(&outstanding_row, "outstanding");
 
     // LTM gasto recibidos
     let ltm_gasto_row = sqlx::query(
@@ -890,7 +891,7 @@ async fn compute_h7(
     .bind(ltm_end_m)
     .fetch_one(pool)
     .await?;
-    let ltm_gasto: f64 = ltm_gasto_row.try_get("total").unwrap_or(0.0);
+    let ltm_gasto: f64 = get_f64(&ltm_gasto_row, "total");
 
     if ltm_gasto <= 0.0 {
         return Ok(None);
@@ -972,7 +973,7 @@ async fn compute_h8(
         .map(|r| SupRow {
             rfc: r.try_get("rfc_emisor").unwrap_or_default(),
             nombre: r.try_get("nombre").unwrap_or_default(),
-            mxn: r.try_get("ltm_mxn").unwrap_or(0.0),
+            mxn: get_f64(r, "ltm_mxn"),
         })
         .collect();
 
@@ -1101,7 +1102,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         .map(|r| AnnualEmitidos {
             year: r.try_get("year").unwrap_or(0),
             month_count: r.try_get("month_count").unwrap_or(0),
-            ingreso: r.try_get("ingreso").unwrap_or(0.0),
+            ingreso: get_f64(r, "ingreso"),
         })
         .collect();
 
@@ -1170,7 +1171,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             .map(|r| {
                 (
                     r.try_get::<i64, _>("year").unwrap_or(0),
-                    r.try_get::<f64, _>("ingreso").unwrap_or(0.0),
+                    get_f64(r, "ingreso"),
                 )
             })
             .collect();
@@ -1202,7 +1203,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             .map(|r| {
                 (
                     r.try_get::<i64, _>("year").unwrap_or(0),
-                    r.try_get::<f64, _>("egreso").unwrap_or(0.0),
+                    get_f64(r, "egreso"),
                 )
             })
             .collect();
@@ -1230,7 +1231,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             .map(|r| {
                 (
                     r.try_get::<i64, _>("year").unwrap_or(0),
-                    r.try_get::<f64, _>("nomina").unwrap_or(0.0),
+                    get_f64(r, "nomina"),
                 )
             })
             .collect();

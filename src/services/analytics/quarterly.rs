@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, parse_ym, rfc_column};
+use super::summary::{dl_type_filter, get_f64, parse_ym, rfc_column};
 /// Quarterly aggregation — groups months into fiscal quarters with YoY comparison.
 use crate::db::DbPool;
 use serde::Serialize;
@@ -90,7 +90,7 @@ pub async fn get(
                 year,
                 quarter,
                 period: format!("{year}-Q{quarter}"),
-                total_mxn: r.try_get("total").unwrap_or(0.0),
+                total_mxn: get_f64(r, "total"),
                 invoice_count: r.try_get("cnt").unwrap_or(0),
                 is_complete: months_present == 3,
             }
