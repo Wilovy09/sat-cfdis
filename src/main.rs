@@ -1355,6 +1355,10 @@ async fn main() -> std::io::Result<()> {
                     )
                     .route(
                         "/normalization/{rule_id}",
+                        web::put().to(analytics_routes::update_normalization),
+                    )
+                    .route(
+                        "/normalization/{rule_id}",
                         web::delete().to(analytics_routes::delete_normalization),
                     )
                     .route(
@@ -1364,6 +1368,10 @@ async fn main() -> std::io::Result<()> {
                     .route(
                         "/normalization/payroll",
                         web::post().to(analytics_routes::create_payroll_normalization),
+                    )
+                    .route(
+                        "/normalization/payroll/{rule_id}",
+                        web::put().to(analytics_routes::update_payroll_normalization),
                     )
                     .route(
                         "/normalization/payroll/{rule_id}",

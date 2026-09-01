@@ -55,9 +55,11 @@ pub const SCALAR_HTML: &str = r#"<!doctype html>
         // Normalization
         crate::routes::analytics::list_normalization,
         crate::routes::analytics::create_normalization,
+        crate::routes::analytics::update_normalization,
         crate::routes::analytics::delete_normalization,
         crate::routes::analytics::list_payroll_normalization,
         crate::routes::analytics::create_payroll_normalization,
+        crate::routes::analytics::update_payroll_normalization,
         crate::routes::analytics::delete_payroll_normalization,
         // Invoices
         crate::routes::invoices::list_invoices,
