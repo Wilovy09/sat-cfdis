@@ -582,9 +582,56 @@ pub async fn create_normalization(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", &rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    // L3-13: accounting_line is now mandatory at creation time. A rule saved without one
-    // used to fall out of the EBITDA bridge silently (it required accounting_line IS NOT
-    // NULL to appear at all) while still cutting money from the P&L -- invisible normalization.
+    validate_comprobante_rule_fields(&body)?;
+    let rule = normalization::create_rule(&pool, &rfc, &body)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    Ok(HttpResponse::Created().json(rule))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/analytics/{rfc}/normalization/{rule_id}",
+    tag = "Normalization",
+    params(
+        ("rfc" = String, Path, description = "RFC del contribuyente"),
+        ("rule_id" = String, Path, description = "ID de la regla"),
+    ),
+    request_body = normalization::CreateRuleRequest,
+    responses(
+        (status = 200, description = "Regla actualizada"),
+        (status = 400, description = "Datos inválidos"),
+        (status = 404, description = "Regla no encontrada"),
+    )
+)]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty, rule_id = tracing::field::Empty))]
+pub async fn update_normalization(
+    req: HttpRequest,
+    path: web::Path<(String, String)>,
+    pool: web::Data<DbPool>,
+    body: web::Json<normalization::CreateRuleRequest>,
+) -> Result<HttpResponse, AppError> {
+    let (rfc, id) = path.into_inner();
+    let rfc = rfc.to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rule_id", &id.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+    validate_comprobante_rule_fields(&body)?;
+    let rule = normalization::update_rule(&pool, &id, &rfc, &body)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    match rule {
+        Some(rule) => Ok(HttpResponse::Ok().json(rule)),
+        None => Err(AppError::not_found("Rule not found")),
+    }
+}
+
+/// L3-13 + L5-12: accounting_line (línea del P&L) and motivo are mandatory on every
+/// comprobante-level rule, for both create and update -- a rule saved without either used
+/// to fall out of the EBITDA bridge silently, or be impossible to defend months later.
+fn validate_comprobante_rule_fields(
+    body: &normalization::CreateRuleRequest,
+) -> Result<(), AppError> {
     if body
         .accounting_line
         .as_deref()
@@ -596,10 +643,18 @@ pub async fn create_normalization(
             "accounting_line es obligatorio: selecciona la línea del P&L de la que sale este ajuste",
         ));
     }
-    let rule = normalization::create_rule(&pool, &rfc, &body)
-        .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
-    Ok(HttpResponse::Created().json(rule))
+    if body
+        .motivo
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        return Err(AppError::bad_request(
+            "motivo es obligatorio: documenta por qué se hace este ajuste",
+        ));
+    }
+    Ok(())
 }
 
 #[utoipa::path(
@@ -679,7 +734,7 @@ pub async fn create_payroll_normalization(
     tracing::Span::current().record("rfc", &rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
 
-    match normalization::check_payroll_rule(&pool, &rfc, &body)
+    match normalization::check_payroll_rule(&pool, &rfc, &body, None)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?
     {
@@ -697,6 +752,59 @@ pub async fn create_payroll_normalization(
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Created().json(rule))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/analytics/{rfc}/normalization/payroll/{rule_id}",
+    tag = "Normalization",
+    params(
+        ("rfc" = String, Path, description = "RFC del contribuyente"),
+        ("rule_id" = String, Path, description = "ID de la regla"),
+    ),
+    request_body = normalization::CreatePayrollRuleRequest,
+    responses(
+        (status = 200, description = "Regla de nómina actualizada"),
+        (status = 400, description = "Datos inválidos"),
+        (status = 404, description = "Regla no encontrada"),
+    )
+)]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty, rule_id = tracing::field::Empty))]
+pub async fn update_payroll_normalization(
+    req: HttpRequest,
+    path: web::Path<(String, String)>,
+    pool: web::Data<DbPool>,
+    body: web::Json<normalization::CreatePayrollRuleRequest>,
+) -> Result<HttpResponse, AppError> {
+    let (rfc, id) = path.into_inner();
+    let rfc = rfc.to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rule_id", &id.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+
+    // L5-10: same locks/validations as creation, run against this rule's own id so it
+    // doesn't get rejected for overlapping itself (L5-08 C1/C2, L5-12, L4-04/L4-12).
+    match normalization::check_payroll_rule(&pool, &rfc, &body, Some(&id))
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?
+    {
+        normalization::PayrollRuleCheck::Rejected(msg) => return Err(AppError::bad_request(msg)),
+        normalization::PayrollRuleCheck::NeedsConfirmation(warnings) => {
+            return Ok(HttpResponse::UnprocessableEntity().json(serde_json::json!({
+                "needs_confirmation": true,
+                "warnings": warnings,
+            })));
+        }
+        normalization::PayrollRuleCheck::Ok => {}
+    }
+
+    let rule = normalization::update_payroll_rule(&pool, &id, &rfc, &body)
+        .await
+        .map_err(|e| AppError::internal(&e.to_string()))?;
+    match rule {
+        Some(rule) => Ok(HttpResponse::Ok().json(rule)),
+        None => Err(AppError::not_found("Payroll rule not found")),
+    }
 }
 
 #[utoipa::path(
@@ -825,16 +933,13 @@ pub async fn list_norm_counterparty_cfdis(
 pub async fn get_normalization_payroll_employees(
     req: HttpRequest,
     path: web::Path<String>,
-    query: web::Query<AnalyticsParams>,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let from = query.from();
-    let to = query.to();
-    let (from_y, from_m) = crate::services::analytics::summary::parse_ym(&from);
-    let (to_y, to_m) = crate::services::analytics::summary::parse_ym(&to);
-    let rows = normalization::list_payroll_employees(&pool, &rfc, from_y, from_m, to_y, to_m)
+    // L5-02: this catalog is no longer windowed by a date range -- it always returns each
+    // employee's real full history, which is the whole point (see normalization.rs).
+    let rows = normalization::list_payroll_employees(&pool, &rfc)
         .await
         .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(rows))

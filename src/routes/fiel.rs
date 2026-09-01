@@ -83,7 +83,8 @@ pub async fn upload(
         let mut field = match item {
             Ok(f) => f,
             Err(e) => {
-                return HttpResponse::BadRequest().json(serde_json::json!({"error": e.to_string()}));
+                return HttpResponse::BadRequest()
+                    .json(serde_json::json!({"error": e.to_string()}));
             }
         };
 
