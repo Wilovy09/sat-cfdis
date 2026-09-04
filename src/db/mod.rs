@@ -1,6 +1,7 @@
 pub mod cfdis;
 pub mod fiel;
 pub mod jobs;
+pub mod migration_guard;
 pub mod subscriptions;
 pub mod users;
 

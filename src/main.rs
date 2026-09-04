@@ -1043,6 +1043,12 @@ async fn main() -> std::io::Result<()> {
         panic!("Failed to connect to PostgreSQL at '{}': {e}", cfg.pg_host);
     });
 
+    // L6-01: catches the environment/repo divergence init_pool's own sqlx::migrate! can't --
+    // migration files present that were never applied (or a DB ahead of this checkout).
+    db::migration_guard::ensure_current(&pool, std::path::Path::new("./migrations"))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
     // Reset any jobs that were left in 'running' state from a previous crash
     match db::jobs::reset_stale_running(&pool).await {
         Ok(0) => {}
@@ -1388,6 +1394,12 @@ async fn main() -> std::io::Result<()> {
                     .service(
                         web::resource("/normalization/counterparties/{cp_rfc}/cfdis")
                             .route(web::get().to(analytics_routes::list_norm_counterparty_cfdis)),
+                    )
+                    .service(
+                        web::resource("/normalization/individual-rule-ids").route(
+                            web::get()
+                                .to(analytics_routes::list_normalization_individual_rule_ids),
+                        ),
                     )
                     .service(web::resource("/normalization/payroll/employees").route(
                         web::get().to(analytics_routes::get_normalization_payroll_employees),
