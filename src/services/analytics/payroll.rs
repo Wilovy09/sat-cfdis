@@ -207,6 +207,71 @@ pub struct EmployeeYearRow {
     pub avg_sdi: f64,
 }
 
+/// Nómina monthly series — L5-04: grouped AND filtered by devengo (n.year_devengo/
+/// n.month_devengo), consistently. Filtering by emisión while grouping by devengo used to
+/// let a receipt stamped after its own accrual month enter through a window that didn't
+/// include the month it actually landed in, so a month's total changed depending on the
+/// window requested.
+///
+/// Extracted out of `get()` so L6-04's performance budget can time this query on its own.
+pub async fn monthly_series(
+    pool: &DbPool,
+    rfc: &str,
+    from_y: i64,
+    from_m: i64,
+    to_y: i64,
+    to_m: i64,
+) -> anyhow::Result<Vec<PayrollMonth>> {
+    let month_rows = sqlx::query(
+        r#"
+        SELECT
+               n.year_devengo  AS year,
+               n.month_devengo AS month,
+               SUM(n.total_percepciones) AS pagado,
+               SUM(n.total_percepciones)               AS perc,
+               SUM(n.total_deducciones)                AS ded,
+               SUM(n.total_otros_pagos)                AS otros,
+               COUNT(DISTINCT n.rfc_receptor)           AS emp_count,
+               COUNT(*)                                AS payrolls_count,
+               BOOL_OR(n.year > n.year_devengo OR (n.year = n.year_devengo AND n.month > n.month_devengo)) AS has_late_receipts
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
+          AND NOT n.is_excluded
+        GROUP BY 1, 2
+        ORDER BY 1, 2
+    "#,
+    )
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(month_rows
+        .iter()
+        .map(|r| {
+            let year: i64 = r.try_get("year").unwrap_or(0);
+            let month: i64 = r.try_get("month").unwrap_or(0);
+            PayrollMonth {
+                period: format!("{year}-{month:02}"),
+                year,
+                month,
+                total_pagado: get_f64(r, "pagado"),
+                total_percepciones: get_f64(r, "perc"),
+                total_deducciones: get_f64(r, "ded"),
+                total_otros_pagos: get_f64(r, "otros"),
+                employee_count: r.try_get("emp_count").unwrap_or(0),
+                payrolls_count: r.try_get("payrolls_count").unwrap_or(0),
+                has_late_receipts: r.try_get("has_late_receipts").unwrap_or(false),
+            }
+        })
+        .collect())
+}
+
 pub async fn get(
     pool: &DbPool,
     rfc: &str, // employer RFC (rfc_emisor for nomina)
@@ -284,59 +349,7 @@ pub async fn get(
         payrolls_count: payrolls,
     };
 
-    // By month — L5-04: grouped AND filtered by devengo (n.year_devengo/n.month_devengo),
-    // consistently. Filtering by emisión while grouping by devengo used to let a receipt
-    // stamped after its own accrual month enter through a window that didn't include the
-    // month it actually landed in, so a month's total changed depending on the window
-    // requested.
-    let month_rows = sqlx::query(&format!(
-        r#"
-        SELECT
-               n.year_devengo  AS year,
-               n.month_devengo AS month,
-               SUM(n.total_percepciones) AS pagado,
-               SUM(n.total_percepciones)               AS perc,
-               SUM(n.total_deducciones)                AS ded,
-               SUM(n.total_otros_pagos)                AS otros,
-               COUNT(DISTINCT n.rfc_receptor)           AS emp_count,
-               COUNT(*)                                AS payrolls_count,
-               BOOL_OR(n.year > n.year_devengo OR (n.year = n.year_devengo AND n.month > n.month_devengo)) AS has_late_receipts
-        FROM pulso.nomina_normalizada n
-        WHERE n.rfc_emisor = $1
-          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
-          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
-          AND NOT n.is_excluded
-        GROUP BY 1, 2
-        ORDER BY 1, 2
-    "#,
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_all(pool)
-    .await?;
-
-    let by_month: Vec<PayrollMonth> = month_rows
-        .iter()
-        .map(|r| {
-            let year: i64 = r.try_get("year").unwrap_or(0);
-            let month: i64 = r.try_get("month").unwrap_or(0);
-            PayrollMonth {
-                period: format!("{year}-{month:02}"),
-                year,
-                month,
-                total_pagado: get_f64(r, "pagado"),
-                total_percepciones: get_f64(r, "perc"),
-                total_deducciones: get_f64(r, "ded"),
-                total_otros_pagos: get_f64(r, "otros"),
-                employee_count: r.try_get("emp_count").unwrap_or(0),
-                payrolls_count: r.try_get("payrolls_count").unwrap_or(0),
-                has_late_receipts: r.try_get("has_late_receipts").unwrap_or(false),
-            }
-        })
-        .collect();
+    let by_month = monthly_series(pool, rfc, from_y, from_m, to_y, to_m).await?;
 
     // By employee (top 100 by total paid) — latest dept/puesto/contrato via DISTINCT ON
     let emp_rows = sqlx::query(&format!(
@@ -646,28 +659,25 @@ pub async fn get(
         })
         .collect();
 
-    // NRS03: individual indemnization records filtered by tipo_regimen LIKE '13%'
+    // NRS03: individual indemnization records filtered by tipo_regimen LIKE '13%'. L6-07:
+    // windowed and projected by devengo (n.year_devengo/n.month_devengo), matching by_month/
+    // by_year/by_month_ordinaria -- this was the last of the 13 original queries still
+    // computing devengo inline instead of reading it from the view.
     let indem_rows = sqlx::query(&format!(
         r#"
         SELECT
             n.rfc_receptor                                                               AS emp_rfc,
             COALESCE(NULLIF(TRIM(n.nombre_receptor), ''), n.rfc_receptor)                AS nombre,
             COALESCE(NULLIF(TRIM(n.puesto), ''), '')                                     AS puesto,
-            EXTRACT(YEAR FROM COALESCE(
-              NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-              n.fecha_emision::date
-            ))::bigint                                                                   AS year,
-            EXTRACT(MONTH FROM COALESCE(
-              NULLIF(NULLIF(TRIM(COALESCE(n.fecha_final_pago,'')), ''), '0000-00-00')::date,
-              n.fecha_emision::date
-            ))::bigint                                                                   AS month,
+            n.year_devengo                                                               AS year,
+            n.month_devengo                                                              AS month,
             n.total_percepciones                                                        AS total_perc,
             COALESCE(n.tipo_regimen, '')                                                 AS tipo_regimen
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
           AND TRIM(COALESCE(n.tipo_regimen,'')) LIKE '13%'
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         ORDER BY year, month, total_perc DESC
     "#,

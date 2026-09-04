@@ -1208,14 +1208,16 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             })
             .collect();
 
-        // Nómina neta de caja (percepciones + otros_pagos - deducciones, NOM-7), todo
-        // tipo_nomina -- matches payroll.by_month.total_pagado, which is what the
-        // dashboard's "Neto facturado" nómina leg reads. No longer excludes eventual
-        // percepciones: that exclusion is a run-rate concept (DEC-020), not a cash one.
+        // Nómina bruta (total_percepciones, L5-04's bruto redefinition), todo tipo_nomina --
+        // matches the single definition every other consumer (payroll.rs's by_month/by_year,
+        // the bridge's three nomina sources, list_excluded_cfdis) uses since Lote 5. Prior to
+        // that redefinition this summed percepciones + otros_pagos - deducciones to match
+        // payroll.by_month.total_pagado; that parity claim is no longer true since
+        // total_pagado itself moved to pure total_percepciones.
         let nom_rows = sqlx::query(
             r#"
             SELECT n.year,
-                   SUM(n.total_percepciones + n.total_otros_pagos - n.total_deducciones) AS nomina
+                   SUM(n.total_percepciones) AS nomina
             FROM pulso.nomina_normalizada n
             WHERE n.rfc_emisor = $1
               AND NOT n.is_excluded

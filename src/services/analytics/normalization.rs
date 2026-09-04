@@ -5,6 +5,7 @@ use crate::services::analytics::summary::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::collections::HashMap;
 use utoipa::ToSchema;
 
 // ---------------------------------------------------------------------------
@@ -385,6 +386,25 @@ pub async fn list_payroll_rules(
     .fetch_all(pool)
     .await?;
 
+    // L6-04: the L5-14 re-evaluation below used to call compute_adjust_factor_warnings once
+    // per adjust_to_amount_mxn rule -- one network round trip per rule (measured: 60 seeded
+    // rows took ~9.7s end to end, an order of magnitude over the 1s performance budget).
+    // Every candidate employee's monthly percepciones are fetched once here instead, and
+    // classified against each rule's own period bounds in memory below.
+    let mut adjust_employee_rfcs: Vec<String> = Vec::new();
+    for r in &rows {
+        let rule_family: String = r.try_get("rule_family").unwrap_or_default();
+        if rule_family != "adjust_to_amount_mxn" {
+            continue;
+        }
+        if let Ok(Some(employee_rfc)) = r.try_get::<Option<String>, _>("employee_rfc") {
+            adjust_employee_rfcs.push(employee_rfc);
+        }
+    }
+    let adjust_sources =
+        batch_adjust_factor_sources(pool, owner_rfc, &adjust_employee_rfcs).await?;
+    let no_sources: Vec<(i64, i64, f64)> = Vec::new();
+
     let mut result = Vec::with_capacity(rows.len());
     for r in &rows {
         let rule_family: String = r.try_get("rule_family").unwrap_or_default();
@@ -399,15 +419,13 @@ pub async fn list_payroll_rules(
         // informational: it marks the row, it never removes it from the list.
         let factor_warnings = match (rule_family.as_str(), employee_rfc.as_deref(), value_mxn) {
             ("adjust_to_amount_mxn", Some(employee_rfc), Some(value_mxn)) => {
-                let (high, low) = compute_adjust_factor_warnings(
-                    pool,
-                    owner_rfc,
-                    employee_rfc,
+                let monthly = adjust_sources.get(employee_rfc).unwrap_or(&no_sources);
+                let (high, low) = classify_adjust_factor_warnings(
+                    monthly,
                     value_mxn,
                     period_start.as_deref(),
                     period_end.as_deref(),
-                )
-                .await?;
+                );
                 high.into_iter().chain(low).collect()
             }
             _ => Vec::new(),
@@ -595,13 +613,13 @@ async fn check_payroll_rule_locks(
     Ok(None)
 }
 
-/// Per-month factor for a (would-be or already-saved) `adjust_to_amount_mxn` rule against
-/// real percepciones, split into months above `FACTOR_REJECT_ABOVE` and below
-/// `FACTOR_WARN_BELOW`. Shared by `check_payroll_rule` (a candidate value, before the rule
-/// is written) and `list_payroll_rules` (L5-14: the rule's own saved value, re-evaluated
-/// against whatever real percepciones exist now). A month with zero percepciones is
-/// skipped -- factor is undefined, "no se inventa el monto donde no hubo recibo", same
-/// rule `pulso.nomina_normalizada` already follows.
+/// Per-month factor for a candidate `adjust_to_amount_mxn` value against real percepciones,
+/// split into months above `FACTOR_REJECT_ABOVE` and below `FACTOR_WARN_BELOW`. Used by
+/// `check_payroll_rule` for the one value a create/update request is proposing -- a single
+/// call, not looped, so querying per-employee here is fine. `list_payroll_rules` (L5-14:
+/// re-evaluating every already-saved rule) instead uses the batched
+/// `batch_adjust_factor_sources` + `classify_adjust_factor_warnings` pair below (L6-04),
+/// which apply the exact same math without one query per rule.
 async fn compute_adjust_factor_warnings(
     pool: &DbPool,
     owner_rfc: &str,
@@ -649,6 +667,83 @@ async fn compute_adjust_factor_warnings(
         }
     }
     Ok((high, low))
+}
+
+/// L6-04: every `adjust_to_amount_mxn` candidate employee's monthly percepciones, fetched
+/// in one query instead of `list_payroll_rules` running `compute_adjust_factor_warnings`
+/// once per rule. No period filtering here -- `classify_adjust_factor_warnings` applies
+/// each rule's own bounds afterward, since two rules can share an employee with different
+/// periods.
+async fn batch_adjust_factor_sources(
+    pool: &DbPool,
+    owner_rfc: &str,
+    employee_rfcs: &[String],
+) -> anyhow::Result<HashMap<String, Vec<(i64, i64, f64)>>> {
+    if employee_rfcs.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
+        r#"SELECT c.rfc_receptor AS employee_rfc, c.year, c.month,
+                  SUM(COALESCE(n.total_percepciones, 0))::float8 AS perc
+           FROM pulso.cfdis c
+           JOIN pulso.cfdi_nomina n ON n.uuid = c.uuid
+           WHERE c.rfc_emisor = $1 AND c.rfc_receptor = ANY($2)
+             AND c.tipo_comprobante = 'N' AND NOT c.is_cancelled
+           GROUP BY c.rfc_receptor, c.year, c.month"#,
+    )
+    .bind(owner_rfc)
+    .bind(employee_rfcs)
+    .fetch_all(pool)
+    .await?;
+
+    let mut by_employee: HashMap<String, Vec<(i64, i64, f64)>> = HashMap::new();
+    for r in &rows {
+        let employee_rfc: String = r.try_get("employee_rfc").unwrap_or_default();
+        let year: i64 = r.try_get("year").unwrap_or(0);
+        let month: i64 = r.try_get("month").unwrap_or(0);
+        by_employee
+            .entry(employee_rfc)
+            .or_default()
+            .push((year, month, get_f64(r, "perc")));
+    }
+    Ok(by_employee)
+}
+
+/// Same threshold/period logic as `compute_adjust_factor_warnings`, applied in memory
+/// against a pre-fetched (year, month, percepciones) set instead of running its own query
+/// per rule -- see `batch_adjust_factor_sources`.
+fn classify_adjust_factor_warnings(
+    monthly_percepciones: &[(i64, i64, f64)],
+    value_mxn: f64,
+    period_start: Option<&str>,
+    period_end: Option<&str>,
+) -> (Vec<FactorWarning>, Vec<FactorWarning>) {
+    let mut high: Vec<FactorWarning> = Vec::new();
+    let mut low: Vec<FactorWarning> = Vec::new();
+    for &(year, month, perc) in monthly_percepciones {
+        if perc <= 0.0 {
+            continue;
+        }
+        let period = format!("{year}-{month:02}");
+        if period_start.is_some_and(|s| period.as_str() < s)
+            || period_end.is_some_and(|e| period.as_str() > e)
+        {
+            continue;
+        }
+        let factor = value_mxn / perc;
+        let warning = FactorWarning {
+            period,
+            factor,
+            real_percepciones: perc,
+        };
+        if factor > FACTOR_REJECT_ABOVE {
+            high.push(warning);
+        } else if factor < FACTOR_WARN_BELOW {
+            low.push(warning);
+        }
+    }
+    (high, low)
 }
 
 /// Validates a payroll rule before it's written: required fields and the nómina motivo
@@ -1289,6 +1384,68 @@ pub async fn list_cfdis_for_counterparty(
 }
 
 // ---------------------------------------------------------------------------
+// L6-11: individual (cfdi_uuid-specific) rule ids a counterparty-wide rule would make
+// redundant
+// ---------------------------------------------------------------------------
+
+/// Every ALREADY-SAVED individual (`cfdi_uuid IS NOT NULL`) exclusion rule whose target
+/// comprobante falls inside the population a counterparty-wide rule (matching
+/// `owner_rfc`/`source_rfc`/`dl_type`, optionally narrowed by `source_name_key` and a
+/// period) would exclude -- so the caller can delete them and avoid double-counting the
+/// same receipt twice (L5-07's fix at the read layer only holds if these get cleaned up).
+///
+/// Same three match predicates `pulso.cfdi_exclusion`'s counterparty branches use
+/// (migration 062): direction (dl_type vs. which side owner_rfc/source_rfc sit on),
+/// the optional generic-RFC name key, and the optional period window. Driven off
+/// `pulso.normalization_rules` (an owner's individual rules number in the tens at most)
+/// joined to `pulso.cfdis` by UUID (primary-key lookup) -- cost scales with how many
+/// individual rules this owner has, never with how many comprobantes the counterparty
+/// relationship has (the 500-row cap L5-15's client-side version was bound by, and which
+/// a 4,599-comprobante relationship already exceeds 9x over). No comprobante rows
+/// travel over the wire, no page limit, and no 2023-or-later floor.
+pub async fn list_individual_rule_ids_for_counterparty(
+    pool: &DbPool,
+    owner_rfc: &str,
+    source_rfc: &str,
+    dl_type: &str,
+    source_name_key: Option<&str>,
+    period_start: Option<&str>,
+    period_end: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query(
+        r#"SELECT nr.id
+           FROM pulso.normalization_rules nr
+           JOIN pulso.cfdis c ON UPPER(nr.cfdi_uuid) = UPPER(c.uuid)
+           WHERE nr.owner_rfc = $1
+             AND nr.cfdi_uuid IS NOT NULL
+             AND nr.action = 'exclude'
+             AND (
+                   ($3 IN ('emitidos', 'ambos') AND c.rfc_emisor = $1 AND c.rfc_receptor = $2
+                    AND ($4::text IS NULL OR $4::text =
+                         REGEXP_REPLACE(REGEXP_REPLACE(TRIM(UPPER(COALESCE(c.nombre_receptor, ''))), '\s+', ' ', 'g'), '[^A-Z0-9 &\-]', '', 'g')))
+                OR ($3 IN ('recibidos', 'ambos') AND c.rfc_receptor = $1 AND c.rfc_emisor = $2
+                    AND ($4::text IS NULL OR $4::text =
+                         REGEXP_REPLACE(REGEXP_REPLACE(TRIM(UPPER(COALESCE(c.nombre_emisor, ''))), '\s+', ' ', 'g'), '[^A-Z0-9 &\-]', '', 'g')))
+             )
+             AND ($5::text IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) >= $5)
+             AND ($6::text IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) <= $6)"#,
+    )
+    .bind(owner_rfc)
+    .bind(source_rfc)
+    .bind(dl_type)
+    .bind(source_name_key)
+    .bind(period_start)
+    .bind(period_end)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| r.try_get::<String, _>("id").unwrap_or_default())
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // GET /normalization/payroll/employees
 // ---------------------------------------------------------------------------
 
@@ -1497,19 +1654,23 @@ pub async fn list_ebitda_bridge_adjustments(
     // total_percepciones alone -- deducciones are withheld on the employee's behalf, still
     // the employer's cost, not a discount to it; otros_pagos is immaterial and mostly the
     // generic SAT bucket, not an employer cost.
+    // L6-08: windowed and grouped by devengo (nn.year_devengo/nn.month_devengo), matching
+    // payroll.rs's by_month/by_year -- grouping by emision while payroll.rs groups by
+    // devengo put a receipt whose emision and devengo straddle a year boundary in a
+    // different year bucket on the bridge than in the P&L for that same receipt.
     let employee_excl_rows = sqlx::query(
         r#"
         SELECT
             pr.id, pr.rule_name, pr.accounting_line, pr.motivo,
-            nn.year,
+            nn.year_devengo AS year,
             SUM(cn.total_percepciones::float8) AS year_total
         FROM pulso.nomina_normalizada nn
         JOIN pulso.payroll_normalization_rules pr ON pr.id = nn.employee_rule_id
         JOIN pulso.cfdi_nomina cn ON cn.uuid = nn.uuid
         WHERE nn.rfc_emisor = $1
-          AND (nn.year > $2 OR (nn.year = $2 AND nn.month >= $3))
-          AND (nn.year < $4 OR (nn.year = $4 AND nn.month <= $5))
-        GROUP BY pr.id, pr.rule_name, pr.accounting_line, pr.motivo, nn.year
+          AND (nn.year_devengo > $2 OR (nn.year_devengo = $2 AND nn.month_devengo >= $3))
+          AND (nn.year_devengo < $4 OR (nn.year_devengo = $4 AND nn.month_devengo <= $5))
+        GROUP BY pr.id, pr.rule_name, pr.accounting_line, pr.motivo, nn.year_devengo
         "#,
     )
     .bind(owner_rfc)
@@ -1531,6 +1692,10 @@ pub async fn list_ebitda_bridge_adjustments(
     // is excluded via nomina_normalizada.employee_rule_id already (source 1) -- joining
     // back to the view and requiring employee_rule_id IS NULL keeps this source from
     // double-counting it.
+    // L6-08: windowed and grouped by devengo (nn.year_devengo/nn.month_devengo) rather than
+    // c.year/c.month (emision) -- same fix as source 1, for the same reason: this source
+    // already joins nn (added in L5-06 for the employee-rule-wins fix above), so the devengo
+    // columns are available directly without an extra join.
     let receipt_excl_rows = sqlx::query(
         r#"
         SELECT
@@ -1539,7 +1704,7 @@ pub async fn list_ebitda_bridge_adjustments(
             -- L5-01: see the analogous cast on the source-1 query above.
             nr.capex_useful_life_years::float8 AS capex_useful_life_years,
             nr.capex_annual_dep_mxn::float8 AS capex_annual_dep_mxn,
-            c.year,
+            nn.year_devengo AS year,
             SUM(n.total_percepciones::float8) AS year_total
         FROM pulso.cfdi_exclusion ex
         JOIN pulso.normalization_rules nr ON nr.id = ex.rule_id
@@ -1550,11 +1715,11 @@ pub async fn list_ebitda_bridge_adjustments(
           AND c.tipo_comprobante = 'N'
           AND NOT c.is_cancelled
           AND nn.employee_rule_id IS NULL
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND (nn.year_devengo > $2 OR (nn.year_devengo = $2 AND nn.month_devengo >= $3))
+          AND (nn.year_devengo < $4 OR (nn.year_devengo = $4 AND nn.month_devengo <= $5))
         GROUP BY nr.id, nr.rule_name, nr.accounting_line, nr.motivo, nr.dl_type,
                  nr.impacts_ebitda, nr.capex_estimate_dep, nr.capex_asset_type,
-                 nr.capex_useful_life_years, nr.capex_annual_dep_mxn, c.year
+                 nr.capex_useful_life_years, nr.capex_annual_dep_mxn, nn.year_devengo
         "#,
     )
     .bind(owner_rfc)
@@ -1576,20 +1741,21 @@ pub async fn list_ebitda_bridge_adjustments(
     // L5-05: an employee who is both excluded and has a scale/adjust rule must not also
     // contribute a factor difference here -- their cost is already fully out of the P&L
     // via the exclusion (source 1), so this would be a phantom adjustment on top of it.
+    // L6-08: windowed and grouped by devengo, same fix and same reason as source 1.
     let factor_diff_rows = sqlx::query(
         r#"
         SELECT
             pr.id, pr.rule_name, pr.accounting_line, pr.motivo,
-            nn.year,
+            nn.year_devengo AS year,
             SUM(cn.total_percepciones::float8 - nn.total_percepciones)::float8 AS year_total
         FROM pulso.nomina_normalizada nn
         JOIN pulso.payroll_normalization_rules pr ON pr.id = nn.factor_rule_id
         JOIN pulso.cfdi_nomina cn ON cn.uuid = nn.uuid
         WHERE nn.rfc_emisor = $1
           AND NOT nn.is_excluded
-          AND (nn.year > $2 OR (nn.year = $2 AND nn.month >= $3))
-          AND (nn.year < $4 OR (nn.year = $4 AND nn.month <= $5))
-        GROUP BY pr.id, pr.rule_name, pr.accounting_line, pr.motivo, nn.year
+          AND (nn.year_devengo > $2 OR (nn.year_devengo = $2 AND nn.month_devengo >= $3))
+          AND (nn.year_devengo < $4 OR (nn.year_devengo = $4 AND nn.month_devengo <= $5))
+        GROUP BY pr.id, pr.rule_name, pr.accounting_line, pr.motivo, nn.year_devengo
         "#,
     )
     .bind(owner_rfc)

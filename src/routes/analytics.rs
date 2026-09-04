@@ -585,7 +585,7 @@ pub async fn create_normalization(
     validate_comprobante_rule_fields(&body)?;
     let rule = normalization::create_rule(&pool, &rfc, &body)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(map_normalization_rule_error)?;
     Ok(HttpResponse::Created().json(rule))
 }
 
@@ -619,7 +619,7 @@ pub async fn update_normalization(
     validate_comprobante_rule_fields(&body)?;
     let rule = normalization::update_rule(&pool, &id, &rfc, &body)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(map_normalization_rule_error)?;
     match rule {
         Some(rule) => Ok(HttpResponse::Ok().json(rule)),
         None => Err(AppError::not_found("Rule not found")),
@@ -655,6 +655,26 @@ fn validate_comprobante_rule_fields(
         ));
     }
     Ok(())
+}
+
+/// C4 (L6-10): migration 067 adds a partial unique index on
+/// `(owner_rfc, cfdi_uuid) WHERE cfdi_uuid IS NOT NULL AND action = 'exclude'` -- the DB
+/// now rejects what the UI already avoided by hiding "Ajustar CFDI individual" once a
+/// receipt is excluded (still reachable by a stale tab or a race between two requests).
+/// Translates the resulting 23505 into the same conflict, instead of a raw 500.
+fn map_normalization_rule_error(e: anyhow::Error) -> AppError {
+    let is_duplicate_cfdi_rule = e
+        .downcast_ref::<sqlx::Error>()
+        .and_then(|se| se.as_database_error())
+        .is_some_and(|de| de.code().as_deref() == Some("23505"));
+    if is_duplicate_cfdi_rule {
+        AppError::bad_request(
+            "Ya existe una regla que excluye este mismo comprobante. Dos reglas no pueden \
+             apuntar al mismo CFDI.",
+        )
+    } else {
+        AppError::internal(&e.to_string())
+    }
 }
 
 #[utoipa::path(
@@ -924,6 +944,65 @@ pub async fn list_norm_counterparty_cfdis(
     .await
     .map_err(|e| AppError::internal(&e.to_string()))?;
     Ok(HttpResponse::Ok().json(rows))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/normalization/individual-rule-ids
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct IndividualRuleIdsParams {
+    pub source_rfc: Option<String>,
+    pub dl_type: Option<String>,
+    pub source_name_key: Option<String>,
+    pub period_start: Option<String>,
+    pub period_end: Option<String>,
+}
+
+/// L6-11: server-side replacement for the client-side `findCpIndividualRuleIds`, which
+/// paginated up to 500 comprobantes per request (the server's own `limit()` cap) to spot
+/// individual rules a counterparty-wide rule would make redundant -- silently missing
+/// anything past that cap on a relationship as large as 4,599 comprobantes (9.2x over).
+/// Same match logic as `pulso.cfdi_exclusion`'s counterparty branches (migration 062),
+/// resolved entirely in SQL: no comprobante rows returned, no page limit, no date floor.
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
+pub async fn list_normalization_individual_rule_ids(
+    req: HttpRequest,
+    path: web::Path<String>,
+    query: web::Query<IndividualRuleIdsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", &rfc.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+
+    let source_rfc = query
+        .source_rfc
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::bad_request("source_rfc es obligatorio"))?
+        .to_uppercase();
+    let dl_type = query
+        .dl_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::bad_request("dl_type es obligatorio"))?;
+
+    let rule_ids = normalization::list_individual_rule_ids_for_counterparty(
+        &pool,
+        &rfc,
+        &source_rfc,
+        dl_type,
+        query.source_name_key.as_deref(),
+        query.period_start.as_deref(),
+        query.period_end.as_deref(),
+    )
+    .await
+    .map_err(|e| AppError::internal(&e.to_string()))?;
+
+    Ok(HttpResponse::Ok().json(rule_ids))
 }
 
 // ---------------------------------------------------------------------------
