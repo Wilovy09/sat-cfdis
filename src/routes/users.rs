@@ -205,6 +205,32 @@ fn month_progress(
     months
 }
 
+/// L6-13-adjacent fix: `months` (above) is direction-blind -- a month reads "done" the
+/// instant either emitidas or recibidas has one row, so an RFC downloaded on only one side
+/// still shows a fully "done" grid. Builds the same grid scoped to one direction: its own
+/// months-with-data (rfc_emisor vs rfc_receptor) and its own job's cursor/status, not the
+/// one job `sync_status` happened to pick for the top-level fields.
+async fn direction_months(
+    pool: &DbPool,
+    rfc: &str,
+    direction: &str,
+    range_from: &str,
+    range_to: &str,
+) -> Vec<serde_json::Value> {
+    let months_with_data = crate::db::cfdis::months_with_data_direction(pool, rfc, direction)
+        .await
+        .unwrap_or_default();
+    let job = crate::db::jobs::get_latest_for_rfc_direction(pool, rfc, direction)
+        .await
+        .ok()
+        .flatten();
+    let (cursor, status) = match &job {
+        Some(j) => (j.cursor_date.as_deref(), j.status.as_str()),
+        None => (None, "pending"),
+    };
+    month_progress(range_from, range_to, cursor, status, &months_with_data)
+}
+
 /// (year, month) the counting/downloading pass is currently on, for the
 /// frontend's "consultando"/"descargando" indicators — `None` when that
 /// pass hasn't produced a date yet.
@@ -655,6 +681,10 @@ pub async fn sync_status(
                     &active_job.status,
                     &months_with_data,
                 );
+                let months_emitidos =
+                    direction_months(&pool, rfc, "emitidos", &range_from, &range_to).await;
+                let months_recibidos =
+                    direction_months(&pool, rfc, "recibidos", &range_from, &range_to).await;
                 let (counting_year, counting_month) =
                     current_year_month(active_job.count_cursor_date.as_deref());
                 let (downloading_year, downloading_month) =
@@ -672,6 +702,8 @@ pub async fn sync_status(
                     "error_code":         active_job.error_code,
                     "error_msg":          active_job.error_msg,
                     "months":             months,
+                    "months_emitidos":    months_emitidos,
+                    "months_recibidos":   months_recibidos,
                     "counting_year":      counting_year,
                     "counting_month":     counting_month,
                     "downloading_year":   downloading_year,
@@ -738,6 +770,10 @@ pub async fn sync_status(
                 &job.status,
                 &months_with_data,
             );
+            let months_emitidos =
+                direction_months(&pool, &job.rfc, "emitidos", &range_from, &range_to).await;
+            let months_recibidos =
+                direction_months(&pool, &job.rfc, "recibidos", &range_from, &range_to).await;
             let (counting_year, counting_month) =
                 current_year_month(job.count_cursor_date.as_deref());
             let (downloading_year, downloading_month) =
@@ -755,6 +791,8 @@ pub async fn sync_status(
                 "error_code":         job.error_code,
                 "error_msg":          job.error_msg,
                 "months":             months,
+                "months_emitidos":    months_emitidos,
+                "months_recibidos":   months_recibidos,
                 "counting_year":      counting_year,
                 "counting_month":     counting_month,
                 "downloading_year":   downloading_year,

@@ -762,6 +762,37 @@ pub async fn months_with_data(
         .collect())
 }
 
+/// Same as `months_with_data`, scoped to one direction -- `rfc_emisor = rfc` for "emitidos",
+/// `rfc_receptor = rfc` for "recibidos" (`rfc_column`'s own convention, reused from
+/// services/analytics/summary.rs). `months_with_data`'s OR of both columns is exactly what
+/// hides an asymmetric sync (all emitidos downloaded, recibidos barely started) behind a
+/// grid that looks fully done -- a month reads "done" there the instant *either* side has
+/// one row.
+pub async fn months_with_data_direction(
+    pool: &PgPool,
+    rfc: &str,
+    dl_type: &str,
+) -> Result<std::collections::HashSet<(i64, i64)>, sqlx::Error> {
+    use sqlx::Row;
+    let rfc = rfc.to_uppercase();
+    let col = crate::services::analytics::summary::rfc_column(dl_type);
+    let rows = sqlx::query(&format!(
+        "SELECT DISTINCT year, month FROM pulso.cfdis WHERE {col} = $1"
+    ))
+    .bind(&rfc)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.try_get::<i64, _>("year").unwrap_or(0),
+                r.try_get::<i64, _>("month").unwrap_or(0),
+            )
+        })
+        .collect())
+}
+
 /// Candidate invoices for `estado_sat` re-verification: currently flagged
 /// cancelled, and either never checked (one-time historical backlog) or
 /// emitted within `recent_days` and not checked within `min_recheck_hours` —

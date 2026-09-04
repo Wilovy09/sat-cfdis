@@ -662,6 +662,52 @@ pub async fn get_active_for_rfc(pool: &PgPool, rfc: &str) -> Result<Option<SyncJ
     .await
 }
 
+/// Same as `get_active_for_rfc`, scoped to jobs that actually advance the given direction:
+/// `dl_type` equal to it, or `'ambos'` (an `'ambos'` job downloads both directions in
+/// lockstep day-by-day, so its cursor is valid progress for either one -- see
+/// php-cli/bin/cfdi-scraper's `list-stream`). Falls back to the most recently created job
+/// for that direction regardless of status (so a completed direction still reports
+/// `status: "completed"` instead of looking never-started) when none is currently active.
+/// Powers sync_status's per-direction month grid (emitidas vs recibidas).
+pub async fn get_latest_for_rfc_direction(
+    pool: &PgPool,
+    rfc: &str,
+    direction: &str,
+) -> Result<Option<SyncJob>, sqlx::Error> {
+    let rfc = rfc.to_uppercase();
+    if let Some(job) = sqlx::query_as::<_, SyncJob>(
+        r#"SELECT * FROM pulso.sync_jobs
+           WHERE rfc = $1
+             AND dl_type IN ($2, 'ambos')
+             AND status IN ('running', 'queued', 'paused_limit')
+           ORDER BY
+             CASE status
+               WHEN 'running'      THEN 0
+               WHEN 'queued'       THEN 1
+               WHEN 'paused_limit' THEN 2
+             END,
+             created_at DESC
+           LIMIT 1"#,
+    )
+    .bind(&rfc)
+    .bind(direction)
+    .fetch_optional(pool)
+    .await?
+    {
+        return Ok(Some(job));
+    }
+    sqlx::query_as::<_, SyncJob>(
+        r#"SELECT * FROM pulso.sync_jobs
+           WHERE rfc = $1 AND dl_type IN ($2, 'ambos')
+           ORDER BY created_at DESC
+           LIMIT 1"#,
+    )
+    .bind(&rfc)
+    .bind(direction)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Widest [period_from, period_to] across every job this RFC has ever had,
 /// any status. `sync_status`'s coverage widget used to show a single job's
 /// own period_from/period_to — fine while an RFC had one job at a time, but
