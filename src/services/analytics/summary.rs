@@ -280,7 +280,7 @@ pub fn rfc_column(dl_type: &str) -> &'static str {
 pub fn dl_type_filter(dl_type: &str) -> &'static str {
     match dl_type {
         "recibidos" => "dl_type IN ('recibidos', 'ambos')",
-        "ambos" => "1=1",
+        "ambos" => "dl_type IN ('emitidos', 'recibidos', 'ambos')",
         _ => "dl_type IN ('emitidos', 'ambos')",
     }
 }
