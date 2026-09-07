@@ -123,7 +123,7 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
     // LTM = last 12 *calendar* months ending at to_y/to_m.
     // Do NOT use .take(12) — that grabs the last 12 data points and skips
     // gap months, producing inflated totals when data is sparse.
-    by_month.sort_by(|a, b| (a.year, a.month).cmp(&(b.year, b.month)));
+    by_month.sort_by_key(|a| (a.year, a.month));
     let ltm_total_months = to_y * 12 + to_m; // absolute month index of the end
     let ltm_start_abs = ltm_total_months - 11; // 12-month window inclusive
     let ltm_start_y = (ltm_start_abs - 1) / 12;

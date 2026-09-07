@@ -29,6 +29,11 @@ pub mod services {
         // modules above (only `super::summary` and `crate::db::DbPool`).
         pub mod counterparties;
         pub mod quarterly;
+        // L6C-10 addition: needed to call the real hallazgos::get for the "H3 vs
+        // payroll::monthly_series" consistency invariant. Only depends on
+        // super::summary::get_f64, crate::db::DbPool, and super::payroll::get_snapshot --
+        // all three already exposed above, no binary-only dependency.
+        pub mod hallazgos;
     }
     // `db::cfdis` (pulled in by `pub mod db` above) depends on this for XML parsing.
     pub mod xml_parser;

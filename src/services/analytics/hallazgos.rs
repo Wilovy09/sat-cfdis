@@ -480,24 +480,46 @@ async fn compute_h1(
 // H5A — Rotación de personal
 // ---------------------------------------------------------------------------
 
-async fn compute_h5a(
-    pool: &DbPool,
-    rfc: &str,
-    ltm_start_y: i64,
-    ltm_start_m: i64,
-    ltm_end_y: i64,
-    ltm_end_m: i64,
-) -> anyhow::Result<Option<Hallazgo>> {
+/// L6C-03: H5A/H5B's own "last period" -- nómina's own MAX(year, month), not the facturas
+/// anchor `get()` resolves for H1/H2/H3/H6 (which excludes tipo_comprobante='N' precisely
+/// so nómina can't move it). Nómina is timbrada after facturas, so the facturas anchor is
+/// routinely a month ahead of the last real payroll -- for 5 of 7 RFCs measured 2026-09-04,
+/// the facturas anchor's month has ZERO nómina rows, so `latest_row`/`term_rows` compared
+/// every real employee against an empty ghost month: H5A read 100% rotación (every LTM
+/// employee counted as a baja against a month with nobody in it) and H5B marked the entire
+/// plantilla as terminada. Resolved by having H5A/H5B query nomina_normalizada's own anchor
+/// directly instead of receiving the facturas one from the caller.
+async fn nomina_last_period(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<(i64, i64)>> {
+    let row = sqlx::query(
+        r#"
+        SELECT MAX(year * 100 + month)::bigint AS max_ym
+        FROM pulso.nomina_normalizada
+        WHERE rfc_emisor = $1 AND NOT is_excluded
+        "#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await?;
+    let max_ym: Option<i64> = row.try_get("max_ym").ok().flatten();
+    Ok(max_ym.filter(|ym| *ym > 0).map(|ym| (ym / 100, ym % 100)))
+}
+
+async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo>> {
+    let Some((ltm_end_y, ltm_end_m)) = nomina_last_period(pool, rfc).await? else {
+        return Ok(None);
+    };
+    let (ltm_start_y, ltm_start_m) = subtract_months(ltm_end_y, ltm_end_m, 11);
+
     // Per-month distinct employee count in LTM
     let month_rows = sqlx::query(
         r#"
-        SELECT n.year, n.month, COUNT(DISTINCT n.rfc_receptor)::bigint AS hc
+        SELECT n.year_devengo AS year, n.month_devengo AS month, COUNT(DISTINCT n.rfc_receptor)::bigint AS hc
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
-        GROUP BY n.year, n.month
+        GROUP BY n.year_devengo, n.month_devengo
         "#,
     )
     .bind(rfc)
@@ -524,7 +546,7 @@ async fn compute_h5a(
         SELECT COUNT(DISTINCT n.rfc_receptor)::bigint AS active
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
-          AND n.year = $2 AND n.month = $3
+          AND n.year_devengo = $2 AND n.month_devengo = $3
           AND NOT n.is_excluded
         "#,
     )
@@ -543,15 +565,15 @@ async fn compute_h5a(
             SELECT DISTINCT n.rfc_receptor
             FROM pulso.nomina_normalizada n
             WHERE n.rfc_emisor = $1
-              AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-              AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+              AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+              AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
               AND NOT n.is_excluded
         ) ltm
         WHERE NOT EXISTS (
             SELECT 1 FROM pulso.nomina_normalizada n2
             WHERE n2.rfc_emisor = $1
               AND n2.rfc_receptor = ltm.rfc_receptor
-              AND n2.year = $4 AND n2.month = $5
+              AND n2.year_devengo = $4 AND n2.month_devengo = $5
               AND NOT n2.is_excluded
         )
         "#,
@@ -599,12 +621,10 @@ async fn compute_h5a(
 // H5B — Baja de personal clave (top 10% salarial, últimos 24 meses)
 // ---------------------------------------------------------------------------
 
-async fn compute_h5b(
-    pool: &DbPool,
-    rfc: &str,
-    ltm_end_y: i64,
-    ltm_end_m: i64,
-) -> anyhow::Result<Option<Hallazgo>> {
+async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo>> {
+    let Some((ltm_end_y, ltm_end_m)) = nomina_last_period(pool, rfc).await? else {
+        return Ok(None);
+    };
     let (win_start_y, win_start_m) = subtract_months(ltm_end_y, ltm_end_m, 23);
 
     // Employees with last payroll in the 24-month window but not in latest month
@@ -613,16 +633,16 @@ async fn compute_h5b(
         SELECT
             n.rfc_receptor                                                       AS rfc,
             MAX(COALESCE(n.curp, n.rfc_receptor))                               AS nombre,
-            MIN(n.year * 100 + n.month)::bigint                                 AS first_period,
-            MAX(n.year * 100 + n.month)::bigint                                 AS last_period,
+            MIN(n.year_devengo * 100 + n.month_devengo)::bigint                 AS first_period,
+            MAX(n.year_devengo * 100 + n.month_devengo)::bigint                 AS last_period,
             AVG(COALESCE(n.salario_diario_integrado, 0)::float8) * 30           AS sueldo_mensual
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         GROUP BY n.rfc_receptor
-        HAVING MAX(n.year * 100 + n.month) < $4 * 100 + $5
+        HAVING MAX(n.year_devengo * 100 + n.month_devengo) < $4 * 100 + $5
         "#,
     )
     .bind(rfc)
@@ -1146,7 +1166,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         // SUM(I) - SUM(E) within one direction), nómina neta de caja, and L3-01's shared
         // exclusion base instead of a hand-rolled join (AUD-012's broken AND/OR precedence
         // left the UUID branch of that join with no owner/action guard at all).
-        let ing_rows = sqlx::query(&format!(
+        let ing_rows = sqlx::query(
             r#"
             SELECT c.year,
                    SUM(CASE WHEN c.tipo_comprobante = 'I' THEN COALESCE(c.total_mxn,0)
@@ -1161,8 +1181,8 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
                   SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
               )
             GROUP BY c.year
-            "#
-        ))
+            "#,
+        )
         .bind(rfc)
         .fetch_all(pool)
         .await?;
@@ -1177,7 +1197,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             .collect();
 
         // Recibidos per year (con IVA, menos notas de crédito recibidas)
-        let rec_rows = sqlx::query(&format!(
+        let rec_rows = sqlx::query(
             r#"
             SELECT c.year,
                    SUM(CASE WHEN c.tipo_comprobante = 'I' THEN COALESCE(c.total_mxn,0)
@@ -1192,8 +1212,8 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
                   SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
               )
             GROUP BY c.year
-            "#
-        ))
+            "#,
+        )
         .bind(rfc)
         .fetch_all(pool)
         .await?;
@@ -1214,14 +1234,22 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         // that redefinition this summed percepciones + otros_pagos - deducciones to match
         // payroll.by_month.total_pagado; that parity claim is no longer true since
         // total_pagado itself moved to pure total_percepciones.
+        //
+        // DEC-038/L6C-06: grouped by year_devengo, matching payroll::by_year -- L6-06 only
+        // fixed the amount (total_percepciones alone), not the year, so this still diverged
+        // from by_year's total whenever a receipt's devengo and emisión years differed.
+        // Looked up below against `yd.year`, the facturas-side (emisión) annual bucket H1/H2
+        // already iterate -- an accepted mismatch of bases at the year grain: measured
+        // system-wide, only one year boundary (2025/2026) has any receipts that cross it, for
+        // 10,855 pesos total, so this doesn't manufacture a new visible divergence in practice.
         let nom_rows = sqlx::query(
             r#"
-            SELECT n.year,
+            SELECT n.year_devengo AS year,
                    SUM(n.total_percepciones) AS nomina
             FROM pulso.nomina_normalizada n
             WHERE n.rfc_emisor = $1
               AND NOT n.is_excluded
-            GROUP BY n.year
+            GROUP BY n.year_devengo
             "#,
         )
         .bind(rfc)
@@ -1285,37 +1313,38 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     }
 
     // H4, H5A, H5B — payroll hallazgos (conditional on nomina data)
-    if let Ok(snap) = super::payroll::get_snapshot(pool, rfc).await {
-        if snap.has_data {
-            // H4 — Pasivo laboral relativo
-            let ltm_ingreso =
-                compute_ltm_ingreso(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m)
-                    .await
-                    .unwrap_or(0.0);
-            if ltm_ingreso > 0.0 {
-                let ratio_pct = snap.pasivo_laboral_estimado_mxn / ltm_ingreso * 100.0;
-                let meses_equiv = if snap.run_rate_mensual_ltm_mxn > 0.0 {
-                    snap.pasivo_laboral_estimado_mxn / snap.run_rate_mensual_ltm_mxn
-                } else {
-                    0.0
-                };
-                let nivel = h4_nivel(ratio_pct);
-                let interp = h4_interpretacion(nivel);
-                let cuerpo_h4 = if snap.months_of_data >= 6 {
-                    format!(
-                        "El pasivo laboral estimado asciende a {}, equivalente al {:.1}% del ingreso LTM y a {:.1} meses de nómina ordinaria estimada.",
-                        fmt_mxn(snap.pasivo_laboral_estimado_mxn),
-                        ratio_pct,
-                        meses_equiv
-                    )
-                } else {
-                    format!(
-                        "El pasivo laboral estimado asciende a {}, equivalente al {:.1}% del ingreso LTM.",
-                        fmt_mxn(snap.pasivo_laboral_estimado_mxn),
-                        ratio_pct,
-                    )
-                };
-                all.push(Hallazgo {
+    if let Ok(snap) = super::payroll::get_snapshot(pool, rfc).await
+        && snap.has_data
+    {
+        // H4 — Pasivo laboral relativo
+        let ltm_ingreso =
+            compute_ltm_ingreso(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m)
+                .await
+                .unwrap_or(0.0);
+        if ltm_ingreso > 0.0 {
+            let ratio_pct = snap.pasivo_laboral_estimado_mxn / ltm_ingreso * 100.0;
+            let meses_equiv = if snap.run_rate_mensual_ltm_mxn > 0.0 {
+                snap.pasivo_laboral_estimado_mxn / snap.run_rate_mensual_ltm_mxn
+            } else {
+                0.0
+            };
+            let nivel = h4_nivel(ratio_pct);
+            let interp = h4_interpretacion(nivel);
+            let cuerpo_h4 = if snap.months_of_data >= 6 {
+                format!(
+                    "El pasivo laboral estimado asciende a {}, equivalente al {:.1}% del ingreso LTM y a {:.1} meses de nómina ordinaria estimada.",
+                    fmt_mxn(snap.pasivo_laboral_estimado_mxn),
+                    ratio_pct,
+                    meses_equiv
+                )
+            } else {
+                format!(
+                    "El pasivo laboral estimado asciende a {}, equivalente al {:.1}% del ingreso LTM.",
+                    fmt_mxn(snap.pasivo_laboral_estimado_mxn),
+                    ratio_pct,
+                )
+            };
+            all.push(Hallazgo {
                     id: "H4".to_string(),
                     titulo: "Pasivo laboral estimado".to_string(),
                     familia: "riesgo".to_string(),
@@ -1327,19 +1356,16 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
                     nota_fija: Some("Estimación con prestaciones de ley: aguinaldo 15 días, vacaciones y prima vacacional según Ley Federal del Trabajo. No constituye un cálculo definitivo.".to_string()),
                     datos_tabla: None,
                 });
-            }
+        }
 
-            // H5A — Rotación
-            if let Some(h) =
-                compute_h5a(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?
-            {
-                all.push(h);
-            }
+        // H5A — Rotación
+        if let Some(h) = compute_h5a(pool, rfc).await? {
+            all.push(h);
+        }
 
-            // H5B — Personal clave
-            if let Some(h) = compute_h5b(pool, rfc, ltm_end_y, ltm_end_m).await? {
-                all.push(h);
-            }
+        // H5B — Personal clave
+        if let Some(h) = compute_h5b(pool, rfc).await? {
+            all.push(h);
         }
     }
 

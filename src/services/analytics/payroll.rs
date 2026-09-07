@@ -1,13 +1,14 @@
+//! Payroll: employee analytics from CFDI Nómina complements.
+//!
+//! Money-computing queries here read `pulso.nomina_normalizada` (migration 054, L3-16)
+//! instead of joining `pulso.cfdi_nomina`/`pulso.cfdis` directly: it centralizes the
+//! exclusion rules (exposed as `is_excluded`, which callers must filter with
+//! `AND NOT is_excluded` — rows aren't dropped in the view because a couple of hallazgos
+//! need to see who got excluded) and the scale/adjust factor (exposed as `factor`, already
+//! baked into the view's `total_*` columns, and to be applied by hand when joining the
+//! detail child tables `cfdi_nomina_percepciones`/`_deducciones`/`_otros_pagos`).
+
 use super::summary::{get_f64, parse_ym};
-/// Payroll: employee analytics from CFDI Nómina complements.
-///
-/// Money-computing queries here read `pulso.nomina_normalizada` (migration 054, L3-16)
-/// instead of joining `pulso.cfdi_nomina`/`pulso.cfdis` directly: it centralizes the
-/// exclusion rules (exposed as `is_excluded`, which callers must filter with
-/// `AND NOT is_excluded` — rows aren't dropped in the view because a couple of hallazgos
-/// need to see who got excluded) and the scale/adjust factor (exposed as `factor`, already
-/// baked into the view's `total_*` columns, and to be applied by hand when joining the
-/// detail child tables `cfdi_nomina_percepciones`/`_deducciones`/`_otros_pagos`).
 
 /// Percepciones eventuales — se excluyen de toda métrica de costo recurrente (DEC-020).
 /// Claves validadas contra pulso-adquiere/src/utils/nomina.ts::SAT_PERCEPCIONES.
@@ -282,7 +283,7 @@ pub async fn get(
     let (to_y, to_m) = parse_ym(to);
 
     // Summary (all tipos, to match full payroll spend)
-    let summary_row = sqlx::query(&format!(
+    let summary_row = sqlx::query(
         r#"
         SELECT
             SUM(n.total_percepciones)                                            AS total_pagado,
@@ -294,11 +295,11 @@ pub async fn get(
             COUNT(*)                                                              AS payrolls_count
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
-    "#
-    ))
+    "#,
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -312,18 +313,18 @@ pub async fn get(
     let payrolls: i64 = summary_row.try_get("payrolls_count").unwrap_or(0);
 
     // ISR retenido = deducciones tipo '002' (SAT clave ISR)
-    let isr_row = sqlx::query(&format!(
+    let isr_row = sqlx::query(
         r#"
         SELECT COALESCE(SUM(COALESCE(d.importe, 0)::float8 * n.factor), 0) AS total_isr
         FROM pulso.cfdi_nomina_deducciones d
         JOIN pulso.nomina_normalizada n ON n.uuid = d.uuid
         WHERE n.rfc_emisor = $1
           AND d.tipo_deduccion = '002'
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         "#,
-    ))
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -352,8 +353,7 @@ pub async fn get(
     let by_month = monthly_series(pool, rfc, from_y, from_m, to_y, to_m).await?;
 
     // By employee (top 100 by total paid) — latest dept/puesto/contrato via DISTINCT ON
-    let emp_rows = sqlx::query(&format!(
-        r#"
+    let emp_rows = sqlx::query(r#"
         WITH latest_attrs AS (
             SELECT DISTINCT ON (c.rfc_receptor)
                 c.rfc_receptor AS emp_rfc,
@@ -401,26 +401,25 @@ pub async fn get(
             SUM(n.total_deducciones)                    AS ded,
             AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi,
             COUNT(*)                                    AS payrolls,
-            COUNT(DISTINCT n.year * 100 + n.month)      AS months_active,
-            -- L4-11: the comprobante's own (year, month) -- same attribution the payroll
-            -- rule engine uses (L3-16) -- not fecha_pago, which disagrees with it on 11.8%
-            -- of receipts and used to make the rule form's period picker reject a real
-            -- last month the calculation would have honored.
-            MIN(n.year::text || '-' || LPAD(n.month::text, 2, '0') || '-01') AS first_pay,
-            MAX(n.year::text || '-' || LPAD(n.month::text, 2, '0') || '-01') AS last_pay
+            COUNT(DISTINCT n.year_devengo * 100 + n.month_devengo) AS months_active,
+            -- DEC-038/L6C-04: devengo, not the comprobante's own (year, month) -- L4-11's
+            -- reasoning (fecha_pago disagrees with the comprobante's own period on 11.8% of
+            -- receipts) still holds against fecha_pago, but devengo is the definition that
+            -- applies since DEC-034/DEC-038, a third option L4-11 didn't have to choose from.
+            MIN(n.year_devengo::text || '-' || LPAD(n.month_devengo::text, 2, '0') || '-01') AS first_pay,
+            MAX(n.year_devengo::text || '-' || LPAD(n.month_devengo::text, 2, '0') || '-01') AS last_pay
         FROM pulso.nomina_normalizada n
         JOIN latest_attrs la ON la.emp_rfc = n.rfc_receptor
         LEFT JOIN earliest_attrs ea ON ea.emp_rfc = n.rfc_receptor
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         GROUP BY n.rfc_receptor, la.departamento, la.puesto, la.tipo_contrato, la.tipo_jornada, la.tipo_regimen,
                  la.sdi_latest, la.fecha_final_pago, ea.sdi_at_first, ea.fecha_inicio_rel_laboral
         ORDER BY pagado DESC
         LIMIT 100
-    "#,
-    ))
+    "#)
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -431,8 +430,7 @@ pub async fn get(
 
     // Percepciones desglosadas — últimos 3 meses completos, tipo_nomina='O'
     // Usado para clasificación e sueldos promedio por clave SAT (001 = ordinario, 046 = asimilado)
-    let perc_3m_rows = sqlx::query(&format!(
-        r#"
+    let perc_3m_rows = sqlx::query(r#"
         SELECT
             n.rfc_receptor                                                              AS emp_rfc,
             SUM(CASE WHEN p.tipo_percepcion = '001'
@@ -442,7 +440,7 @@ pub async fn get(
                      THEN (COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor
                      ELSE 0.0 END)                                                      AS total_046,
             SUM(COALESCE(n.num_dias_pagados,0)::float8)                                 AS total_dias,
-            COUNT(DISTINCT (n.year * 100 + n.month))                                    AS meses_con_dato,
+            COUNT(DISTINCT (n.year_devengo * 100 + n.month_devengo))                    AS meses_con_dato,
             BOOL_OR(p.tipo_percepcion = '001')                                          AS has_001,
             BOOL_OR(p.tipo_percepcion = '046')                                          AS has_046
         FROM pulso.cfdi_nomina_percepciones p
@@ -452,18 +450,18 @@ pub async fn get(
           AND NOT n.is_excluded
           -- AUD-015/DEC-025: anchored to the last COMPLETE calendar month, not CURRENT_DATE,
           -- so the window is reproducible across runs on different days (same idiom as
-          -- migrations 052's dias_antiguedad / rfc_as_of_cutoff).
-          AND (n.year * 100 + n.month) >= (
+          -- migrations 052's dias_antiguedad / rfc_as_of_cutoff). L6C-04: compares against
+          -- devengo now, same anchor formula.
+          AND (n.year_devengo * 100 + n.month_devengo) >= (
               EXTRACT(YEAR FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date - interval '2 months')::int * 100 +
               EXTRACT(MONTH FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date - interval '2 months')::int
           )
-          AND (n.year * 100 + n.month) <= (
+          AND (n.year_devengo * 100 + n.month_devengo) <= (
               EXTRACT(YEAR FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date)::int * 100 +
               EXTRACT(MONTH FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date)::int
           )
         GROUP BY n.rfc_receptor
-        "#,
-    ))
+        "#)
     .bind(rfc)
     .fetch_all(pool)
     .await?;
@@ -618,19 +616,19 @@ pub async fn get(
         .collect();
 
     // By tipo nomina
-    let tipo_rows = sqlx::query(&format!(
+    let tipo_rows = sqlx::query(
         r#"
         SELECT n.tipo_nomina,
                SUM(n.total_percepciones) AS total,
                COUNT(*) AS cnt
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         GROUP BY n.tipo_nomina
     "#,
-    ))
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -663,8 +661,7 @@ pub async fn get(
     // windowed and projected by devengo (n.year_devengo/n.month_devengo), matching by_month/
     // by_year/by_month_ordinaria -- this was the last of the 13 original queries still
     // computing devengo inline instead of reading it from the view.
-    let indem_rows = sqlx::query(&format!(
-        r#"
+    let indem_rows = sqlx::query(r#"
         SELECT
             n.rfc_receptor                                                               AS emp_rfc,
             COALESCE(NULLIF(TRIM(n.nombre_receptor), ''), n.rfc_receptor)                AS nombre,
@@ -680,8 +677,7 @@ pub async fn get(
           AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         ORDER BY year, month, total_perc DESC
-    "#,
-    ))
+    "#)
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -704,7 +700,7 @@ pub async fn get(
         .collect();
 
     // By deduccion type
-    let ded_rows = sqlx::query(&format!(
+    let ded_rows = sqlx::query(
         r#"
         SELECT d.tipo_deduccion,
                MAX(d.concepto) AS concepto,
@@ -713,13 +709,13 @@ pub async fn get(
         FROM pulso.cfdi_nomina_deducciones d
         JOIN pulso.nomina_normalizada n ON n.uuid = d.uuid
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         GROUP BY d.tipo_deduccion
         ORDER BY total DESC
     "#,
-    ))
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -739,8 +735,7 @@ pub async fn get(
         .collect();
 
     // By percepcion type
-    let per_rows = sqlx::query(&format!(
-        r#"
+    let per_rows = sqlx::query(r#"
         SELECT p.tipo_percepcion,
                MAX(p.concepto) AS concepto,
                SUM(COALESCE(p.importe_gravado,0)::float8 * n.factor) AS gravado,
@@ -749,13 +744,12 @@ pub async fn get(
         FROM pulso.cfdi_nomina_percepciones p
         JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         GROUP BY p.tipo_percepcion
         ORDER BY SUM(COALESCE(p.importe_gravado,0)::float8 * n.factor) + SUM(COALESCE(p.importe_exento,0)::float8 * n.factor) DESC
-    "#,
-    ))
+    "#)
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -781,7 +775,7 @@ pub async fn get(
         .collect();
 
     // By year — L5-04: grouped and filtered by devengo, same as by_month.
-    let year_rows = sqlx::query(&format!(
+    let year_rows = sqlx::query(
         r#"
         SELECT
                n.year_devengo AS year,
@@ -799,7 +793,7 @@ pub async fn get(
         GROUP BY 1
         ORDER BY 1
     "#,
-    ))
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -825,8 +819,7 @@ pub async fn get(
     // PTU, finiquitos, indemnizaciones) es su propia serie: son eventos
     // aislados y mezclarlos distorsiona la lectura del costo recurrente (NOM-1).
     // L5-04: grouped and filtered by devengo, same as by_month.
-    let month_ord_rows = sqlx::query(&format!(
-        r#"
+    let month_ord_rows = sqlx::query(r#"
         SELECT
                n.year_devengo  AS year,
                n.month_devengo AS month,
@@ -845,8 +838,7 @@ pub async fn get(
           AND NOT n.is_excluded
         GROUP BY 1, 2
         ORDER BY 1, 2
-    "#,
-    ))
+    "#)
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -876,22 +868,20 @@ pub async fn get(
         .collect();
 
     // By percepcion year
-    let per_year_rows = sqlx::query(&format!(
-        r#"
+    let per_year_rows = sqlx::query(r#"
         SELECT p.tipo_percepcion,
                MAX(p.concepto) AS concepto,
-               n.year,
+               n.year_devengo AS year,
                SUM((COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor) AS total
         FROM pulso.cfdi_nomina_percepciones p
         JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
-        GROUP BY p.tipo_percepcion, n.year
-        ORDER BY n.year, SUM((COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor) DESC
-    "#,
-    ))
+        GROUP BY p.tipo_percepcion, n.year_devengo
+        ORDER BY n.year_devengo, SUM((COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor) DESC
+    "#)
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
     .fetch_all(pool)
     .await?;
@@ -907,22 +897,22 @@ pub async fn get(
         .collect();
 
     // By deduccion year
-    let ded_year_rows = sqlx::query(&format!(
+    let ded_year_rows = sqlx::query(
         r#"
         SELECT d.tipo_deduccion,
                MAX(d.concepto) AS concepto,
-               n.year,
+               n.year_devengo AS year,
                SUM(COALESCE(d.importe,0)::float8 * n.factor) AS total
         FROM pulso.cfdi_nomina_deducciones d
         JOIN pulso.nomina_normalizada n ON n.uuid = d.uuid
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
-        GROUP BY d.tipo_deduccion, n.year
-        ORDER BY n.year, SUM(COALESCE(d.importe,0)::float8 * n.factor) DESC
+        GROUP BY d.tipo_deduccion, n.year_devengo
+        ORDER BY n.year_devengo, SUM(COALESCE(d.importe,0)::float8 * n.factor) DESC
     "#,
-    ))
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -942,22 +932,22 @@ pub async fn get(
         .collect();
 
     // By otro pago year
-    let op_year_rows = sqlx::query(&format!(
+    let op_year_rows = sqlx::query(
         r#"
         SELECT op.tipo_otro_pago,
                MAX(op.concepto) AS concepto,
-               n.year,
+               n.year_devengo AS year,
                SUM(COALESCE(op.importe,0)::float8 * n.factor) AS total
         FROM pulso.cfdi_nomina_otros_pagos op
         JOIN pulso.nomina_normalizada n ON n.uuid = op.uuid
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
-        GROUP BY op.tipo_otro_pago, n.year
-        ORDER BY n.year, SUM(COALESCE(op.importe,0)::float8 * n.factor) DESC
+        GROUP BY op.tipo_otro_pago, n.year_devengo
+        ORDER BY n.year_devengo, SUM(COALESCE(op.importe,0)::float8 * n.factor) DESC
     "#,
-    ))
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -977,22 +967,22 @@ pub async fn get(
         .collect();
 
     // By department year
-    let dept_year_rows = sqlx::query(&format!(
+    let dept_year_rows = sqlx::query(
         r#"
         SELECT COALESCE(NULLIF(TRIM(n.departamento),''), 'Sin departamento') AS departamento,
-               n.year,
+               n.year_devengo AS year,
                SUM(n.total_percepciones) AS pagado,
                COUNT(DISTINCT n.rfc_receptor) AS emp_count
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
           AND n.tipo_nomina = 'O'
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
-        GROUP BY departamento, n.year
-        ORDER BY n.year, pagado DESC
+        GROUP BY departamento, n.year_devengo
+        ORDER BY n.year_devengo, pagado DESC
     "#,
-    ))
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -1023,23 +1013,23 @@ pub async fn get(
                MAX(n.nombre_receptor) AS nombre,
                MAX(n.departamento) AS dpto,
                MAX(n.puesto) AS puesto,
-               n.year,
+               n.year_devengo AS year,
                SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * n.factor)
                  FILTER (WHERE p.tipo_percepcion = '001')                    AS sueldo_base,
                SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * n.factor)
                  FILTER (WHERE p.tipo_percepcion NOT IN
                          ({percepciones_eventuales_sql}))                    AS compensacion_ordinaria,
-               COUNT(DISTINCT n.month) AS months_active,
+               COUNT(DISTINCT n.month_devengo) AS months_active,
                AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi
         FROM pulso.cfdi_nomina_percepciones p
         JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid
         WHERE n.rfc_emisor = $1
           AND n.tipo_nomina = 'O'
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
-        GROUP BY n.rfc_receptor, n.year
-        ORDER BY n.rfc_receptor, n.year
+        GROUP BY n.rfc_receptor, n.year_devengo
+        ORDER BY n.rfc_receptor, n.year_devengo
     "#,
     ))
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
@@ -1069,13 +1059,13 @@ pub async fn get(
         .collect();
 
     // New employees per month: first-ever payslip from this employer is within range
-    let new_emp_rows = sqlx::query(&format!(
+    let new_emp_rows = sqlx::query(
         r#"
         SELECT yr AS year, mo AS month, COUNT(*) AS new_emp
         FROM (
             SELECT n2.rfc_receptor,
-                   (MIN(n2.year * 100 + n2.month) / 100)::bigint AS yr,
-                   (MIN(n2.year * 100 + n2.month) % 100)::bigint AS mo
+                   (MIN(n2.year_devengo * 100 + n2.month_devengo) / 100)::bigint AS yr,
+                   (MIN(n2.year_devengo * 100 + n2.month_devengo) % 100)::bigint AS mo
             FROM pulso.nomina_normalizada n2
             WHERE n2.rfc_emisor = $1
               AND NOT n2.is_excluded
@@ -1085,7 +1075,7 @@ pub async fn get(
           AND (yr < $4 OR (yr = $4 AND mo <= $5))
         GROUP BY yr, mo
         "#,
-    ))
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -1105,17 +1095,17 @@ pub async fn get(
         .collect();
 
     // All (year, month, rfc_receptor) in range — used to compute departures
-    let emp_month_rows = sqlx::query(&format!(
+    let emp_month_rows = sqlx::query(
         r#"
-        SELECT DISTINCT n.year, n.month, n.rfc_receptor
+        SELECT DISTINCT n.year_devengo AS year, n.month_devengo AS month, n.rfc_receptor
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
-        ORDER BY n.year, n.month
+        ORDER BY n.year_devengo, n.month_devengo
         "#,
-    ))
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -1137,18 +1127,18 @@ pub async fn get(
     }
 
     // Headcount by month (distinct employees per month)
-    let hc_rows = sqlx::query(&format!(
+    let hc_rows = sqlx::query(
         r#"
-        SELECT n.year, n.month, COUNT(DISTINCT n.rfc_receptor) AS hc
+        SELECT n.year_devengo AS year, n.month_devengo AS month, COUNT(DISTINCT n.rfc_receptor) AS hc
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
-        GROUP BY n.year, n.month
-        ORDER BY n.year, n.month
+        GROUP BY n.year_devengo, n.month_devengo
+        ORDER BY n.year_devengo, n.month_devengo
     "#,
-    ))
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -1263,15 +1253,16 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
         months_of_data: 0,
     };
 
-    // Most recent period with payroll data
-    let period_row = sqlx::query(&format!(
+    // Most recent period with payroll data -- DEC-038/L6C-05: devengo, the anchor everything
+    // below (LTM window, YoY, pasivo laboral) is built from.
+    let period_row = sqlx::query(
         r#"
-        SELECT MAX(n.year * 100 + n.month) AS last_period
+        SELECT MAX(n.year_devengo * 100 + n.month_devengo) AS last_period
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
           AND NOT n.is_excluded
         "#,
-    ))
+    )
     .bind(rfc)
     .fetch_one(pool)
     .await?;
@@ -1291,29 +1282,72 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     let (prior_to_y, prior_to_m) = subtract_months(last_y, last_m, 12);
     let (prior_from_y, prior_from_m) = subtract_months(prior_to_y, prior_to_m, 11);
 
-    // Headcount in the most recent period
-    let hc_row = sqlx::query(&format!(
+    // L6C-08: hc_row/meses_row/ltm_row/prior_row/months_row (5 separate round trips,
+    // originally) each independently re-evaluated pulso.nomina_normalizada's three per-row
+    // LATERAL joins (factor/exclusion) over this RFC's full history -- ~10,592 rows for the
+    // RFC grande, none of it prunable by an index once year_devengo replaced the indexed
+    // year/month (measured: emisión's single-month hc_row was 8ms via idx_cfdis_emisor_ym,
+    // devengo's was 344ms with no equivalent index). Five such round trips is most of
+    // get_snapshot's ~4s post-emp_rows-fix cost. Consolidated into one query: the view is
+    // materialized exactly once, and every aggregate below is a FILTER over that same
+    // in-memory result instead of a fresh view evaluation per metric.
+    let combined_row = sqlx::query(
         r#"
-        SELECT COUNT(DISTINCT n.rfc_receptor) AS headcount
-        FROM pulso.nomina_normalizada n
-        WHERE n.rfc_emisor = $1
-          AND n.year = $2 AND n.month = $3
-          AND NOT n.is_excluded
+        WITH base AS MATERIALIZED (
+            SELECT rfc_receptor, year_devengo, month_devengo, tipo_nomina, total_percepciones
+            FROM pulso.nomina_normalizada
+            WHERE rfc_emisor = $1 AND NOT is_excluded
+        )
+        SELECT
+            COUNT(DISTINCT rfc_receptor) FILTER (
+                WHERE year_devengo = $2 AND month_devengo = $3
+            ) AS headcount,
+            COUNT(DISTINCT year_devengo * 100 + month_devengo) FILTER (
+                WHERE tipo_nomina = 'O'
+                  AND (year_devengo > $4 OR (year_devengo = $4 AND month_devengo >= $5))
+                  AND (year_devengo < $2 OR (year_devengo = $2 AND month_devengo <= $3))
+            ) AS meses_ltm,
+            COALESCE(SUM(total_percepciones) FILTER (
+                WHERE (year_devengo > $4 OR (year_devengo = $4 AND month_devengo >= $5))
+                  AND (year_devengo < $2 OR (year_devengo = $2 AND month_devengo <= $3))
+            ), 0) AS ltm_masa,
+            COALESCE(SUM(total_percepciones) FILTER (
+                WHERE (year_devengo > $6 OR (year_devengo = $6 AND month_devengo >= $7))
+                  AND (year_devengo < $8 OR (year_devengo = $8 AND month_devengo <= $9))
+            ), 0) AS prior_masa
+        FROM base
         "#,
-    ))
+    )
     .bind(rfc)
     .bind(last_y)
     .bind(last_m)
+    .bind(ltm_from_y)
+    .bind(ltm_from_m)
+    .bind(prior_from_y)
+    .bind(prior_from_m)
+    .bind(prior_to_y)
+    .bind(prior_to_m)
     .fetch_one(pool)
     .await?;
-    let headcount_actual: i64 = hc_row.try_get("headcount").unwrap_or(0);
+    let headcount_actual: i64 = combined_row.try_get("headcount").unwrap_or(0);
 
     if headcount_actual == 0 {
         return Ok(empty());
     }
 
+    let meses_con_nomina_ltm: i64 = combined_row.try_get("meses_ltm").unwrap_or(0);
+    let ltm_masa: f64 = get_f64(&combined_row, "ltm_masa");
+    let prior_masa: f64 = get_f64(&combined_row, "prior_masa");
+    let yoy_masa_salarial_pct = if prior_masa > 0.0 {
+        Some((ltm_masa - prior_masa) / prior_masa * 100.0)
+    } else {
+        None
+    };
+
     // Run-rate LTM: exclude eventual percepciones (DEC-020, PERCEPCIONES_EVENTUALES) and
     // extraordinary payroll runs, to match by_employee_year and by_month_ordinaria (NOM-1, AUD-003).
+    // Kept as its own round trip -- unlike the five folded into combined_row above, this one
+    // needs cfdi_nomina_percepciones joined in, a different row population than `base`.
     let percepciones_eventuales_sql = PERCEPCIONES_EVENTUALES
         .iter()
         .map(|k| format!("'{k}'"))
@@ -1329,8 +1363,8 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
         WHERE n.rfc_emisor = $1
           AND n.tipo_nomina = 'O'
           AND p.tipo_percepcion NOT IN ({percepciones_eventuales_sql})
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         "#,
     ))
@@ -1342,101 +1376,43 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     .fetch_one(pool)
     .await?;
     let total_regular: f64 = get_f64(&rr_row, "total_regular");
-
-    // Divisor: months with ordinary payroll data *inside this LTM window*, not the
-    // unwindowed months_of_data (AUD-003 pt.4) — a short LTM history must not be
-    // diluted by /12.
-    let meses_row = sqlx::query(&format!(
-        r#"
-        SELECT COUNT(DISTINCT n.year * 100 + n.month) AS meses
-        FROM pulso.nomina_normalizada n
-        WHERE n.rfc_emisor = $1
-          AND n.tipo_nomina = 'O'
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
-          AND NOT n.is_excluded
-        "#,
-    ))
-    .bind(rfc)
-    .bind(ltm_from_y)
-    .bind(ltm_from_m)
-    .bind(last_y)
-    .bind(last_m)
-    .fetch_one(pool)
-    .await?;
-    let meses_con_nomina_ltm: i64 = meses_row.try_get("meses").unwrap_or(0);
     let run_rate_mensual_ltm_mxn = total_regular / (meses_con_nomina_ltm.max(1) as f64);
-
-    // YoY masa salarial: total percepciones LTM vs prior 12 months
-    let ltm_row = sqlx::query(&format!(
-        r#"
-        SELECT COALESCE(SUM(n.total_percepciones), 0) AS total
-        FROM pulso.nomina_normalizada n
-        WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
-          AND NOT n.is_excluded
-        "#,
-    ))
-    .bind(rfc)
-    .bind(ltm_from_y)
-    .bind(ltm_from_m)
-    .bind(last_y)
-    .bind(last_m)
-    .fetch_one(pool)
-    .await?;
-    let ltm_masa: f64 = get_f64(&ltm_row, "total");
-
-    let prior_row = sqlx::query(&format!(
-        r#"
-        SELECT COALESCE(SUM(n.total_percepciones), 0) AS total
-        FROM pulso.nomina_normalizada n
-        WHERE n.rfc_emisor = $1
-          AND (n.year > $2 OR (n.year = $2 AND n.month >= $3))
-          AND (n.year < $4 OR (n.year = $4 AND n.month <= $5))
-          AND NOT n.is_excluded
-        "#,
-    ))
-    .bind(rfc)
-    .bind(prior_from_y)
-    .bind(prior_from_m)
-    .bind(prior_to_y)
-    .bind(prior_to_m)
-    .fetch_one(pool)
-    .await?;
-    let prior_masa: f64 = get_f64(&prior_row, "total");
-    let yoy_masa_salarial_pct = if prior_masa > 0.0 {
-        Some((ltm_masa - prior_masa) / prior_masa * 100.0)
-    } else {
-        None
-    };
 
     // Labor liability (pasivo laboral): per active employee
     // SDI = salario diario integrado (daily rate for benefit provisioning)
     // Tenure from first payroll ever recorded for this employer
-    let emp_rows = sqlx::query(&format!(
-        r#"
-        WITH active_emps AS (
-            SELECT DISTINCT n.rfc_receptor
+    //
+    // L6C-08: found while adding this function's first timed regression guard -- pre-existing
+    // in both emisión and devengo form (confirmed directly, same ~12s either way), not
+    // something the devengo migration introduced. `WHERE rfc_receptor IN (SELECT ... FROM
+    // active_emps)` against a view with three per-row LATERAL joins (factor/exclusion) made
+    // Postgres re-evaluate the whole view (10,592 rows) once per active employee (40 loops)
+    // instead of once total -- confirmed via EXPLAIN ANALYZE, 12.47s. `MATERIALIZED` forces
+    // the expensive view expansion to run exactly once; everything downstream (the active-
+    // employee filter and the per-employee aggregate) reads that already-computed result
+    // instead of re-triggering it. Verified: 347ms after this change, same row counts.
+    let emp_rows = sqlx::query(r#"
+        WITH base AS MATERIALIZED (
+            SELECT n.rfc_receptor, n.year_devengo, n.month_devengo,
+                   n.salario_diario_integrado, n.fecha_pago
             FROM pulso.nomina_normalizada n
-            WHERE n.rfc_emisor = $1
-              AND n.year = $2 AND n.month = $3
-              AND NOT n.is_excluded
+            WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
+        ),
+        active_emps AS (
+            SELECT DISTINCT rfc_receptor FROM base
+            WHERE year_devengo = $2 AND month_devengo = $3
         )
         SELECT
-            n.rfc_receptor,
-            AVG(COALESCE(n.salario_diario_integrado, 0)::float8) AS sdi,
+            b.rfc_receptor,
+            AVG(COALESCE(b.salario_diario_integrado, 0)::float8) AS sdi,
             -- AUD-015/DEC-025: anchored to the last day of the last COMPLETE calendar month
             -- (same idiom as migration 052's dias_antiguedad), not CURRENT_DATE directly, so
             -- tenure is reproducible across runs on different days within the same month.
-            COALESCE((((date_trunc('month', CURRENT_DATE) - interval '1 day')::date) - MIN(n.fecha_pago)::date)::integer, 0) AS tenure_days
-        FROM pulso.nomina_normalizada n
-        WHERE n.rfc_emisor = $1
-          AND n.rfc_receptor IN (SELECT rfc_receptor FROM active_emps)
-          AND NOT n.is_excluded
-        GROUP BY n.rfc_receptor
-        "#,
-    ))
+            COALESCE((((date_trunc('month', CURRENT_DATE) - interval '1 day')::date) - MIN(b.fecha_pago)::date)::integer, 0) AS tenure_days
+        FROM base b
+        WHERE b.rfc_receptor IN (SELECT rfc_receptor FROM active_emps)
+        GROUP BY b.rfc_receptor
+        "#)
     .bind(rfc)
     .bind(last_y)
     .bind(last_m)
@@ -1464,13 +1440,16 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
         })
         .sum();
 
+    // L6C-05: devengo instead of the comprobante's own emisión year/month. Switched from
+    // pulso.cfdis to pulso.nomina_normalizada for year_devengo/month_devengo -- the view's
+    // own WHERE (tipo_comprobante='N' AND NOT is_cancelled) already matches this query's
+    // original filter exactly, so no is_excluded filter is added: this counts every month
+    // nómina data has ever existed for, same as before, not a windowed/excluded subset.
     let months_row = sqlx::query(
         r#"
-        SELECT COUNT(DISTINCT c.year * 100 + c.month) AS cnt
-        FROM pulso.cfdis c
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
+        SELECT COUNT(DISTINCT n.year_devengo * 100 + n.month_devengo) AS cnt
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
         "#,
     )
     .bind(rfc)

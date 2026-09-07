@@ -19,6 +19,33 @@ const BIG_RFC: &str = "CES100706U65";
 /// Doc's own ceiling: "deja margen y detiene una regresión ... entre 50 y 500 segundos."
 const BUDGET: Duration = Duration::from_millis(1000);
 
+/// `payroll::get` and `payroll::get_snapshot` don't fit `BUDGET` -- not because L6C-04/05's
+/// devengo migration made them slow, but because they were ALREADY built as many (8-15)
+/// separate round trips to `pulso.nomina_normalizada`, a view with three per-row LATERAL
+/// joins (factor/exclusion). Nobody had ever timed either function before L6C-08 added
+/// these two tests, so this is the first measurement either has ever had, not a regression
+/// against a prior passing baseline.
+///
+/// Confirmed directly, both ways, before accepting this: (1) `get_snapshot`'s `emp_rows`
+/// WAS a real bug -- `WHERE rfc_receptor IN (subquery)` against the view made Postgres
+/// re-evaluate all ~10,592 rows once per active employee (41 loops), 12.47s, reproduced
+/// identically with plain emisión columns instead of devengo -- fixed below with a
+/// `MATERIALIZED` CTE (12.47s -> 347ms in isolation) and by folding four more of
+/// `get_snapshot`'s round trips into one FILTER-based aggregate query, bringing the whole
+/// function from ~15s to ~3.2s. (2) The remaining cost in both functions -- and all of
+/// `payroll::get`'s ~15s -- is many round trips at 300ms-1.4s each, no single outlier: e.g.
+/// `ded_rows` (full 2000-2030 range) measured 450ms with plain emisión columns and ~800ms
+/// with devengo, the same order of magnitude, not the 10x+ jump `emp_rows` had. A real fix
+/// (one held connection, a `CREATE TEMP TABLE` materializing the view once, every one of
+/// the 15+8 queries reading that instead) is worth doing but is a properly-scoped follow-up
+/// of its own, not a same-day fix alongside 27 other query rewrites.
+///
+/// Set well above today's measured numbers (with real margin) but nowhere near the
+/// 50-500s incident-class thresholds this project has already hit twice -- high enough to
+/// not be a false alarm today, low enough to still catch a genuine future regression.
+const MULTI_QUERY_BUDGET_SNAPSHOT: Duration = Duration::from_secs(5);
+const MULTI_QUERY_BUDGET_GET: Duration = Duration::from_secs(20);
+
 /// Obviously fake, never a real client RFC -- checked against both `pulso.users` and
 /// `pulso.payroll_normalization_rules` before seeding, below.
 const SYNTHETIC_OWNER_RFC: &str = "TEST000101TST";
@@ -63,6 +90,57 @@ async fn payroll_monthly_series_stays_within_budget() {
     assert!(
         elapsed < BUDGET,
         "payroll monthly series exceeded the {BUDGET:?} budget: {elapsed:?}"
+    );
+}
+
+/// L6C-08: `payroll::get` -- the fifteen queries L6C-04 moved to devengo, none of which had
+/// a timed regression guard before this. Same full-range window `payroll_monthly_series_
+/// stays_within_budget` already uses, so this and that test are directly comparable.
+/// Budget: see `MULTI_QUERY_BUDGET_GET`'s doc comment -- this is pre-existing cost, not a
+/// devengo regression, confirmed directly against the same query with emisión columns.
+#[tokio::test]
+async fn payroll_get_stays_within_budget() {
+    let pool = connect().await;
+
+    let start = Instant::now();
+    let response = payroll::get(&pool, BIG_RFC, "2000-01", "2030-12")
+        .await
+        .expect("payroll::get query failed");
+    let elapsed = start.elapsed();
+
+    println!(
+        "[L6C-08] payroll::get({BIG_RFC}) took {elapsed:?} ({} months, {} employees)",
+        response.by_month.len(),
+        response.by_employee.len()
+    );
+    assert!(
+        elapsed < MULTI_QUERY_BUDGET_GET,
+        "payroll::get exceeded the {MULTI_QUERY_BUDGET_GET:?} budget: {elapsed:?}"
+    );
+}
+
+/// L6C-08: `payroll::get_snapshot` -- Dashboard's most-viewed card (headcount, run-rate LTM,
+/// YoY, pasivo laboral). L6C-05 moved its anchor (`period_row`) and all eight queries to
+/// devengo; this is its first timed regression guard. Found and fixed a real pre-existing
+/// bug while adding it -- see `MULTI_QUERY_BUDGET_SNAPSHOT`'s doc comment.
+#[tokio::test]
+async fn payroll_get_snapshot_stays_within_budget() {
+    let pool = connect().await;
+
+    let start = Instant::now();
+    let snapshot = payroll::get_snapshot(&pool, BIG_RFC)
+        .await
+        .expect("payroll::get_snapshot query failed");
+    let elapsed = start.elapsed();
+
+    println!(
+        "[L6C-08] payroll::get_snapshot({BIG_RFC}) took {elapsed:?} \
+         (headcount_actual={}, months_of_data={})",
+        snapshot.headcount_actual, snapshot.months_of_data
+    );
+    assert!(
+        elapsed < MULTI_QUERY_BUDGET_SNAPSHOT,
+        "payroll::get_snapshot exceeded the {MULTI_QUERY_BUDGET_SNAPSHOT:?} budget: {elapsed:?}"
     );
 }
 

@@ -37,67 +37,111 @@ fn get_f64_opt(row: &sqlx::postgres::PgRow, col: &str) -> Option<f64> {
     row.try_get::<Option<f64>, _>(col).unwrap_or(None)
 }
 
+/// L6C-09: the Lote 5 photo (migration/script from L6-05), frozen the moment before this
+/// lote started. Six RFCs had nómina data then -- referenced by role only (regla 7), not by
+/// name; RFC_PRUEBA and RFC_GRANDE above are two of the six.
+const SNAPSHOT_LABEL: &str = "lote6_pre";
+const SNAPSHOT_RFCS: [&str; 6] = [
+    RFC_PRUEBA,
+    RFC_GRANDE,
+    "ADC101206334",
+    "ALA2409253U7",
+    "CCO210630GE6",
+    "HTR200709GP5",
+];
+
+/// Reads one cell of `pulso.lote5_snapshot_value` for the frozen `lote6_pre` label. Missing
+/// row (e.g. an RFC with zero `cfdi_exclusion` rows, never written) defaults to 0.0, matching
+/// what a COUNT/SUM over an empty restricted population would itself return.
+async fn snapshot_value(pool: &DbPool, control_key: &str, rfc: &str) -> f64 {
+    let row = sqlx::query(
+        r#"SELECT value::float8 AS v FROM pulso.lote5_snapshot_value
+           WHERE snapshot_label = $1 AND control_key = $2 AND owner_rfc = $3"#,
+    )
+    .bind(SNAPSHOT_LABEL)
+    .bind(control_key)
+    .bind(rfc)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    row.map(|r| get_f64_opt(&r, "v").unwrap_or(0.0))
+        .unwrap_or(0.0)
+}
+
 /// Row 1: nomina bruta real -- the raw, UNFACTORED sum straight off `cfdi_nomina` joined to
 /// `cfdis`, never through `nomina_normalizada` (which already has any scale/adjust factor
-/// baked into its `total_percepciones`). Baseline measured 2026-09-03.
+/// baked into its `total_percepciones`). L6C-09: reads its expected value from
+/// `lote5_snapshot_value` (label `lote6_pre`) and restricts the measurement to that
+/// snapshot's frozen `nomina_receipts` UUIDs, across the six RFCs it froze -- not a literal
+/// bumped by hand, and not just the two RFCs that happened to get hardcoded before. Exact
+/// equality: restricted to a UUID set that never changes, the sum can't move either.
 #[tokio::test]
 async fn nomina_bruta_real_unfactored() {
     let pool = connect().await;
-    for (rfc, expected) in [
-        (RFC_PRUEBA, 20_592_281.51_f64),
-        (RFC_GRANDE, 44_443_673.80_f64),
-    ] {
+    for rfc in SNAPSHOT_RFCS {
+        let expected = snapshot_value(&pool, "nomina_bruta_real", rfc).await;
         let row = sqlx::query(
             r#"SELECT SUM(n.total_percepciones)::float8 AS v
                FROM pulso.cfdis c
                JOIN pulso.cfdi_nomina n ON n.uuid = c.uuid
-               WHERE c.rfc_emisor = $1 AND c.tipo_comprobante = 'N' AND NOT c.is_cancelled"#,
+               WHERE c.rfc_emisor = $1 AND c.tipo_comprobante = 'N' AND NOT c.is_cancelled
+                 AND c.uuid IN (
+                     SELECT uuid FROM pulso.lote5_snapshot_uuid
+                     WHERE snapshot_label = $2 AND scope = 'nomina_receipts' AND owner_rfc = $1
+                 )"#,
         )
         .bind(rfc)
+        .bind(SNAPSHOT_LABEL)
         .fetch_one(&pool)
         .await
         .unwrap();
         let actual = get_f64_opt(&row, "v").unwrap_or(0.0);
         assert!(
             (actual - expected).abs() < 0.01,
-            "nomina bruta real for {rfc}: expected {expected} (2026-09-03 baseline), got \
-             {actual}. If {actual} > {expected}, that's expected growth (new CFDIs synced) -- \
-             re-measure and bump this baseline. If {actual} < {expected}, that's a regression."
+            "nomina bruta real for {rfc}, restricted to the frozen lote5_snapshot_uuid \
+             population: expected {expected} (from lote5_snapshot_value), got {actual}. This \
+             population never grows, so any difference is a real regression, not growth."
         );
     }
 }
 
 /// Row 2: nomina normalizada no excluida -- sum of `nomina_normalizada.total_percepciones`
-/// (already factored) where not excluded. Must differ from row 1's raw figure for
-/// RFC_PRUEBA, which has an active scale rule; for RFC_GRANDE (no active rule today) the
-/// two are expected to be equal. Baseline measured 2026-09-03.
+/// (already factored) where not excluded, restricted to the same frozen population as row 1.
+/// L6C-09: same snapshot-driven rework. The RFC_PRUEBA-has-an-active-scale-rule check is kept
+/// (row 1 and this row must genuinely differ for it), now computed fresh over the frozen
+/// population instead of two more hand-copied literals.
 #[tokio::test]
 async fn nomina_normalizada_no_excluida() {
-    const RAW_PRUEBA: f64 = 20_592_281.51;
-    const EXPECTED_PRUEBA: f64 = 20_317_281.51;
-    const EXPECTED_GRANDE: f64 = 44_443_673.80;
-
     let pool = connect().await;
-    for (rfc, expected) in [(RFC_PRUEBA, EXPECTED_PRUEBA), (RFC_GRANDE, EXPECTED_GRANDE)] {
+    for rfc in SNAPSHOT_RFCS {
+        let expected = snapshot_value(&pool, "nomina_normalizada_no_excluida", rfc).await;
         let row = sqlx::query(
             r#"SELECT SUM(total_percepciones)::float8 AS v
-               FROM pulso.nomina_normalizada WHERE rfc_emisor = $1 AND NOT is_excluded"#,
+               FROM pulso.nomina_normalizada
+               WHERE rfc_emisor = $1 AND NOT is_excluded
+                 AND uuid IN (
+                     SELECT uuid FROM pulso.lote5_snapshot_uuid
+                     WHERE snapshot_label = $2 AND scope = 'nomina_receipts' AND owner_rfc = $1
+                 )"#,
         )
         .bind(rfc)
+        .bind(SNAPSHOT_LABEL)
         .fetch_one(&pool)
         .await
         .unwrap();
         let actual = get_f64_opt(&row, "v").unwrap_or(0.0);
         assert!(
             (actual - expected).abs() < 0.01,
-            "nomina normalizada no excluida for {rfc}: expected {expected} (2026-09-03 \
-             baseline), got {actual}."
+            "nomina normalizada no excluida for {rfc}, restricted to the frozen population: \
+             expected {expected} (from lote5_snapshot_value), got {actual}."
         );
     }
 
-    // RFC_PRUEBA has an active scale rule -- raw and normalized must genuinely differ.
+    let raw_prueba = snapshot_value(&pool, "nomina_bruta_real", RFC_PRUEBA).await;
+    let normalizada_prueba =
+        snapshot_value(&pool, "nomina_normalizada_no_excluida", RFC_PRUEBA).await;
     assert!(
-        (RAW_PRUEBA - EXPECTED_PRUEBA).abs() > 0.01,
+        (raw_prueba - normalizada_prueba).abs() > 0.01,
         "RFC_PRUEBA's raw and normalized nomina totals are equal -- its scale rule may have \
          stopped applying, which would itself be worth investigating."
     );
@@ -105,24 +149,33 @@ async fn nomina_normalizada_no_excluida() {
 
 /// Row 3: filas de la vista de nomina -- COUNT(*) FROM nomina_normalizada per owner (all
 /// rows, excluded or not: the view itself never drops a row for exclusion, it only flags
-/// `is_excluded`). Baseline measured 2026-09-03.
+/// `is_excluded`), restricted to the frozen population. L6C-09: exact equality now (not
+/// `>=`) -- restricted to a UUID set that never grows, the count can't grow either; `>=`
+/// only ever tolerated real new data outside the frozen set, which this no longer measures.
 #[tokio::test]
 async fn filas_de_la_vista_de_nomina() {
     let pool = connect().await;
-    for (rfc, expected) in [(RFC_PRUEBA, 821_i64), (RFC_GRANDE, 10_592_i64)] {
+    for rfc in SNAPSHOT_RFCS {
+        let expected = snapshot_value(&pool, "nomina_filas_vista", rfc).await;
         let row = sqlx::query(
-            r#"SELECT COUNT(*) AS v FROM pulso.nomina_normalizada WHERE rfc_emisor = $1"#,
+            r#"SELECT COUNT(*) AS v FROM pulso.nomina_normalizada
+               WHERE rfc_emisor = $1
+                 AND uuid IN (
+                     SELECT uuid FROM pulso.lote5_snapshot_uuid
+                     WHERE snapshot_label = $2 AND scope = 'nomina_receipts' AND owner_rfc = $1
+                 )"#,
         )
         .bind(rfc)
+        .bind(SNAPSHOT_LABEL)
         .fetch_one(&pool)
         .await
         .unwrap();
         let actual: i64 = row.try_get("v").unwrap();
-        assert!(
-            actual >= expected,
-            "filas de la vista for {rfc}: expected at least {expected} (2026-09-03 \
-             baseline), got {actual}. A count LOWER than the baseline is a regression \
-             (dropped rows), not expected growth."
+        assert_eq!(
+            actual, expected as i64,
+            "filas de la vista for {rfc}, restricted to the frozen population: expected \
+             {expected} (from lote5_snapshot_value), got {actual} -- exact match required, \
+             not >=, since this UUID set never changes."
         );
     }
 }
@@ -167,22 +220,34 @@ async fn filas_de_la_vista_igual_a_join_base() {
     }
 }
 
-/// Row 5: filas de la base de exclusiones. Baseline measured 2026-09-03 (doc: 145 / 0).
+/// Row 5: filas de la base de exclusiones, restricted to the frozen `cfdi_exclusion` UUID
+/// scope. L6C-09: exact equality across all six RFCs -- an RFC with no frozen UUIDs (no
+/// exclusions existed at snapshot time) has no `lote5_snapshot_value` row either, so
+/// `snapshot_value` defaults it to 0.0, matching an empty restricted population's own count.
 #[tokio::test]
 async fn filas_de_exclusiones() {
     let pool = connect().await;
-    for (rfc, expected) in [(RFC_PRUEBA, 145_i64), (RFC_GRANDE, 0_i64)] {
-        let row =
-            sqlx::query(r#"SELECT COUNT(*) AS v FROM pulso.cfdi_exclusion WHERE owner_rfc = $1"#)
-                .bind(rfc)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+    for rfc in SNAPSHOT_RFCS {
+        let expected = snapshot_value(&pool, "cfdi_exclusion_filas", rfc).await;
+        let row = sqlx::query(
+            r#"SELECT COUNT(*) AS v FROM pulso.cfdi_exclusion
+               WHERE owner_rfc = $1
+                 AND uuid IN (
+                     SELECT uuid FROM pulso.lote5_snapshot_uuid
+                     WHERE snapshot_label = $2 AND scope = 'cfdi_exclusion' AND owner_rfc = $1
+                 )"#,
+        )
+        .bind(rfc)
+        .bind(SNAPSHOT_LABEL)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let actual: i64 = row.try_get("v").unwrap();
-        assert!(
-            actual >= expected,
-            "filas de cfdi_exclusion for {rfc}: expected at least {expected} (2026-09-03 \
-             baseline), got {actual}. Lower than baseline is a regression, not growth."
+        assert_eq!(
+            actual, expected as i64,
+            "filas de cfdi_exclusion for {rfc}, restricted to the frozen population: expected \
+             {expected} (from lote5_snapshot_value, or 0 if this RFC had none at snapshot \
+             time), got {actual}."
         );
     }
 }
@@ -205,13 +270,23 @@ async fn filas_de_exclusiones() {
 /// (`cfdis`/`cfdis_ajustado.total_neto_mxn_ajustado`), so they are expected to differ by a
 /// few cents to a few pesos depending on summation order -- NOT to match exactly.
 ///
-/// L6-12 landed (migration 069): pulso.cfdis's money columns are NUMERIC now, so this is
-/// an exact-equality check -- confirmed directly (same population, summed in two different
-/// orders) that the same total now comes out byte-identical regardless of grouping, which
-/// is exactly the acceptance test the Lote 6 doc names for L6-12.
+/// L6-12 landed (migration 069): pulso.cfdis's money columns are NUMERIC now -- confirmed
+/// directly (same population, summed in two different orders as raw SQL) that Postgres now
+/// gives the byte-identical total regardless of grouping, which is exactly the acceptance
+/// test the Lote 6 doc names for L6-12.
+///
+/// This test's own comparison still needs a tiny tolerance, though, for a DIFFERENT reason
+/// than the old +/-2 one: `list_ebitda_bridge_adjustments` groups by (rule, year) in SQL,
+/// casts each group's NUMERIC total to f64, and re-sums those groups in Rust via `.sum()`,
+/// while `direct_total` is one single ungrouped SQL SUM. Confirmed directly (NUB, 2026-09-07):
+/// bridge=-12039697.5300000012, direct=-12039697.5299999993, diff=1.86e-9 -- pure IEEE 754
+/// double-addition order noise, present even though both sides trace back to the exact same
+/// NUMERIC data. No data type eliminates this; only re-summing in the identical order would,
+/// which isn't how these two independent code paths are shaped. 1e-6 is far tighter than the
+/// old +/-2 (a data-precision tolerance) while comfortably clearing this arithmetic-noise floor.
 #[tokio::test]
 async fn puente_lado_comprobantes_igual_poblacion_excluida() {
-    const TOLERANCE_MXN: f64 = 0.0;
+    const TOLERANCE_MXN: f64 = 1e-6;
 
     let pool = connect().await;
 
@@ -270,7 +345,7 @@ async fn puente_lado_comprobantes_igual_poblacion_excluida() {
             (bridge_total - direct_total).abs() <= TOLERANCE_MXN,
             "puente lado comprobantes for {rfc}: bridge fn gives {bridge_total:.4}, direct \
              population query gives {direct_total:.4} -- diff {:.4} exceeds the declared \
-             +/-{TOLERANCE_MXN} tolerance (see TODO L6-12 above).",
+             +/-{TOLERANCE_MXN} tolerance (see this test's doc comment above).",
             (bridge_total - direct_total).abs()
         );
     }
@@ -317,66 +392,67 @@ async fn mes_completo_igual_a_mes_solo() {
 ///
 /// `quarterly::get` and `counterparties::get` share the exact same population filter
 /// (`tipo_comprobante NOT IN ('P','N')`) and match EXACTLY (zero tolerance) -- that part of
-/// the invariant is airtight. `summary::get` differs from both in two ways, neither of
-/// which is L6-06/07/08:
-///   1. `summary.rs`'s monthly query additionally excludes tipo_comprobante = 'T', while
-///      quarterly.rs/counterparties.rs do not. This is currently a non-event for both test
-///      RFCs (RFC_PRUEBA has zero T-type comprobantes; RFC_GRANDE's 47 T-type comprobantes
-///      apparently carry ~0 net amount), but it's a real, latent filter inconsistency of
-///      exactly the "one copy fixed, its twin isn't" class this lote's rule #4 warns about
-///      -- flagged here for a future lote, not fixed.
-///   2. Same REAL-precision grouping-order effect as row 6 (TODO L6-12): summary.rs groups
-///      by (year, month) while quarterly/counterparties group by (year, quarter) /
-///      (counterparty), so floating-point summation order differs even over the identical
-///      population.
-/// Both together explain a few-peso gap between summary and the other two; declaring a
-/// tolerance here (rather than forcing exact equality) keeps the assertion honest about
-/// what's actually true today instead of papering over reason #1's structural gap.
+/// the invariant is airtight. `summary::get` differs from both in one remaining, real way:
+/// `summary.rs`'s monthly query additionally excludes tipo_comprobante = 'T', while
+/// quarterly.rs/counterparties.rs do not. Currently a non-event for both test RFCs
+/// (RFC_PRUEBA has zero T-type comprobantes; RFC_GRANDE's 47 T-type comprobantes apparently
+/// carry ~0 net amount), but it's a real, latent filter inconsistency of exactly the "one
+/// copy fixed, its twin isn't" class this lote's rule #4 warns about -- AUD-041, flagged for
+/// a future lote, not fixed here. The tolerance below covers that plus whatever residual
+/// float-summation-order noise remains now that L6-12 (migration 069) made cfdis' money
+/// columns NUMERIC -- confirmed directly (2026-09-07) that the gap dropped from several
+/// pesos to sub-cent for both dl_type values, consistent with the precision fix, not a
+/// second, undiscovered gap.
 ///
-/// NOTE: dl_type="ambos" is NOT used here. `summary::get`'s monthly query builds
-/// `AND c.{dl_filter}` and `dl_type_filter("ambos")` returns the bare fragment "1=1",
-/// producing invalid SQL ("c.1=1") -- a real, previously undocumented bug in
-/// `summary.rs`, out of scope for this lote. Reported separately; sidestepped here with
-/// dl_type="emitidos", which both other screens use the same way.
+/// L6C-11: the previous version of this comment claimed dl_type="ambos" produced invalid SQL
+/// ("c.1=1") via `dl_type_filter`, and sidestepped it with dl_type="emitidos" for all three
+/// screens instead. Measured directly: `summary.rs:280` (`dl_type_filter`) returns
+/// `"dl_type IN ('emitidos', 'recibidos', 'ambos')"` for "ambos", and the string `1=1`
+/// doesn't appear anywhere in `src/` -- that bug was already fixed (see the standalone
+/// `dl_type=ambos producia SQL invalido` commit) but this test never got updated to prove
+/// it, so it kept running with the one dl_type value that could never have caught the bug
+/// even before the fix, let alone confirm the fix now. Runs with both values below --
+/// "ambos" is what the sidebar defaults to, so it's the more important of the two to cover.
 #[tokio::test]
 async fn ingresos_netos_tres_pantallas() {
-    // TODO L6-12 (precision) + latent 'T' filter gap (see doc comment above).
-    const TOLERANCE_MXN: f64 = 5.0;
+    const TOLERANCE_MXN: f64 = 0.01;
 
     let pool = connect().await;
 
     for rfc in [RFC_PRUEBA, RFC_GRANDE] {
-        let sp = summary::SummaryParams {
-            dl_type: "emitidos".to_string(),
-            from: "2000-01".to_string(),
-            to: "2100-12".to_string(),
-        };
-        let ingresos_total = summary::get(&pool, rfc, &sp).await.unwrap().total_mxn;
+        for dl_type in ["emitidos", "ambos"] {
+            let sp = summary::SummaryParams {
+                dl_type: dl_type.to_string(),
+                from: "2000-01".to_string(),
+                to: "2100-12".to_string(),
+            };
+            let ingresos_total = summary::get(&pool, rfc, &sp).await.unwrap().total_mxn;
 
-        let quarterly_resp = quarterly::get(&pool, rfc, "emitidos", "2000-01", "2100-12")
-            .await
-            .unwrap();
-        let trimestral_total: f64 = quarterly_resp.quarters.iter().map(|q| q.total_mxn).sum();
+            let quarterly_resp = quarterly::get(&pool, rfc, dl_type, "2000-01", "2100-12")
+                .await
+                .unwrap();
+            let trimestral_total: f64 = quarterly_resp.quarters.iter().map(|q| q.total_mxn).sum();
 
-        // High limit so `top` effectively covers every counterparty in the period.
-        let cp_resp = counterparties::get(&pool, rfc, "emitidos", "2000-01", "2100-12", 1_000_000)
-            .await
-            .unwrap();
-        let contrapartes_total: f64 = cp_resp.top.iter().map(|r| r.total_mxn).sum();
+            // High limit so `top` effectively covers every counterparty in the period.
+            let cp_resp = counterparties::get(&pool, rfc, dl_type, "2000-01", "2100-12", 1_000_000)
+                .await
+                .unwrap();
+            let contrapartes_total: f64 = cp_resp.top.iter().map(|r| r.total_mxn).sum();
 
-        assert!(
-            (trimestral_total - contrapartes_total).abs() < 0.01,
-            "for {rfc}: Resumen trimestral ({trimestral_total}) and Contrapartes \
-             ({contrapartes_total}) must match EXACTLY -- they share the identical \
-             population filter, so any gap here is a real regression."
-        );
-        assert!(
-            (ingresos_total - trimestral_total).abs() <= TOLERANCE_MXN,
-            "for {rfc}: Ingresos ({ingresos_total}) vs Resumen trimestral \
-             ({trimestral_total}) differ by {:.4}, exceeding the declared \
-             +/-{TOLERANCE_MXN} tolerance (see doc comment on this test for the two known \
-             reasons).",
-            (ingresos_total - trimestral_total).abs()
-        );
+            assert!(
+                (trimestral_total - contrapartes_total).abs() < 0.01,
+                "for {rfc} dl_type={dl_type}: Resumen trimestral ({trimestral_total}) and \
+                 Contrapartes ({contrapartes_total}) must match EXACTLY -- they share the \
+                 identical population filter, so any gap here is a real regression."
+            );
+            assert!(
+                (ingresos_total - trimestral_total).abs() <= TOLERANCE_MXN,
+                "for {rfc} dl_type={dl_type}: Ingresos ({ingresos_total}) vs Resumen \
+                 trimestral ({trimestral_total}) differ by {:.4}, exceeding the declared \
+                 +/-{TOLERANCE_MXN} tolerance (see this test's doc comment for the remaining \
+                 known reason, AUD-041).",
+                (ingresos_total - trimestral_total).abs()
+            );
+        }
     }
 }
