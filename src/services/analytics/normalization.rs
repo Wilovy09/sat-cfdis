@@ -135,6 +135,7 @@ pub struct PayrollEmployeeRow {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct EbitdaBridgeRow {
     pub concepto: String,
     pub seccion: String,
@@ -241,11 +242,11 @@ pub async fn create_rule(
     .bind(&req.cfdi_uuid)
     .bind(&req.accounting_line)
     .bind(&req.motivo)
-    .bind(&req.impacts_ebitda)
-    .bind(&req.capex_estimate_dep)
+    .bind(req.impacts_ebitda)
+    .bind(req.capex_estimate_dep)
     .bind(&req.capex_asset_type)
-    .bind(&req.capex_useful_life_years)
-    .bind(&req.capex_annual_dep_mxn)
+    .bind(req.capex_useful_life_years)
+    .bind(req.capex_annual_dep_mxn)
     .bind(&req.period_start)
     .bind(&req.period_end)
     .bind(&now)
@@ -322,11 +323,11 @@ pub async fn update_rule(
     .bind(&req.cfdi_uuid)
     .bind(&req.accounting_line)
     .bind(&req.motivo)
-    .bind(&req.impacts_ebitda)
-    .bind(&req.capex_estimate_dep)
+    .bind(req.impacts_ebitda)
+    .bind(req.capex_estimate_dep)
     .bind(&req.capex_asset_type)
-    .bind(&req.capex_useful_life_years)
-    .bind(&req.capex_annual_dep_mxn)
+    .bind(req.capex_useful_life_years)
+    .bind(req.capex_annual_dep_mxn)
     .bind(&req.period_start)
     .bind(&req.period_end)
     .bind(&now)
@@ -628,15 +629,23 @@ async fn compute_adjust_factor_warnings(
     period_start: Option<&str>,
     period_end: Option<&str>,
 ) -> anyhow::Result<(Vec<FactorWarning>, Vec<FactorWarning>)> {
+    // L6C-12: devengo, not the comprobante's own emisión year/month -- DEC-038. Joined
+    // through nomina_normalizada (rather than cfdis/cfdi_nomina directly) purely to read its
+    // already-computed year_devengo/month_devengo; still sums cfdi_nomina's RAW (unfactored)
+    // total_percepciones, not the view's factored one, since this is checking a CANDIDATE
+    // rule's implied factor against real percepciones, not a value any existing rule should
+    // have already adjusted.
     let rows = sqlx::query(
-        r#"SELECT c.year, c.month, SUM(COALESCE(n.total_percepciones, 0))::float8 AS perc
+        r#"SELECT nn.year_devengo AS year, nn.month_devengo AS month,
+                  SUM(COALESCE(n.total_percepciones, 0))::float8 AS perc
            FROM pulso.cfdis c
            JOIN pulso.cfdi_nomina n ON n.uuid = c.uuid
+           JOIN pulso.nomina_normalizada nn ON nn.uuid = c.uuid
            WHERE c.rfc_emisor = $1 AND c.rfc_receptor = $2
              AND c.tipo_comprobante = 'N' AND NOT c.is_cancelled
-             AND ($3::text IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) >= $3)
-             AND ($4::text IS NULL OR (c.year::text || '-' || LPAD(c.month::text, 2, '0')) <= $4)
-           GROUP BY c.year, c.month"#,
+             AND ($3::text IS NULL OR (nn.year_devengo::text || '-' || LPAD(nn.month_devengo::text, 2, '0')) >= $3)
+             AND ($4::text IS NULL OR (nn.year_devengo::text || '-' || LPAD(nn.month_devengo::text, 2, '0')) <= $4)
+           GROUP BY nn.year_devengo, nn.month_devengo"#,
     )
     .bind(owner_rfc)
     .bind(employee_rfc)
@@ -683,14 +692,18 @@ async fn batch_adjust_factor_sources(
         return Ok(HashMap::new());
     }
 
+    // L6C-12: devengo, same reasoning as compute_adjust_factor_warnings above (joined through
+    // nomina_normalizada for year_devengo/month_devengo, still sums cfdi_nomina's raw
+    // total_percepciones).
     let rows = sqlx::query(
-        r#"SELECT c.rfc_receptor AS employee_rfc, c.year, c.month,
+        r#"SELECT c.rfc_receptor AS employee_rfc, nn.year_devengo AS year, nn.month_devengo AS month,
                   SUM(COALESCE(n.total_percepciones, 0))::float8 AS perc
            FROM pulso.cfdis c
            JOIN pulso.cfdi_nomina n ON n.uuid = c.uuid
+           JOIN pulso.nomina_normalizada nn ON nn.uuid = c.uuid
            WHERE c.rfc_emisor = $1 AND c.rfc_receptor = ANY($2)
              AND c.tipo_comprobante = 'N' AND NOT c.is_cancelled
-           GROUP BY c.rfc_receptor, c.year, c.month"#,
+           GROUP BY c.rfc_receptor, nn.year_devengo, nn.month_devengo"#,
     )
     .bind(owner_rfc)
     .bind(employee_rfcs)
@@ -808,12 +821,11 @@ pub async fn check_payroll_rule(
         None
     };
 
-    if let Some(employee_rfc) = req.employee_rfc.as_deref() {
-        if let Some(reason) =
+    if let Some(employee_rfc) = req.employee_rfc.as_deref()
+        && let Some(reason) =
             check_payroll_rule_locks(pool, owner_rfc, employee_rfc, req, exclude_rule_id).await?
-        {
-            return Ok(PayrollRuleCheck::Rejected(reason));
-        }
+    {
+        return Ok(PayrollRuleCheck::Rejected(reason));
     }
 
     if let Some(value_mxn) = value_mxn {
@@ -871,8 +883,8 @@ pub async fn create_payroll_rule(
     .bind(&req.employee_rfc)
     .bind(&req.employee_name)
     .bind(&req.action)
-    .bind(&req.value_pct)
-    .bind(&req.value_mxn)
+    .bind(req.value_pct)
+    .bind(req.value_mxn)
     .bind(&req.period_start)
     .bind(&req.period_end)
     .bind(&req.notes)
@@ -947,8 +959,8 @@ pub async fn update_payroll_rule(
     .bind(&req.employee_rfc)
     .bind(&req.employee_name)
     .bind(&req.action)
-    .bind(&req.value_pct)
-    .bind(&req.value_mxn)
+    .bind(req.value_pct)
+    .bind(req.value_mxn)
     .bind(&req.period_start)
     .bind(&req.period_end)
     .bind(&req.notes)
@@ -1022,7 +1034,7 @@ pub async fn list_excluded_cfdis(
         r#"SELECT pnr.id AS rule_id, 'payroll' AS rule_type, pnr.rule_name, pnr.label,
                   n.uuid, n.rfc_emisor, n.rfc_receptor, n.nombre_emisor, n.nombre_receptor,
                   'N' AS tipo_comprobante, n.fecha_emision, n.total_percepciones AS total_mxn,
-                  n.year::text || '-' || LPAD(n.month::text, 2, '0') AS period,
+                  n.year_devengo::text || '-' || LPAD(n.month_devengo::text, 2, '0') AS period,
                   -- pulso.nomina_normalizada already filters out cancelled receipts.
                   false AS is_cancelled
            FROM pulso.nomina_normalizada n
@@ -1107,7 +1119,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let mut y = 1970u64;
     let mut rem = days;
     loop {
-        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
         let dy = if leap { 366 } else { 365 };
         if rem < dy {
             break;
@@ -1115,7 +1127,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
         rem -= dy;
         y += 1;
     }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let months = [
         31u64,
         if leap { 29 } else { 28 },
@@ -1287,6 +1299,7 @@ pub async fn list_counterparties_for_normalization(
 
 /// Returns CFDIs for a specific counterparty RFC, with per-CFDI exclusion status.
 /// Marks CFDIs excluded either by UUID-level or by RFC-level rule.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_cfdis_for_counterparty(
     pool: &DbPool,
     owner_rfc: &str,
@@ -1537,7 +1550,7 @@ pub async fn list_nomina_receipts_for_employee(
 ) -> anyhow::Result<Vec<NomReceiptRow>> {
     let rows = sqlx::query(
         r#"SELECT uuid,
-                  year::text || '-' || LPAD(month::text, 2, '0') AS period,
+                  year_devengo::text || '-' || LPAD(month_devengo::text, 2, '0') AS period,
                   fecha_emision::text AS fecha_emision,
                   total_percepciones,
                   is_excluded
