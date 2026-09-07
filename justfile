@@ -9,7 +9,13 @@ set dotenv-required := false
 default:
     cargo run
 
-# static_invariants: pure source-text checks, no DB connection, safe on every push.
+# static_invariants (2 tests) + --lib (15 unit tests across 4 #[cfg(test)] modules:
+# db/migration_guard.rs, services/xml_parser.rs, services/analytics/normalization.rs,
+# services/analytics/summary.rs): pure source-text checks and pure logic, no DB
+# connection -- confirmed zero references to `pool`, `Config::from_env`, or POSTGRES_*
+# anywhere in those four modules' test code -- safe on every push. `cargo test --test X`
+# never runs --lib on its own, so these 15 sat unexercised by both recipes and the
+# pipeline until this line existed.
 #
 # consistency_invariants moved to test-db below (L6C-10): its two invariants used to be
 # static-text/data-precondition checks (no DB needed), but L6C-10 redid them as live
@@ -19,6 +25,7 @@ default:
 # PREVIOUS version of that file; leaving it in `test` here would silently need a DB or
 # panic in a container with none, which is exactly the failure L6C-01 exists to prevent.
 test:
+    cargo test --lib
     cargo test --test static_invariants
 
 # migration_guard + number_contract + perf_budget + consistency_invariants: need

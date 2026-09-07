@@ -39,10 +39,6 @@ async fn connect() -> DbPool {
         .expect("connect to the shared test database (POSTGRES_* env vars)")
 }
 
-fn get_f64_opt(row: &sqlx::postgres::PgRow, col: &str) -> Option<f64> {
-    row.try_get::<Option<f64>, _>(col).unwrap_or(None)
-}
-
 /// Rows with year <> year_devengo anywhere in this RFC's (non-excluded) nomina -- the
 /// non-vacuity guard both invariants below assert is nonzero before trusting a green result.
 async fn has_devengo_divergence(pool: &DbPool, rfc: &str) -> bool {
@@ -62,10 +58,12 @@ async fn has_devengo_divergence(pool: &DbPool, rfc: &str) -> bool {
 /// payroll::monthly_series, year by year.
 ///
 /// H3's own per-year nomina figure isn't exposed by hallazgos::get's public response (only a
-/// margin-percentage delta appears in its `cuerpo` string) -- mirrored here verbatim from its
-/// current query (see hallazgos.rs's own `nom_rows`) as the only way to test it end-to-end
-/// short of refactoring H3 purely for testability, same technique this suite's own "puente"
-/// test (number_contract.rs) already uses for a different private query. Comparison side
+/// margin-percentage delta appears in its `cuerpo` string). Per Rob's review: the earlier
+/// version of this test re-typed H3's query inline here instead of calling real code -- two
+/// independent copies of "one definition," so reverting hallazgos.rs to `n.year` would leave
+/// this test passing against its own untouched copy while the real code silently regressed.
+/// `hallazgos::nomina_por_year` (pub, extracted from H3's own query) is now the one thing
+/// both H3 and this test call -- there's no second copy left to diverge. Comparison side
 /// calls the real `payroll::monthly_series`.
 #[tokio::test]
 async fn invariante_una_sola_definicion_costo_nomina() {
@@ -86,16 +84,9 @@ async fn invariante_una_sola_definicion_costo_nomina() {
             .await
             .expect("hallazgos::get failed");
 
-        let h3_nom_rows = sqlx::query(
-            r#"SELECT n.year_devengo AS year, SUM(n.total_percepciones)::float8 AS nomina
-               FROM pulso.nomina_normalizada n
-               WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
-               GROUP BY n.year_devengo"#,
-        )
-        .bind(rfc)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let h3_nom_map = hallazgos::nomina_por_year(&pool, rfc)
+            .await
+            .expect("hallazgos::nomina_por_year failed");
 
         let by_month = payroll::monthly_series(&pool, rfc, 2000, 1, 2100, 12)
             .await
@@ -107,9 +98,7 @@ async fn invariante_una_sola_definicion_costo_nomina() {
         }
 
         let mut checked = 0;
-        for row in &h3_nom_rows {
-            let year: i64 = row.try_get("year").unwrap_or(0);
-            let h3_nomina = get_f64_opt(row, "nomina").unwrap_or(0.0);
+        for (&year, &h3_nomina) in &h3_nom_map {
             let Some(&monthly_total) = by_year_from_monthly.get(&year) else {
                 continue;
             };

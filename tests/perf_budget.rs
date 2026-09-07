@@ -3,14 +3,18 @@
 //!
 //! `list_payroll_rules`'s per-rule factor-warning re-evaluation (L5-14) only runs its
 //! extra query for rules in the `adjust_to_amount_mxn` family, and today there are none
-//! platform-wide -- so the budget seeds 60 synthetic rows under a clearly fake owner RFC
-//! to exercise that loop for real, and tears them down before any assertion that could
-//! panic (see `list_payroll_rules_with_seeded_adjust_rules_stays_within_budget`).
+//! platform-wide -- so the budget seeds 60 synthetic rows under `BIG_RFC` itself (real
+//! employees sampled from its own nómina, so the factor lookup hits real percepciones data
+//! -- an earlier version seeded under a fake owner RFC instead, which made that lookup
+//! resolve to nothing for all 60 rules every run) to exercise that loop for real, and tears
+//! them down by a synthetic id prefix (never by owner_rfc -- BIG_RFC is a real, heavily-used
+//! RFC) before any assertion that could panic (see
+//! `list_payroll_rules_with_seeded_adjust_rules_stays_within_budget`).
 
 use std::time::{Duration, Instant};
 
 use pulso_backend::db::{self, DbPool};
-use pulso_backend::services::analytics::{normalization, payroll, summary};
+use pulso_backend::services::analytics::{hallazgos, normalization, payroll, summary};
 use sqlx::Row;
 
 /// The RFC with the most data in the shared test database (per `PULSO_Correcciones_Lote6.md`).
@@ -46,9 +50,14 @@ const BUDGET: Duration = Duration::from_millis(1000);
 const MULTI_QUERY_BUDGET_SNAPSHOT: Duration = Duration::from_secs(5);
 const MULTI_QUERY_BUDGET_GET: Duration = Duration::from_secs(20);
 
-/// Obviously fake, never a real client RFC -- checked against both `pulso.users` and
-/// `pulso.payroll_normalization_rules` before seeding, below.
-const SYNTHETIC_OWNER_RFC: &str = "TEST000101TST";
+/// `hallazgos::get` -- L6C-08 named this one explicitly and it went unmeasured through the
+/// whole lote (found in a later review). Same "many round trips, no single outlier" shape
+/// as `payroll::get`: it calls `payroll::get_snapshot` internally (H4) on top of its own
+/// ~10 round trips (H1, H2/H3's annual data, H5A/H5B's several queries, H6). Measured
+/// directly: 19.6s, no `IN (subquery)`-against-the-view pattern found (the specific shape
+/// `get_snapshot`'s `emp_rows` bug was) -- shares `MULTI_QUERY_BUDGET_GET` rather than a
+/// third near-identical constant.
+const MULTI_QUERY_BUDGET_HALLAZGOS: Duration = MULTI_QUERY_BUDGET_GET;
 
 async fn connect() -> DbPool {
     dotenvy::dotenv().ok();
@@ -144,6 +153,27 @@ async fn payroll_get_snapshot_stays_within_budget() {
     );
 }
 
+/// L6C-08 named this one by name; it went unmeasured until a later review caught it.
+#[tokio::test]
+async fn hallazgos_get_stays_within_budget() {
+    let pool = connect().await;
+
+    let start = Instant::now();
+    let response = hallazgos::get(&pool, BIG_RFC)
+        .await
+        .expect("hallazgos::get query failed");
+    let elapsed = start.elapsed();
+
+    println!(
+        "[L6C-08] hallazgos::get({BIG_RFC}) took {elapsed:?} ({} hallazgos)",
+        response.all.len()
+    );
+    assert!(
+        elapsed < MULTI_QUERY_BUDGET_HALLAZGOS,
+        "hallazgos::get exceeded the {MULTI_QUERY_BUDGET_HALLAZGOS:?} budget: {elapsed:?}"
+    );
+}
+
 #[tokio::test]
 async fn payroll_employee_catalog_stays_within_budget() {
     let pool = connect().await;
@@ -164,12 +194,19 @@ async fn payroll_employee_catalog_stays_within_budget() {
     );
 }
 
-/// Real employee RFCs from `BIG_RFC`'s own nómina population, so `compute_adjust_factor_
-/// warnings`'s join runs against real percepciones shape rather than made-up strings. The
-/// synthetic rules still bind to `SYNTHETIC_OWNER_RFC` as `rfc_emisor`, which no real CFDI
-/// carries -- each of the 60 extra queries the loop fires resolves to zero rows, but the
-/// dominant cost L5-14 introduced is the one-round-trip-per-rule shape itself, which this
-/// preserves regardless of row count.
+/// Real employee RFCs from `BIG_RFC`'s own nómina population, so the seeded rules bind to
+/// employees who actually have real CFDIs to look up.
+///
+/// Per Rob's review: the previous version of this test bound the synthetic rules'
+/// `owner_rfc` to `SYNTHETIC_OWNER_RFC` (a fake RFC with zero real CFDIs) instead of
+/// `BIG_RFC` -- `batch_adjust_factor_sources`'s `WHERE c.rfc_emisor = $1` never matched a
+/// single row regardless of which real `employee_rfc` a rule named, so the per-rule
+/// percepciones lookup resolved to nothing for all 60 rules, every run. The budget measured
+/// ~0ms of the actual cost path (confirmed: "0 carrying a factor warning" every time this
+/// ran) -- exactly the kind of blind spot that let the real regression this same review
+/// found (compute_adjust_factor_warnings/batch_adjust_factor_sources joining the whole view
+/// for two columns, 385x slower) go uncaught. Rules now seed under `BIG_RFC` itself, so the
+/// lookup hits real rows.
 async fn sample_employee_rfcs(pool: &DbPool, count: i64) -> Vec<String> {
     let rows = sqlx::query(
         "SELECT DISTINCT rfc_receptor FROM pulso.nomina_normalizada
@@ -187,6 +224,12 @@ async fn sample_employee_rfcs(pool: &DbPool, count: i64) -> Vec<String> {
         .collect()
 }
 
+/// ID prefix for every synthetic rule this test seeds -- distinct enough that no real rule
+/// (production IDs are UUIDs) could ever collide, and used as the ONLY key `cleanup_adjust_
+/// rules` deletes by. Deliberately not `owner_rfc = BIG_RFC` (a real, heavily-used RFC) --
+/// deleting by owner_rfc here would risk a real client rule if one existed at cleanup time.
+const SYNTHETIC_RULE_ID_PREFIX: &str = "l6-04-synthetic-";
+
 async fn seed_adjust_rules(pool: &DbPool, employee_rfcs: &[String]) -> Result<(), sqlx::Error> {
     for (i, employee_rfc) in employee_rfcs.iter().enumerate() {
         sqlx::query(
@@ -195,8 +238,8 @@ async fn seed_adjust_rules(pool: &DbPool, employee_rfcs: &[String]) -> Result<()
                  value_mxn, created_at, updated_at)
              VALUES ($1, $2, 'adjust_to_amount_mxn', $3, $4, 'adjust', $5, NOW()::text, NOW()::text)",
         )
-        .bind(format!("l6-04-synthetic-{i}"))
-        .bind(SYNTHETIC_OWNER_RFC)
+        .bind(format!("{SYNTHETIC_RULE_ID_PREFIX}{i}"))
+        .bind(BIG_RFC)
         .bind(employee_rfc)
         .bind(format!("L6-04 synthetic employee {i}"))
         .bind(15_000.0_f64)
@@ -206,12 +249,14 @@ async fn seed_adjust_rules(pool: &DbPool, employee_rfcs: &[String]) -> Result<()
     Ok(())
 }
 
-/// Deletes every synthetic row under `SYNTHETIC_OWNER_RFC`, regardless of how many made it
-/// in. Called unconditionally before any assertion in the seeded test below, so a budget
-/// failure (an `assert!` that panics) still leaves the shared test database clean.
+/// Deletes every synthetic row by id prefix, regardless of how many made it in. Called
+/// unconditionally before any assertion in the seeded test below, so a budget failure (an
+/// `assert!` that panics) still leaves the shared test database clean. By id, not by
+/// `owner_rfc = BIG_RFC` -- BIG_RFC is a real, heavily-used RFC; deleting by owner_rfc would
+/// risk a real client rule.
 async fn cleanup_adjust_rules(pool: &DbPool) {
-    let result = sqlx::query("DELETE FROM pulso.payroll_normalization_rules WHERE owner_rfc = $1")
-        .bind(SYNTHETIC_OWNER_RFC)
+    let result = sqlx::query("DELETE FROM pulso.payroll_normalization_rules WHERE id LIKE $1")
+        .bind(format!("{SYNTHETIC_RULE_ID_PREFIX}%"))
         .execute(pool)
         .await;
     if let Err(e) = result {
@@ -230,27 +275,18 @@ async fn list_payroll_rules_with_seeded_adjust_rules_stays_within_budget() {
 
     let pool = connect().await;
 
-    let already_used_as_owner: i64 = sqlx::query(
-        "SELECT COUNT(*) AS n FROM pulso.payroll_normalization_rules WHERE owner_rfc = $1",
-    )
-    .bind(SYNTHETIC_OWNER_RFC)
-    .fetch_one(&pool)
-    .await
-    .expect("failed to check for a pre-existing synthetic owner_rfc")
-    .try_get("n")
-    .unwrap_or(0);
-    let already_a_real_user: i64 =
-        sqlx::query("SELECT COUNT(*) AS n FROM pulso.users WHERE rfc = $1")
-            .bind(SYNTHETIC_OWNER_RFC)
+    let already_seeded: i64 =
+        sqlx::query("SELECT COUNT(*) AS n FROM pulso.payroll_normalization_rules WHERE id LIKE $1")
+            .bind(format!("{SYNTHETIC_RULE_ID_PREFIX}%"))
             .fetch_one(&pool)
             .await
-            .expect("failed to check the synthetic RFC against pulso.users")
+            .expect("failed to check for pre-existing synthetic rule ids")
             .try_get("n")
             .unwrap_or(0);
     assert_eq!(
-        already_used_as_owner + already_a_real_user,
-        0,
-        "{SYNTHETIC_OWNER_RFC} must be unused before seeding -- pick a different fake RFC"
+        already_seeded, 0,
+        "rows with id LIKE '{SYNTHETIC_RULE_ID_PREFIX}%' already exist under {BIG_RFC} -- a \
+         previous run's cleanup may have failed; clear them by hand before re-running"
     );
 
     let employee_rfcs = sample_employee_rfcs(&pool, RULE_COUNT).await;
@@ -264,7 +300,7 @@ async fn list_payroll_rules_with_seeded_adjust_rules_stays_within_budget() {
 
     let measurement = if seed_result.is_ok() {
         let start = Instant::now();
-        let read = normalization::list_payroll_rules(&pool, SYNTHETIC_OWNER_RFC).await;
+        let read = normalization::list_payroll_rules(&pool, BIG_RFC).await;
         Some((start.elapsed(), read))
     } else {
         None
@@ -282,13 +318,38 @@ async fn list_payroll_rules_with_seeded_adjust_rules_stays_within_budget() {
         RULE_COUNT_USIZE,
         "expected all 60 seeded rules back"
     );
+    // Per Rob's review: the previous version of this assertion (implicitly, by never
+    // checking) let every rule's factor lookup silently resolve to zero rows -- seeding
+    // under a fake owner_rfc meant zero real percepciones could ever match, so "0 carrying
+    // a factor warning" was indistinguishable from the real cost path never running at all.
+    // Seeded against BIG_RFC's own real employees now (`sample_employee_rfcs`), so each of
+    // the 60 lookups should find real percepciones data -- asserting that directly here,
+    // not just hoping the elapsed time reflects real work.
+    let checked_percepciones: i64 = sqlx::query(
+        "SELECT COUNT(DISTINCT rfc_receptor) AS n FROM pulso.nomina_normalizada
+         WHERE rfc_emisor = $1 AND rfc_receptor = ANY($2)",
+    )
+    .bind(BIG_RFC)
+    .bind(&employee_rfcs)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to confirm the seeded employees have real nomina data")
+    .try_get("n")
+    .unwrap_or(0);
+    assert_eq!(
+        checked_percepciones, RULE_COUNT,
+        "expected all {RULE_COUNT} seeded employee RFCs to have real nomina_normalizada rows \
+         under {BIG_RFC} -- if this is 0, the factor lookup this budget measures resolves to \
+         nothing again, same blind spot as before"
+    );
     let warned = rules
         .iter()
         .filter(|r| !r.factor_warnings.is_empty())
         .count();
     println!(
-        "[L6-04] list_payroll_rules({SYNTHETIC_OWNER_RFC}) with {RULE_COUNT} adjust_to_amount_mxn \
-         rules took {elapsed:?} ({warned} carrying a factor warning)"
+        "[L6-04] list_payroll_rules({BIG_RFC}) with {RULE_COUNT} adjust_to_amount_mxn \
+         rules took {elapsed:?} ({warned} carrying a factor warning, {checked_percepciones} \
+         of {RULE_COUNT} employees confirmed to have real nomina data)"
     );
     assert!(
         elapsed < BUDGET,

@@ -489,10 +489,49 @@ async fn compute_h1(
 /// employee counted as a baja against a month with nobody in it) and H5B marked the entire
 /// plantilla as terminada. Resolved by having H5A/H5B query nomina_normalizada's own anchor
 /// directly instead of receiving the facturas one from the caller.
+/// Nómina bruta por año (total_percepciones, L5-04's bruto redefinition), todo tipo_nomina,
+/// grouped by year_devengo -- matches the single definition every other consumer
+/// (payroll.rs's by_month/by_year, the bridge's three nomina sources, list_excluded_cfdis)
+/// uses since Lote 5. `pub`, not `pub(crate)`: this is the single source H3's `cuerpo` reads
+/// from AND the one `tests/consistency_invariants.rs` (an integration test, which only sees
+/// the public API) calls to verify H3 against `payroll::monthly_series` -- per Rob's review
+/// of L6C-10: the invariant used to re-type this exact query inside the test file, so
+/// reverting H3 to `n.year` would leave the test passing against its own untouched copy
+/// while the real code silently regressed. Extracted here, both call sites read the same
+/// compiled function; there's no second copy left to diverge.
+pub async fn nomina_por_year(
+    pool: &DbPool,
+    rfc: &str,
+) -> anyhow::Result<std::collections::HashMap<i64, f64>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT n.year_devengo AS year,
+               SUM(n.total_percepciones) AS nomina
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND NOT n.is_excluded
+        GROUP BY n.year_devengo
+        "#,
+    )
+    .bind(rfc)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<i64, _>("year").unwrap_or(0),
+                get_f64(r, "nomina"),
+            )
+        })
+        .collect())
+}
+
 async fn nomina_last_period(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<(i64, i64)>> {
     let row = sqlx::query(
         r#"
-        SELECT MAX(year * 100 + month)::bigint AS max_ym
+        SELECT MAX(year_devengo * 100 + month_devengo)::bigint AS max_ym
         FROM pulso.nomina_normalizada
         WHERE rfc_emisor = $1 AND NOT is_excluded
         "#,
@@ -555,7 +594,7 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     .bind(ltm_end_m)
     .fetch_one(pool)
     .await?;
-    let _latest_hc: i64 = latest_row.try_get("active").unwrap_or(0);
+    let latest_hc: i64 = latest_row.try_get("active").unwrap_or(0);
 
     // Employees who appeared in LTM but not in the latest month
     let bajas_row = sqlx::query(
@@ -596,11 +635,14 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     let interp = h5a_interpretacion(nivel);
 
     let cuerpo = format!(
-        "La rotación estimada en los últimos 12 meses es de {:.1}% ({} baja{} / headcount promedio {:.0} empleados).",
+        "La rotación estimada en los últimos 12 meses es de {:.1}% ({} baja{} / headcount \
+         promedio {:.0} empleados, {} activo{} en el último periodo).",
         tasa_pct,
         bajas,
         if bajas == 1 { "" } else { "s" },
-        avg_hc
+        avg_hc,
+        latest_hc,
+        if latest_hc == 1 { "" } else { "s" }
     );
 
     Ok(Some(Hallazgo {
@@ -1228,43 +1270,11 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             })
             .collect();
 
-        // Nómina bruta (total_percepciones, L5-04's bruto redefinition), todo tipo_nomina --
-        // matches the single definition every other consumer (payroll.rs's by_month/by_year,
-        // the bridge's three nomina sources, list_excluded_cfdis) uses since Lote 5. Prior to
-        // that redefinition this summed percepciones + otros_pagos - deducciones to match
-        // payroll.by_month.total_pagado; that parity claim is no longer true since
-        // total_pagado itself moved to pure total_percepciones.
-        //
-        // DEC-038/L6C-06: grouped by year_devengo, matching payroll::by_year -- L6-06 only
-        // fixed the amount (total_percepciones alone), not the year, so this still diverged
-        // from by_year's total whenever a receipt's devengo and emisión years differed.
         // Looked up below against `yd.year`, the facturas-side (emisión) annual bucket H1/H2
         // already iterate -- an accepted mismatch of bases at the year grain: measured
         // system-wide, only one year boundary (2025/2026) has any receipts that cross it, for
         // 10,855 pesos total, so this doesn't manufacture a new visible divergence in practice.
-        let nom_rows = sqlx::query(
-            r#"
-            SELECT n.year_devengo AS year,
-                   SUM(n.total_percepciones) AS nomina
-            FROM pulso.nomina_normalizada n
-            WHERE n.rfc_emisor = $1
-              AND NOT n.is_excluded
-            GROUP BY n.year_devengo
-            "#,
-        )
-        .bind(rfc)
-        .fetch_all(pool)
-        .await?;
-
-        let nom_map: std::collections::HashMap<i64, f64> = nom_rows
-            .iter()
-            .map(|r| {
-                (
-                    r.try_get::<i64, _>("year").unwrap_or(0),
-                    get_f64(r, "nomina"),
-                )
-            })
-            .collect();
+        let nom_map = nomina_por_year(pool, rfc).await?;
 
         struct YearMargin {
             year: i64,

@@ -629,23 +629,27 @@ async fn compute_adjust_factor_warnings(
     period_start: Option<&str>,
     period_end: Option<&str>,
 ) -> anyhow::Result<(Vec<FactorWarning>, Vec<FactorWarning>)> {
-    // L6C-12: devengo, not the comprobante's own emisión year/month -- DEC-038. Joined
-    // through nomina_normalizada (rather than cfdis/cfdi_nomina directly) purely to read its
-    // already-computed year_devengo/month_devengo; still sums cfdi_nomina's RAW (unfactored)
-    // total_percepciones, not the view's factored one, since this is checking a CANDIDATE
-    // rule's implied factor against real percepciones, not a value any existing rule should
-    // have already adjusted.
+    // L6C-12/review: devengo, not the comprobante's own emisión year/month -- DEC-038.
+    // pulso.devengo_date(...) (migration 071) is the SAME function nomina_normalizada's own
+    // year_devengo/month_devengo call -- one definition, not a re-inlined copy. Calls it
+    // directly against cfdis/cfdi_nomina instead of joining through the view: joining the
+    // view just to read two computed columns forced Postgres to build the whole thing
+    // (three per-row LATERAL joins for factor/exclusion) for however many rows matched --
+    // measured against a real employee, 7,317ms through the view vs 19ms this way, same 7
+    // rows. Still sums cfdi_nomina's RAW (unfactored) total_percepciones, not the view's
+    // factored one, since this is checking a CANDIDATE rule's implied factor against real
+    // percepciones, not a value any existing rule should have already adjusted.
     let rows = sqlx::query(
-        r#"SELECT nn.year_devengo AS year, nn.month_devengo AS month,
+        r#"SELECT EXTRACT(YEAR FROM pulso.devengo_date(n.fecha_final_pago, c.fecha_emision))::bigint AS year,
+                  EXTRACT(MONTH FROM pulso.devengo_date(n.fecha_final_pago, c.fecha_emision))::bigint AS month,
                   SUM(COALESCE(n.total_percepciones, 0))::float8 AS perc
            FROM pulso.cfdis c
            JOIN pulso.cfdi_nomina n ON n.uuid = c.uuid
-           JOIN pulso.nomina_normalizada nn ON nn.uuid = c.uuid
            WHERE c.rfc_emisor = $1 AND c.rfc_receptor = $2
              AND c.tipo_comprobante = 'N' AND NOT c.is_cancelled
-             AND ($3::text IS NULL OR (nn.year_devengo::text || '-' || LPAD(nn.month_devengo::text, 2, '0')) >= $3)
-             AND ($4::text IS NULL OR (nn.year_devengo::text || '-' || LPAD(nn.month_devengo::text, 2, '0')) <= $4)
-           GROUP BY nn.year_devengo, nn.month_devengo"#,
+             AND ($3::text IS NULL OR (EXTRACT(YEAR FROM pulso.devengo_date(n.fecha_final_pago, c.fecha_emision))::text || '-' || LPAD(EXTRACT(MONTH FROM pulso.devengo_date(n.fecha_final_pago, c.fecha_emision))::text, 2, '0')) >= $3)
+             AND ($4::text IS NULL OR (EXTRACT(YEAR FROM pulso.devengo_date(n.fecha_final_pago, c.fecha_emision))::text || '-' || LPAD(EXTRACT(MONTH FROM pulso.devengo_date(n.fecha_final_pago, c.fecha_emision))::text, 2, '0')) <= $4)
+           GROUP BY 1, 2"#,
     )
     .bind(owner_rfc)
     .bind(employee_rfc)
@@ -692,18 +696,20 @@ async fn batch_adjust_factor_sources(
         return Ok(HashMap::new());
     }
 
-    // L6C-12: devengo, same reasoning as compute_adjust_factor_warnings above (joined through
-    // nomina_normalizada for year_devengo/month_devengo, still sums cfdi_nomina's raw
-    // total_percepciones).
+    // L6C-12/review: devengo via pulso.devengo_date (migration 071), same reasoning and same
+    // measured cost gap as compute_adjust_factor_warnings above -- calls the shared function
+    // directly against cfdis/cfdi_nomina instead of joining nomina_normalizada just to read
+    // two of its computed columns.
     let rows = sqlx::query(
-        r#"SELECT c.rfc_receptor AS employee_rfc, nn.year_devengo AS year, nn.month_devengo AS month,
+        r#"SELECT c.rfc_receptor AS employee_rfc,
+                  EXTRACT(YEAR FROM pulso.devengo_date(n.fecha_final_pago, c.fecha_emision))::bigint AS year,
+                  EXTRACT(MONTH FROM pulso.devengo_date(n.fecha_final_pago, c.fecha_emision))::bigint AS month,
                   SUM(COALESCE(n.total_percepciones, 0))::float8 AS perc
            FROM pulso.cfdis c
            JOIN pulso.cfdi_nomina n ON n.uuid = c.uuid
-           JOIN pulso.nomina_normalizada nn ON nn.uuid = c.uuid
            WHERE c.rfc_emisor = $1 AND c.rfc_receptor = ANY($2)
              AND c.tipo_comprobante = 'N' AND NOT c.is_cancelled
-           GROUP BY c.rfc_receptor, nn.year_devengo, nn.month_devengo"#,
+           GROUP BY 1, 2, 3"#,
     )
     .bind(owner_rfc)
     .bind(employee_rfcs)
