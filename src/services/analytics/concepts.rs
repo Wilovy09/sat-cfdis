@@ -93,7 +93,7 @@ pub async fn get(
 
     // Top by count
     let mut top_by_count = top_by_amount.clone();
-    top_by_count.sort_by(|a, b| b.invoice_count.cmp(&a.invoice_count));
+    top_by_count.sort_by_key(|x| std::cmp::Reverse(x.invoice_count));
     top_by_count.truncate(20);
 
     // By clave_prod_serv

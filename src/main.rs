@@ -248,7 +248,7 @@ fn days_in_month(y: u32, m: u32) -> u32 {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 => {
-            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            if (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400) {
                 29
             } else {
                 28
@@ -318,7 +318,8 @@ async fn daily_sync_worker(pool: DbPool) {
             let mut y = 1970u32;
             let mut d = days as u32;
             loop {
-                let dy = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                let dy = if (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+                {
                     366
                 } else {
                     365
@@ -976,49 +977,49 @@ async fn run_worker_chunk(
 
         // Email 1: initial sync complete (job_type == "list" and this is the user's initial_sync_job_id)
         // Email 2: monthly complete (job_type == "auto_daily" and period_to falls on the last day of its month)
-        if let Some(ref api_key) = cfg.sendgrid_api_key {
-            if let Ok(Some(email)) = crate::db::users::get_email_by_rfc(&pool, &job_rfc).await {
-                let send_result = if job_type == "list" {
-                    match crate::db::users::is_initial_sync_job(&pool, &job_rfc, &job_id).await {
-                        Ok(true) => Some(
-                            crate::services::email::send_sync_complete(
-                                api_key,
-                                &cfg.sendgrid_from,
-                                &email,
-                                &job_rfc,
-                                found,
-                                &period_from,
-                                &period_to,
-                            )
-                            .await,
-                        ),
-                        _ => None,
-                    }
-                } else if job_type == "auto_daily" && is_last_day_of_month(&period_to) {
-                    let month_label = month_label_es(&period_to);
-                    Some(
-                        crate::services::email::send_monthly_complete(
+        if let Some(ref api_key) = cfg.sendgrid_api_key
+            && let Ok(Some(email)) = crate::db::users::get_email_by_rfc(&pool, &job_rfc).await
+        {
+            let send_result = if job_type == "list" {
+                match crate::db::users::is_initial_sync_job(&pool, &job_rfc, &job_id).await {
+                    Ok(true) => Some(
+                        crate::services::email::send_sync_complete(
                             api_key,
                             &cfg.sendgrid_from,
                             &email,
                             &job_rfc,
-                            &month_label,
+                            found,
+                            &period_from,
+                            &period_to,
                         )
                         .await,
-                    )
-                } else {
-                    None
-                };
-
-                match send_result {
-                    Some(Err(e)) => {
-                        tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}")
-                    }
-                    Some(Ok(_)) => {
-                        tracing::info!(job_id = %job_id, "Sent completion email to {email}")
-                    }
-                    None => {}
+                    ),
+                    _ => None,
                 }
+            } else if job_type == "auto_daily" && is_last_day_of_month(&period_to) {
+                let month_label = month_label_es(&period_to);
+                Some(
+                    crate::services::email::send_monthly_complete(
+                        api_key,
+                        &cfg.sendgrid_from,
+                        &email,
+                        &job_rfc,
+                        &month_label,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
+
+            match send_result {
+                Some(Err(e)) => {
+                    tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}")
+                }
+                Some(Ok(_)) => {
+                    tracing::info!(job_id = %job_id, "Sent completion email to {email}")
+                }
+                None => {}
             }
         }
     }
@@ -1395,12 +1396,9 @@ async fn main() -> std::io::Result<()> {
                         web::resource("/normalization/counterparties/{cp_rfc}/cfdis")
                             .route(web::get().to(analytics_routes::list_norm_counterparty_cfdis)),
                     )
-                    .service(
-                        web::resource("/normalization/individual-rule-ids").route(
-                            web::get()
-                                .to(analytics_routes::list_normalization_individual_rule_ids),
-                        ),
-                    )
+                    .service(web::resource("/normalization/individual-rule-ids").route(
+                        web::get().to(analytics_routes::list_normalization_individual_rule_ids),
+                    ))
                     .service(web::resource("/normalization/payroll/employees").route(
                         web::get().to(analytics_routes::get_normalization_payroll_employees),
                     ))

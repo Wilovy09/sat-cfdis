@@ -44,17 +44,17 @@ fn jwt_sub(token: &str) -> Option<String> {
 /// After a successful Adquiere auth response, enrich the JSON body with
 /// `pulso_complete_profile` and `is_admin` queried from our local DB.
 async fn enrich_with_profile(pool: &DbPool, mut body: serde_json::Value) -> serde_json::Value {
-    if let Some(token) = body.get("access_token").and_then(|t| t.as_str()) {
-        if let Some(user_id) = jwt_sub(token) {
-            let complete = crate::db::users::get_profile_complete(pool, &user_id)
-                .await
-                .unwrap_or(false);
-            let is_admin = crate::db::users::is_user_admin(pool, &user_id)
-                .await
-                .unwrap_or(false);
-            body["pulso_complete_profile"] = serde_json::Value::Bool(complete);
-            body["is_admin"] = serde_json::Value::Bool(is_admin);
-        }
+    if let Some(token) = body.get("access_token").and_then(|t| t.as_str())
+        && let Some(user_id) = jwt_sub(token)
+    {
+        let complete = crate::db::users::get_profile_complete(pool, &user_id)
+            .await
+            .unwrap_or(false);
+        let is_admin = crate::db::users::is_user_admin(pool, &user_id)
+            .await
+            .unwrap_or(false);
+        body["pulso_complete_profile"] = serde_json::Value::Bool(complete);
+        body["is_admin"] = serde_json::Value::Bool(is_admin);
     }
     body
 }
@@ -213,6 +213,7 @@ struct GoogleTokenResponse {
 struct GoogleIdTokenClaims {
     sub: String,
     email: String,
+    #[allow(dead_code)]
     name: Option<String>,
 }
 

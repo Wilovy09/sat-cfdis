@@ -316,7 +316,7 @@ fn ymd_from_epoch_secs(secs: u64) -> String {
     let mut y = 1970u32;
     let mut d = days as u32;
     loop {
-        let leap_year = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let leap_year = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
         let days_in_year = if leap_year { 366 } else { 365 };
         if d < days_in_year {
             break;
@@ -324,7 +324,7 @@ fn ymd_from_epoch_secs(secs: u64) -> String {
         d -= days_in_year;
         y += 1;
     }
-    let leap_year = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let leap_year = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let mut m = 0usize;
     for (i, &dim) in DAYS_IN_MONTH.iter().enumerate() {
         let dim = if i == 1 && leap_year { 29 } else { dim };

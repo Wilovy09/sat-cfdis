@@ -71,7 +71,7 @@ pub(crate) fn extract_cfdi_path_info(bytes: &[u8]) -> (String, String, u32, u32,
                 .ok()?
                 .parse::<u32>()
                 .ok()?;
-            if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+            if (1..=12).contains(&m) && (1..=31).contains(&d) {
                 Some((y, m, d))
             } else {
                 None
@@ -125,7 +125,7 @@ pub async fn xml_content(
 ) -> Result<HttpResponse, AppError> {
     let body = body.into_inner();
     let uuid = body.uuid.to_lowercase();
-    tracing::Span::current().record("uuid", &uuid.as_str());
+    tracing::Span::current().record("uuid", uuid.as_str());
 
     // Parse year/month/day from fecha "YYYY-MM-DD"
     let (year, month, day) = parse_fecha_ymd(&body.fecha);
@@ -214,7 +214,7 @@ fn parse_fecha_ymd(fecha: &str) -> (u32, u32, u32) {
         let y = fecha.get(0..4)?.parse::<u32>().ok()?;
         let m = fecha.get(5..7)?.parse::<u32>().ok()?;
         let d = fecha.get(8..10)?.parse::<u32>().ok()?;
-        if m >= 1 && m <= 12 && d >= 1 && d <= 31 {
+        if (1..=12).contains(&m) && (1..=31).contains(&d) {
             Some((y, m, d))
         } else {
             None
@@ -273,6 +273,7 @@ async fn build_auth_payload(auth: Auth, work_dir: &TempDir) -> Result<serde_json
 /// Forwards all output lines to `line_tx`. Handles `__captcha__` events inline
 /// (keeps stdin open, writes answers from captcha_map) so CIEC sessions can
 /// authenticate without a separate auth phase.
+#[allow(clippy::too_many_arguments)]
 async fn run_php_chunk(
     php_bin: String,
     php_cli_path: String,
@@ -665,9 +666,9 @@ pub async fn download_stream(
             if line.is_empty() { continue; }
 
             // Captcha events are always single-line JSON — detect quickly
-            if line.contains("\"__captcha__\"") {
-                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if data.get("__captcha__").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if line.contains("\"__captcha__\"")
+                && let Ok(data) = serde_json::from_str::<serde_json::Value>(&line)
+                    && data.get("__captcha__").and_then(|v| v.as_bool()).unwrap_or(false) {
                         let session_id = uuid::Uuid::new_v4().to_string();
                         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
                         if let Ok(mut map) = captcha_map.lock() {
@@ -688,8 +689,6 @@ pub async fn download_stream(
                         }
                         continue;
                     }
-                }
-            }
 
             // Accumulate non-captcha lines to parse as the final JSON result
             output_buf.push_str(&line);
@@ -722,9 +721,9 @@ pub async fn download_stream(
         if should_upload_dl {
             let bucket_dl = s3_bucket.as_deref().unwrap_or("");
             for file in &files {
-                if let Some(path) = file["path"].as_str() {
-                    if path.ends_with(".xml") {
-                        if let Ok(bytes) = tokio::fs::read(path).await {
+                if let Some(path) = file["path"].as_str()
+                    && path.ends_with(".xml")
+                        && let Ok(bytes) = tokio::fs::read(path).await {
                             let fname = file["filename"].as_str().unwrap_or("");
                             let uuid_str = fname.trim_end_matches(".xml");
                             let (rfc_e, rfc_r, year, month, day) = extract_cfdi_path_info(&bytes);
@@ -734,8 +733,6 @@ pub async fn download_stream(
                                 uuid_str, bytes,
                             ).await;
                         }
-                    }
-                }
             }
         }
 
@@ -1079,18 +1076,17 @@ pub async fn list_stream(
                         job_id_ls = Some(id);
                     }
                 }
-                if let Some(ref jid) = job_id_ls {
-                    if let Some(uuid) = data["uuid"].as_str().or(data["Uuid"].as_str()) {
-                        let _ = db_jobs::upsert_invoice(&pool_ls, jid, uuid, &line).await;
-                        if total % 50 == 0 {
-                            let cursor = data["fecha"]
-                                .as_str()
-                                .or(data["Fecha"].as_str())
-                                .map(|f| format!("{} 00:00:00", &f[..10.min(f.len())]))
-                                .unwrap_or_else(|| period_from.clone());
-                            let _ =
-                                db_jobs::update_found(&pool_ls, jid, total as i64, &cursor).await;
-                        }
+                if let Some(ref jid) = job_id_ls
+                    && let Some(uuid) = data["uuid"].as_str().or(data["Uuid"].as_str())
+                {
+                    let _ = db_jobs::upsert_invoice(&pool_ls, jid, uuid, &line).await;
+                    if total.is_multiple_of(50) {
+                        let cursor = data["fecha"]
+                            .as_str()
+                            .or(data["Fecha"].as_str())
+                            .map(|f| format!("{} 00:00:00", &f[..10.min(f.len())]))
+                            .unwrap_or_else(|| period_from.clone());
+                        let _ = db_jobs::update_found(&pool_ls, jid, total as i64, &cursor).await;
                     }
                 }
             }
@@ -1101,11 +1097,11 @@ pub async fn list_stream(
         let _ = handle.await;
 
         // Mark job complete in DB (if it was created and no limit/auth error was hit)
-        if limit_cursor.is_none() && !auth_error_hit {
-            if let Some(ref jid) = job_id_ls {
-                let _ =
-                    db_jobs::complete(&pool_ls, jid, &user_rfc_ls, &period_to, total as i64).await;
-            }
+        if limit_cursor.is_none()
+            && !auth_error_hit
+            && let Some(ref jid) = job_id_ls
+        {
+            let _ = db_jobs::complete(&pool_ls, jid, &user_rfc_ls, &period_to, total as i64).await;
         }
 
         // Send aggregated __done__ event
@@ -1270,8 +1266,8 @@ pub async fn bulk_stream(
         if should_upload {
             let bucket_str = s3_bucket.as_deref().unwrap_or("");
             for file in &files {
-                if let Some(path) = file["path"].as_str() {
-                    if let Ok(bytes) = tokio::fs::read(path).await {
+                if let Some(path) = file["path"].as_str()
+                    && let Ok(bytes) = tokio::fs::read(path).await {
                         let uuid_str = file["uuid"].as_str()
                             .unwrap_or_else(|| file["filename"].as_str().unwrap_or(""))
                             .trim_end_matches(".xml");
@@ -1282,7 +1278,6 @@ pub async fn bulk_stream(
                             uuid_str, bytes,
                         ).await;
                     }
-                }
             }
         }
 

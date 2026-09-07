@@ -100,7 +100,7 @@ pub async fn get(
     let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
     let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
-    let years_vec: Vec<i32> = years.iter().copied().collect();
+    let years_vec: Vec<i32> = years.to_vec();
 
     // Month abbreviations in Spanish
     const MONTHS: [&str; 12] = [

@@ -1,6 +1,6 @@
-/// Abstraction over XML storage.
-/// - `debug_assertions` ON  → local filesystem (`./invoices/{rfc_emisor}/{rfc_receptor}/{year}/{month:02}/{day:02}/{uuid}.xml`)
-/// - `debug_assertions` OFF → AWS S3 with path `cfdis/{rfc_emisor}/{rfc_receptor}/{year}/{month:02}/{day:02}/{uuid}.xml`
+//! Abstraction over XML storage.
+//! - `debug_assertions` ON  → local filesystem (`./invoices/{rfc_emisor}/{rfc_receptor}/{year}/{month:02}/{day:02}/{uuid}.xml`)
+//! - `debug_assertions` OFF → AWS S3 with path `cfdis/{rfc_emisor}/{rfc_receptor}/{year}/{month:02}/{day:02}/{uuid}.xml`
 
 #[cfg(debug_assertions)]
 const LOCAL_BASE: &str = "invoices";
@@ -9,6 +9,7 @@ const LOCAL_BASE: &str = "invoices";
 // Upload
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub async fn upload(
     #[allow(unused_variables)] s3: &aws_sdk_s3::Client,
     #[allow(unused_variables)] bucket: &str,
@@ -30,7 +31,7 @@ pub async fn upload(
         tokio::fs::write(&path, &data)
             .await
             .map_err(|e| e.to_string())?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(debug_assertions))]
@@ -55,6 +56,7 @@ pub async fn upload(
 // Get
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub async fn get(
     #[allow(unused_variables)] s3: &aws_sdk_s3::Client,
     #[allow(unused_variables)] bucket: &str,

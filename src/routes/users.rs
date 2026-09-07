@@ -246,7 +246,7 @@ fn days_in_month(y: u32, m: u32) -> u32 {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 => {
-            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            if (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400) {
                 29
             } else {
                 28
@@ -284,7 +284,7 @@ pub async fn get_profile(req: HttpRequest, pool: web::Data<DbPool>) -> HttpRespo
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
@@ -346,10 +346,10 @@ pub async fn complete_profile(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let rfc = body.rfc.trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     if rfc.is_empty() {
         return HttpResponse::UnprocessableEntity().json(ErrorBody {
             error: "RFC es requerido".to_string(),
@@ -495,7 +495,7 @@ pub async fn trigger_sync(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let requested_rfc = body
         .as_ref()
@@ -537,19 +537,18 @@ pub async fn trigger_sync(
             }
         }
     };
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     // If there's already an active job, return its status instead of creating a duplicate
-    if let Some(ref job_id) = existing_job_id {
-        if let Ok(Some(job)) = crate::db::jobs::get_by_id(&pool, job_id).await {
-            if matches!(job.status.as_str(), "queued" | "running" | "paused_limit") {
-                return HttpResponse::Conflict().json(serde_json::json!({
-                    "error": "Ya existe un job activo",
-                    "job_id": job_id,
-                    "status": job.status,
-                }));
-            }
-        }
+    if let Some(ref job_id) = existing_job_id
+        && let Ok(Some(job)) = crate::db::jobs::get_by_id(&pool, job_id).await
+        && matches!(job.status.as_str(), "queued" | "running" | "paused_limit")
+    {
+        return HttpResponse::Conflict().json(serde_json::json!({
+            "error": "Ya existe un job activo",
+            "job_id": job_id,
+            "status": job.status,
+        }));
     }
 
     // Decrypt the stored CIEC password and rebuild auth payload
@@ -651,7 +650,7 @@ pub async fn sync_status(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let specific_rfc = query
         .rfc
@@ -817,11 +816,11 @@ pub async fn sync_status(
 pub async fn get_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> Result<HttpResponse, AppError> {
     let token = bearer_token(&req).ok_or_else(|| AppError::unauthorized("Token requerido"))?;
     let user_id = jwt_user_id(&token).ok_or_else(|| AppError::unauthorized("Token inválido"))?;
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
 
     if is_admin {
         // Return all (user_id, rfc) pairs
@@ -829,13 +828,13 @@ pub async fn get_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> Result<HttpR
             sqlx::query_as("SELECT user_id::text, rfc FROM pulso.users ORDER BY ctid")
                 .fetch_all(pool.as_ref())
                 .await
-                .map_err(|e| AppError::internal(&e.to_string()))?;
+                .map_err(|e| AppError::internal(e.to_string()))?;
         return Ok(HttpResponse::Ok().json(serde_json::json!({ "rfcs": rows.into_iter().map(|(uid, rfc)| serde_json::json!({ "user_id": uid, "rfc": rfc })).collect::<Vec<_>>() })));
     }
 
     let rows = crate::db::users::get_user_rfcs_with_role(&pool, &user_id)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     let rfcs: Vec<_> = rows
         .into_iter()
         .map(
@@ -871,10 +870,10 @@ pub async fn add_rfc(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let rfc = body.rfc.trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     if rfc.is_empty() {
         return HttpResponse::UnprocessableEntity().json(ErrorBody {
             error: "RFC es requerido".to_string(),
@@ -1022,10 +1021,10 @@ pub async fn update_rfc_clave_handler(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let rfc = path.into_inner().trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     if body.clave.is_empty() {
         return HttpResponse::UnprocessableEntity().json(ErrorBody {
@@ -1110,10 +1109,10 @@ pub async fn validate_clave_handler(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let rfc = path.into_inner().trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     let clave_enc = match crate::db::users::get_credentials_for_rfc(&pool, &user_id, &rfc).await {
         Ok(Some((clave_enc, _initial_job_id))) => clave_enc,
@@ -1228,10 +1227,10 @@ pub async fn update_priority_analysis_handler(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let rfc = path.into_inner().trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     if !matches!(
         body.priority_analysis.as_str(),
@@ -1297,10 +1296,10 @@ pub async fn delete_rfc_handler(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let rfc = path.into_inner().trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     // Only the owner may delete
     match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
@@ -1386,10 +1385,10 @@ pub async fn list_rfc_shares_handler(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let rfc = path.into_inner().trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     // Only owner can list shares
     match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
@@ -1442,10 +1441,10 @@ pub async fn share_rfc_handler(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let rfc = path.into_inner().trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     let email = body.email.trim().to_lowercase();
     if email.is_empty() {
@@ -1557,11 +1556,11 @@ pub async fn revoke_rfc_share_handler(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let (rfc, share_id) = path.into_inner();
     let rfc = rfc.trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     // Only owner can revoke
     match crate::db::users::user_owns_rfc_or_admin(&pool, &user_id, &rfc).await {
@@ -1628,7 +1627,7 @@ pub async fn admin_download(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
@@ -1640,7 +1639,7 @@ pub async fn admin_download(
     }
 
     let rfc = body.rfc.trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     let clave_enc = match crate::db::users::get_clave_for_rfc(&pool, &rfc).await {
         Ok(Some(c)) => c,
@@ -1728,7 +1727,7 @@ fn parse_ym(s: &str) -> Option<(i32, i32)> {
     }
     let y = parts[0].parse::<i32>().ok()?;
     let m = parts[1].parse::<i32>().ok()?;
-    if m < 1 || m > 12 {
+    if !(1..=12).contains(&m) {
         return None;
     }
     Some((y, m))
@@ -1756,7 +1755,7 @@ pub async fn admin_reprocess(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
@@ -1768,7 +1767,7 @@ pub async fn admin_reprocess(
     }
 
     let rfc = body.rfc.trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     let dl_type = body.dl_type.as_deref().unwrap_or("ambos");
 
@@ -1844,7 +1843,7 @@ pub async fn admin_list_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> HttpR
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
@@ -1966,7 +1965,7 @@ pub async fn admin_list_rfcs_full(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
@@ -2022,13 +2021,15 @@ pub async fn admin_list_rfcs_full(
 
     let page_rfcs: Vec<String> = rows.iter().map(|(rfc, ..)| rfc.clone()).collect();
 
-    let share_rows: Vec<(
+    // (rfc, viewer_email, viewer_name, invited_email, granted_at)
+    type RfcShareRow = (
         String,
         Option<String>,
         Option<String>,
         Option<String>,
         String,
-    )> = match sqlx::query_as(
+    );
+    let share_rows: Vec<RfcShareRow> = match sqlx::query_as(
         r#"
         SELECT rs.rfc, viewer.email, viewer.name, rs.invited_email,
                to_char(rs.granted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS granted_at
@@ -2138,7 +2139,7 @@ pub async fn admin_list_users(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
@@ -2245,7 +2246,7 @@ pub async fn admin_user_rfcs(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
@@ -2257,7 +2258,7 @@ pub async fn admin_user_rfcs(
     }
 
     let target_user_id = path.into_inner();
-    tracing::Span::current().record("target_user_id", &target_user_id.as_str());
+    tracing::Span::current().record("target_user_id", target_user_id.as_str());
 
     let target_uuid: uuid::Uuid = match target_user_id.parse() {
         Ok(id) => id,
@@ -2361,7 +2362,7 @@ pub async fn admin_rfc_xml_years(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
@@ -2373,7 +2374,7 @@ pub async fn admin_rfc_xml_years(
     }
 
     let rfc = path.into_inner().trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     let rows: Vec<(i64,)> = match sqlx::query_as(
         r#"SELECT DISTINCT year FROM pulso.cfdis WHERE rfc_emisor = $1 OR rfc_receptor = $1 ORDER BY year"#,
@@ -2427,7 +2428,7 @@ pub async fn admin_rfc_xml_days(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
@@ -2439,7 +2440,7 @@ pub async fn admin_rfc_xml_days(
     }
 
     let rfc = path.into_inner().trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
 
     let rows: Vec<(String, i64)> = match sqlx::query_as(
         r#"
@@ -2543,7 +2544,7 @@ pub async fn admin_rfc_xml_day(
             });
         }
     };
-    tracing::Span::current().record("user_id", &user_id.as_str());
+    tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
@@ -2555,7 +2556,7 @@ pub async fn admin_rfc_xml_day(
     }
 
     let rfc = path.into_inner().trim().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     let date = query.date.trim();
     let search = query.search.trim();
     let page = query.page.max(1);

@@ -31,6 +31,7 @@ pub struct Config {
     pub google_client_secret: String,
     pub google_redirect_uri: String,
     pub jwt_secret: String,
+    #[allow(dead_code)]
     pub app_base_url: String,
 }
 

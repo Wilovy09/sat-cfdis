@@ -149,6 +149,7 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn redownload_chunk(
     pool: &DbPool,
     cfg: &Config,

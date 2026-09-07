@@ -16,6 +16,7 @@ fn key(
 
 /// Upload XML bytes to S3. Returns the S3 key.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_xml(
     client: &Client,
     bucket: &str,
@@ -42,6 +43,7 @@ pub async fn upload_xml(
 
 /// Download XML bytes from S3 if the key exists. Returns None if not found.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub async fn get_xml(
     client: &Client,
     bucket: &str,

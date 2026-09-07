@@ -81,7 +81,8 @@ fn fmt_unix(secs: u64) -> String {
     // Days since 1970-01-01
     let mut year = 1970u64;
     loop {
-        let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let leap =
+            (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
         let days_in_year = if leap { 366 } else { 365 };
         if remaining < days_in_year {
             break;
@@ -89,7 +90,7 @@ fn fmt_unix(secs: u64) -> String {
         remaining -= days_in_year;
         year += 1;
     }
-    let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
     let mut month = 0usize;
     for (i, &dim) in DAYS_IN_MONTH.iter().enumerate() {
         let dim = if i == 1 && leap { 29 } else { dim };
@@ -606,6 +607,7 @@ pub async fn set_running(pool: &PgPool, job_id: &str) -> Result<(), sqlx::Error>
 
 /// Insert a new job with status 'queued' (will be picked up by the background worker).
 /// `job_type`: `"list"` for manual jobs, `"auto_daily"` for automatic daily sync.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_queued(
     pool: &PgPool,
     job_type: &str,
@@ -793,6 +795,7 @@ pub async fn find_failed_retryable(
 /// Queues a fresh job covering a failed job's unfinished range, inheriting
 /// `gap_retry_count + 1` so the cap in `find_failed_retryable` eventually
 /// stops it. Returns the new job's id.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_gap_continuation(
     pool: &PgPool,
     rfc: &str,

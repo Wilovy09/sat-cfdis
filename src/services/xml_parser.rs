@@ -195,12 +195,14 @@ pub fn parse(
     let mut reader = Reader::from_reader(xml_bytes);
     reader.config_mut().trim_text(true);
 
-    let mut cfdi = ParsedCfdi::default();
-    cfdi.job_id = job_id.to_string();
-    cfdi.dl_type = dl_type.to_string();
-    cfdi.estado_sat = estado_sat.to_string();
-    cfdi.xml_available = 1;
-    cfdi.created_at = utc_now();
+    let mut cfdi = ParsedCfdi {
+        job_id: job_id.to_string(),
+        dl_type: dl_type.to_string(),
+        estado_sat: estado_sat.to_string(),
+        xml_available: 1,
+        created_at: utc_now(),
+        ..Default::default()
+    };
 
     let mut ctx_stack: Vec<Ctx> = vec![Ctx::Root];
     let mut current_concept = ParsedConcept::default();
@@ -860,7 +862,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let mut y = 1970u64;
     let mut rem = days;
     loop {
-        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
         let dy = if leap { 366 } else { 365 };
         if rem < dy {
             break;
@@ -868,7 +870,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
         rem -= dy;
         y += 1;
     }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let months = [
         31u64,
         if leap { 29 } else { 28 },

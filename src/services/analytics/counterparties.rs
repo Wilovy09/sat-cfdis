@@ -863,6 +863,10 @@ pub struct CpConceptRow {
     pub total_mxn: f64,
 }
 
+/// Per-concept accumulator while aggregating `concept_rows` below: (year -> amount, year ->
+/// count, running total_mxn), keyed by concept description.
+type ConceptAccumulator = HashMap<String, (HashMap<String, f64>, HashMap<String, i64>, f64)>;
+
 pub async fn get_individual(
     pool: &DbPool,
     owner_rfc: &str,
@@ -1075,8 +1079,7 @@ pub async fn get_individual(
     .await?;
 
     // Aggregate concepts
-    let mut concept_map: HashMap<String, (HashMap<String, f64>, HashMap<String, i64>, f64)> =
-        HashMap::new();
+    let mut concept_map: ConceptAccumulator = HashMap::new();
     for row in &concept_rows {
         let desc: String = row.try_get("desc_key").unwrap_or_default();
         let year: i32 = row.try_get::<i64, _>("year").unwrap_or(0) as i32;

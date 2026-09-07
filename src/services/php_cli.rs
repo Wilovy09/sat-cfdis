@@ -67,10 +67,10 @@ impl PhpCli {
         if !output.status.success() {
             // Try to parse a structured error from stderr first
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&output.stderr) {
-                if let Some(msg) = map.get("error").and_then(|v| v.as_str()) {
-                    bail!("PHP CLI error: {msg}");
-                }
+            if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&output.stderr)
+                && let Some(msg) = map.get("error").and_then(|v| v.as_str())
+            {
+                bail!("PHP CLI error: {msg}");
             }
             bail!("PHP CLI exited with status {}: {stderr}", output.status);
         }

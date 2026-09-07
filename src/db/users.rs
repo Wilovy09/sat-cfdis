@@ -191,6 +191,7 @@ pub async fn get_user_rfcs(pool: &PgPool, user_id: &str) -> Result<Vec<String>, 
     Ok(rows.into_iter().map(|(rfc,)| rfc).collect())
 }
 
+#[allow(dead_code)]
 pub async fn get_user_rfcs_with_nombre(
     pool: &PgPool,
     user_id: &str,
@@ -344,6 +345,7 @@ pub async fn user_owns_rfc_or_admin(
 
 /// Grant a viewer their own `pulso.users` row for the shared RFC (no clave, no sync job).
 /// Idempotent: restores soft-deleted row or skips if already active.
+#[allow(dead_code)]
 pub async fn add_viewer_rfc(pool: &PgPool, user_id: &str, rfc: &str) -> Result<(), sqlx::Error> {
     let uid = parse_uuid(user_id)?;
     let rfc_upper = rfc.to_uppercase();

@@ -234,7 +234,7 @@ pub async fn get(
         .collect();
 
     // Q3: top recurrent counterparties (>= 75% of window, min 1, capped at 18)
-    let min_months: i64 = ((actual_window * 3 / 4).max(1)).min(18);
+    let min_months: i64 = (actual_window * 3 / 4).clamp(1, 18);
     let q3 = format!(
         r#"
         WITH cp_data AS (

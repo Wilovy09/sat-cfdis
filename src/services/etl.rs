@@ -56,11 +56,11 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
         };
         for job_id in enrich_ids {
             // Decrement and skip if in backoff
-            if let Some(remaining) = enrich_skip.get_mut(&job_id) {
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    continue;
-                }
+            if let Some(remaining) = enrich_skip.get_mut(&job_id)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                continue;
             }
 
             let (enriched, sat_failed) = match enrich_job(&pool, &cfg, &s3, &job_id).await {
@@ -194,23 +194,23 @@ async fn process_invoice(
 
     // For nómina CFDIs the relevant period is the payment period, NOT fecha_emision.
     // Override year/month from fecha_final_pago (fallback: fecha_inicial_pago).
-    if cfdi.tipo_comprobante == "N" {
-        if let Some(ref nom) = cfdi.nomina {
-            let fecha_periodo = nom
-                .fecha_final_pago
-                .as_deref()
-                .or(nom.fecha_inicial_pago.as_deref())
-                .unwrap_or("");
-            if !fecha_periodo.is_empty() {
-                let parts: Vec<&str> = fecha_periodo.splitn(3, '-').collect();
-                if parts.len() >= 2 {
-                    if let (Ok(y), Ok(m)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
-                        if y > 2000 && m >= 1 && m <= 12 {
-                            cfdi.year = y;
-                            cfdi.month = m;
-                        }
-                    }
-                }
+    if cfdi.tipo_comprobante == "N"
+        && let Some(ref nom) = cfdi.nomina
+    {
+        let fecha_periodo = nom
+            .fecha_final_pago
+            .as_deref()
+            .or(nom.fecha_inicial_pago.as_deref())
+            .unwrap_or("");
+        if !fecha_periodo.is_empty() {
+            let parts: Vec<&str> = fecha_periodo.splitn(3, '-').collect();
+            if parts.len() >= 2
+                && let (Ok(y), Ok(m)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>())
+                && y > 2000
+                && (1..=12).contains(&m)
+            {
+                cfdi.year = y;
+                cfdi.month = m;
             }
         }
     }
@@ -222,22 +222,23 @@ async fn process_invoice(
     }
 
     // Insert taxes
-    if !cfdi.taxes.is_empty() {
-        if let Err(e) = db::cfdis::insert_taxes(pool, &cfdi.uuid, &cfdi.taxes).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_taxes: {e}");
-        }
+    if !cfdi.taxes.is_empty()
+        && let Err(e) = db::cfdis::insert_taxes(pool, &cfdi.uuid, &cfdi.taxes).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_taxes: {e}");
     }
 
     // Insert concepts (only if XML was available to avoid duplicates)
-    if xml_bytes.is_some() && !cfdi.concepts.is_empty() {
-        if let Err(e) = db::cfdis::insert_concepts(pool, &cfdi.uuid, &cfdi.concepts).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_concepts: {e}");
-        }
+    if xml_bytes.is_some()
+        && !cfdi.concepts.is_empty()
+        && let Err(e) = db::cfdis::insert_concepts(pool, &cfdi.uuid, &cfdi.concepts).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_concepts: {e}");
     }
 
     // Insert payment complement data
-    if !cfdi.payments.is_empty() {
-        if let Err(e) = db::cfdis::insert_payments(
+    if !cfdi.payments.is_empty()
+        && let Err(e) = db::cfdis::insert_payments(
             pool,
             Some(job_id),
             &cfdi.rfc_emisor,
@@ -246,23 +247,22 @@ async fn process_invoice(
             &cfdi.payments,
         )
         .await
-        {
-            tracing::warn!(uuid = %uuid, "ETL: insert_payments: {e}");
-        }
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_payments: {e}");
     }
 
     // Insert cfdi_relacionados (credit notes, etc.)
-    if !cfdi.relacionados.is_empty() {
-        if let Err(e) = db::cfdis::insert_relacionados(pool, &cfdi.uuid, &cfdi.relacionados).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_relacionados: {e}");
-        }
+    if !cfdi.relacionados.is_empty()
+        && let Err(e) = db::cfdis::insert_relacionados(pool, &cfdi.uuid, &cfdi.relacionados).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_relacionados: {e}");
     }
 
     // Insert nomina data
-    if let Some(nomina) = &cfdi.nomina {
-        if let Err(e) = db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}");
-        }
+    if let Some(nomina) = &cfdi.nomina
+        && let Err(e) = db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}");
     }
 }
 
@@ -369,10 +369,10 @@ pub(crate) async fn apply_xml_bytes(
         return false;
     }
 
-    if !cfdi.taxes.is_empty() {
-        if let Err(e) = db::cfdis::insert_taxes(pool, &cfdi.uuid, &cfdi.taxes).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_taxes: {e}");
-        }
+    if !cfdi.taxes.is_empty()
+        && let Err(e) = db::cfdis::insert_taxes(pool, &cfdi.uuid, &cfdi.taxes).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_taxes: {e}");
     }
 
     if !cfdi.payments.is_empty() {
@@ -392,22 +392,23 @@ pub(crate) async fn apply_xml_bytes(
         }
     }
 
-    if !cfdi.relacionados.is_empty() {
-        if let Err(e) = db::cfdis::insert_relacionados(pool, &cfdi.uuid, &cfdi.relacionados).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_relacionados: {e}");
-        }
+    if !cfdi.relacionados.is_empty()
+        && let Err(e) = db::cfdis::insert_relacionados(pool, &cfdi.uuid, &cfdi.relacionados).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_relacionados: {e}");
     }
 
-    if !cfdi.concepts.is_empty() && !db::cfdis::concepts_exist(pool, &cfdi.uuid).await {
-        if let Err(e) = db::cfdis::insert_concepts(pool, &cfdi.uuid, &cfdi.concepts).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_concepts: {e}");
-        }
+    if !cfdi.concepts.is_empty()
+        && !db::cfdis::concepts_exist(pool, &cfdi.uuid).await
+        && let Err(e) = db::cfdis::insert_concepts(pool, &cfdi.uuid, &cfdi.concepts).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_concepts: {e}");
     }
 
-    if let Some(nomina) = &cfdi.nomina {
-        if let Err(e) = db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}");
-        }
+    if let Some(nomina) = &cfdi.nomina
+        && let Err(e) = db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}");
     }
 
     tracing::debug!(uuid = %uuid, "ETL: applied real XML");
@@ -553,7 +554,7 @@ pub(crate) fn extract_path_from_meta(metadata: &str) -> (String, String, u32, u3
         .or_else(|| v["fechaEmision"].as_str())
         .unwrap_or("2000-01-01");
 
-    let parts: Vec<&str> = fecha.splitn(4, |c| c == '-' || c == 'T').collect();
+    let parts: Vec<&str> = fecha.splitn(4, ['-', 'T']).collect();
     let year = parts.first().and_then(|s| s.parse().ok()).unwrap_or(2000);
     let month = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
     let day = parts

@@ -65,7 +65,7 @@ async fn check_rfc_access(
 
     let rfc_access = crate::db::users::user_has_rfc_or_admin(pool, &user_id, rfc)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     if !rfc_access {
         return Err(AppError::forbidden("Acceso denegado"));
     }
@@ -135,7 +135,7 @@ pub async fn get_summary(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let p = summary::SummaryParams {
         dl_type: query.dl_type(),
@@ -144,7 +144,7 @@ pub async fn get_summary(
     };
     let result = summary::get(&pool, &rfc, &p)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -166,11 +166,11 @@ pub async fn get_data_quality(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = data_quality::get(&pool, &rfc)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -199,7 +199,7 @@ pub async fn get_counterparties(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = counterparties::get(
         &pool,
@@ -210,7 +210,7 @@ pub async fn get_counterparties(
         query.limit(),
     )
     .await
-    .map_err(|e| AppError::internal(&e.to_string()))?;
+    .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -250,7 +250,7 @@ pub async fn get_recurrence(
     let to = query.get("to").map(|s| s.as_str());
     let result = recurrence::get(&pool, &rfc, dl_type, window_months, from, to)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -282,7 +282,7 @@ pub async fn get_retention(
         .unwrap_or("emitidos");
     let result = retention::get(&pool, &rfc, dl_type)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -310,11 +310,11 @@ pub async fn get_geography(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = geography::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -342,11 +342,11 @@ pub async fn get_concepts(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = concepts::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -374,11 +374,11 @@ pub async fn get_fiscal(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = fiscal::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -406,11 +406,11 @@ pub async fn get_payments(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = payments::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -438,11 +438,11 @@ pub async fn get_cashflow(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = cashflow::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -469,11 +469,11 @@ pub async fn get_payroll(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = payroll::get(&pool, &rfc, &query.from(), &query.to())
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -495,11 +495,11 @@ pub async fn get_payroll_snapshot(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = payroll::get_snapshot(&pool, &rfc)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -521,11 +521,11 @@ pub async fn get_hallazgos(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = hallazgos::get(&pool, &rfc)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -553,11 +553,11 @@ pub async fn list_normalization(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let rules = normalization::list_rules(&pool, &rfc)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(rules))
 }
 
@@ -580,7 +580,7 @@ pub async fn create_normalization(
     body: web::Json<normalization::CreateRuleRequest>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     validate_comprobante_rule_fields(&body)?;
     let rule = normalization::create_rule(&pool, &rfc, &body)
@@ -613,8 +613,8 @@ pub async fn update_normalization(
 ) -> Result<HttpResponse, AppError> {
     let (rfc, id) = path.into_inner();
     let rfc = rfc.to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
-    tracing::Span::current().record("rule_id", &id.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
+    tracing::Span::current().record("rule_id", id.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     validate_comprobante_rule_fields(&body)?;
     let rule = normalization::update_rule(&pool, &id, &rfc, &body)
@@ -673,7 +673,7 @@ fn map_normalization_rule_error(e: anyhow::Error) -> AppError {
              apuntar al mismo CFDI.",
         )
     } else {
-        AppError::internal(&e.to_string())
+        AppError::internal(e.to_string())
     }
 }
 
@@ -697,12 +697,12 @@ pub async fn delete_normalization(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let (rfc, id) = path.into_inner();
-    tracing::Span::current().record("rfc", &rfc.to_uppercase().as_str());
-    tracing::Span::current().record("rule_id", &id.as_str());
+    tracing::Span::current().record("rfc", rfc.to_uppercase().as_str());
+    tracing::Span::current().record("rule_id", id.as_str());
     check_rfc_access(&pool, &req, &rfc.to_uppercase()).await?;
     let deleted = normalization::delete_rule(&pool, &id, &rfc.to_uppercase())
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     if deleted {
         Ok(HttpResponse::NoContent().finish())
     } else {
@@ -724,11 +724,11 @@ pub async fn list_payroll_normalization(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let rules = normalization::list_payroll_rules(&pool, &rfc)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(rules))
 }
 
@@ -751,12 +751,12 @@ pub async fn create_payroll_normalization(
     body: web::Json<normalization::CreatePayrollRuleRequest>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
 
     match normalization::check_payroll_rule(&pool, &rfc, &body, None)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?
+        .map_err(|e| AppError::internal(e.to_string()))?
     {
         normalization::PayrollRuleCheck::Rejected(msg) => return Err(AppError::bad_request(msg)),
         normalization::PayrollRuleCheck::NeedsConfirmation(warnings) => {
@@ -770,7 +770,7 @@ pub async fn create_payroll_normalization(
 
     let rule = normalization::create_payroll_rule(&pool, &rfc, &body)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Created().json(rule))
 }
 
@@ -798,15 +798,15 @@ pub async fn update_payroll_normalization(
 ) -> Result<HttpResponse, AppError> {
     let (rfc, id) = path.into_inner();
     let rfc = rfc.to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
-    tracing::Span::current().record("rule_id", &id.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
+    tracing::Span::current().record("rule_id", id.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
 
     // L5-10: same locks/validations as creation, run against this rule's own id so it
     // doesn't get rejected for overlapping itself (L5-08 C1/C2, L5-12, L4-04/L4-12).
     match normalization::check_payroll_rule(&pool, &rfc, &body, Some(&id))
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?
+        .map_err(|e| AppError::internal(e.to_string()))?
     {
         normalization::PayrollRuleCheck::Rejected(msg) => return Err(AppError::bad_request(msg)),
         normalization::PayrollRuleCheck::NeedsConfirmation(warnings) => {
@@ -820,7 +820,7 @@ pub async fn update_payroll_normalization(
 
     let rule = normalization::update_payroll_rule(&pool, &id, &rfc, &body)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     match rule {
         Some(rule) => Ok(HttpResponse::Ok().json(rule)),
         None => Err(AppError::not_found("Payroll rule not found")),
@@ -847,12 +847,12 @@ pub async fn delete_payroll_normalization(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let (rfc, id) = path.into_inner();
-    tracing::Span::current().record("rfc", &rfc.to_uppercase().as_str());
-    tracing::Span::current().record("rule_id", &id.as_str());
+    tracing::Span::current().record("rfc", rfc.to_uppercase().as_str());
+    tracing::Span::current().record("rule_id", id.as_str());
     check_rfc_access(&pool, &req, &rfc.to_uppercase()).await?;
     let deleted = normalization::delete_payroll_rule(&pool, &id, &rfc.to_uppercase())
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     if deleted {
         Ok(HttpResponse::NoContent().finish())
     } else {
@@ -878,11 +878,11 @@ pub async fn list_excluded_cfdis(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let cfdis = normalization::list_excluded_cfdis(&pool, &rfc)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(cfdis))
 }
 
@@ -907,7 +907,7 @@ pub async fn list_norm_counterparties(
         &pool, &rfc, &dl_type, from_y, from_m, to_y, to_m,
     )
     .await
-    .map_err(|e| AppError::internal(&e.to_string()))?;
+    .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(rows))
 }
 
@@ -942,7 +942,7 @@ pub async fn list_norm_counterparty_cfdis(
         limit,
     )
     .await
-    .map_err(|e| AppError::internal(&e.to_string()))?;
+    .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(rows))
 }
 
@@ -973,7 +973,7 @@ pub async fn list_normalization_individual_rule_ids(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
 
     let source_rfc = query
@@ -1000,7 +1000,7 @@ pub async fn list_normalization_individual_rule_ids(
         query.period_end.as_deref(),
     )
     .await
-    .map_err(|e| AppError::internal(&e.to_string()))?;
+    .map_err(|e| AppError::internal(e.to_string()))?;
 
     Ok(HttpResponse::Ok().json(rule_ids))
 }
@@ -1020,7 +1020,7 @@ pub async fn get_normalization_payroll_employees(
     // employee's real full history, which is the whole point (see normalization.rs).
     let rows = normalization::list_payroll_employees(&pool, &rfc)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(rows))
 }
 
@@ -1039,7 +1039,7 @@ pub async fn get_normalization_payroll_employee_receipts(
     let rows =
         normalization::list_nomina_receipts_for_employee(&pool, &rfc, &employee_rfc.to_uppercase())
             .await
-            .map_err(|e| AppError::internal(&e.to_string()))?;
+            .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(rows))
 }
 
@@ -1062,7 +1062,7 @@ pub async fn get_normalization_ebitda_bridge(
     let rows =
         normalization::list_ebitda_bridge_adjustments(&pool, &rfc, from_y, from_m, to_y, to_m)
             .await
-            .map_err(|e| AppError::internal(&e.to_string()))?;
+            .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(rows))
 }
 
@@ -1081,7 +1081,7 @@ pub async fn get_counterparties_evolution(
     let result =
         counterparties::get_evolution(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
             .await
-            .map_err(|e| AppError::internal(&e.to_string()))?;
+            .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -1099,7 +1099,7 @@ pub async fn get_counterparties_ltm(
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = counterparties::get_ltm_comparison(&pool, &rfc, &query.dl_type(), &query.to())
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -1123,7 +1123,7 @@ pub async fn get_counterparties_payments_detail(
         &query.to(),
     )
     .await
-    .map_err(|e| AppError::internal(&e.to_string()))?;
+    .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -1142,7 +1142,7 @@ pub async fn get_counterparties_atypical(
     let result =
         counterparties::get_atypical(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
             .await
-            .map_err(|e| AppError::internal(&e.to_string()))?;
+            .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -1169,7 +1169,7 @@ pub async fn get_counterparty_individual(
         &query.to(),
     )
     .await
-    .map_err(|e| AppError::internal(&e.to_string()))?;
+    .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -1228,11 +1228,11 @@ pub async fn get_quarterly(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = quarterly::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -1240,7 +1240,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let mut y = 1970u64;
     let mut rem = days;
     loop {
-        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
         let dy = if leap { 366 } else { 365 };
         if rem < dy {
             break;
@@ -1248,7 +1248,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
         rem -= dy;
         y += 1;
     }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let months = [
         31u64,
         if leap { 29 } else { 28 },
@@ -1295,7 +1295,7 @@ pub async fn get_period_comparison(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let dl_type = query.dl_type.clone().unwrap_or_else(|| "emitidos".into());
     let from_month = query.from_month.unwrap_or(1).clamp(1, 12);
@@ -1311,7 +1311,7 @@ pub async fn get_period_comparison(
 
     let result = period_comparison::get(&pool, &rfc, &dl_type, from_month, to_month, &years, limit)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -1323,7 +1323,7 @@ pub async fn get_xml_count(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let dl_type = query
         .get("dl_type")
@@ -1331,7 +1331,7 @@ pub async fn get_xml_count(
         .unwrap_or("emitidos");
     let result = xml_count::get(&pool, &rfc, dl_type)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
 
@@ -1341,10 +1341,10 @@ pub async fn get_xml_breakdown(
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    tracing::Span::current().record("rfc", &rfc.as_str());
+    tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = xml_breakdown::get(&pool, &rfc)
         .await
-        .map_err(|e| AppError::internal(&e.to_string()))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
 }
