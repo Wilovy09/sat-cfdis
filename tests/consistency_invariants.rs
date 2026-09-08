@@ -39,13 +39,45 @@ async fn connect() -> DbPool {
         .expect("connect to the shared test database (POSTGRES_* env vars)")
 }
 
-/// Rows with year <> year_devengo anywhere in this RFC's (non-excluded) nomina -- the
-/// non-vacuity guard both invariants below assert is nonzero before trusting a green result.
+/// Rows where raw fecha_emision's year or month differs from year_devengo/month_devengo --
+/// the non-vacuity guard for invariante 2, which compares at both grains (by_year/by_month at
+/// year grain, headcount_by_month/by_month at month grain).
+///
+/// Per a later review: this used to compare `year`/`month` (the header, i.e. cfdis.year/month)
+/// against devengo instead of raw fecha_emision. That was live-divergent data back when the
+/// header still had the ingestion bug this whole invariant exists to catch (see
+/// PULSO_Cierre_Lote6.md's devengo fix) -- but the fix's own backfill corrects every row where
+/// header != devengo, by construction driving this guard's old signal to permanently zero
+/// (confirmed: 0 rows platform-wide right after the backfill ran). Raw fecha_emision vs
+/// devengo has no such ceiling -- late-filed payroll is normal, ongoing behavior, not a bug,
+/// so it stays non-vacuous indefinitely (see this file's own top-of-file note: "that's
+/// permanently true for real payroll data").
 async fn has_devengo_divergence(pool: &DbPool, rfc: &str) -> bool {
     let row = sqlx::query(
         r#"SELECT COUNT(*) AS n FROM pulso.nomina_normalizada
            WHERE rfc_emisor = $1 AND NOT is_excluded
-             AND (year <> year_devengo OR month <> month_devengo)"#,
+             AND (EXTRACT(YEAR FROM fecha_emision::date)::bigint <> year_devengo
+                  OR EXTRACT(MONTH FROM fecha_emision::date)::bigint <> month_devengo)"#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.try_get::<i64, _>("n").unwrap_or(0) > 0
+}
+
+/// Same signal as `has_devengo_divergence` above, restricted to year -- the non-vacuity guard
+/// for invariante 1, which compares H3 against payroll::monthly_series at YEAR grain only
+/// (both summed to year). Per Rob's review: the general guard above checks month OR year
+/// divergence, which invariante 1 doesn't need and doesn't test -- measured directly against
+/// raw fecha_emision, RFC_PRUEBA has 24 rows that diverge in month and zero that diverge in
+/// year, so the general guard would pass while invariante 1's actual year-grain comparison
+/// stays vacuous for that RFC.
+async fn has_year_devengo_divergence(pool: &DbPool, rfc: &str) -> bool {
+    let row = sqlx::query(
+        r#"SELECT COUNT(*) AS n FROM pulso.nomina_normalizada
+           WHERE rfc_emisor = $1 AND NOT is_excluded
+             AND EXTRACT(YEAR FROM fecha_emision::date)::bigint <> year_devengo"#,
     )
     .bind(rfc)
     .fetch_one(pool)
@@ -65,12 +97,20 @@ async fn has_devengo_divergence(pool: &DbPool, rfc: &str) -> bool {
 /// `hallazgos::nomina_por_year` (pub, extracted from H3's own query) is now the one thing
 /// both H3 and this test call -- there's no second copy left to diverge. Comparison side
 /// calls the real `payroll::monthly_series`.
+///
+/// RFC_GRANDE only, not RFC_PRUEBA: this compares at YEAR grain (both sides summed to year),
+/// so the guard above needs the year-only signal specifically, not month. Measured directly
+/// against raw fecha_emision vs devengo: RFC_PRUEBA has 24 rows that diverge in month and
+/// zero that diverge in year -- structurally can't exercise this invariant, not a data
+/// hiccup that'll clear up (it held before the devengo backfill too, at 14/0). RFC_GRANDE's
+/// year-level divergence is a healthy 356 rows on the same signal -- comfortably above the
+/// old header-based guard's 3-receipt/10,855-peso margin from before the backfill.
 #[tokio::test]
 async fn invariante_una_sola_definicion_costo_nomina() {
     let pool = connect().await;
-    for rfc in [RFC_PRUEBA, RFC_GRANDE] {
+    for rfc in [RFC_GRANDE] {
         assert!(
-            has_devengo_divergence(&pool, rfc).await,
+            has_year_devengo_divergence(&pool, rfc).await,
             "for {rfc}: zero rows have year <> year_devengo -- this invariant can't \
              distinguish the emision- and devengo-grouped definitions on today's data, so a \
              passing result here would prove nothing. Confirm the data is as expected before \
@@ -196,7 +236,8 @@ async fn invariante_una_sola_definicion_mes_de_nomina() {
         let divergent_year_row = sqlx::query(
             r#"SELECT year_devengo AS y FROM pulso.nomina_normalizada
                WHERE rfc_emisor = $1 AND NOT is_excluded
-                 AND (year <> year_devengo OR month <> month_devengo)
+                 AND (EXTRACT(YEAR FROM fecha_emision::date)::bigint <> year_devengo
+                      OR EXTRACT(MONTH FROM fecha_emision::date)::bigint <> month_devengo)
                LIMIT 1"#,
         )
         .bind(rfc)

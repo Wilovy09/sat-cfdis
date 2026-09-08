@@ -55,9 +55,17 @@ const MULTI_QUERY_BUDGET_GET: Duration = Duration::from_secs(20);
 /// as `payroll::get`: it calls `payroll::get_snapshot` internally (H4) on top of its own
 /// ~10 round trips (H1, H2/H3's annual data, H5A/H5B's several queries, H6). Measured
 /// directly: 19.6s, no `IN (subquery)`-against-the-view pattern found (the specific shape
-/// `get_snapshot`'s `emp_rows` bug was) -- shares `MULTI_QUERY_BUDGET_GET` rather than a
-/// third near-identical constant.
-const MULTI_QUERY_BUDGET_HALLAZGOS: Duration = MULTI_QUERY_BUDGET_GET;
+/// `get_snapshot`'s `emp_rows` bug was).
+///
+/// Per a later review: first landed sharing `MULTI_QUERY_BUDGET_GET` (20s) -- 19.6s against
+/// a 20s ceiling is 2% margin, in a binary whose six perf_budget tests run in parallel
+/// against the shared database (one of them seeding 60 rows) alongside it. That's a flaky
+/// gate waiting to happen, and a job that cries wolf teaches people to ignore it. Given its
+/// own budget with real margin instead -- a PROVISIONAL ceiling meant to catch a real
+/// regression (going to minutes, the incident class this project has already hit twice),
+/// not a target to optimize toward. The real fix (one held connection, materialize the view
+/// once, every round trip reads that) is its own follow-up, same as `payroll::get`'s.
+const MULTI_QUERY_BUDGET_HALLAZGOS: Duration = Duration::from_secs(40);
 
 async fn connect() -> DbPool {
     dotenvy::dotenv().ok();

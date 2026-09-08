@@ -234,7 +234,20 @@ pub async fn monthly_series(
                SUM(n.total_otros_pagos)                AS otros,
                COUNT(DISTINCT n.rfc_receptor)           AS emp_count,
                COUNT(*)                                AS payrolls_count,
-               BOOL_OR(n.year > n.year_devengo OR (n.year = n.year_devengo AND n.month > n.month_devengo)) AS has_late_receipts
+               -- Per a later review: comparing n.year/n.month (the header) against
+               -- n.year_devengo/n.month_devengo used to detect "late receipts" only because
+               -- the header was WRONG (still emisión-based) for the rows that mattered --
+               -- once ingestion writes the header as devengo (a separate fix), that
+               -- comparison always reads year=year_devengo, month=month_devengo, and this
+               -- alert goes silent even for genuinely late-timbrado receipts. Compares the
+               -- RAW fecha_emision (independent of whatever the header holds) against the
+               -- view's own devengo instead -- the two fixes have to land together, or this
+               -- one goes quiet the moment the other lands.
+               BOOL_OR(
+                   EXTRACT(YEAR FROM n.fecha_emision::date)::bigint > n.year_devengo
+                   OR (EXTRACT(YEAR FROM n.fecha_emision::date)::bigint = n.year_devengo
+                       AND EXTRACT(MONTH FROM n.fecha_emision::date)::bigint > n.month_devengo)
+               ) AS has_late_receipts
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
           AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
@@ -819,7 +832,8 @@ pub async fn get(
     // PTU, finiquitos, indemnizaciones) es su propia serie: son eventos
     // aislados y mezclarlos distorsiona la lectura del costo recurrente (NOM-1).
     // L5-04: grouped and filtered by devengo, same as by_month.
-    let month_ord_rows = sqlx::query(r#"
+    let month_ord_rows = sqlx::query(
+        r#"
         SELECT
                n.year_devengo  AS year,
                n.month_devengo AS month,
@@ -829,7 +843,13 @@ pub async fn get(
                SUM(n.total_otros_pagos)   AS otros,
                COUNT(DISTINCT n.rfc_receptor)             AS emp_count,
                COUNT(*)                                   AS payrolls_count,
-               BOOL_OR(n.year > n.year_devengo OR (n.year = n.year_devengo AND n.month > n.month_devengo)) AS has_late_receipts
+               -- Same fix as monthly_series's copy above -- raw fecha_emision vs devengo,
+               -- not the header vs devengo (see that copy's comment for why).
+               BOOL_OR(
+                   EXTRACT(YEAR FROM n.fecha_emision::date)::bigint > n.year_devengo
+                   OR (EXTRACT(YEAR FROM n.fecha_emision::date)::bigint = n.year_devengo
+                       AND EXTRACT(MONTH FROM n.fecha_emision::date)::bigint > n.month_devengo)
+               ) AS has_late_receipts
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
           AND n.tipo_nomina = 'O'
@@ -838,7 +858,8 @@ pub async fn get(
           AND NOT n.is_excluded
         GROUP BY 1, 2
         ORDER BY 1, 2
-    "#)
+    "#,
+    )
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)

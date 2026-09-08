@@ -41,7 +41,19 @@ pub async fn upsert_cfdi(pool: &PgPool, c: &ParsedCfdi) -> Result<(), sqlx::Erro
             forma_pago                = excluded.forma_pago,
             lugar_expedicion          = excluded.lugar_expedicion,
             estado_sat                = excluded.estado_sat,
-            xml_available             = excluded.xml_available
+            xml_available             = excluded.xml_available,
+            -- Per a later review: year/month were insert-only before this -- a nómina
+            -- receipt first upserted via from_metadata (xml_available=0, no Nomina complement,
+            -- year/month stuck at emisión) never got corrected once real XML arrived and
+            -- computed the true devengo period (xml_parser::parse always sets
+            -- xml_available=1). Guarded by xml_available so this can't run in reverse: a
+            -- later from_metadata hit on an already-XML-backed row (xml_available=1) has
+            -- excluded.xml_available=0, so `excluded.xml_available >= cfdis.xml_available`
+            -- is false and year/month keep their existing (better) value instead of being
+            -- degraded back to emisión. Same-or-better source quality is the only thing that
+            -- gets to move year/month.
+            year  = CASE WHEN excluded.xml_available >= pulso.cfdis.xml_available THEN excluded.year  ELSE pulso.cfdis.year  END,
+            month = CASE WHEN excluded.xml_available >= pulso.cfdis.xml_available THEN excluded.month ELSE pulso.cfdis.month END
         "#,
     )
     .bind(&c.uuid)

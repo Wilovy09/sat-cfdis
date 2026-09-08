@@ -414,6 +414,39 @@ pub fn parse(
         cfdi.nomina = Some(current_nomina);
     }
 
+    // For nómina CFDIs the relevant period is the payment period, NOT fecha_emision.
+    // Override year/month from fecha_final_pago (fallback: fecha_inicial_pago).
+    //
+    // Moved here (single point, inside the only parser that ever populates `cfdi.nomina`)
+    // per a later review: this used to live in etl.rs's `process_invoice`, called only on
+    // the "XML already in storage on first pass" path. `apply_xml_bytes` (the enrichment/
+    // redownload path, which parses real XML too and always has a nómina block available)
+    // called `xml_parser::parse` directly and skipped the override entirely -- measured,
+    // 1,968 of 3,457 receipts where devengo actually differs from emisión lost the correct
+    // period this way. `from_metadata` never populates `cfdi.nomina` (it has no XML to read
+    // a Nomina complement from), so it can never reach this block -- exactly the "don't
+    // touch year/month when parsing didn't bring nómina" property a shared fix needs.
+    if cfdi.tipo_comprobante == "N"
+        && let Some(ref nom) = cfdi.nomina
+    {
+        let fecha_periodo = nom
+            .fecha_final_pago
+            .as_deref()
+            .or(nom.fecha_inicial_pago.as_deref())
+            .unwrap_or("");
+        if !fecha_periodo.is_empty() {
+            let parts: Vec<&str> = fecha_periodo.splitn(3, '-').collect();
+            if parts.len() >= 2
+                && let (Ok(y), Ok(m)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>())
+                && y > 2000
+                && (1..=12).contains(&m)
+            {
+                cfdi.year = y;
+                cfdi.month = m;
+            }
+        }
+    }
+
     // Require at minimum an RFC emisor
     if cfdi.rfc_emisor.is_empty() {
         let prefix: String = xml_bytes

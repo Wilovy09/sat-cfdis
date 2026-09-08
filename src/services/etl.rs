@@ -192,28 +192,9 @@ async fn process_invoice(
         cfdi.uuid = cfdi.uuid.to_uppercase();
     }
 
-    // For nómina CFDIs the relevant period is the payment period, NOT fecha_emision.
-    // Override year/month from fecha_final_pago (fallback: fecha_inicial_pago).
-    if cfdi.tipo_comprobante == "N"
-        && let Some(ref nom) = cfdi.nomina
-    {
-        let fecha_periodo = nom
-            .fecha_final_pago
-            .as_deref()
-            .or(nom.fecha_inicial_pago.as_deref())
-            .unwrap_or("");
-        if !fecha_periodo.is_empty() {
-            let parts: Vec<&str> = fecha_periodo.splitn(3, '-').collect();
-            if parts.len() >= 2
-                && let (Ok(y), Ok(m)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>())
-                && y > 2000
-                && (1..=12).contains(&m)
-            {
-                cfdi.year = y;
-                cfdi.month = m;
-            }
-        }
-    }
+    // Nómina year/month-to-devengo override lives in xml_parser::parse now (a single place
+    // every caller that produces a populated `.nomina` shares, not just this one path) --
+    // see its own comment. Nothing to do here anymore.
 
     // Insert header
     if let Err(e) = db::cfdis::upsert_cfdi(pool, &cfdi).await {
