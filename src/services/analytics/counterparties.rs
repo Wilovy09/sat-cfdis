@@ -290,11 +290,21 @@ pub async fn get_evolution(
         .map(|(cp_rfc, (cp_nombre, year_map))| {
             let total_acumulado: f64 = year_map.values().map(|&(full, _)| full).sum();
 
-            // Sorted years with non-zero values, using the capped measure for CAGR/tendencia
-            // when cap_active -- a client whose billing stopped mid-year still gets the
-            // full Jan-M window (later months read as zero, which is the signal wanted),
-            // not a window shrunk to just its own active months.
-            let mut nonzero_years: Vec<(i32, f64)> = year_map
+            // C8-03 / AUD-067: two separate vectors, not one shared between them. The full
+            // (uncapped) series decides the tendencia label -- a counterparty that billed
+            // Sep-Dec 2025 and something in 2026 has real history even though L8-08's
+            // capped (Jan-M) series sees only one year of it. The capped series feeds CAGR
+            // only, same as L8-08 -- a counterparty can end up with a tendencia label and
+            // no CAGR (fewer than 2 years in the capped series but 2+ in the full one);
+            // that's correct, not a bug to paper over by computing CAGR on the full series.
+            let mut nonzero_full: Vec<(i32, f64)> = year_map
+                .iter()
+                .map(|(&y, &(full, _))| (y, full))
+                .filter(|&(_, v)| v > 0.0)
+                .collect();
+            nonzero_full.sort_by_key(|(y, _)| *y);
+
+            let mut nonzero_capped: Vec<(i32, f64)> = year_map
                 .iter()
                 .filter(|&(&y, _)| !(exclude_current_from_cagr && y == current_year))
                 .map(|(&y, &(full, capped))| {
@@ -303,13 +313,13 @@ pub async fn get_evolution(
                 })
                 .filter(|&(_, v)| v > 0.0)
                 .collect();
-            nonzero_years.sort_by_key(|(y, _)| *y);
+            nonzero_capped.sort_by_key(|(y, _)| *y);
 
-            let cagr_pct = if nonzero_years.len() >= 2 {
-                let first_val = nonzero_years.first().unwrap().1;
-                let last_val = nonzero_years.last().unwrap().1;
+            let cagr_pct = if nonzero_capped.len() >= 2 {
+                let first_val = nonzero_capped.first().unwrap().1;
+                let last_val = nonzero_capped.last().unwrap().1;
                 let n_years =
-                    (nonzero_years.last().unwrap().0 - nonzero_years.first().unwrap().0) as f64;
+                    (nonzero_capped.last().unwrap().0 - nonzero_capped.first().unwrap().0) as f64;
                 if first_val > 0.0 && n_years > 0.0 {
                     Some(((last_val / first_val).powf(1.0 / n_years) - 1.0) * 100.0)
                 } else {
@@ -322,19 +332,21 @@ pub async fn get_evolution(
             // L8-11: "Nuevo" requires the single year of activity to BE the most recent
             // year in the series -- a counterparty whose only invoice was years ago, with
             // nothing since (up to and including the last year), is a dead account, not a
-            // new one.
-            let tendencia = if nonzero_years.len() <= 1 {
-                let is_most_recent = nonzero_years
+            // new one. An EMPTY series is not "Nuevo" either (is_some_and, not is_none_or --
+            // that was the bug: on an empty capped series it returned true unconditionally,
+            // labeling dead accounts with zero Jan-M activity as "Nuevo").
+            let tendencia = if nonzero_full.len() <= 1 {
+                let is_most_recent = nonzero_full
                     .first()
-                    .is_none_or(|&(y, _)| Some(&y) == years_sorted.last());
+                    .is_some_and(|&(y, _)| Some(&y) == years_sorted.last());
                 if is_most_recent {
                     "Nuevo".to_string()
                 } else {
                     "↓ En declive".to_string()
                 }
             } else {
-                let first_val = nonzero_years.first().unwrap().1;
-                let last_val = nonzero_years.last().unwrap().1;
+                let first_val = nonzero_full.first().unwrap().1;
+                let last_val = nonzero_full.last().unwrap().1;
                 if last_val > first_val {
                     "↑ Crecimiento".to_string()
                 } else if last_val < first_val * 0.5 {
@@ -653,9 +665,17 @@ pub async fn get_payments_detail(
               )
         ),
         inv_base AS (
+            -- C8-01 / AUD-065: saldo is its own column, read straight from the view's
+            -- saldo_mxn (same as get_individual/CNT07 already does) -- not derived as
+            -- facturado - cobrado. Since L7-04 made "cobrado" real collection (excluding
+            -- credit notes), that subtraction started absorbing credit notes as if they
+            -- were still pending. Grouped with cp_key_bare, the same variant the rest of
+            -- this CTE uses -- not cp_key_inv, or the join below silently stops matching
+            -- for split (generic-RFC) counterparties.
             SELECT ({cp_key_bare}) AS cp_rfc,
                    {cp_nombre_bare} AS cp_nombre,
                    SUM(inv_total) AS facturado,
+                   SUM(saldo_mxn)::float8 AS saldo,
                    COUNT(DISTINCT CASE WHEN metodo_pago = 'PPD' THEN uuid END) AS facturas_ppd
             FROM all_inv
             GROUP BY ({cp_key_bare})
@@ -692,6 +712,7 @@ pub async fn get_payments_detail(
         SELECT ib.cp_rfc,
                ib.cp_nombre,
                ib.facturado,
+               ib.saldo,
                COALESCE(cb.cobrado, 0)           AS cobrado,
                ib.facturas_ppd,
                COALESCE(rb.facturas_abiertas, 0) AS facturas_abiertas,
@@ -714,7 +735,10 @@ pub async fn get_payments_detail(
         .map(|r| {
             let facturado: f64 = get_f64(r, "facturado");
             let cobrado: f64 = get_f64(r, "cobrado");
-            let saldo_pendiente = facturado - cobrado;
+            // C8-01: read, not derived -- facturado - cobrado is no longer the same number
+            // now that "cobrado" excludes credit notes (L7-04); saldo_mxn already accounts
+            // for them directly, same source get_individual/CNT07 already reads from.
+            let saldo_pendiente: f64 = get_f64(r, "saldo");
             let pct_cobrado = if facturado > 0.0 {
                 cobrado / facturado * 100.0
             } else {

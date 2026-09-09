@@ -242,7 +242,11 @@ fn h5a_interpretacion(nivel: &str) -> &'static str {
     }
 }
 
-fn h6_nivel(ratio_pct: f64) -> &'static str {
+/// C8-04 (opcional): H6 and H7 measure a saldo/ingreso ratio with the same shape now
+/// (both con IVA, sin exclusiones -- see compute_h6's comment for why) and had been writing
+/// identical thresholds twice. One definition; the interpretation text stays separate below
+/// since "cartera de clientes" and "saldo con proveedores" read differently.
+fn cartera_pct_nivel(ratio_pct: f64) -> &'static str {
     if ratio_pct < 2.0 {
         "muy_bajo"
     } else if ratio_pct < 5.0 {
@@ -265,20 +269,6 @@ fn h6_interpretacion(nivel: &str) -> &'static str {
             "Saldo pendiente relevante. Verificar composición por cliente y buckets de antigüedad."
         }
         _ => "Cobranza eficiente. Cartera pendiente dentro de rangos normales.",
-    }
-}
-
-fn h7_nivel(ratio_pct: f64) -> &'static str {
-    if ratio_pct < 2.0 {
-        "muy_bajo"
-    } else if ratio_pct < 5.0 {
-        "bajo"
-    } else if ratio_pct < 10.0 {
-        "medio"
-    } else if ratio_pct < 20.0 {
-        "alto"
-    } else {
-        "critico"
     }
 }
 
@@ -885,14 +875,38 @@ async fn compute_h6(
     .await?;
     let outstanding: f64 = get_f64(&outstanding_row, "outstanding");
 
-    let ltm_ingreso =
-        compute_ltm_ingreso(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?;
+    // C8-04 / AUD-068: H6's numerator (outstanding, above) is a balance -- con IVA, sin
+    // exclusiones. A ratio between a balance and a P&L figure means nothing (DEC-044
+    // backwards), so the denominator has to be the same shape, not `compute_ltm_ingreso`
+    // (moved to the Resumen base by L8-03 for H9/H4, which are P&L measures and correctly
+    // stay net-with-exclusions -- not touched here). Same form H7 already uses for its own
+    // ratio, applied to the emitidos side.
+    let ltm_ingreso_row = sqlx::query(
+        r#"
+        SELECT COALESCE(SUM(COALESCE(total_mxn,0))::float8, 0) AS total
+        FROM pulso.cfdis
+        WHERE rfc_emisor = $1
+          AND dl_type IN ('emitidos','ambos')
+          AND tipo_comprobante = 'I'
+          AND NOT is_cancelled
+          AND (year > $2 OR (year = $2 AND month >= $3))
+          AND (year < $4 OR (year = $4 AND month <= $5))
+        "#,
+    )
+    .bind(rfc)
+    .bind(ltm_start_y)
+    .bind(ltm_start_m)
+    .bind(ltm_end_y)
+    .bind(ltm_end_m)
+    .fetch_one(pool)
+    .await?;
+    let ltm_ingreso: f64 = get_f64(&ltm_ingreso_row, "total");
     if ltm_ingreso <= 0.0 {
         return Ok(None);
     }
 
     let ratio_pct = outstanding / ltm_ingreso * 100.0;
-    let nivel = h6_nivel(ratio_pct);
+    let nivel = cartera_pct_nivel(ratio_pct);
     let interp = h6_interpretacion(nivel);
 
     let cuerpo = format!(
@@ -992,7 +1006,7 @@ async fn compute_h7(
     }
 
     let ratio_pct = outstanding / ltm_gasto * 100.0;
-    let nivel = h7_nivel(ratio_pct);
+    let nivel = cartera_pct_nivel(ratio_pct);
     let interp = h7_interpretacion(nivel);
 
     let cuerpo = format!(

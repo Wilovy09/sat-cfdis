@@ -291,17 +291,23 @@ pub async fn get(
     // falls into the first bucket.
     let aging_row = sqlx::query(&format!(
         r#"
+        -- C8-02 / AUD-066: the five COUNTs get their own `AND saldo_mxn > 0` -- otherwise
+        -- they count every invoice in the universe, including ones already fully paid.
+        -- The five SUMs stay unfiltered on purpose (same as C-01 already established: a
+        -- saldo floor there loses $61.10 and breaks the tie-out with "Saldo pendiente").
+        -- `> 0`, not `> 1`: the count must count exactly what the amount sums, and a
+        -- fifty-cent saldo still sums into the amount.
         SELECT
             COALESCE(SUM(c.saldo_mxn) FILTER (WHERE c.dias_antiguedad <= 30), 0)::float8                                    AS b1_mxn,
-            COUNT(*) FILTER (WHERE c.dias_antiguedad <= 30)                                                                  AS b1_cnt,
+            COUNT(*) FILTER (WHERE c.dias_antiguedad <= 30 AND c.saldo_mxn > 0)                                              AS b1_cnt,
             COALESCE(SUM(c.saldo_mxn) FILTER (WHERE c.dias_antiguedad > 30 AND c.dias_antiguedad <= 60), 0)::float8          AS b2_mxn,
-            COUNT(*) FILTER (WHERE c.dias_antiguedad > 30 AND c.dias_antiguedad <= 60)                                       AS b2_cnt,
+            COUNT(*) FILTER (WHERE c.dias_antiguedad > 30 AND c.dias_antiguedad <= 60 AND c.saldo_mxn > 0)                   AS b2_cnt,
             COALESCE(SUM(c.saldo_mxn) FILTER (WHERE c.dias_antiguedad > 60 AND c.dias_antiguedad <= 90), 0)::float8          AS b3_mxn,
-            COUNT(*) FILTER (WHERE c.dias_antiguedad > 60 AND c.dias_antiguedad <= 90)                                       AS b3_cnt,
+            COUNT(*) FILTER (WHERE c.dias_antiguedad > 60 AND c.dias_antiguedad <= 90 AND c.saldo_mxn > 0)                   AS b3_cnt,
             COALESCE(SUM(c.saldo_mxn) FILTER (WHERE c.dias_antiguedad > 90 AND c.dias_antiguedad <= 180), 0)::float8         AS b4_mxn,
-            COUNT(*) FILTER (WHERE c.dias_antiguedad > 90 AND c.dias_antiguedad <= 180)                                      AS b4_cnt,
+            COUNT(*) FILTER (WHERE c.dias_antiguedad > 90 AND c.dias_antiguedad <= 180 AND c.saldo_mxn > 0)                  AS b4_cnt,
             COALESCE(SUM(c.saldo_mxn) FILTER (WHERE c.dias_antiguedad > 180), 0)::float8                                     AS b5_mxn,
-            COUNT(*) FILTER (WHERE c.dias_antiguedad > 180)                                                                  AS b5_cnt
+            COUNT(*) FILTER (WHERE c.dias_antiguedad > 180 AND c.saldo_mxn > 0)                                              AS b5_cnt
         FROM pulso.cfdi_cobro_estado c
         WHERE c.{owner_col} = $1
           AND c.{dl_filter}
