@@ -751,8 +751,13 @@ pub async fn months_with_data(
 ) -> Result<std::collections::HashSet<(i64, i64)>, sqlx::Error> {
     use sqlx::Row;
     let rfc = rfc.to_uppercase();
+    // L7-11: a month whose only comprobantes are cancelled (no XML, precisely the ones
+    // data_quality.rs's missing-XML check is meant to catch) used to count as "covered"
+    // here -- the opposite direction of that same check's bug, so fixing one without the
+    // other leaves the banner's two halves reading two different universes.
     let rows = sqlx::query(
-        r#"SELECT DISTINCT year, month FROM pulso.cfdis WHERE rfc_emisor = $1 OR rfc_receptor = $1"#,
+        r#"SELECT DISTINCT year, month FROM pulso.cfdis
+           WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND NOT is_cancelled"#,
     )
     .bind(&rfc)
     .fetch_all(pool)
@@ -789,8 +794,9 @@ pub async fn months_with_data_direction(
     use sqlx::Row;
     let rfc = rfc.to_uppercase();
     let col = crate::services::analytics::summary::rfc_column(dl_type);
+    // L7-11: same fix as months_with_data above.
     let rows = sqlx::query(&format!(
-        "SELECT DISTINCT year, month FROM pulso.cfdis WHERE {col} = $1"
+        "SELECT DISTINCT year, month FROM pulso.cfdis WHERE {col} = $1 AND NOT is_cancelled"
     ))
     .bind(&rfc)
     .fetch_all(pool)

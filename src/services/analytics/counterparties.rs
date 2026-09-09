@@ -1,7 +1,7 @@
 use super::summary::{
     LABEL_EXTRANJERO_GENERICO, LABEL_PUBLICO_GENERAL, RFC_EXTRANJERO_GENERICO, RFC_PUBLICO_GENERAL,
-    cp_key_expr, cp_nombre_expr, dl_type_filter, get_f64, get_f64_opt, normalized_name_expr,
-    parse_ym, rfc_column,
+    cp_key_expr, cp_nombre_expr, current_month_yyyymm, dl_type_filter, get_f64, get_f64_opt,
+    normalized_name_expr, parse_ym, rfc_column,
 };
 use crate::db::DbPool;
 use serde::Serialize;
@@ -71,7 +71,7 @@ pub async fn get(
         FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N')
+          AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
@@ -110,7 +110,7 @@ pub async fn get(
             FROM pulso.cfdis_ajustado c
             WHERE {owner_col} = $1
               AND {dl_filter}
-              AND tipo_comprobante NOT IN ('P','N')
+              AND tipo_comprobante NOT IN ('P','N','T')
               AND NOT is_cancelled
               AND (year > $2 OR (year = $2 AND month >= $3))
               AND (year < $4 OR (year = $4 AND month <= $5))
@@ -215,14 +215,21 @@ pub async fn get_evolution(
     let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
     let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
+    // L8-08: two measures per year -- yr_total (full year, what gets painted) and
+    // yr_total_capped (months 1..M, where M is the last closed month's month number, fed
+    // to CAGR/tendencia only). Computed here with one extra FILTER instead of a second
+    // query.
+    let current_ym = current_month_yyyymm();
+    let cap_month = (current_ym % 100) as i32;
     let rows = sqlx::query(&format!(
         r#"
         SELECT ({cp_key_expr}) AS cp_rfc,
                {cp_nombre_expr} AS cp_nombre,
                year,
-               SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS yr_total
+               SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS yr_total,
+               SUM(COALESCE(total_neto_mxn_ajustado,0)::float8) FILTER (WHERE month <= $6)::float8 AS yr_total_capped
         FROM pulso.cfdis_ajustado c
-        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
@@ -238,11 +245,13 @@ pub async fn get_evolution(
     .bind(from_m)
     .bind(to_y)
     .bind(to_m)
+    .bind(cap_month as i64)
     .fetch_all(pool)
     .await?;
 
-    // Group by cp_rfc
-    let mut cp_map: HashMap<String, (String, HashMap<i32, f64>)> = HashMap::new();
+    // Group by cp_rfc. Per-year value is (full total, capped-to-month total) -- L8-08.
+    type YearTotals = HashMap<i32, (f64, f64)>;
+    let mut cp_map: HashMap<String, (String, YearTotals)> = HashMap::new();
     let mut all_years: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
 
     for row in &rows {
@@ -250,28 +259,49 @@ pub async fn get_evolution(
         let cp_nombre: String = row.try_get("cp_nombre").unwrap_or_default();
         let year: i32 = row.try_get::<i64, _>("year").unwrap_or(0) as i32;
         let yr_total: f64 = get_f64(row, "yr_total");
+        let yr_total_capped: f64 = get_f64(row, "yr_total_capped");
 
         all_years.insert(year);
         let entry = cp_map
             .entry(cp_rfc.clone())
             .or_insert_with(|| (cp_nombre.clone(), HashMap::new()));
         entry.0 = cp_nombre;
-        entry.1.insert(year, yr_total);
+        entry.1.insert(year, (yr_total, yr_total_capped));
     }
 
     let years_sorted: Vec<i32> = all_years.into_iter().collect();
+
+    // L8-08: capping only activates when the series' last year is the current calendar
+    // year (otherwise every year in view is already closed, so full-year totals already
+    // compare fairly) and M >= 3 (a one- or two-month partial year isn't a usable CAGR
+    // base). "Todos los años" get capped to 1..M, not just the current one -- comparing
+    // Jan-Ago in every year, not eight months against twelve.
+    let current_year = (current_ym / 100) as i32;
+    let last_year_is_current = years_sorted.last() == Some(&current_year);
+    let cap_active = last_year_is_current && cap_month >= 3;
+    // Piso: with fewer than 3 months in the current year, a capped comparison isn't a rate
+    // (one month against one month), so the current year is dropped from CAGR/tendencia
+    // entirely instead of capped -- it still appears in the painted `years` column.
+    let exclude_current_from_cagr = last_year_is_current && cap_month < 3;
 
     // Build rows
     let mut evolution_rows: Vec<CpEvolutionRow> = cp_map
         .into_iter()
         .map(|(cp_rfc, (cp_nombre, year_map))| {
-            let total_acumulado: f64 = year_map.values().sum();
+            let total_acumulado: f64 = year_map.values().map(|&(full, _)| full).sum();
 
-            // Sorted years with non-zero values
+            // Sorted years with non-zero values, using the capped measure for CAGR/tendencia
+            // when cap_active -- a client whose billing stopped mid-year still gets the
+            // full Jan-M window (later months read as zero, which is the signal wanted),
+            // not a window shrunk to just its own active months.
             let mut nonzero_years: Vec<(i32, f64)> = year_map
                 .iter()
-                .filter(|&(_, &v)| v > 0.0)
-                .map(|(&y, &v)| (y, v))
+                .filter(|&(&y, _)| !(exclude_current_from_cagr && y == current_year))
+                .map(|(&y, &(full, capped))| {
+                    let v = if cap_active { capped } else { full };
+                    (y, v)
+                })
+                .filter(|&(_, v)| v > 0.0)
                 .collect();
             nonzero_years.sort_by_key(|(y, _)| *y);
 
@@ -289,8 +319,19 @@ pub async fn get_evolution(
                 None
             };
 
+            // L8-11: "Nuevo" requires the single year of activity to BE the most recent
+            // year in the series -- a counterparty whose only invoice was years ago, with
+            // nothing since (up to and including the last year), is a dead account, not a
+            // new one.
             let tendencia = if nonzero_years.len() <= 1 {
-                "Nuevo".to_string()
+                let is_most_recent = nonzero_years
+                    .first()
+                    .is_none_or(|&(y, _)| Some(&y) == years_sorted.last());
+                if is_most_recent {
+                    "Nuevo".to_string()
+                } else {
+                    "↓ En declive".to_string()
+                }
             } else {
                 let first_val = nonzero_years.first().unwrap().1;
                 let last_val = nonzero_years.last().unwrap().1;
@@ -305,9 +346,11 @@ pub async fn get_evolution(
                 }
             };
 
+            // L8-08: the painted column stays the full-year total -- only CAGR/tendencia
+            // above read the capped measure.
             let years_str: HashMap<String, f64> = year_map
                 .into_iter()
-                .map(|(y, v)| (y.to_string(), v))
+                .map(|(y, (full, _))| (y.to_string(), full))
                 .collect();
 
             CpEvolutionRow {
@@ -381,27 +424,11 @@ pub async fn get_ltm_comparison(
     let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
     let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
-    // Clamp requested `to` to the actual last data month so LTM always ends at
-    // real data regardless of a hardcoded future date from the frontend
-    let max_q = format!(
-        "SELECT MAX(year * 100 + month)::bigint AS max_ym \
-         FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') \
-           AND NOT is_cancelled"
-    );
-    let max_row = sqlx::query(&max_q).bind(rfc).fetch_one(pool).await?;
-    let max_ym_db: i64 = max_row.try_get("max_ym").unwrap_or(0);
-    let (actual_to_y, actual_to_m): (i64, i64) = if max_ym_db > 0 {
-        let db_y = max_ym_db / 100;
-        let db_m = max_ym_db % 100;
-        if req_to_y * 100 + req_to_m <= db_y * 100 + db_m {
-            (req_to_y, req_to_m)
-        } else {
-            (db_y, db_m)
-        }
-    } else {
-        (req_to_y, req_to_m)
-    };
+    // L8-09: no longer clamped to the last month with any data. The KPI above this table
+    // and this table's own totals used to read the window two different ways -- one
+    // clamped here, one not -- so the same RFC could show one figure in the KPI and a
+    // different one in the table for what's supposed to be the same LTM window.
+    let (actual_to_y, actual_to_m): (i64, i64) = (req_to_y, req_to_m);
 
     // Compute LTM window: [to - 11 months ... to]
     let ltm_end_y = actual_to_y;
@@ -426,7 +453,7 @@ pub async fn get_ltm_comparison(
                COUNT(DISTINCT year * 100 + month) AS months_active,
                COUNT(*) AS invoice_count
         FROM pulso.cfdis_ajustado c
-        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
@@ -450,7 +477,7 @@ pub async fn get_ltm_comparison(
                {cp_nombre_expr} AS cp_nombre,
                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS prev_total
         FROM pulso.cfdis_ajustado c
-        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
@@ -614,10 +641,16 @@ pub async fn get_payments_detail(
         WITH all_inv AS (
             SELECT c.{cp_col} AS {cp_col}, c.{cp_name_col} AS {cp_name_col},
                    b.uuid, b.fecha_emision, b.total_mxn AS inv_total, b.metodo_pago,
-                   b.saldo_mxn, b.dias_antiguedad, b.ultimo_pago_fecha
+                   b.saldo_mxn, b.pagado_mxn, b.dias_antiguedad, b.ultimo_pago_fecha
             FROM pulso.cfdi_cobro_estado b
             JOIN pulso.cfdis c ON c.uuid = b.uuid
             WHERE b.{owner_col} = $1 AND b.{dl_filter}
+              -- L7-06: same clause the RFC predicate already lives in, not a derived CTE
+              -- or the final projection -- pulso.cfdi_exclusion is the view that caused
+              -- the August incident; the planner can re-evaluate it per row otherwise.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = b.uuid
+              )
         ),
         inv_base AS (
             SELECT ({cp_key_bare}) AS cp_rfc,
@@ -628,8 +661,11 @@ pub async fn get_payments_detail(
             GROUP BY ({cp_key_bare})
         ),
         cobrado_by_cp AS (
+            -- L7-04 / DEC-040: real collection, not saldo's derived "paid" (which nets out
+            -- credit notes applied to the invoice). LEAST guards the same overpayment edge
+            -- case saldo's own clamp-to-zero already protects against on the other side.
             SELECT ({cp_key_inv}) AS cp_rfc,
-                   SUM(inv.inv_total - inv.saldo_mxn)::float8 AS cobrado
+                   SUM(LEAST(inv.pagado_mxn, inv.inv_total))::float8 AS cobrado
             FROM all_inv inv
             GROUP BY ({cp_key_inv})
         ),
@@ -754,7 +790,7 @@ pub async fn get_atypical(
                    year::text || '-' || LPAD(month::text, 2, '0') AS period,
                    SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS mo_total
             FROM pulso.cfdis_ajustado c
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T')
               AND NOT is_cancelled
               AND (year > $2 OR (year = $2 AND month >= $3))
               AND (year < $4 OR (year = $4 AND month <= $5))
@@ -908,7 +944,7 @@ pub async fn get_individual(
                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS yr_total,
                COUNT(*) AS cnt
         FROM pulso.cfdis_ajustado c
-        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
           AND (year > $4 OR (year = $4 AND month >= $5))
@@ -1015,7 +1051,7 @@ pub async fn get_individual(
                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS mo_total,
                COUNT(*) AS cnt
         FROM pulso.cfdis_ajustado c
-        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
           AND (year > $4 OR (year = $4 AND month >= $5))
@@ -1057,7 +1093,7 @@ pub async fn get_individual(
                COUNT(*) AS yr_count
         FROM pulso.cfdi_concepts cc
         JOIN pulso.cfdis c ON c.uuid = cc.uuid
-        WHERE c.{owner_col} = $1 AND c.{dl_filter} AND c.tipo_comprobante NOT IN ('P','N')
+        WHERE c.{owner_col} = $1 AND c.{dl_filter} AND c.tipo_comprobante NOT IN ('P','N','T')
           AND NOT c.is_cancelled
           AND c.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_c} = $3)
           AND (c.year > $4 OR (c.year = $4 AND c.month >= $5))
@@ -1119,7 +1155,7 @@ pub async fn get_individual(
         SELECT year,
                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS yr_total
         FROM pulso.cfdis_ajustado c
-        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N')
+        WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
@@ -1164,17 +1200,23 @@ pub async fn get_individual(
     let cobranza_row = sqlx::query(&format!(
         r#"
         WITH ppd_detail AS (
-            SELECT b.uuid, b.total_mxn AS inv_total, b.saldo_mxn
+            SELECT b.uuid, b.total_mxn AS inv_total, b.saldo_mxn, b.pagado_mxn
             FROM pulso.cfdi_cobro_estado b
             JOIN pulso.cfdis inv ON inv.uuid = b.uuid
             WHERE b.{owner_col} = $1 AND b.{dl_filter}
               AND b.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_inv} = $3)
               AND b.metodo_pago = 'PPD'
+              -- L7-06: same clause as the RFC predicate, see all_inv above for why.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = b.uuid
+              )
         )
+        -- L7-04 / DEC-040: "cobrado" is real collection (LEAST(pagado_mxn, inv_total)), not
+        -- saldo's derived "paid" -- see cobrado_by_cp in get_payments_detail above for why.
         SELECT
-            SUM(inv_total)::float8            AS facturado,
-            SUM(inv_total - saldo_mxn)::float8 AS cobrado,
-            SUM(saldo_mxn)::float8             AS saldo
+            SUM(inv_total)::float8                      AS facturado,
+            SUM(LEAST(pagado_mxn, inv_total))::float8    AS cobrado,
+            SUM(saldo_mxn)::float8                       AS saldo
         FROM ppd_detail
         "#
     ))
@@ -1202,6 +1244,11 @@ pub async fn get_individual(
           AND b.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_inv} = $3)
           AND b.metodo_pago = 'PPD'
           AND b.ultimo_pago_fecha IS NOT NULL
+          -- L7-06: no CTE here, so it goes directly in this WHERE (same clause as the
+          -- RFC predicate), see all_inv above for why.
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = b.uuid
+          )
         "#
     ))
     .bind(owner_rfc)

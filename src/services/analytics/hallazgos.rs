@@ -1,4 +1,4 @@
-use super::summary::get_f64;
+use super::summary::{current_month_yyyymm, get_f64};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -83,18 +83,39 @@ fn h_priority(id: &str) -> u8 {
 // Nivel thresholds + interpretation text
 // ---------------------------------------------------------------------------
 
-fn h1_nivel(top3_pct: f64) -> &'static str {
-    if top3_pct < 40.0 {
-        "muy_bajo"
-    } else if top3_pct < 60.0 {
+/// L8-05: shared concentration scale for H1 and H8 -- both compute the same arithmetic
+/// (top 3 / base identificable), so they share one scale; the difference between "clientes"
+/// and "proveedores" lives in the interpretation text below, not the color. Decided as
+/// Opción C: <25% is omitted (the piso común -- H8 used to omit under 15%, H1 never
+/// omitted at all), 25-45 bajo, 45-65 medio, 65-80 alto, >=80 crítico. Top 1 is a second
+/// disparador on top of the Top 3 band: >=35% forces at least "alto", >=50% forces
+/// "crítico" -- covers the shape Top 3 dilutes (many small counterparties plus one that
+/// dominates), not "fixing" the data, just reading a different concentration pattern.
+fn concentracion_nivel(top3_pct: f64, top1_pct: f64) -> Option<&'static str> {
+    if top3_pct < 25.0 {
+        return None;
+    }
+    let base = if top3_pct < 45.0 {
         "bajo"
-    } else if top3_pct < 75.0 {
+    } else if top3_pct < 65.0 {
         "medio"
-    } else if top3_pct < 85.0 {
+    } else if top3_pct < 80.0 {
         "alto"
     } else {
         "critico"
-    }
+    };
+    let disparador = if top1_pct >= 50.0 {
+        Some("critico")
+    } else if top1_pct >= 35.0 {
+        Some("alto")
+    } else {
+        None
+    };
+    // The more severe of the two readings wins (lower severity_score = more severe).
+    Some(match disparador {
+        Some(d) if severity_score(d) < severity_score(base) => d,
+        _ => base,
+    })
 }
 
 fn h1_interpretacion(nivel: &str) -> &'static str {
@@ -112,12 +133,17 @@ fn h1_interpretacion(nivel: &str) -> &'static str {
     }
 }
 
+// L8-06: adopts H9's neutral band (-5% to +5%) instead of its own (0% to +5%) -- the same
+// class of twin-hallazgo defect as concentracion_nivel above. A CAGR of two extremes that
+// actually rose 20% then fell 17% used to land at -0.22%, just inside H2's old "negativo"
+// band, and print "Caída sostenida ... requiere explicación de gestión" for a trajectory
+// that wasn't a sustained fall at all.
 fn h2_nivel(cagr: f64) -> &'static str {
     if cagr > 15.0 {
         "muy_positivo"
-    } else if cagr > 5.0 {
+    } else if cagr >= 5.0 {
         "positivo"
-    } else if cagr >= 0.0 {
+    } else if cagr > -5.0 {
         "neutral"
     } else if cagr >= -15.0 {
         "negativo"
@@ -266,20 +292,6 @@ fn h7_interpretacion(nivel: &str) -> &'static str {
     }
 }
 
-fn h8_nivel(top3_pct: f64) -> Option<&'static str> {
-    if top3_pct < 15.0 {
-        None // omit
-    } else if top3_pct < 25.0 {
-        Some("bajo")
-    } else if top3_pct < 40.0 {
-        Some("medio")
-    } else if top3_pct < 60.0 {
-        Some("alto")
-    } else {
-        Some("critico")
-    }
-}
-
 fn h8_interpretacion(nivel: &str) -> &'static str {
     match nivel {
         "critico" | "alto" => {
@@ -336,16 +348,21 @@ async fn compute_ltm_ingreso(
     to_y: i64,
     to_m: i64,
 ) -> anyhow::Result<f64> {
+    // L8-03 / DEC-041: same four properties as H1's query above. Feeds H9, called once for
+    // the current LTM window and once for LTM-12.
     let row = sqlx::query(
         r#"
-        SELECT COALESCE(SUM(COALESCE(total_mxn,0))::float8, 0) AS total
-        FROM pulso.cfdis
+        SELECT COALESCE(SUM(COALESCE(total_neto_mxn_ajustado,0))::float8, 0) AS total
+        FROM pulso.cfdis_ajustado c
         WHERE rfc_emisor = $1
           AND dl_type IN ('emitidos','ambos')
-          AND tipo_comprobante = 'I'
+          AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         "#,
     )
     .bind(rfc)
@@ -370,17 +387,25 @@ async fn compute_h1(
     ltm_end_y: i64,
     ltm_end_m: i64,
 ) -> anyhow::Result<Option<Hallazgo>> {
+    // L8-03 / DEC-041: base del Resumen -- cfdis_ajustado, total_neto_mxn_ajustado,
+    // exclusiones, tipo_comprobante NOT IN ('P','N','T') instead of ='I' (con IVA, sin
+    // exclusiones, notas de crédito descartadas del todo). Same four properties on every
+    // one of H1/H2/H8/H9's six feeder queries.
     let rows = sqlx::query(
         r#"
-        SELECT rfc_receptor, MAX(nombre_receptor) AS nombre, SUM(COALESCE(total_mxn,0))::float8 AS ltm_mxn
-        FROM pulso.cfdis
-        WHERE rfc_emisor = $1
-          AND dl_type IN ('emitidos','ambos')
-          AND tipo_comprobante = 'I'
-          AND NOT is_cancelled
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY rfc_receptor
+        SELECT c.rfc_receptor, MAX(c.nombre_receptor) AS nombre,
+               SUM(COALESCE(c.total_neto_mxn_ajustado,0))::float8 AS ltm_mxn
+        FROM pulso.cfdis_ajustado c
+        WHERE c.rfc_emisor = $1
+          AND c.dl_type IN ('emitidos','ambos')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
+          AND NOT c.is_cancelled
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
+        GROUP BY c.rfc_receptor
         ORDER BY ltm_mxn DESC
         "#,
     )
@@ -425,10 +450,14 @@ async fn compute_h1(
         .sum();
     let peg_pct = peg_mxn / total_ltm * 100.0;
 
-    // Top 3 excluding PeG (take first 3 non-XAXX clients)
+    // Top 3 excluding PeG (take first 3 non-XAXX clients). L8-03: with credit notes now
+    // netted in, a counterparty can land with a negative total_neto_mxn_ajustado --
+    // excluded here, not just from the top-3 pick (rows sort DESC so a negative total
+    // wouldn't be picked anyway) but from the concentration denominator too, or a negative
+    // contributor drags total_excl_peg below top3_mxn and the percentage passes 100.
     let identifiable: Vec<&ClientRow> = clients
         .iter()
-        .filter(|c| c.rfc != "XAXX010101000")
+        .filter(|c| c.rfc != "XAXX010101000" && c.mxn > 0.0)
         .collect();
 
     if identifiable.is_empty() {
@@ -443,19 +472,31 @@ async fn compute_h1(
     let top3: Vec<&ClientRow> = identifiable.iter().take(3).copied().collect();
     let top3_mxn: f64 = top3.iter().map(|c| c.mxn).sum();
     let top3_pct = top3_mxn / total_excl_peg * 100.0;
+    let top1_pct = top3
+        .first()
+        .map(|c| c.mxn / total_excl_peg * 100.0)
+        .unwrap_or(0.0);
     let n = top3.len();
 
-    let nivel = h1_nivel(top3_pct);
+    let nivel = match concentracion_nivel(top3_pct, top1_pct) {
+        Some(n) => n,
+        None => return Ok(None), // < 25% Top 3 and < 35% Top 1 -- omit
+    };
     let interp = h1_interpretacion(nivel);
 
+    // L8-04: the denominator stays base identificable (concentration among identifiable
+    // clients is the right metric) -- what changes is the body saying so explicitly,
+    // instead of implying it's a share of the whole LTM ingreso.
     let mut cuerpo = format!(
-        "El Top {} cliente{} representa el {:.1}% del ingreso LTM.",
+        "El Top {} cliente{} representa el {:.1}% del ingreso identificable.",
         n,
         if n == 1 { "" } else { "s" },
         top3_pct
     );
 
-    if peg_pct > 30.0 {
+    // L8-04: no longer conditioned on >30% -- if there's any ingreso a Público en
+    // General, it's always named, with its own percentage.
+    if peg_mxn > 0.0 {
         cuerpo.push_str(&format!(
             " Adicionalmente, el {:.1}% del ingreso corresponde a ventas a Público en General.",
             peg_pct
@@ -826,25 +867,20 @@ async fn compute_h6(
     }
 
     // Outstanding = base saldo for PPD invoices (L2-04: shared with payments.rs/counterparties.rs),
-    // capped at the same as_of_cutoff those two use (AUD-011) -- without it this disagreed
-    // with the Cobranza tab's own saldo for the same RFC.
+    // capped at the last complete calendar month like those two (L7-03 / DEC-039, AUD-011)
+    // -- without it this disagreed with the Cobranza tab's own saldo for the same RFC.
     let outstanding_row = sqlx::query(
         r#"
-        WITH cutoff AS (
-            SELECT COALESCE(
-                (SELECT as_of_ym FROM pulso.rfc_as_of_cutoff WHERE owner_rfc = $1 AND direccion = 'emitidos'),
-                999912
-            ) AS as_of_ym
-        )
         SELECT COALESCE(SUM(c.saldo_mxn), 0)::float8 AS outstanding
-        FROM pulso.cfdi_cobro_estado c, cutoff
+        FROM pulso.cfdi_cobro_estado c
         WHERE c.rfc_emisor = $1
           AND c.dl_type IN ('emitidos','ambos')
           AND c.metodo_pago = 'PPD'
-          AND (c.year * 100 + c.month) <= cutoff.as_of_ym
+          AND (c.year * 100 + c.month) <= $2
         "#,
     )
     .bind(rfc)
+    .bind(current_month_yyyymm())
     .fetch_one(pool)
     .await?;
     let outstanding: f64 = get_f64(&outstanding_row, "outstanding");
@@ -911,24 +947,20 @@ async fn compute_h7(
         return Ok(None);
     }
 
-    // AUD-011: capped at as_of_cutoff, same as H6 and the Cobranza tab.
+    // L7-03 / DEC-039, AUD-011: capped at the last complete calendar month, same as H6 and
+    // the Cobranza tab.
     let outstanding_row = sqlx::query(
         r#"
-        WITH cutoff AS (
-            SELECT COALESCE(
-                (SELECT as_of_ym FROM pulso.rfc_as_of_cutoff WHERE owner_rfc = $1 AND direccion = 'recibidos'),
-                999912
-            ) AS as_of_ym
-        )
         SELECT COALESCE(SUM(c.saldo_mxn), 0)::float8 AS outstanding
-        FROM pulso.cfdi_cobro_estado c, cutoff
+        FROM pulso.cfdi_cobro_estado c
         WHERE c.rfc_receptor = $1
           AND c.dl_type IN ('recibidos','ambos')
           AND c.metodo_pago = 'PPD'
-          AND (c.year * 100 + c.month) <= cutoff.as_of_ym
+          AND (c.year * 100 + c.month) <= $2
         "#,
     )
     .bind(rfc)
+    .bind(current_month_yyyymm())
     .fetch_one(pool)
     .await?;
     let outstanding: f64 = get_f64(&outstanding_row, "outstanding");
@@ -998,17 +1030,22 @@ async fn compute_h8(
     ltm_end_y: i64,
     ltm_end_m: i64,
 ) -> anyhow::Result<Option<Hallazgo>> {
+    // L8-03 / DEC-041: same four properties as H1's query above.
     let rows = sqlx::query(
         r#"
-        SELECT rfc_emisor, MAX(nombre_emisor) AS nombre, SUM(COALESCE(total_mxn,0))::float8 AS ltm_mxn
-        FROM pulso.cfdis
-        WHERE rfc_receptor = $1
-          AND dl_type IN ('recibidos','ambos')
-          AND tipo_comprobante = 'I'
-          AND NOT is_cancelled
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY rfc_emisor
+        SELECT c.rfc_emisor, MAX(c.nombre_emisor) AS nombre,
+               SUM(COALESCE(c.total_neto_mxn_ajustado,0))::float8 AS ltm_mxn
+        FROM pulso.cfdis_ajustado c
+        WHERE c.rfc_receptor = $1
+          AND c.dl_type IN ('recibidos','ambos')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
+          AND NOT c.is_cancelled
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
+        GROUP BY c.rfc_emisor
         ORDER BY ltm_mxn DESC
         "#,
     )
@@ -1039,13 +1076,18 @@ async fn compute_h8(
         })
         .collect();
 
-    // Exclude regulatory RFCs from concentration calculation
+    // L8-07: exact RFC, not prefix -- IMS.../INF... matched a legitimate manufacturing
+    // supplier of the RFC de control ($4,072) whose RFC happened to start the same way.
+    // Confirmed by the team, not guessed: IMSS = IMS421231I45, Infonavit = INF7205011ZA.
+    const RFC_IMSS: &str = "IMS421231I45";
+    const RFC_INFONAVIT: &str = "INF7205011ZA";
     let is_regulatory =
-        |rfc: &str| rfc.starts_with("IMS") || rfc.starts_with("INF") || rfc == "XAXX010101000";
+        |rfc: &str| rfc == RFC_IMSS || rfc == RFC_INFONAVIT || rfc == "XAXX010101000";
 
+    // L8-03: same negative-total edge case as H1 -- see its comment for why.
     let identifiable: Vec<&SupRow> = suppliers
         .iter()
-        .filter(|s| !is_regulatory(&s.rfc))
+        .filter(|s| !is_regulatory(&s.rfc) && s.mxn > 0.0)
         .collect();
     if identifiable.is_empty() {
         return Ok(None);
@@ -1059,18 +1101,18 @@ async fn compute_h8(
     let top3: Vec<&SupRow> = identifiable.iter().take(3).copied().collect();
     let top3_mxn: f64 = top3.iter().map(|s| s.mxn).sum();
     let top3_pct = top3_mxn / total_excl * 100.0;
-
-    let nivel = match h8_nivel(top3_pct) {
-        Some(n) => n,
-        None => return Ok(None), // < 15% — omit
-    };
-
-    let interp = h8_interpretacion(nivel);
     let top1_nombre = top3.first().map(|s| s.nombre.as_str()).unwrap_or("");
     let top1_pct = top3
         .first()
         .map(|s| s.mxn / total_excl * 100.0)
         .unwrap_or(0.0);
+
+    let nivel = match concentracion_nivel(top3_pct, top1_pct) {
+        Some(n) => n,
+        None => return Ok(None), // < 25% Top 3 and < 35% Top 1 -- omit
+    };
+
+    let interp = h8_interpretacion(nivel);
 
     let cuerpo = format!(
         "El Top 3 proveedores representa el {:.1}% del gasto LTM. El mayor proveedor es {} con el {:.1}% del gasto.",
@@ -1112,8 +1154,15 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     .await?;
 
     let max_ym: Option<i64> = max_ym_row.try_get("max_ym").ok().flatten();
+    // L8-01: anchor at the last CLOSED calendar month, not the last month with any
+    // comprobante -- 5 of 6 RFC anchored on the in-progress current month (a handful of
+    // days of data) before this. This one line reaches all ten hallazgos below, not just
+    // H1/H2/H8/H9: H6/H7 (L7-03) and H3/H5A/H5B (Lote 6) all inherit it too, correctly.
     let (ltm_end_y, ltm_end_m) = match max_ym {
-        Some(ym) if ym > 0 => (ym / 100, ym % 100),
+        Some(ym) if ym > 0 => {
+            let ym = ym.min(current_month_yyyymm());
+            (ym / 100, ym % 100)
+        }
         _ => {
             return Ok(HallazgosResponse {
                 visible: vec![],
@@ -1134,17 +1183,25 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         all.push(h);
     }
 
-    // Annual emitidos data — needed for H2, H3
+    // Annual emitidos data — needed for H2 (the `ingreso` figure), and H3 (only the
+    // `complete_years` year list -- H3's own ingreso comes from its ing_rows/rec_rows
+    // queries below, untouched by this one). L8-03 / DEC-041: H2's ingreso now sums
+    // total_neto_mxn_ajustado over cfdis_ajustado with exclusions applied, same four
+    // properties as H1's query above -- was con-IVA and counted only tipo_comprobante='I',
+    // discarding notas de crédito ('E') entirely instead of netting them.
     let annual_rows = sqlx::query(
         r#"
         SELECT year,
                COUNT(DISTINCT month)::bigint AS month_count,
-               SUM(CASE WHEN tipo_comprobante='I' THEN COALESCE(total_mxn,0) ELSE 0 END)::float8 AS ingreso
-        FROM pulso.cfdis
+               SUM(COALESCE(total_neto_mxn_ajustado,0))::float8 AS ingreso
+        FROM pulso.cfdis_ajustado c
         WHERE rfc_emisor = $1
           AND dl_type IN ('emitidos','ambos')
           AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         GROUP BY year
         ORDER BY year
         "#,
@@ -1188,8 +1245,13 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
                 familia: "desempeno".to_string(),
                 nivel: nivel.to_string(),
                 metrica_principal: Some(cagr_pct),
+                // L8-06: H2 only ever uses complete calendar years -- correct for a CAGR,
+                // but silently discarding the in-progress current year read as a
+                // contradiction next to H9 (which does use it) with nothing on screen to
+                // reconcile the two. Says its own window now instead of assuming it's
+                // implied.
                 cuerpo: format!(
-                    "Los ingresos muestran un CAGR de {:.1}% en el período {}-{}.",
+                    "Los ingresos muestran un CAGR de {:.1}% en el período {}-{} (años calendario completos; no incluye el año en curso).",
                     cagr_pct, first.year, last.year
                 ),
                 interpretacion: interp.to_string(),
@@ -1394,15 +1456,19 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         all.push(h);
     }
 
-    // H9 — Momentum reciente (≥ 24 months condition)
+    // H9 — Momentum reciente (≥ 24 months condition). L8-03: same base as the other five --
+    // a month excluded entirely shouldn't count toward the 24-month gate either.
     let total_months_row = sqlx::query(
         r#"
         SELECT COUNT(DISTINCT year * 100 + month)::bigint AS cnt
-        FROM pulso.cfdis
+        FROM pulso.cfdis_ajustado c
         WHERE rfc_emisor = $1
           AND dl_type IN ('emitidos','ambos')
           AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         "#,
     )
     .bind(rfc)
@@ -1451,6 +1517,11 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             });
         }
     }
+
+    // L8-02 / DEC-043: H4 "Pasivo laboral estimado" doesn't ship in the launch -- dropped
+    // here, the one place, so it never reaches the response (not just hidden from the
+    // five visible slots).
+    all.retain(|h| h.id != "H4");
 
     // -------------------------------------------------------------------------
     // Ranking & visible selection (max 5)

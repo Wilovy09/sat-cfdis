@@ -367,6 +367,79 @@ pub fn cp_nombre_expr(cp_col: &str, cp_name_col: &str) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// L7-03: shared "last complete calendar month" cutoff
+// ---------------------------------------------------------------------------
+// Moved here from routes/analytics.rs. hallazgos.rs is mirrored into the lib crate root
+// for consistency_invariants.rs (L6C-10 -- it needs to call the real hallazgos::get), but
+// `routes` only exists in the binary crate root, so a caller inside hallazgos.rs can't
+// reach `crate::routes::analytics::current_month_yyyymm()`. summary.rs is already the
+// lib-visible home every analytics module depends on, so it holds the one definition both
+// crate roots share -- routes/analytics.rs re-exports it so existing callers
+// (recurrence.rs, period_comparison.rs) keep calling it the same way.
+pub(crate) fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    let mut y = 1970u64;
+    let mut rem = days;
+    loop {
+        let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+        let dy = if leap { 366 } else { 365 };
+        if rem < dy {
+            break;
+        }
+        rem -= dy;
+        y += 1;
+    }
+    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+    let months = [
+        31u64,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut mo = 1u64;
+    for &dm in &months {
+        if rem < dm {
+            break;
+        }
+        rem -= dm;
+        mo += 1;
+    }
+    (y, mo, rem + 1)
+}
+
+/// Returns the last fully-closed month (i.e. never the current in-progress month).
+pub(crate) fn current_month() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    let (y, m, _) = days_to_ymd(days);
+    // Step back one month to get the last complete month
+    let total = y as i64 * 12 + m as i64 - 1 - 1;
+    let ly = total / 12;
+    let lm = total % 12 + 1;
+    format!("{ly:04}-{lm:02}")
+}
+
+/// Same cutoff as `current_month()`, as YYYYMM — for callers that compare against
+/// `year*100+month` integers instead of formatted strings (e.g. `recurrence.rs`,
+/// `period_comparison.rs`, `hallazgos.rs`, `payments.rs`, `cashflow.rs`).
+pub(crate) fn current_month_yyyymm() -> i64 {
+    let s = current_month();
+    let y: i64 = s[0..4].parse().unwrap_or(0);
+    let m: i64 = s[5..7].parse().unwrap_or(0);
+    y * 100 + m
+}
+
 #[cfg(test)]
 mod generic_rfc_tests {
     use super::*;

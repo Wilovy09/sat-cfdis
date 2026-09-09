@@ -78,15 +78,18 @@ fn section(total: i64, missing: i64) -> DataQualitySection {
 }
 
 pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<DataQualityResponse> {
+    // L7-11: cancelled comprobantes are the ones most likely to have no XML (they were
+    // never re-downloaded), so leaving them in inflated missing_ratio for RFCs whose real,
+    // vigente population is fine.
     let row = sqlx::query(
         r#"
         SELECT
-            COUNT(*) FILTER (WHERE rfc_emisor = $1 AND dl_type IN ('emitidos','ambos') AND tipo_comprobante IN ('I','E'))                                   AS emitidas_total,
-            COUNT(*) FILTER (WHERE rfc_emisor = $1 AND dl_type IN ('emitidos','ambos') AND tipo_comprobante IN ('I','E') AND xml_available = -1)             AS emitidas_missing,
-            COUNT(*) FILTER (WHERE rfc_receptor = $1 AND dl_type IN ('recibidos','ambos') AND tipo_comprobante IN ('I','E'))                                  AS recibidas_total,
-            COUNT(*) FILTER (WHERE rfc_receptor = $1 AND dl_type IN ('recibidos','ambos') AND tipo_comprobante IN ('I','E') AND xml_available = -1)           AS recibidas_missing,
-            COUNT(*) FILTER (WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND tipo_comprobante = 'N')                                                        AS nomina_total,
-            COUNT(*) FILTER (WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND tipo_comprobante = 'N' AND xml_available = -1)                                 AS nomina_missing
+            COUNT(*) FILTER (WHERE rfc_emisor = $1 AND dl_type IN ('emitidos','ambos') AND tipo_comprobante IN ('I','E') AND NOT is_cancelled)                                   AS emitidas_total,
+            COUNT(*) FILTER (WHERE rfc_emisor = $1 AND dl_type IN ('emitidos','ambos') AND tipo_comprobante IN ('I','E') AND xml_available = -1 AND NOT is_cancelled)             AS emitidas_missing,
+            COUNT(*) FILTER (WHERE rfc_receptor = $1 AND dl_type IN ('recibidos','ambos') AND tipo_comprobante IN ('I','E') AND NOT is_cancelled)                                  AS recibidas_total,
+            COUNT(*) FILTER (WHERE rfc_receptor = $1 AND dl_type IN ('recibidos','ambos') AND tipo_comprobante IN ('I','E') AND xml_available = -1 AND NOT is_cancelled)           AS recibidas_missing,
+            COUNT(*) FILTER (WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND tipo_comprobante = 'N' AND NOT is_cancelled)                                                        AS nomina_total,
+            COUNT(*) FILTER (WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND tipo_comprobante = 'N' AND xml_available = -1 AND NOT is_cancelled)                                 AS nomina_missing
         FROM pulso.cfdis
         WHERE rfc_emisor = $1 OR rfc_receptor = $1
         "#,

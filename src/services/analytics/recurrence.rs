@@ -26,6 +26,11 @@ pub struct ActiveMonthsBucket {
 pub struct YearScore {
     pub year: i32,
     pub score: f64,
+    // L7-07: the same denominator q2 already computes internally (months of that year,
+    // within the window, that have comprobantes) -- not calendar months, so a year with
+    // one unbilled month gives 11, not 12. The frontend needs it to mark a truncated
+    // window year instead of recomputing its own guess.
+    pub months_avail: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,11 +189,17 @@ pub async fn get(
     let q2 = format!(
         r#"
         WITH months_avail_year AS (
+            -- L7-07: numerator (cp_year below) applies the exclusion filter, denominator
+            -- didn't -- the ratio crossed two different universes. Needs its own alias to
+            -- add the NOT EXISTS (there was none to hang it on before).
             SELECT year,
                    COUNT(DISTINCT month)::float8 AS months_avail
-            FROM pulso.cfdis
+            FROM pulso.cfdis c2
             WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c2.uuid
+              )
             GROUP BY year
         ),
         cp_year AS (
@@ -212,11 +223,12 @@ pub async fn get(
                    (cy.cp_months_in_year / ma.months_avail)
                    * (cy.year_total / yt.yt)
                  ) * 100
-               )::float8 AS score
+               )::float8 AS score,
+               ma.months_avail::bigint AS months_avail
         FROM cp_year cy
         JOIN months_avail_year ma ON ma.year = cy.year
         JOIN year_totals yt ON yt.year = cy.year
-        GROUP BY cy.year ORDER BY cy.year
+        GROUP BY cy.year, ma.months_avail ORDER BY cy.year
     "#
     );
     let rows2 = sqlx::query(&q2)
@@ -230,6 +242,7 @@ pub async fn get(
         .map(|r| YearScore {
             year: r.try_get::<i64, _>("year").unwrap_or(0) as i32,
             score: get_f64(r, "score"),
+            months_avail: r.try_get("months_avail").unwrap_or(0),
         })
         .collect();
 

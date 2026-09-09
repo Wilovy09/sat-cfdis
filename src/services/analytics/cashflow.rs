@@ -188,31 +188,23 @@ pub async fn get(
     .await?;
     let ppd_paid: f64 = get_f64(&ppd_paid_row, "paid");
 
-    // PPD outstanding — full universe, as_of_cutoff-bounded like payments.rs (AUD-009),
-    // so cashflow's cartera figure matches the Cobranza tab's exactly (L2-09 control).
-    let direccion = if dl_type == "recibidos" {
-        "recibidos"
-    } else {
-        "emitidos"
-    };
+    // PPD outstanding — full universe, capped at the last complete calendar month like
+    // payments.rs (L7-03 / DEC-039, AUD-009), so cashflow's cartera figure matches the
+    // Cobranza tab's exactly (L2-09 control). Appears twice at the call site (emitidos and
+    // recibidos), both through this one function.
+    let cutoff_yyyymm = crate::routes::analytics::current_month_yyyymm();
     let ppd_outstanding_row = sqlx::query(&format!(
         r#"
-        WITH cutoff AS (
-            SELECT COALESCE(
-                (SELECT as_of_ym FROM pulso.rfc_as_of_cutoff WHERE owner_rfc = $1 AND direccion = $2),
-                999912
-            ) AS as_of_ym
-        )
         SELECT COALESCE(SUM(c.saldo_mxn), 0)::float8 AS outstanding
-        FROM pulso.cfdi_cobro_estado c, cutoff
+        FROM pulso.cfdi_cobro_estado c
         WHERE c.{owner_col} = $1
           AND c.{dl_filter}
           AND c.metodo_pago = 'PPD'
-          AND (c.year * 100 + c.month) <= cutoff.as_of_ym
+          AND (c.year * 100 + c.month) <= $2
         "#
     ))
     .bind(rfc)
-    .bind(direccion)
+    .bind(cutoff_yyyymm)
     .fetch_one(pool)
     .await?;
     let ppd_outstanding: f64 = get_f64(&ppd_outstanding_row, "outstanding");

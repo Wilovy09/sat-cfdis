@@ -14,6 +14,8 @@ pub struct PeriodComparisonResponse {
     pub monthly_matrix: Vec<MonthMatrixRow>,
     pub top_cp_by_year: Vec<CpPeriodRow>,
     pub bridges: Vec<BridgeEntry>,
+    pub effective_from_month: i32,
+    pub effective_to_month: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,6 +103,20 @@ pub async fn get(
     let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
     let years_vec: Vec<i32> = years.to_vec();
+
+    // L7-01: if -- and only if -- the compared years include the year of the last closed
+    // calendar month, the effective to_month drops to min(to_month, that month), applied to
+    // ALL compared years so the comparison stays over the same period for every year. Must
+    // land before period_label is built below, or CMP02's "Periodo" column would keep saying
+    // the untopped range while the queries already use the topped one.
+    let last_closed_yyyymm = crate::routes::analytics::current_month_yyyymm();
+    let last_closed_year = (last_closed_yyyymm / 100) as i32;
+    let last_closed_month = (last_closed_yyyymm % 100) as i32;
+    let to_month = if years_vec.contains(&last_closed_year) {
+        to_month.min(last_closed_month)
+    } else {
+        to_month
+    };
 
     // Month abbreviations in Spanish
     const MONTHS: [&str; 12] = [
@@ -589,5 +605,7 @@ pub async fn get(
         monthly_matrix,
         top_cp_by_year,
         bridges,
+        effective_from_month: from_month,
+        effective_to_month: to_month,
     })
 }

@@ -1177,30 +1177,13 @@ pub async fn get_counterparty_individual(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the last fully-closed month (i.e. never the current in-progress month).
-fn current_month() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = secs / 86400;
-    let (y, m, _) = days_to_ymd(days);
-    // Step back one month to get the last complete month
-    let total = y as i64 * 12 + m as i64 - 1 - 1;
-    let ly = total / 12;
-    let lm = total % 12 + 1;
-    format!("{ly:04}-{lm:02}")
-}
-
-/// Same cutoff as `current_month()`, as YYYYMM — for callers that compare
-/// against `year*100+month` integers instead of formatted strings (e.g.
-/// `recurrence.rs`, which builds its own window bounds that way).
-pub(crate) fn current_month_yyyymm() -> i64 {
-    let s = current_month();
-    let y: i64 = s[0..4].parse().unwrap_or(0);
-    let m: i64 = s[5..7].parse().unwrap_or(0);
-    y * 100 + m
-}
+// L7-03: the definitions live in services::analytics::summary now (it's mirrored into the
+// lib crate root; routes isn't). `current_month_yyyymm` is re-exported as `pub(crate)` so
+// external callers (`recurrence.rs`, `period_comparison.rs`) keep calling
+// `crate::routes::analytics::current_month_yyyymm()` unchanged; `current_month`/
+// `days_to_ymd` are only used internally below.
+pub(crate) use crate::services::analytics::summary::current_month_yyyymm;
+use crate::services::analytics::summary::{current_month, days_to_ymd};
 
 fn default_from() -> String {
     let secs = std::time::SystemTime::now()
@@ -1234,44 +1217,6 @@ pub async fn get_quarterly(
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
-}
-
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    let mut y = 1970u64;
-    let mut rem = days;
-    loop {
-        let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
-        let dy = if leap { 366 } else { 365 };
-        if rem < dy {
-            break;
-        }
-        rem -= dy;
-        y += 1;
-    }
-    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
-    let months = [
-        31u64,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut mo = 1u64;
-    for &dm in &months {
-        if rem < dm {
-            break;
-        }
-        rem -= dm;
-        mo += 1;
-    }
-    (y, mo, rem + 1)
 }
 
 // ---------------------------------------------------------------------------

@@ -390,19 +390,18 @@ async fn mes_completo_igual_a_mes_solo() {
 /// Row 8: ingresos netos normalizados -- mismo valor en Ingresos, Resumen trimestral y
 /// Contrapartes.
 ///
-/// `quarterly::get` and `counterparties::get` share the exact same population filter
-/// (`tipo_comprobante NOT IN ('P','N')`) and match EXACTLY (zero tolerance) -- that part of
-/// the invariant is airtight. `summary::get` differs from both in one remaining, real way:
-/// `summary.rs`'s monthly query additionally excludes tipo_comprobante = 'T', while
-/// quarterly.rs/counterparties.rs do not. Currently a non-event for both test RFCs
-/// (RFC_PRUEBA has zero T-type comprobantes; RFC_GRANDE's 47 T-type comprobantes apparently
-/// carry ~0 net amount), but it's a real, latent filter inconsistency of exactly the "one
-/// copy fixed, its twin isn't" class this lote's rule #4 warns about -- AUD-041, flagged for
-/// a future lote, not fixed here. The tolerance below covers that plus whatever residual
-/// float-summation-order noise remains now that L6-12 (migration 069) made cfdis' money
-/// columns NUMERIC -- confirmed directly (2026-09-07) that the gap dropped from several
-/// pesos to sub-cent for both dl_type values, consistent with the precision fix, not a
-/// second, undiscovered gap.
+/// `quarterly::get` and `counterparties::get` used to share the exact same population
+/// filter (`tipo_comprobante NOT IN ('P','N')`) and matched EXACTLY (zero tolerance).
+/// **L8-10 broke that equality on purpose**: `counterparties.rs`'s eleven queries now also
+/// exclude `tipo_comprobante = 'T'` (comprobantes de traslado), same as `summary.rs`
+/// already did; `quarterly.rs` doesn't yet -- that fix is scoped to `counterparties.rs`
+/// alone this lote (recurrence.rs/retention.rs/period_comparison.rs/fiscal.rs/quarterly.rs
+/// get it in the next one, per AUD-041). The zero-tolerance assertion below still
+/// numerically passes -- traslado comprobantes are worth $0 for both test RFCs, same fact
+/// already true of the summary.rs-vs-the-other-two gap below -- but it's no longer proof
+/// the two functions share one filter; it's a coincidence of this test's fixture data. The
+/// float-summation-order tolerance note (NUMERIC columns since migration 069, confirmed
+/// 2026-09-07 the residual gap is sub-cent) still applies to the second assertion.
 ///
 /// L6C-11: the previous version of this comment claimed dl_type="ambos" produced invalid SQL
 /// ("c.1=1") via `dl_type_filter`, and sidestepped it with dl_type="emitidos" for all three
@@ -442,8 +441,9 @@ async fn ingresos_netos_tres_pantallas() {
             assert!(
                 (trimestral_total - contrapartes_total).abs() < 0.01,
                 "for {rfc} dl_type={dl_type}: Resumen trimestral ({trimestral_total}) and \
-                 Contrapartes ({contrapartes_total}) must match EXACTLY -- they share the \
-                 identical population filter, so any gap here is a real regression."
+                 Contrapartes ({contrapartes_total}) differ by more than the traslado-comprobante \
+                 coincidence (see this test's doc comment, AUD-041/L8-10) should allow -- \
+                 a real regression."
             );
             assert!(
                 (ingresos_total - trimestral_total).abs() <= TOLERANCE_MXN,
