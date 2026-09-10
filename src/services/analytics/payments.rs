@@ -348,24 +348,9 @@ pub async fn get(
         .collect();
 
     // Average days to pay — PPD invoices only, using the base's ultimo_pago_fecha (already
-    // guarded against fecha_pago < fecha_emision data errors).
-    let avg_days_row = sqlx::query(&format!(
-        r#"
-        SELECT AVG((c.ultimo_pago_fecha - c.fecha_emision::date)::float8) AS avg_days
-        FROM pulso.cfdi_cobro_estado c
-        WHERE c.{owner_col} = $1
-          AND c.{dl_filter}
-          AND c.metodo_pago = 'PPD'
-          AND c.ultimo_pago_fecha IS NOT NULL
-        "#
-    ))
-    .bind(rfc)
-    .fetch_one(pool)
-    .await?;
-    // Not get_f64 on purpose: an empty PPD population (no rows to average) makes AVG
-    // return SQL NULL, which is a normal outcome here, not an f64 decode failure -- the
-    // cast is already correct, so wrapping it would log a spurious warning every request.
-    let avg_days_to_pay: f64 = avg_days_row.try_get("avg_days").unwrap_or(0.0);
+    // guarded against fecha_pago < fecha_emision data errors). L9-06: shared with
+    // cashflow.rs's identical query now, see avg_dias_a_cobro's own comment for why.
+    let avg_days_to_pay: f64 = super::summary::avg_dias_a_cobro(pool, rfc, dl_type).await?;
 
     // Monthly timeline: invoiced = PUE+PPD emitted; paid = PUE (immediate) + PPD DR payments
     // grouped by invoice emission month. Avoids multiplying PUE totals via payment doc JOIN.
@@ -441,6 +426,9 @@ pub async fn get(
     })
 }
 
+// P-04 / DEC-042: only caller was cashflow.rs's payment_method_breakdown, paused (not
+// deleted) since nothing on screen reads it -- kept, not removed, for when that's restored.
+#[allow(dead_code)]
 pub fn forma_label_str(f: &str) -> String {
     forma_label(f).to_string()
 }

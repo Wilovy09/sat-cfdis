@@ -17,6 +17,20 @@ pub struct Config {
     pub pg_password: String,
     pub pg_database: String,
     pub pg_cert_path: String,
+    // P-05 / AUD-079: pool size and acquire timeout used to be hardcoded (max_connections(5),
+    // no timeout at all) -- configurable now, and split from the background-worker pool
+    // below so a long sync doesn't compete with user traffic for the same five slots.
+    /// User-facing (HTTP server) pool size. Default sized for the Dashboard's own load: 9
+    /// simultaneous requests, plus headroom for more than one browser tab/user at once.
+    pub pg_pool_size: u32,
+    /// Background-worker pool size (resume, ETL, daily sync, recheck-cancelled,
+    /// gap-detector, xml-redownload) -- same size the single shared pool used to be, since
+    /// the point of splitting it off is to stop it from taking slots away from users, not
+    /// to give the workers more capacity than they had.
+    pub pg_worker_pool_size: u32,
+    /// How long a request waits for a free connection before giving up, instead of
+    /// queuing forever.
+    pub pg_acquire_timeout_secs: u64,
     /// Optional residential proxy for PHP CLI SAT requests (e.g. http://user:pass@host:port)
     pub https_proxy: Option<String>,
     /// SendGrid API key for transactional email notifications
@@ -60,6 +74,18 @@ impl Config {
             pg_database: env::var("POSTGRES_DATABASE").unwrap_or_else(|_| "adquiere".to_string()),
             pg_cert_path: env::var("POSTGRES_CERT_PATH")
                 .unwrap_or_else(|_| "/arena/certs/rds-ca-bundle.pem".to_string()),
+            pg_pool_size: env::var("POSTGRES_POOL_SIZE")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(15),
+            pg_worker_pool_size: env::var("POSTGRES_WORKER_POOL_SIZE")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5),
+            pg_acquire_timeout_secs: env::var("POSTGRES_ACQUIRE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(10),
             https_proxy: env::var("HTTPS_PROXY").ok(),
             sendgrid_api_key: env::var("SENDGRID_API_KEY").ok(),
             sendgrid_from: env::var("SENDGRID_FROM")

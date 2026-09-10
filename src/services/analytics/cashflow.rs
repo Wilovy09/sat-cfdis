@@ -2,7 +2,6 @@ use super::summary::{dl_type_filter, get_f64, parse_ym, rfc_column};
 /// Cashflow: timeline of invoiced vs paid amounts, net cash position.
 use crate::db::DbPool;
 use serde::Serialize;
-use sqlx::Row;
 
 #[derive(Debug, Serialize)]
 pub struct CashflowResponse {
@@ -46,147 +45,141 @@ pub async fn get(
     from: &str,
     to: &str,
 ) -> anyhow::Result<CashflowResponse> {
-    let (from_y, from_m) = parse_ym(from);
-    let (to_y, to_m) = parse_ym(to);
+    // P-04: from/to only fed the five paused queries below -- unused while they're paused,
+    // still parsed (not removed from the signature) since they come straight from the
+    // caller and every paused query block references them by these exact names.
+    let (_from_y, _from_m) = parse_ym(from);
+    let (_to_y, _to_m) = parse_ym(to);
     let dl_filter = dl_type_filter(dl_type);
     let owner_col = rfc_column(dl_type);
 
-    // Monthly invoiced (I and E comprobantes)
-    let invoiced_rows = sqlx::query(&format!(
-        r#"
-        SELECT year, month, tipo_comprobante,
-               SUM(COALESCE(total_mxn,0)::float8)::float8 AS total
-        FROM pulso.cfdis
-        WHERE {owner_col} = $1
-          AND {dl_filter}
-          AND tipo_comprobante IN ('I','E')
-          AND NOT is_cancelled
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY year, month, tipo_comprobante
-        ORDER BY year, month
-        "#
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_all(pool)
-    .await?;
-
-    // Monthly payments received/made via complemento P. L2-09: p.monto is in the
-    // complement's own currency (moneda_p) — convert with tipo_cambio_p, same defect
-    // family as COB-1 but one level up (the complement total, not a per-invoice document).
-    let pago_rows = sqlx::query(&format!(
-        r#"
-        SELECT c.year, c.month,
-               SUM(COALESCE(p.monto, 0)::float8 * COALESCE(NULLIF(p.tipo_cambio_p::float8, 0), 1)) AS total_pagos
-        FROM pulso.cfdi_payments p
-        JOIN pulso.cfdis c ON c.uuid = p.payment_uuid
-        WHERE c.{owner_col} = $1
-          AND {dl_filter}
-          AND c.tipo_comprobante = 'P'
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-        GROUP BY c.year, c.month
-        ORDER BY c.year, c.month
-        "#
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_all(pool)
-    .await?;
-
-    // Build month maps
-    type Ym = (i64, i64);
-    let mut ingreso_map: std::collections::HashMap<Ym, f64> = Default::default();
-    let mut egreso_map: std::collections::HashMap<Ym, f64> = Default::default();
-    let mut pago_map: std::collections::HashMap<Ym, f64> = Default::default();
-    let mut pue_total = 0.0f64;
-    let mut ppd_inv = 0.0f64;
-
-    for r in &invoiced_rows {
-        let y: i64 = r.try_get("year").unwrap_or(0);
-        let m: i64 = r.try_get("month").unwrap_or(0);
-        let tipo: String = r.try_get("tipo_comprobante").unwrap_or_default();
-        let total: f64 = get_f64(r, "total");
-        match tipo.as_str() {
-            "I" => {
-                *ingreso_map.entry((y, m)).or_insert(0.0) += total;
-            }
-            "E" => {
-                *egreso_map.entry((y, m)).or_insert(0.0) += total;
-            }
-            _ => {}
-        }
-    }
-
-    for r in &pago_rows {
-        let y: i64 = r.try_get("year").unwrap_or(0);
-        let m: i64 = r.try_get("month").unwrap_or(0);
-        let t: f64 = get_f64(r, "total_pagos");
-        *pago_map.entry((y, m)).or_insert(0.0) += t;
-    }
-
-    // PUE / PPD totals
-    let metodo_row = sqlx::query(&format!(
-        r#"
-        SELECT COALESCE(metodo_pago, 'PUE') AS metodo_pago,
-               SUM(COALESCE(total_mxn,0)::float8)::float8 AS total
-        FROM pulso.cfdis
-        WHERE {owner_col} = $1
-          AND {dl_filter}
-          AND tipo_comprobante = 'I'
-          AND NOT is_cancelled
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY COALESCE(metodo_pago, 'PUE')
-        "#
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_all(pool)
-    .await?;
-
-    for r in &metodo_row {
-        let m: String = r.try_get("metodo_pago").unwrap_or_default();
-        let t: f64 = get_f64(r, "total");
-        match m.as_str() {
-            "PUE" => pue_total += t,
-            "PPD" => ppd_inv += t,
-            _ => {}
-        }
-    }
-
-    // PPD paid — L2-01/L2-09: shared base (correct currency conversion, cancelled
-    // complements and '01'/'03' credit notes already resolved there).
-    let ppd_paid_row = sqlx::query(&format!(
-        r#"
-        SELECT COALESCE(SUM(c.total_mxn - c.saldo_mxn), 0)::float8 AS paid
-        FROM pulso.cfdi_cobro_estado c
-        WHERE c.{owner_col} = $1
-          AND c.{dl_filter}
-          AND c.metodo_pago = 'PPD'
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-        "#
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_one(pool)
-    .await?;
-    let ppd_paid: f64 = get_f64(&ppd_paid_row, "paid");
+    // P-04 / DEC-042: this endpoint returns nine fields; the frontend reads two
+    // (avg_collection_days, ppd_outstanding_mxn -- see ppd_outstanding_row and
+    // avg_dias_a_cobro below). timeline, cumulative_position, pue_total_mxn,
+    // ppd_invoiced_mxn, ppd_paid_mxn and payment_method_breakdown fed five of the seven
+    // queries this function used to run, for numbers nothing on screen shows. Paused, not
+    // deleted -- the five queries below are commented out, not removed, and the response
+    // still carries all nine fields (zero-valued for the paused ones) so the contract
+    // doesn't change shape. Uncomment when a screen actually calls for them.
+    //
+    // // Monthly invoiced (I and E comprobantes)
+    // let invoiced_rows = sqlx::query(&format!(
+    //     r#"
+    //     SELECT year, month, tipo_comprobante,
+    //            SUM(COALESCE(total_mxn,0)::float8)::float8 AS total
+    //     FROM pulso.cfdis
+    //     WHERE {owner_col} = $1
+    //       AND {dl_filter}
+    //       AND tipo_comprobante IN ('I','E')
+    //       AND NOT is_cancelled
+    //       AND (year > $2 OR (year = $2 AND month >= $3))
+    //       AND (year < $4 OR (year = $4 AND month <= $5))
+    //     GROUP BY year, month, tipo_comprobante
+    //     ORDER BY year, month
+    //     "#
+    // ))
+    // .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    // .fetch_all(pool).await?;
+    //
+    // // Monthly payments received/made via complemento P. L2-09: p.monto is in the
+    // // complement's own currency (moneda_p) — convert with tipo_cambio_p, same defect
+    // // family as COB-1 but one level up (the complement total, not a per-invoice document).
+    // let pago_rows = sqlx::query(&format!(
+    //     r#"
+    //     SELECT c.year, c.month,
+    //            SUM(COALESCE(p.monto, 0)::float8 * COALESCE(NULLIF(p.tipo_cambio_p::float8, 0), 1)) AS total_pagos
+    //     FROM pulso.cfdi_payments p
+    //     JOIN pulso.cfdis c ON c.uuid = p.payment_uuid
+    //     WHERE c.{owner_col} = $1
+    //       AND {dl_filter}
+    //       AND c.tipo_comprobante = 'P'
+    //       AND NOT c.is_cancelled
+    //       AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+    //       AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+    //     GROUP BY c.year, c.month
+    //     ORDER BY c.year, c.month
+    //     "#
+    // ))
+    // .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    // .fetch_all(pool).await?;
+    //
+    // // Build month maps
+    // type Ym = (i64, i64);
+    // let mut ingreso_map: std::collections::HashMap<Ym, f64> = Default::default();
+    // let mut egreso_map: std::collections::HashMap<Ym, f64> = Default::default();
+    // let mut pago_map: std::collections::HashMap<Ym, f64> = Default::default();
+    // let mut pue_total = 0.0f64;
+    // let mut ppd_inv = 0.0f64;
+    //
+    // for r in &invoiced_rows {
+    //     let y: i64 = r.try_get("year").unwrap_or(0);
+    //     let m: i64 = r.try_get("month").unwrap_or(0);
+    //     let tipo: String = r.try_get("tipo_comprobante").unwrap_or_default();
+    //     let total: f64 = get_f64(r, "total");
+    //     match tipo.as_str() {
+    //         "I" => { *ingreso_map.entry((y, m)).or_insert(0.0) += total; }
+    //         "E" => { *egreso_map.entry((y, m)).or_insert(0.0) += total; }
+    //         _ => {}
+    //     }
+    // }
+    //
+    // for r in &pago_rows {
+    //     let y: i64 = r.try_get("year").unwrap_or(0);
+    //     let m: i64 = r.try_get("month").unwrap_or(0);
+    //     let t: f64 = get_f64(r, "total_pagos");
+    //     *pago_map.entry((y, m)).or_insert(0.0) += t;
+    // }
+    //
+    // // PUE / PPD totals
+    // let metodo_row = sqlx::query(&format!(
+    //     r#"
+    //     SELECT COALESCE(metodo_pago, 'PUE') AS metodo_pago,
+    //            SUM(COALESCE(total_mxn,0)::float8)::float8 AS total
+    //     FROM pulso.cfdis
+    //     WHERE {owner_col} = $1
+    //       AND {dl_filter}
+    //       AND tipo_comprobante = 'I'
+    //       AND NOT is_cancelled
+    //       AND (year > $2 OR (year = $2 AND month >= $3))
+    //       AND (year < $4 OR (year = $4 AND month <= $5))
+    //     GROUP BY COALESCE(metodo_pago, 'PUE')
+    //     "#
+    // ))
+    // .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    // .fetch_all(pool).await?;
+    //
+    // for r in &metodo_row {
+    //     let m: String = r.try_get("metodo_pago").unwrap_or_default();
+    //     let t: f64 = get_f64(r, "total");
+    //     match m.as_str() {
+    //         "PUE" => pue_total += t,
+    //         "PPD" => ppd_inv += t,
+    //         _ => {}
+    //     }
+    // }
+    //
+    // // PPD paid — L2-01/L2-09: shared base (correct currency conversion, cancelled
+    // // complements and '01'/'03' credit notes already resolved there).
+    // let ppd_paid_row = sqlx::query(&format!(
+    //     r#"
+    //     SELECT COALESCE(SUM(c.total_mxn - c.saldo_mxn), 0)::float8 AS paid
+    //     FROM pulso.cfdi_cobro_estado c
+    //     WHERE c.{owner_col} = $1
+    //       AND c.{dl_filter}
+    //       AND c.metodo_pago = 'PPD'
+    //       AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+    //       AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+    //     "#
+    // ))
+    // .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    // .fetch_one(pool).await?;
+    // let ppd_paid: f64 = get_f64(&ppd_paid_row, "paid");
+    let timeline: Vec<CashflowMonth> = Vec::new();
+    let cumulative_position = 0.0f64;
+    let pue_total = 0.0f64;
+    let ppd_inv = 0.0f64;
+    let ppd_paid = 0.0f64;
+    let payment_method_breakdown: Vec<PaymentMethodRow> = Vec::new();
 
     // PPD outstanding — full universe, capped at the last complete calendar month like
     // payments.rs (L7-03 / DEC-039, AUD-009), so cashflow's cartera figure matches the
@@ -213,98 +206,75 @@ pub async fn get(
     // ultimo_pago_fecha (last non-cancelled payment, per invoice) that payments.rs and
     // counterparties.rs use, instead of averaging every individual payment-doc row --
     // which double-counted invoices paid in installments and never excluded cancelled
-    // payment complements.
-    let avg_days_row = sqlx::query(&format!(
-        r#"
-        SELECT COALESCE(AVG((c.ultimo_pago_fecha - c.fecha_emision::date)::float8), 0.0) AS avg_days
-        FROM pulso.cfdi_cobro_estado c
-        WHERE c.{owner_col} = $1
-          AND c.{dl_filter}
-          AND c.metodo_pago = 'PPD'
-          AND c.ultimo_pago_fecha IS NOT NULL
-        "#
-    ))
-    .bind(rfc)
-    .fetch_one(pool)
-    .await?;
-    let avg_collection_days: f64 = get_f64(&avg_days_row, "avg_days");
+    // payment complements. L9-06: shared with payments.rs's identical query now, see
+    // avg_dias_a_cobro's own comment for why.
+    let avg_collection_days: f64 = super::summary::avg_dias_a_cobro(pool, rfc, dl_type).await?;
 
-    // Build timeline
-    let mut all_yms: std::collections::BTreeSet<Ym> = Default::default();
-    for &ym in ingreso_map.keys() {
-        all_yms.insert(ym);
-    }
-    for &ym in egreso_map.keys() {
-        all_yms.insert(ym);
-    }
-    for &ym in pago_map.keys() {
-        all_yms.insert(ym);
-    }
-
-    let mut cumulative = 0.0f64;
-    let mut timeline = Vec::new();
-
-    for (y, m) in &all_yms {
-        let ingreso = ingreso_map.get(&(*y, *m)).copied().unwrap_or(0.0);
-        let egreso = egreso_map.get(&(*y, *m)).copied().unwrap_or(0.0);
-        let pagos = pago_map.get(&(*y, *m)).copied().unwrap_or(0.0);
-        let net = ingreso - egreso + pagos;
-        cumulative += net;
-
-        timeline.push(CashflowMonth {
-            period: format!("{y}-{m:02}"),
-            year: *y,
-            month: *m,
-            ingreso_invoiced_mxn: ingreso,
-            egreso_invoiced_mxn: egreso,
-            pago_received_mxn: pagos,
-            net_mxn: net,
-            cumulative_mxn: cumulative,
-            ppd_outstanding_start: 0.0,
-            new_ppd_mxn: 0.0,
-            ppd_paid_this_month: 0.0,
-        });
-    }
-
-    // Payment method breakdown from complementos
-    let pm_rows = sqlx::query(&format!(
-        r#"
-        SELECT p.forma_pago, COUNT(*) AS cnt,
-               SUM(COALESCE(p.monto,0)::float8 * COALESCE(NULLIF(p.tipo_cambio_p::float8, 0), 1)) AS total
-        FROM pulso.cfdi_payments p
-        JOIN pulso.cfdis c ON c.uuid = p.payment_uuid
-        WHERE c.{owner_col} = $1
-          AND {dl_filter}
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-        GROUP BY p.forma_pago
-        ORDER BY total DESC
-        "#
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_all(pool)
-    .await?;
-
-    let payment_method_breakdown: Vec<PaymentMethodRow> = pm_rows
-        .iter()
-        .map(|r| {
-            let forma: String = r.try_get("forma_pago").unwrap_or_default();
-            PaymentMethodRow {
-                label: super::payments::forma_label_str(&forma),
-                forma_pago: forma,
-                total_mxn: get_f64(r, "total"),
-                count: r.try_get("cnt").unwrap_or(0),
-            }
-        })
-        .collect();
+    // // Build timeline
+    // let mut all_yms: std::collections::BTreeSet<Ym> = Default::default();
+    // for &ym in ingreso_map.keys() { all_yms.insert(ym); }
+    // for &ym in egreso_map.keys() { all_yms.insert(ym); }
+    // for &ym in pago_map.keys() { all_yms.insert(ym); }
+    //
+    // let mut cumulative = 0.0f64;
+    // let mut timeline = Vec::new();
+    //
+    // for (y, m) in &all_yms {
+    //     let ingreso = ingreso_map.get(&(*y, *m)).copied().unwrap_or(0.0);
+    //     let egreso = egreso_map.get(&(*y, *m)).copied().unwrap_or(0.0);
+    //     let pagos = pago_map.get(&(*y, *m)).copied().unwrap_or(0.0);
+    //     let net = ingreso - egreso + pagos;
+    //     cumulative += net;
+    //
+    //     timeline.push(CashflowMonth {
+    //         period: format!("{y}-{m:02}"),
+    //         year: *y,
+    //         month: *m,
+    //         ingreso_invoiced_mxn: ingreso,
+    //         egreso_invoiced_mxn: egreso,
+    //         pago_received_mxn: pagos,
+    //         net_mxn: net,
+    //         cumulative_mxn: cumulative,
+    //         ppd_outstanding_start: 0.0,
+    //         new_ppd_mxn: 0.0,
+    //         ppd_paid_this_month: 0.0,
+    //     });
+    // }
+    //
+    // // Payment method breakdown from complementos
+    // let pm_rows = sqlx::query(&format!(
+    //     r#"
+    //     SELECT p.forma_pago, COUNT(*) AS cnt,
+    //            SUM(COALESCE(p.monto,0)::float8 * COALESCE(NULLIF(p.tipo_cambio_p::float8, 0), 1)) AS total
+    //     FROM pulso.cfdi_payments p
+    //     JOIN pulso.cfdis c ON c.uuid = p.payment_uuid
+    //     WHERE c.{owner_col} = $1
+    //       AND {dl_filter}
+    //       AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+    //       AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+    //     GROUP BY p.forma_pago
+    //     ORDER BY total DESC
+    //     "#
+    // ))
+    // .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
+    // .fetch_all(pool).await?;
+    //
+    // let payment_method_breakdown: Vec<PaymentMethodRow> = pm_rows
+    //     .iter()
+    //     .map(|r| {
+    //         let forma: String = r.try_get("forma_pago").unwrap_or_default();
+    //         PaymentMethodRow {
+    //             label: super::payments::forma_label_str(&forma),
+    //             forma_pago: forma,
+    //             total_mxn: get_f64(r, "total"),
+    //             count: r.try_get("cnt").unwrap_or(0),
+    //         }
+    //     })
+    //     .collect();
 
     Ok(CashflowResponse {
         timeline,
-        cumulative_position: cumulative,
+        cumulative_position,
         avg_collection_days,
         pue_total_mxn: pue_total,
         ppd_invoiced_mxn: ppd_inv,

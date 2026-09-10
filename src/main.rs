@@ -1043,6 +1043,15 @@ async fn main() -> std::io::Result<()> {
     let pool = db::init_pool(&cfg).await.unwrap_or_else(|e| {
         panic!("Failed to connect to PostgreSQL at '{}': {e}", cfg.pg_host);
     });
+    // P-05 / AUD-079: background workers get their own pool now, sized separately from the
+    // user-facing one above -- a long sync can no longer take a connection away from
+    // someone using the dashboard. No migration run here; `init_pool` already did it once.
+    let bg_pool = db::init_worker_pool(&cfg).await.unwrap_or_else(|e| {
+        panic!(
+            "Failed to connect background-worker pool to PostgreSQL at '{}': {e}",
+            cfg.pg_host
+        );
+    });
 
     // L6-01: catches the environment/repo divergence init_pool's own sqlx::migrate! can't --
     // migration files present that were never applied (or a DB ahead of this checkout).
@@ -1072,23 +1081,24 @@ async fn main() -> std::io::Result<()> {
     let s3_client = Arc::new(S3Client::new(&aws_cfg));
 
     // ── Background workers ──────────────────────────────────────────────────
+    // P-05: all six now take bg_pool, not pool -- see its own comment above for why.
     {
-        let worker_pool = pool.clone();
+        let worker_pool = bg_pool.clone();
         let worker_cfg = Arc::new(cfg.clone());
         let worker_s3 = s3_client.clone();
         tokio::spawn(resume_worker(worker_pool, worker_cfg, worker_s3));
     }
     {
-        let etl_pool = pool.clone();
+        let etl_pool = bg_pool.clone();
         let etl_cfg = Arc::new(cfg.clone());
         let etl_s3 = s3_client.clone();
         tokio::spawn(etl::etl_worker(etl_pool, etl_cfg, etl_s3));
     }
     {
-        tokio::spawn(daily_sync_worker(pool.clone()));
+        tokio::spawn(daily_sync_worker(bg_pool.clone()));
     }
     {
-        let recheck_pool = pool.clone();
+        let recheck_pool = bg_pool.clone();
         let recheck_cfg = Arc::new(cfg.clone());
         let recheck_s3 = s3_client.clone();
         tokio::spawn(services::recheck_cancelled::worker(
@@ -1098,13 +1108,13 @@ async fn main() -> std::io::Result<()> {
         ));
     }
     {
-        let gap_pool = pool.clone();
+        let gap_pool = bg_pool.clone();
         let gap_cfg = Arc::new(cfg.clone());
         let gap_s3 = s3_client.clone();
         tokio::spawn(services::gap_detector::worker(gap_pool, gap_cfg, gap_s3));
     }
     {
-        let redl_pool = pool.clone();
+        let redl_pool = bg_pool.clone();
         let redl_cfg = Arc::new(cfg.clone());
         let redl_s3 = s3_client.clone();
         tokio::spawn(services::xml_redownload::worker(

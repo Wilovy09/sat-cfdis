@@ -614,6 +614,11 @@ pub struct CpPaymentRow {
     pub facturas_abiertas: i64,
     pub dias_cobro_ppd: f64,
     pub monto_riesgo_180d: f64,
+    // L9-04 / DEC-045: true when there's an active exclude rule *on this counterparty*
+    // (normalization_rules.source_rfc, not a single cfdi_uuid) -- the cartera itself never
+    // applies exclusions (DEC-044: it's a balance), so this only labels rows, it never
+    // changes any amount.
+    pub normalizada: bool,
 }
 
 pub async fn get_payments_detail(
@@ -648,82 +653,118 @@ pub async fn get_payments_detail(
     // L2-01/L2-03: universe and per-invoice state both come from the shared base
     // (pulso.cfdi_cobro_estado) instead of re-deriving pagado/saldo here. Full universe
     // (PUE + PPD), no date filter — cartera is a balance, not a period flow.
+    //
+    // L9-04 / DEC-045: two different universes live in this one table, not one. Facturado,
+    // Cobrado, facturas_ppd and dias_cobro are ventas/P&L concepts -- L7-06's exclusion
+    // filter stays correct for those. Saldo, facturas_abiertas, monto_riesgo and the
+    // "normalizada" flag are cartera -- a balance -- and DEC-045 says a balance doesn't
+    // drop a counterparty just because sales excluded them: "el cliente sigue debiendo lo
+    // que debe." `all_inv` below carries both; each downstream CTE opts into the
+    // exclusion filter or not depending on which side of that line it's on.
     let rows = sqlx::query(&format!(
         r#"
         WITH all_inv AS (
             SELECT c.{cp_col} AS {cp_col}, c.{cp_name_col} AS {cp_name_col},
                    b.uuid, b.fecha_emision, b.total_mxn AS inv_total, b.metodo_pago,
-                   b.saldo_mxn, b.pagado_mxn, b.dias_antiguedad, b.ultimo_pago_fecha
+                   b.saldo_mxn, b.pagado_mxn, b.dias_antiguedad, b.ultimo_pago_fecha,
+                   NOT EXISTS (
+                       SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = b.uuid
+                   ) AS included
             FROM pulso.cfdi_cobro_estado b
             JOIN pulso.cfdis c ON c.uuid = b.uuid
             WHERE b.{owner_col} = $1 AND b.{dl_filter}
-              -- L7-06: same clause the RFC predicate already lives in, not a derived CTE
-              -- or the final projection -- pulso.cfdi_exclusion is the view that caused
-              -- the August incident; the planner can re-evaluate it per row otherwise.
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = b.uuid
-              )
         ),
         inv_base AS (
-            -- C8-01 / AUD-065: saldo is its own column, read straight from the view's
-            -- saldo_mxn (same as get_individual/CNT07 already does) -- not derived as
-            -- facturado - cobrado. Since L7-04 made "cobrado" real collection (excluding
-            -- credit notes), that subtraction started absorbing credit notes as if they
-            -- were still pending. Grouped with cp_key_bare, the same variant the rest of
-            -- this CTE uses -- not cp_key_inv, or the join below silently stops matching
-            -- for split (generic-RFC) counterparties.
+            -- Ventas: facturado / facturas_ppd, exclusion-filtered (L7-06 unchanged).
             SELECT ({cp_key_bare}) AS cp_rfc,
-                   {cp_nombre_bare} AS cp_nombre,
                    SUM(inv_total) AS facturado,
-                   SUM(saldo_mxn)::float8 AS saldo,
                    COUNT(DISTINCT CASE WHEN metodo_pago = 'PPD' THEN uuid END) AS facturas_ppd
             FROM all_inv
+            WHERE included
             GROUP BY ({cp_key_bare})
         ),
         cobrado_by_cp AS (
             -- L7-04 / DEC-040: real collection, not saldo's derived "paid" (which nets out
             -- credit notes applied to the invoice). LEAST guards the same overpayment edge
             -- case saldo's own clamp-to-zero already protects against on the other side.
+            -- Ventas: exclusion-filtered, same as facturado above.
             SELECT ({cp_key_inv}) AS cp_rfc,
                    SUM(LEAST(inv.pagado_mxn, inv.inv_total))::float8 AS cobrado
             FROM all_inv inv
+            WHERE inv.included
             GROUP BY ({cp_key_inv})
         ),
         dias_by_cp AS (
+            -- Ventas-adjacent (collection speed): exclusion-filtered, unchanged.
             SELECT ({cp_key_inv})                                                       AS cp_rfc,
                    AVG((inv.ultimo_pago_fecha - inv.fecha_emision::date)::float8) AS dias_cobro
             FROM all_inv inv
-            WHERE inv.metodo_pago = 'PPD' AND inv.ultimo_pago_fecha IS NOT NULL
+            WHERE inv.included AND inv.metodo_pago = 'PPD' AND inv.ultimo_pago_fecha IS NOT NULL
             GROUP BY ({cp_key_inv})
         ),
-        risk_by_cp AS (
-            SELECT ({cp_key_inv}) AS cp_rfc,
-                   COUNT(DISTINCT CASE WHEN inv.saldo_mxn > 1.0 THEN inv.uuid END) AS facturas_abiertas,
+        -- Cartera: saldo, facturas_abiertas, monto_riesgo and "normalizada" -- the FULL
+        -- universe (no `included` filter). C8-01 / AUD-065 already fixed saldo to read
+        -- straight from saldo_mxn (not facturado - cobrado); this keeps that and drops the
+        -- exclusion on top of it. Grouped with cp_key_bare so a 100%-excluded counterparty
+        -- still gets a cp_rfc/cp_nombre here even though it has no row in inv_base.
+        cartera_by_cp AS (
+            SELECT ({cp_key_bare}) AS cp_rfc,
+                   {cp_nombre_bare} AS cp_nombre,
+                   SUM(saldo_mxn)::float8 AS saldo,
+                   COUNT(DISTINCT CASE WHEN metodo_pago = 'PPD' AND saldo_mxn > 1.0 THEN uuid END) AS facturas_abiertas,
                    COALESCE(SUM(CASE
-                       WHEN inv.saldo_mxn > 1000.0
-                        AND inv.dias_antiguedad > 180
-                        AND inv.saldo_mxn / NULLIF(inv.inv_total, 0) >= 0.03
-                       THEN inv.saldo_mxn
-                   END)::float8, 0) AS monto_riesgo
-            FROM all_inv inv
-            WHERE inv.metodo_pago = 'PPD'
-            GROUP BY ({cp_key_inv})
+                       WHEN metodo_pago = 'PPD'
+                        AND saldo_mxn > 1000.0
+                        AND dias_antiguedad > 180
+                        AND saldo_mxn / NULLIF(inv_total, 0) >= 0.03
+                       THEN saldo_mxn
+                   END)::float8, 0) AS monto_riesgo,
+                   -- L9-04 / DEC-045: an active rule ON THIS COUNTERPARTY (source_rfc), not
+                   -- whether any one of its invoices got excluded -- cfdi_uuid IS NULL
+                   -- excludes single-invoice rules, which don't say anything about the
+                   -- counterparty as a whole.
+                   BOOL_OR(EXISTS (
+                       SELECT 1 FROM pulso.normalization_rules nr
+                       WHERE nr.owner_rfc = $1
+                         AND nr.action = 'exclude'
+                         AND nr.cfdi_uuid IS NULL
+                         AND nr.source_rfc = {cp_col}
+                         AND nr.{dl_filter}
+                   )) AS normalizada
+            FROM all_inv
+            GROUP BY ({cp_key_bare})
+        ),
+        ranked AS (
+            SELECT cb2.cp_rfc,
+                   cb2.cp_nombre,
+                   COALESCE(ib.facturado, 0)         AS facturado,
+                   cb2.saldo,
+                   COALESCE(co.cobrado, 0)            AS cobrado,
+                   COALESCE(ib.facturas_ppd, 0)       AS facturas_ppd,
+                   cb2.facturas_abiertas,
+                   COALESCE(dc.dias_cobro, 0)         AS dias_cobro,
+                   cb2.monto_riesgo,
+                   cb2.normalizada
+            -- Cartera (cartera_by_cp) drives the row set: it's the broader universe, so
+            -- every cp_rfc that has an inv_base row also has one here, but not vice versa
+            -- -- a 100%-excluded counterparty (zero facturado) still needs a row to carry
+            -- its real saldo and its "normalizada" tag.
+            FROM cartera_by_cp cb2
+            LEFT JOIN inv_base ib     ON ib.cp_rfc = cb2.cp_rfc
+            LEFT JOIN cobrado_by_cp co ON co.cp_rfc = cb2.cp_rfc
+            LEFT JOIN dias_by_cp dc    ON dc.cp_rfc = cb2.cp_rfc
         )
-        SELECT ib.cp_rfc,
-               ib.cp_nombre,
-               ib.facturado,
-               ib.saldo,
-               COALESCE(cb.cobrado, 0)           AS cobrado,
-               ib.facturas_ppd,
-               COALESCE(rb.facturas_abiertas, 0) AS facturas_abiertas,
-               COALESCE(dc.dias_cobro, 0)        AS dias_cobro,
-               COALESCE(rb.monto_riesgo, 0)      AS monto_riesgo
-        FROM inv_base ib
-        LEFT JOIN cobrado_by_cp cb ON cb.cp_rfc = ib.cp_rfc
-        LEFT JOIN dias_by_cp dc    ON dc.cp_rfc = ib.cp_rfc
-        LEFT JOIN risk_by_cp rb    ON rb.cp_rfc = ib.cp_rfc
-        ORDER BY ib.facturado DESC
-        LIMIT 50
+        -- Top 50 by facturado (unchanged ranking for the normal case), UNIONed with any
+        -- normalizada row that didn't make that cut -- "no ocultar" (L9-04's own trap #2)
+        -- extends to the row limit, not just to a missing filter toggle: a counterparty
+        -- excluded from sales entirely would otherwise sort to the bottom of a 400+ row
+        -- table and never surface.
+        SELECT * FROM (
+            (SELECT * FROM ranked ORDER BY facturado DESC LIMIT 50)
+            UNION
+            (SELECT * FROM ranked WHERE normalizada)
+        ) combined
+        ORDER BY facturado DESC
         "#
     ))
     .bind(rfc)
@@ -755,6 +796,7 @@ pub async fn get_payments_detail(
                 facturas_abiertas: r.try_get("facturas_abiertas").unwrap_or(0),
                 dias_cobro_ppd: get_f64(r, "dias_cobro"),
                 monto_riesgo_180d: get_f64(r, "monto_riesgo"),
+                normalizada: r.try_get("normalizada").unwrap_or(false),
             }
         })
         .collect();
@@ -1221,10 +1263,13 @@ pub async fn get_individual(
 
     // Cobranza for this specific counterparty — full universe (no date filter).
     // L2-01/L2-03: shared base instead of re-deriving pagado/saldo.
+    // L9-04 / DEC-045: facturado/cobrado are ventas -- exclusion-filtered (L7-06 unchanged).
+    // saldo is cartera -- a balance -- and gets its own, unfiltered query below: a 100%-
+    // excluded counterparty still owes what it owes, same reasoning as get_payments_detail.
     let cobranza_row = sqlx::query(&format!(
         r#"
         WITH ppd_detail AS (
-            SELECT b.uuid, b.total_mxn AS inv_total, b.saldo_mxn, b.pagado_mxn
+            SELECT b.uuid, b.total_mxn AS inv_total, b.pagado_mxn
             FROM pulso.cfdi_cobro_estado b
             JOIN pulso.cfdis inv ON inv.uuid = b.uuid
             WHERE b.{owner_col} = $1 AND b.{dl_filter}
@@ -1239,8 +1284,7 @@ pub async fn get_individual(
         -- saldo's derived "paid" -- see cobrado_by_cp in get_payments_detail above for why.
         SELECT
             SUM(inv_total)::float8                      AS facturado,
-            SUM(LEAST(pagado_mxn, inv_total))::float8    AS cobrado,
-            SUM(saldo_mxn)::float8                       AS saldo
+            SUM(LEAST(pagado_mxn, inv_total))::float8    AS cobrado
         FROM ppd_detail
         "#
     ))
@@ -1252,12 +1296,29 @@ pub async fn get_individual(
 
     let facturado_ppd: f64 = get_f64(&cobranza_row, "facturado");
     let cobrado_mxn: f64 = get_f64(&cobranza_row, "cobrado");
-    let saldo: f64 = get_f64(&cobranza_row, "saldo");
     let pct_cobrado = if facturado_ppd > 0.0 {
         cobrado_mxn / facturado_ppd * 100.0
     } else {
         0.0
     };
+
+    // L9-04 / DEC-045: cartera -- no exclusion filter, unlike facturado/cobrado above.
+    let saldo_row = sqlx::query(&format!(
+        r#"
+        SELECT COALESCE(SUM(b.saldo_mxn), 0)::float8 AS saldo
+        FROM pulso.cfdi_cobro_estado b
+        JOIN pulso.cfdis inv ON inv.uuid = b.uuid
+        WHERE b.{owner_col} = $1 AND b.{dl_filter}
+          AND b.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_inv} = $3)
+          AND b.metodo_pago = 'PPD'
+        "#
+    ))
+    .bind(owner_rfc)
+    .bind(base_rfc)
+    .bind(name_filter)
+    .fetch_one(pool)
+    .await?;
+    let saldo: f64 = get_f64(&saldo_row, "saldo");
 
     let dias_row = sqlx::query(&format!(
         r#"

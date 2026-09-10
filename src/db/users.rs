@@ -286,12 +286,16 @@ pub async fn is_user_admin(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::E
 }
 
 /// True if user owns this active RFC, has a valid share grant, OR has the 'admin' role.
+/// P-03 / AUD-077: `is_admin` is resolved once by the caller (check_rfc_access) and passed
+/// in, instead of this function querying it again -- it used to be the same is_user_admin
+/// query as the caller's own, run twice per request just to find out the same answer.
 pub async fn user_has_rfc_or_admin(
     pool: &PgPool,
     user_id: &str,
     rfc: &str,
+    is_admin: bool,
 ) -> Result<bool, sqlx::Error> {
-    if is_user_admin(pool, user_id).await? {
+    if is_admin {
         return Ok(true);
     }
     let uid = parse_uuid(user_id)?;

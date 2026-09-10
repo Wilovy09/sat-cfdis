@@ -285,6 +285,31 @@ pub fn dl_type_filter(dl_type: &str) -> &'static str {
     }
 }
 
+/// L9-06 / AUD-073: `cashflow.rs` and `payments.rs` had this exact query written twice --
+/// same SQL, same bind params, differing only in COALESCE-in-SQL vs unwrap_or-in-Rust for
+/// the empty-population NULL case, which behave identically. One query, one name here;
+/// `avg_collection_days` (cashflow) and `avg_days_to_pay` (payments) are the response field
+/// names each caller already exposes and keep -- this is the single definition both read
+/// from, so the four screens that show it (L9-03) can't drift again the way they almost did.
+pub async fn avg_dias_a_cobro(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<f64> {
+    let dl_filter = dl_type_filter(dl_type);
+    let owner_col = rfc_column(dl_type);
+    let row = sqlx::query(&format!(
+        r#"
+        SELECT COALESCE(AVG((c.ultimo_pago_fecha - c.fecha_emision::date)::float8), 0.0) AS avg_days
+        FROM pulso.cfdi_cobro_estado c
+        WHERE c.{owner_col} = $1
+          AND c.{dl_filter}
+          AND c.metodo_pago = 'PPD'
+          AND c.ultimo_pago_fecha IS NOT NULL
+        "#
+    ))
+    .bind(rfc)
+    .fetch_one(pool)
+    .await?;
+    Ok(get_f64(&row, "avg_days"))
+}
+
 // ---------------------------------------------------------------------------
 // L5-01: f64 column reads that don't silently swallow a decode failure
 // ---------------------------------------------------------------------------

@@ -610,42 +610,30 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
         .collect();
     let avg_hc = hc_per_month.iter().sum::<i64>() as f64 / hc_per_month.len() as f64;
 
-    // Employees active in last period
-    let latest_row = sqlx::query(
+    // P-01 / AUD-075: latest-period headcount and bajas used to be two separate queries,
+    // the second a correlated NOT EXISTS that rebuilt the whole nomina_normalizada view
+    // once per LTM employee (102 times, measured 5.8s on the RFC grande). Grouping by
+    // employee once and counting with FILTER gets both numbers in a single pass -- 62
+    // bajas, 40 active, same as before, under 300ms. The old `latest_row` query didn't
+    // bind the LTM window (it just filtered the literal latest period); this fused version
+    // inherits the window from the CTE it's built on, which is harmless here because the
+    // latest month is always inside the LTM window by construction -- not a definition
+    // change, just noted so it doesn't read as one later.
+    let emp_rows = sqlx::query(
         r#"
-        SELECT COUNT(DISTINCT n.rfc_receptor)::bigint AS active
-        FROM pulso.nomina_normalizada n
-        WHERE n.rfc_emisor = $1
-          AND n.year_devengo = $2 AND n.month_devengo = $3
-          AND NOT n.is_excluded
-        "#,
-    )
-    .bind(rfc)
-    .bind(ltm_end_y)
-    .bind(ltm_end_m)
-    .fetch_one(pool)
-    .await?;
-    let latest_hc: i64 = latest_row.try_get("active").unwrap_or(0);
-
-    // Employees who appeared in LTM but not in the latest month
-    let bajas_row = sqlx::query(
-        r#"
-        SELECT COUNT(DISTINCT ltm.rfc_receptor)::bigint AS bajas
+        SELECT
+            COUNT(*) FILTER (WHERE active_latest)     AS latest_hc,
+            COUNT(*) FILTER (WHERE NOT active_latest) AS bajas
         FROM (
-            SELECT DISTINCT n.rfc_receptor
+            SELECT n.rfc_receptor,
+                   BOOL_OR(n.year_devengo = $4 AND n.month_devengo = $5) AS active_latest
             FROM pulso.nomina_normalizada n
             WHERE n.rfc_emisor = $1
               AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
               AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
               AND NOT n.is_excluded
-        ) ltm
-        WHERE NOT EXISTS (
-            SELECT 1 FROM pulso.nomina_normalizada n2
-            WHERE n2.rfc_emisor = $1
-              AND n2.rfc_receptor = ltm.rfc_receptor
-              AND n2.year_devengo = $4 AND n2.month_devengo = $5
-              AND NOT n2.is_excluded
-        )
+            GROUP BY n.rfc_receptor
+        ) emp
         "#,
     )
     .bind(rfc)
@@ -655,7 +643,8 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     .bind(ltm_end_m)
     .fetch_one(pool)
     .await?;
-    let bajas: i64 = bajas_row.try_get("bajas").unwrap_or(0);
+    let latest_hc: i64 = emp_rows.try_get("latest_hc").unwrap_or(0);
+    let bajas: i64 = emp_rows.try_get("bajas").unwrap_or(0);
 
     if avg_hc <= 0.0 {
         return Ok(None);

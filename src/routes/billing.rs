@@ -66,11 +66,11 @@ pub async fn get_status(
 // ── Subscription access guard ─────────────────────────────────────────────────
 
 /// Returns `true` if user has an active pulso subscription or is an admin.
-pub async fn has_access(pool: &DbPool, user_id: &str) -> bool {
-    if crate::db::users::is_user_admin(pool, user_id)
-        .await
-        .unwrap_or(false)
-    {
+// P-03 / AUD-077: `is_admin` is resolved once by the caller (check_rfc_access) and passed
+// in, instead of this function running the same is_user_admin query a third time per
+// request.
+pub async fn has_access(pool: &DbPool, user_id: &str, is_admin: bool) -> bool {
+    if is_admin {
         return true;
     }
     let Ok(uid) = Uuid::parse_str(user_id) else {

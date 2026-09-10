@@ -63,7 +63,16 @@ async fn check_rfc_access(
     let user_id = jwt_user_id_analytics(&token)
         .ok_or_else(|| AppError::unauthorized("Token inválido o expirado"))?;
 
-    let rfc_access = crate::db::users::user_has_rfc_or_admin(pool, &user_id, rfc)
+    // P-03 / AUD-077: role resolved once per request, not three times (once inside
+    // user_has_rfc_or_admin, once here, once inside has_access -- all the same query, same
+    // argument). Six permission queries become four; the three identical ones become one.
+    // Order unchanged: RFC access is still checked before subscription, so a user with no
+    // access gets "denegado", not "paga tu suscripción".
+    let is_admin = crate::db::users::is_user_admin(pool, &user_id)
+        .await
+        .unwrap_or(false);
+
+    let rfc_access = crate::db::users::user_has_rfc_or_admin(pool, &user_id, rfc, is_admin)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
     if !rfc_access {
@@ -71,11 +80,8 @@ async fn check_rfc_access(
     }
 
     // Non-admins must have an active pulso subscription.
-    let is_admin = crate::db::users::is_user_admin(pool, &user_id)
-        .await
-        .unwrap_or(false);
     if !is_admin {
-        let subscribed = crate::routes::billing::has_access(pool, &user_id).await;
+        let subscribed = crate::routes::billing::has_access(pool, &user_id, is_admin).await;
         if !subscribed {
             return Err(AppError::payment_required("Suscripción requerida"));
         }
