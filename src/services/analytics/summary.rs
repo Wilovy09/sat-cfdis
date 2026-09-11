@@ -350,6 +350,15 @@ pub const RFC_EXTRANJERO_GENERICO: &str = "XEXX010101000";
 pub const LABEL_PUBLICO_GENERAL: &str = "Público en General";
 pub const LABEL_EXTRANJERO_GENERICO: &str = "Cliente extranjero (RFC genérico)";
 
+// L8-07: exact RFC, not prefix -- confirmed by the team, not guessed (IMSS = IMS421231I45,
+// Infonavit = INF7205011ZA). A prefix match ('IMS%'/'INF%') excluded a legitimate
+// manufacturing supplier of the RFC de control ($4,072) whose RFC happened to start the
+// same way. L10-10 initially proposed reintroducing prefix matching for the counterparties
+// concentration filter; kept exact-match here instead and flagged the conflict, since it's
+// the same false positive H8 already found and fixed once.
+pub const RFC_IMSS: &str = "IMS421231I45";
+pub const RFC_INFONAVIT: &str = "INF7205011ZA";
+
 /// Row-level (non-aggregate) name normalization: upper, trim, collapse internal
 /// whitespace, strip punctuation other than `&` and `-`. Mirrors the normalization
 /// used by the Python reference implementation (xml-dashboard-mvp).

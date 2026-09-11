@@ -1262,6 +1262,13 @@ pub struct PayrollSnapshotResponse {
     pub yoy_masa_salarial_pct: Option<f64>,
     pub pasivo_laboral_estimado_mxn: f64,
     pub months_of_data: i64,
+    // L10-05 / DEC-051: PTU estimada, separada del pasivo laboral -- own card, own definition.
+    pub ptu_estimada_mxn: f64,
+    // L10-04 / AUD-093: gap between the registered daily quota (SDI) and the real daily pay
+    // observed in ordinary payroll, as a percentage the registered value sits below the
+    // real one. None below the 1.15x threshold -- see get_snapshot's own comment for why
+    // that threshold and not some other.
+    pub salario_registrado_brecha_pct: Option<f64>,
 }
 
 pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSnapshotResponse> {
@@ -1272,6 +1279,8 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
         yoy_masa_salarial_pct: None,
         pasivo_laboral_estimado_mxn: 0.0,
         months_of_data: 0,
+        ptu_estimada_mxn: 0.0,
+        salario_registrado_brecha_pct: None,
     };
 
     // Most recent period with payroll data -- DEC-038/L6C-05: devengo, the anchor everything
@@ -1412,27 +1421,58 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     // the expensive view expansion to run exactly once; everything downstream (the active-
     // employee filter and the per-employee aggregate) reads that already-computed result
     // instead of re-triggering it. Verified: 347ms after this change, same row counts.
+    // L10-04 / AUD-089, AUD-090: two fixes to the per-employee base.
+    // 1. `sdi` used to be AVG(salario_diario_integrado) over the employee's WHOLE history --
+    //    a historical average instead of the currently vigent rate. Now it's the average
+    //    within the last devengo month only ($2/$3, same anchor as active_emps).
+    // 2. Tenure used to be inferred from MIN(fecha_pago) -- the first payroll payment this
+    //    employer ever made this employee, which understates tenure for anyone already
+    //    employed before Pulso's own data window starts. `fecha_inicio_rel_laboral` is the
+    //    CFDI's own declared contract-start date -- MAX() (not MIN()) of the values >= 1980
+    //    the employee's receipts carry (data-entry garbage predating any plausible hire
+    //    date -- Compro has one row at 1941-11-16 -- gets discarded by the floor; when a
+    //    receipt corrects an earlier value, the later correction is the one to trust).
+    //    Falls back to MIN(fecha_pago) only when no receipt has a valid declared date at
+    //    all. Verified against this migration's own worked example: Compro's pasivo goes
+    //    to $540,922.80 and average tenure to ~4.57 years with this exact MAX()+floor
+    //    combination -- MIN() over-collects the 1941 outlier's era and undershoots by
+    //    ~$18k; no floor at all overshoots further.
     let emp_rows = sqlx::query(r#"
         WITH base AS MATERIALIZED (
             SELECT n.rfc_receptor, n.year_devengo, n.month_devengo,
-                   n.salario_diario_integrado, n.fecha_pago
+                   n.salario_diario_integrado, n.fecha_pago, n.fecha_inicio_rel_laboral
             FROM pulso.nomina_normalizada n
             WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
         ),
         active_emps AS (
             SELECT DISTINCT rfc_receptor FROM base
             WHERE year_devengo = $2 AND month_devengo = $3
+        ),
+        per_emp AS (
+            SELECT
+                b.rfc_receptor,
+                AVG(COALESCE(b.salario_diario_integrado, 0)::float8) FILTER (
+                    WHERE b.year_devengo = $2 AND b.month_devengo = $3
+                ) AS sdi,
+                COALESCE(
+                    MAX(b.fecha_inicio_rel_laboral::date) FILTER (
+                        WHERE b.fecha_inicio_rel_laboral::date >= DATE '1980-01-01'
+                          AND b.fecha_inicio_rel_laboral::date <= CURRENT_DATE
+                    ),
+                    MIN(b.fecha_pago::date)
+                ) AS start_date
+            FROM base b
+            WHERE b.rfc_receptor IN (SELECT rfc_receptor FROM active_emps)
+            GROUP BY b.rfc_receptor
         )
+        -- AUD-015/DEC-025: anchored to the last day of the last COMPLETE calendar month
+        -- (same idiom as migration 052's dias_antiguedad), not CURRENT_DATE directly, so
+        -- tenure is reproducible across runs on different days within the same month.
         SELECT
-            b.rfc_receptor,
-            AVG(COALESCE(b.salario_diario_integrado, 0)::float8) AS sdi,
-            -- AUD-015/DEC-025: anchored to the last day of the last COMPLETE calendar month
-            -- (same idiom as migration 052's dias_antiguedad), not CURRENT_DATE directly, so
-            -- tenure is reproducible across runs on different days within the same month.
-            COALESCE((((date_trunc('month', CURRENT_DATE) - interval '1 day')::date) - MIN(b.fecha_pago)::date)::integer, 0) AS tenure_days
-        FROM base b
-        WHERE b.rfc_receptor IN (SELECT rfc_receptor FROM active_emps)
-        GROUP BY b.rfc_receptor
+            rfc_receptor,
+            sdi,
+            COALESCE((((date_trunc('month', CURRENT_DATE) - interval '1 day')::date) - start_date)::integer, 0) AS tenure_days
+        FROM per_emp
         "#)
     .bind(rfc)
     .bind(last_y)
@@ -1443,6 +1483,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     // last_m used as "current month of period" for aguinaldo proportion
     let period_month = last_m as f64;
 
+    // L10-05 / DEC-051: PTU no longer lives inside this sum -- own definition below, own card.
     let pasivo_laboral_estimado_mxn: f64 = emp_rows
         .iter()
         .map(|r| {
@@ -1456,10 +1497,132 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
             let vac_pend = vac_days * sdi;
             let prima_vac = vac_pend * 0.25;
             let aguinaldo = sdi * 15.0 * (period_month / 12.0);
-            let ptu = (sdi * 30.0) * 0.1 / 12.0;
-            vac_pend + prima_vac + aguinaldo + ptu
+            vac_pend + prima_vac + aguinaldo
         })
         .sum();
+
+    // L10-04 / AUD-092, AUD-093: alerta de salario registrado. Compares the registered daily
+    // quota (SDI -- confirmed by this same item's diagnosis to actually hold the daily quota,
+    // not an already-integrated value) against the real daily pay, within ordinary payroll
+    // only and only on total_sueldos (no aguinaldo, PTU, finiquitos or otros pagos). Both
+    // sides weighted by num_dias_pagados so a receipt covering more days counts for more.
+    // Threshold is 1.15x: the normal registered/real gap observed platform-wide sits at
+    // 1.04-1.08x (salary updates lag real pay by design, reviewed every two months); 1.15 is
+    // above that band and well below the anomalous 1.29-1.43x band this item found in Compro.
+    let salario_row = sqlx::query(
+        r#"
+        SELECT
+            SUM(salario_diario_integrado::float8 * num_dias_pagados::float8)
+                / NULLIF(SUM(num_dias_pagados::float8), 0) AS cuota_registrada,
+            SUM(total_sueldos::float8) / NULLIF(SUM(num_dias_pagados::float8), 0) AS pago_real_diario
+        FROM pulso.nomina_normalizada
+        WHERE rfc_emisor = $1 AND NOT is_excluded AND tipo_nomina = 'O'
+          AND salario_diario_integrado IS NOT NULL AND salario_diario_integrado > 0
+          AND num_dias_pagados IS NOT NULL AND num_dias_pagados > 0
+        "#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await?;
+    let cuota_registrada = get_f64(&salario_row, "cuota_registrada");
+    let pago_real_diario = get_f64(&salario_row, "pago_real_diario");
+    let salario_registrado_brecha_pct = if cuota_registrada > 0.0 {
+        let ratio = pago_real_diario / cuota_registrada;
+        if ratio > 1.15 {
+            Some((ratio - 1.0) * 100.0)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // L10-05 / DEC-051: PTU estimada = MIN(10% x utilidad del ejercicio en curso, tope legal
+    // de 3 meses de sueldo bruto ordinario por empleado, sumado). Ejercicio en curso, no LTM
+    // -- la PTU se devenga por ejercicio fiscal; mezclar con LTM provisionaria dos veces lo
+    // que ya se pago en mayo. Ingresos/egresos reusan exactamente la misma base neta de IVA
+    // y con exclusiones que ya alimenta "Resultado derivado CFDIs" en el Dashboard -- no es
+    // un calculo nuevo, es el mismo renglon con otra ventana de fechas.
+    let ptu_row = sqlx::query(
+        r#"
+        WITH bounds AS (
+            SELECT EXTRACT(YEAR FROM CURRENT_DATE)::bigint AS cur_year,
+                   CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE) = 1 THEN 0
+                        ELSE EXTRACT(MONTH FROM CURRENT_DATE)::bigint - 1
+                   END AS to_month
+        ),
+        ingresos AS (
+            SELECT COALESCE(SUM(c.total_neto_mxn_ajustado), 0)::float8 AS v
+            FROM pulso.cfdis_ajustado c, bounds b
+            WHERE c.rfc_emisor = $1 AND c.dl_type IN ('emitidos','ambos')
+              AND c.tipo_comprobante NOT IN ('P','N','T') AND NOT c.is_cancelled
+              AND c.year = b.cur_year AND c.month BETWEEN 1 AND b.to_month
+              AND NOT EXISTS (SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid)
+        ),
+        egresos AS (
+            SELECT COALESCE(SUM(c.total_neto_mxn_ajustado), 0)::float8 AS v
+            FROM pulso.cfdis_ajustado c, bounds b
+            WHERE c.rfc_receptor = $1 AND c.dl_type IN ('recibidos','ambos')
+              AND c.tipo_comprobante NOT IN ('P','N','T') AND NOT c.is_cancelled
+              AND c.year = b.cur_year AND c.month BETWEEN 1 AND b.to_month
+              AND NOT EXISTS (SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid)
+        ),
+        -- L6C-08's own lesson, applied here too: nomina_normalizada's three per-row LATERAL
+        -- joins are expensive to expand, and `nomina`/`active_emps`/`ranked` below each used
+        -- to scan it independently -- 6.7s of this query's ~10s measured that way. One
+        -- MATERIALIZED scan, everything else reads from it.
+        nomina_base AS MATERIALIZED (
+            SELECT rfc_receptor, year_devengo, month_devengo, tipo_nomina,
+                   total_percepciones, total_sueldos, num_dias_pagados, fecha_pago
+            FROM pulso.nomina_normalizada
+            WHERE rfc_emisor = $1 AND NOT is_excluded
+        ),
+        nomina AS (
+            SELECT COALESCE(SUM(nb.total_percepciones), 0)::float8 AS v
+            FROM nomina_base nb, bounds b
+            WHERE nb.year_devengo = b.cur_year AND nb.month_devengo BETWEEN 1 AND b.to_month
+        ),
+        active_emps AS (
+            SELECT DISTINCT rfc_receptor FROM nomina_base
+            WHERE year_devengo = $2 AND month_devengo = $3
+        ),
+        -- L10-05 trap 3: el tope se calcula por empleado y se suma, no sobre el agregado --
+        -- un empleado muy bien pagado no puede subir el tope de los demas. "Un mes" por
+        -- empleado es la suma de sus recibos ordinarios mas recientes hasta acumular al
+        -- menos 30 dias pagados -- se adapta sola a semanal, quincenal o cualquier otra
+        -- periodicidad, sin asumir cual es.
+        ranked AS (
+            SELECT nb.rfc_receptor, nb.total_sueldos,
+                SUM(nb.num_dias_pagados::float8) OVER (
+                    PARTITION BY nb.rfc_receptor ORDER BY nb.fecha_pago DESC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                ) AS cum_before
+            FROM nomina_base nb
+            JOIN active_emps a ON a.rfc_receptor = nb.rfc_receptor
+            WHERE nb.tipo_nomina = 'O'
+        ),
+        tope AS (
+            SELECT COALESCE(SUM(total_sueldos::float8), 0) * 3.0 AS v
+            FROM ranked WHERE COALESCE(cum_before, 0) < 30
+        )
+        SELECT
+            (SELECT v FROM ingresos) AS ingresos,
+            (SELECT v FROM egresos) AS egresos,
+            (SELECT v FROM nomina) AS nomina,
+            (SELECT v FROM tope) AS tope
+        "#,
+    )
+    .bind(rfc)
+    .bind(last_y)
+    .bind(last_m)
+    .fetch_one(pool)
+    .await?;
+    let utilidad_ejercicio = (get_f64(&ptu_row, "ingresos")
+        - get_f64(&ptu_row, "egresos")
+        - get_f64(&ptu_row, "nomina"))
+    .max(0.0);
+    let tope_ptu = get_f64(&ptu_row, "tope");
+    let ptu_estimada_mxn = (utilidad_ejercicio * 0.10).min(tope_ptu);
 
     // L6C-05: devengo instead of the comprobante's own emisión year/month. Switched from
     // pulso.cfdis to pulso.nomina_normalizada for year_devengo/month_devengo -- the view's
@@ -1485,6 +1648,8 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
         yoy_masa_salarial_pct,
         pasivo_laboral_estimado_mxn,
         months_of_data,
+        ptu_estimada_mxn,
+        salario_registrado_brecha_pct,
     })
 }
 

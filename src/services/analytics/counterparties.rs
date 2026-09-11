@@ -1,7 +1,7 @@
 use super::summary::{
-    LABEL_EXTRANJERO_GENERICO, LABEL_PUBLICO_GENERAL, RFC_EXTRANJERO_GENERICO, RFC_PUBLICO_GENERAL,
-    cp_key_expr, cp_nombre_expr, current_month_yyyymm, dl_type_filter, get_f64, get_f64_opt,
-    normalized_name_expr, parse_ym, rfc_column,
+    LABEL_EXTRANJERO_GENERICO, LABEL_PUBLICO_GENERAL, RFC_EXTRANJERO_GENERICO, RFC_IMSS,
+    RFC_INFONAVIT, RFC_PUBLICO_GENERAL, cp_key_expr, cp_nombre_expr, current_month_yyyymm,
+    dl_type_filter, get_f64, get_f64_opt, normalized_name_expr, parse_ym, rfc_column,
 };
 use crate::db::DbPool;
 use serde::Serialize;
@@ -54,31 +54,59 @@ pub async fn get(
     let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
     let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
-    // Window functions supply grand_total and cp_count alongside each top-N row,
-    // eliminating the second full-table scan.
+    // L10-10 / AUD-099, AUD-102: IMSS/Infonavit aren't sourcing decisions and the two
+    // generic RFCs ("público en general", "residente extranjero") aren't single
+    // counterparties -- excluded from the ranked universe itself, not just the displayed
+    // percentage, so a real counterparty sitting just below them moves into the top 10 and
+    // `total_counterparties` reflects the same universe the ranking and top10_pct do. One
+    // definition, used by clientes and proveedores alike (trap 2) -- CFE is deliberately
+    // not in this list, it counts on both sides.
+    //
+    // L10-10 proposed matching IMS/INF by PREFIX -- not implemented that way: L8-07 (see
+    // compute_h8 in hallazgos.rs, and RFC_IMSS/RFC_INFONAVIT's own comment in summary.rs)
+    // already found that exact false positive once, a real manufacturing supplier of the
+    // RFC de control excluded because its RFC happened to start the same way. Exact match
+    // against the team-confirmed RFCs instead.
+    //
+    // First attempt (do not repeat): put this filter straight into the WHERE clause, which
+    // also shrank `grand_total` -- caught by number_contract.rs's ingresos_netos_tres_pantallas
+    // cross-check against Resumen trimestral, which doesn't exclude regulatorias and
+    // shouldn't (that screen is "total money", not "vendor concentration"). `grand_total`
+    // stays the full population; only which rows can be ranked/counted as counterparties
+    // narrows.
+    let regulatory_filter = format!(
+        "cp_rfc NOT IN ('{RFC_IMSS}', '{RFC_INFONAVIT}', '{RFC_PUBLICO_GENERAL}', '{RFC_EXTRANJERO_GENERICO}')"
+    );
+
     let rows = sqlx::query(&format!(
         r#"
+        WITH per_cp AS (
+            SELECT
+                ({cp_key_expr})                                        AS cp_rfc,
+                {cp_nombre_expr}                                       AS cp_nombre,
+                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total,
+                COUNT(*)                                               AS cnt,
+                MIN(fecha_emision)                                     AS first_inv,
+                MAX(fecha_emision)                                     AS last_inv,
+                COUNT(DISTINCT year * 100 + month)                     AS months_active
+            FROM pulso.cfdis_ajustado c
+            WHERE {owner_col} = $1
+              AND {dl_filter}
+              AND tipo_comprobante NOT IN ('P','N','T')
+              AND NOT is_cancelled
+              AND (year > $2 OR (year = $2 AND month >= $3))
+              AND (year < $4 OR (year = $4 AND month <= $5))
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+              )
+            GROUP BY ({cp_key_expr})
+        )
         SELECT
-            ({cp_key_expr})                                        AS cp_rfc,
-            {cp_nombre_expr}                                       AS cp_nombre,
-            SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8                          AS total,
-            COUNT(*)                                               AS cnt,
-            MIN(fecha_emision)                                     AS first_inv,
-            MAX(fecha_emision)                                     AS last_inv,
-            COUNT(DISTINCT year * 100 + month)                     AS months_active,
-            SUM(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)) OVER ()::float8 AS grand_total,
-            COUNT(*) OVER ()                                       AS cp_count
-        FROM pulso.cfdis_ajustado c
-        WHERE {owner_col} = $1
-          AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N','T')
-          AND NOT is_cancelled
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
-          )
-        GROUP BY ({cp_key_expr})
+            cp_rfc, cp_nombre, total, cnt, first_inv, last_inv, months_active,
+            (SELECT SUM(total) FROM per_cp)::float8 AS grand_total,
+            (SELECT COUNT(*) FROM per_cp WHERE {regulatory_filter}) AS cp_count
+        FROM per_cp
+        WHERE {regulatory_filter}
         ORDER BY total DESC
         LIMIT $6
         "#
@@ -119,9 +147,12 @@ pub async fn get(
               )
             GROUP BY ({cp_key_expr})
         )
+        -- L10-10: HHI measures concentration among real vendors/clients, so regulatorias
+        -- are excluded here too -- but only after `cp_rfc` exists (this CTE's own output
+        -- column), not inside per_cp's WHERE where only the raw {cp_col} exists.
         SELECT COALESCE(SUM(POWER(total, 2)) / NULLIF(POWER(SUM(total), 2), 0) * 10000, 0)::float8 AS hhi
         FROM per_cp
-        WHERE total > 0
+        WHERE total > 0 AND {regulatory_filter}
         "#
     ))
     .bind(rfc)

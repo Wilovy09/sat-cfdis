@@ -14,7 +14,21 @@ pub struct XmlBreakdownRow {
 pub struct XmlBreakdownResponse {
     pub rows: Vec<XmlBreakdownRow>,
     pub grand_total: i64,
+    // L10-11 / AUD-100: the full universe's own date range and how much of it sits before
+    // the analysis window -- "XMLs disponibles" used to be computed from the already-
+    // windowed emitidos/recibidos summaries, so it always agreed with "Período consultado"
+    // by construction and could never tell an analyst there's more the platform hasn't
+    // analyzed. Both come from this same unfiltered query (rfc_emisor OR rfc_receptor, no
+    // tipo/cancelación/exclusión/ventana filter), same as `grand_total` above.
+    pub min_fecha: Option<String>,
+    pub max_fecha: Option<String>,
+    pub out_of_window_count: i64,
 }
+
+// DEC-054: the analysis window starts here by design (three full ejercicios plus the
+// current one) -- fixed, not derived from today's date. Matches the frontend's own
+// `defaultFrom = '2023-01'`.
+const ANALYSIS_WINDOW_START: &str = "2023-01-01";
 
 pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<XmlBreakdownResponse> {
     let rows = sqlx::query(
@@ -48,8 +62,26 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<XmlBreakdownRespons
         });
     }
 
+    let range_row = sqlx::query(
+        r#"
+        SELECT
+            MIN(fecha_emision::date)::text AS min_fecha,
+            MAX(fecha_emision::date)::text AS max_fecha,
+            COUNT(*) FILTER (WHERE fecha_emision::date < $2::date)::bigint AS out_of_window
+        FROM pulso.cfdis
+        WHERE rfc_emisor = $1 OR rfc_receptor = $1
+        "#,
+    )
+    .bind(rfc)
+    .bind(ANALYSIS_WINDOW_START)
+    .fetch_one(pool)
+    .await?;
+
     Ok(XmlBreakdownResponse {
         rows: result,
         grand_total,
+        min_fecha: range_row.try_get("min_fecha").ok().flatten(),
+        max_fecha: range_row.try_get("max_fecha").ok().flatten(),
+        out_of_window_count: range_row.try_get("out_of_window").unwrap_or(0),
     })
 }
