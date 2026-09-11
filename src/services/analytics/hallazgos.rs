@@ -1,4 +1,4 @@
-use super::summary::{current_month_yyyymm, get_f64};
+use super::summary::{cp_key_expr, current_month_yyyymm, get_f64};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -418,13 +418,18 @@ async fn compute_h1(
     ltm_end_y: i64,
     ltm_end_m: i64,
 ) -> anyhow::Result<Option<Hallazgo>> {
+    // C13-04/DEC-080: every query that groups by counterparty uses cp_key_expr, so a
+    // generic RFC (XAXX/XEXX) hiding several distinct real clients doesn't collapse them
+    // into one row here while every other module keeps them separate.
+    let cp_key = cp_key_expr("c.rfc_receptor", "c.nombre_receptor");
+
     // L8-03 / DEC-041: base del Resumen -- cfdis_ajustado, total_neto_mxn_ajustado,
     // exclusiones, tipo_comprobante NOT IN ('P','N','T') instead of ='I' (con IVA, sin
     // exclusiones, notas de crédito descartadas del todo). Same four properties on every
     // one of H1/H2/H8/H9's six feeder queries.
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         r#"
-        SELECT c.rfc_receptor, MAX(c.nombre_receptor) AS nombre,
+        SELECT ({cp_key}) AS rfc_receptor, MAX(c.nombre_receptor) AS nombre,
                SUM(COALESCE(c.total_neto_mxn_ajustado,0))::float8 AS ltm_mxn
         FROM pulso.cfdis_ajustado c
         WHERE c.rfc_emisor = $1
@@ -436,10 +441,10 @@ async fn compute_h1(
           AND NOT EXISTS (
               SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
-        GROUP BY c.rfc_receptor
+        GROUP BY ({cp_key})
         ORDER BY ltm_mxn DESC
-        "#,
-    )
+        "#
+    ))
     .bind(rfc)
     .bind(ltm_start_y)
     .bind(ltm_start_m)
@@ -461,10 +466,18 @@ async fn compute_h1(
 
     let clients: Vec<ClientRow> = rows
         .iter()
-        .map(|r| ClientRow {
-            rfc: r.try_get("rfc_receptor").unwrap_or_default(),
-            nombre: r.try_get("nombre").unwrap_or_default(),
-            mxn: get_f64(r, "ltm_mxn"),
+        .map(|r| {
+            let cp_key: String = r.try_get("rfc_receptor").unwrap_or_default();
+            // C13-04/DEC-080: split the composite key back apart -- the PeG/extranjero
+            // comparisons below match the bare RFC, same as before this item.
+            let rfc = cp_key
+                .split_once("||")
+                .map_or_else(|| cp_key.clone(), |(base, _)| base.to_string());
+            ClientRow {
+                rfc,
+                nombre: r.try_get("nombre").unwrap_or_default(),
+                mxn: get_f64(r, "ltm_mxn"),
+            }
         })
         .collect();
 
@@ -1279,10 +1292,13 @@ async fn compute_h8(
     ltm_end_y: i64,
     ltm_end_m: i64,
 ) -> anyhow::Result<Option<Hallazgo>> {
+    // C13-04/DEC-080: same cp_key_expr grouping as H1 above.
+    let cp_key = cp_key_expr("c.rfc_emisor", "c.nombre_emisor");
+
     // L8-03 / DEC-041: same four properties as H1's query above.
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         r#"
-        SELECT c.rfc_emisor, MAX(c.nombre_emisor) AS nombre,
+        SELECT ({cp_key}) AS rfc_emisor, MAX(c.nombre_emisor) AS nombre,
                SUM(COALESCE(c.total_neto_mxn_ajustado,0))::float8 AS ltm_mxn
         FROM pulso.cfdis_ajustado c
         WHERE c.rfc_receptor = $1
@@ -1294,10 +1310,10 @@ async fn compute_h8(
           AND NOT EXISTS (
               SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
-        GROUP BY c.rfc_emisor
+        GROUP BY ({cp_key})
         ORDER BY ltm_mxn DESC
-        "#,
-    )
+        "#
+    ))
     .bind(rfc)
     .bind(ltm_start_y)
     .bind(ltm_start_m)
@@ -1318,10 +1334,18 @@ async fn compute_h8(
 
     let suppliers: Vec<SupRow> = rows
         .iter()
-        .map(|r| SupRow {
-            rfc: r.try_get("rfc_emisor").unwrap_or_default(),
-            nombre: r.try_get("nombre").unwrap_or_default(),
-            mxn: get_f64(r, "ltm_mxn"),
+        .map(|r| {
+            let cp_key: String = r.try_get("rfc_emisor").unwrap_or_default();
+            // C13-04/DEC-080: split the composite key back apart -- `is_regulatory` below
+            // matches the bare RFC, same as before this item.
+            let rfc = cp_key
+                .split_once("||")
+                .map_or_else(|| cp_key.clone(), |(base, _)| base.to_string());
+            SupRow {
+                rfc,
+                nombre: r.try_get("nombre").unwrap_or_default(),
+                mxn: get_f64(r, "ltm_mxn"),
+            }
         })
         .collect();
 

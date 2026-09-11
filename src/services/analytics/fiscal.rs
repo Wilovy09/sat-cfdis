@@ -77,7 +77,7 @@ pub async fn get(
         JOIN pulso.cfdis c ON c.uuid = t.uuid
         WHERE c.{owner_col} = $1
           AND {dl_filter}
-          AND c.tipo_comprobante NOT IN ('P','N')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
           AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
@@ -168,7 +168,7 @@ pub async fn get(
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N')
+          AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
@@ -224,7 +224,7 @@ pub async fn get(
         LEFT JOIN pulso.cfdi_taxes t ON t.uuid = c.uuid
         WHERE c.{owner_col} = $1
           AND {dl_filter}
-          AND c.tipo_comprobante NOT IN ('P','N')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
           AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))

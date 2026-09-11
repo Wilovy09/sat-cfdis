@@ -1,4 +1,6 @@
-use super::summary::{RFC_EXTRANJERO_GENERICO, dl_type_filter, get_f64, parse_ym, rfc_column};
+use super::summary::{
+    RFC_EXTRANJERO_GENERICO, cp_key_expr, dl_type_filter, get_f64, parse_ym, rfc_column,
+};
 /// Geography: breakdown by lugar_expedicion (postal code) and state.
 use crate::db::DbPool;
 use serde::Serialize;
@@ -61,6 +63,16 @@ pub async fn get(
     let dl_filter = dl_type_filter(dl_type);
     let owner_col = rfc_column(dl_type);
 
+    // C13-04/DEC-080: 'ambos' rows can be either direction, so the counterparty RFC/name
+    // pair fed to cp_key_expr must mirror the same per-row CASE the raw counterparty_rfc
+    // (now counterparty_key) column already used -- otherwise a generic RFC (XAXX/XEXX)
+    // would group by the bare RFC here while every other module groups it by
+    // RFC||NORMALIZED_NAME, undercounting real distinct counterparties.
+    let cp_col_expr = "(CASE WHEN rfc_emisor = $1 THEN rfc_receptor ELSE rfc_emisor END)";
+    let cp_name_col_expr =
+        "(CASE WHEN rfc_emisor = $1 THEN nombre_receptor ELSE nombre_emisor END)";
+    let counterparty_key_expr = cp_key_expr(cp_col_expr, cp_name_col_expr);
+
     // AUD-005: geographic grouping must reflect the counterparty's location, not the
     // owner's own lugar_expedicion. Resolved per-row against $1 (not against the
     // requested dl_type) so 'ambos' rows are each classified by their own direction:
@@ -73,7 +85,7 @@ pub async fn get(
                 CASE WHEN rfc_emisor = $1 THEN domicilio_fiscal_receptor ELSE lugar_expedicion END,
                 'UNKNOWN'
             )                                                                AS cp,
-            CASE WHEN rfc_emisor = $1 THEN rfc_receptor ELSE rfc_emisor END AS counterparty_rfc,
+            ({counterparty_key_expr})                                       AS counterparty_key,
             SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total,
             COUNT(*)::bigint                      AS cnt
         FROM pulso.cfdis_ajustado c
@@ -117,15 +129,23 @@ pub async fn get(
 
     for r in &rows {
         let cp: String = r.try_get("cp").unwrap_or_default();
-        let counterparty_rfc: String = r.try_get("counterparty_rfc").unwrap_or_default();
+        let counterparty_rfc: String = r.try_get("counterparty_key").unwrap_or_default();
         let total: f64 = get_f64(r, "total");
         let cnt: i64 = r.try_get("cnt").unwrap_or(0);
 
         all_rfcs.insert(counterparty_rfc.clone());
 
+        // C13-04/DEC-080: counterparty_rfc may be a composite "RFC||NORMALIZED_NAME" (see
+        // cp_key_expr) -- split it back apart before comparing against the bare generic
+        // RFC, or a real foreign counterparty hiding behind XEXX010101000 would fail this
+        // match and fall through to "Sin estado asignado" instead of "Extranjero".
+        let (base_rfc, _) = counterparty_rfc
+            .split_once("||")
+            .unwrap_or((&counterparty_rfc, ""));
+
         // L11-30 trap 3: extranjero is classified by RFC, not CP -- even the rows that come
         // in with no CP at all still go to "Extranjero", never to "Sin estado asignado".
-        if counterparty_rfc == RFC_EXTRANJERO_GENERICO {
+        if base_rfc == RFC_EXTRANJERO_GENERICO {
             extranjero_total += total;
             extranjero_count += cnt;
             extranjero_rfcs.insert(counterparty_rfc);

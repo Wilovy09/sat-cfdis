@@ -12,7 +12,6 @@ use std::collections::HashMap;
 pub struct CounterpartiesResponse {
     pub top: Vec<CounterpartyRow>,
     pub total_counterparties: i64,
-    pub hhi: f64,       // Herfindahl-Hirschman Index (concentration)
     pub top10_pct: f64, // % of total from top 10
 }
 
@@ -107,44 +106,6 @@ pub async fn get(
         .first()
         .map_or(0, |r| r.try_get("cp_count").unwrap_or(0));
 
-    // L2-06: HHI over ALL counterparties in the period, not just the `limit`-bounded
-    // rows above (the UI's `limit` param used to silently double as the HHI universe,
-    // understating concentration for fragmented portfolios). Counterparties with a
-    // negative net total (more credit notes than invoices) are excluded from both the
-    // numerator and denominator -- squaring a negative share would inflate the index.
-    let hhi_row = sqlx::query(&format!(
-        r#"
-        WITH per_cp AS (
-            SELECT ({cp_key_expr}) AS cp_rfc,
-                   SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8) AS total
-            FROM pulso.cfdis_ajustado c
-            WHERE {owner_col} = $1
-              AND {dl_filter}
-              AND tipo_comprobante NOT IN ('P','N','T')
-              AND NOT is_cancelled
-              AND (year > $2 OR (year = $2 AND month >= $3))
-              AND (year < $4 OR (year = $4 AND month <= $5))
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
-              )
-            GROUP BY ({cp_key_expr})
-        )
-        -- L11-33 / DEC-069: no regulatory exclusion here either -- same reasoning as the
-        -- main query above.
-        SELECT COALESCE(SUM(POWER(total, 2)) / NULLIF(POWER(SUM(total), 2), 0) * 10000, 0)::float8 AS hhi
-        FROM per_cp
-        WHERE total > 0
-        "#
-    ))
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_one(pool)
-    .await?;
-    let hhi: f64 = get_f64(&hhi_row, "hhi");
-
     let top: Vec<CounterpartyRow> = rows
         .iter()
         .map(|r| {
@@ -178,7 +139,6 @@ pub async fn get(
     Ok(CounterpartiesResponse {
         top,
         total_counterparties: cp_count,
-        hhi,
         top10_pct,
     })
 }

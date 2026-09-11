@@ -60,7 +60,7 @@ pub async fn get(
         FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N')
+          AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))

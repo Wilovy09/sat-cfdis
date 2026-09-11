@@ -70,7 +70,7 @@ pub async fn get(
     let max_q = format!(
         "SELECT MAX(year * 100 + month)::bigint AS max_period \
          FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND NOT is_cancelled"
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N', 'T') AND NOT is_cancelled"
     );
     let max_row = sqlx::query(&max_q).bind(rfc).fetch_one(pool).await?;
     let max_period_raw: i64 = max_row.try_get("max_period").unwrap_or(0);
@@ -114,7 +114,7 @@ pub async fn get(
         "SELECT COUNT(DISTINCT year * 100 + month)::bigint AS cnt, \
                 MIN(year * 100 + month)::bigint AS min_period \
          FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND NOT is_cancelled \
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N', 'T') AND NOT is_cancelled \
            AND year * 100 + month >= $2 AND year * 100 + month <= $3"
     );
     let actual_row = sqlx::query(&actual_q)
@@ -139,7 +139,7 @@ pub async fn get(
                    COUNT(DISTINCT year * 100 + month)::bigint   AS months_active,
                    SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8   AS total_mxn
             FROM pulso.cfdis_ajustado c
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
               AND NOT EXISTS (
                   SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
@@ -181,7 +181,7 @@ pub async fn get(
                    SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8    AS total_mxn,
                    COUNT(*)::bigint                                    AS invoice_count
             FROM pulso.cfdis_ajustado c
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
               AND NOT EXISTS (
                   SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
@@ -192,7 +192,7 @@ pub async fn get(
         wt AS (
             SELECT GREATEST(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8), 1) AS total
             FROM pulso.cfdis_ajustado c
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
               AND NOT EXISTS (
                   SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
