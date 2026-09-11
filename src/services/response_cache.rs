@@ -11,11 +11,30 @@
 //! The cache is purely additive: a read miss or a write failure always falls back to
 //! `compute`, never turns into a request error. Losing the cache loses speed, not
 //! correctness.
+//!
+//! `data_version` only tracks *data* changes -- it has no idea the running binary's
+//! *logic* for an endpoint changed (a bug fix with no accompanying migration, same RFC,
+//! same data). Every cache read also requires `computed_at > process_start()`, so a row
+//! written by a previous process (i.e. before the last deploy/restart) never counts as a
+//! hit, regardless of `data_version` -- it gets recomputed and overwritten by the current
+//! code on its next access, same lazy self-healing path a `data_version` bump already
+//! uses. A deploy is a restart, so this makes every deploy invalidate the whole cache for
+//! free, with no separate step to remember.
 
 use serde::Serialize;
 use std::future::Future;
+use std::sync::OnceLock;
+use time::OffsetDateTime;
 
 use crate::db::DbPool;
+
+static PROCESS_START: OnceLock<OffsetDateTime> = OnceLock::new();
+
+/// Wall-clock time this process started serving cache reads (first call wins, which is
+/// close enough to actual process start -- within a request or two of it).
+fn process_start() -> OffsetDateTime {
+    *PROCESS_START.get_or_init(OffsetDateTime::now_utc)
+}
 
 /// Invalidates every cached response for `rfc` by advancing its data version. Cheap (one
 /// upsert) -- the actual recompute happens lazily, on the next request that misses.
@@ -67,12 +86,14 @@ where
 
     let cached: Option<serde_json::Value> = sqlx::query_scalar(
         r#"SELECT payload FROM pulso.endpoint_response_cache
-           WHERE rfc = $1 AND endpoint = $2 AND params_key = $3 AND data_version = $4"#,
+           WHERE rfc = $1 AND endpoint = $2 AND params_key = $3 AND data_version = $4
+             AND computed_at > $5"#,
     )
     .bind(rfc)
     .bind(endpoint)
     .bind(params_key)
     .bind(version)
+    .bind(process_start())
     .fetch_optional(pool)
     .await?;
 
