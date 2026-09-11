@@ -61,6 +61,18 @@ pub struct BridgeEntry {
     pub top_contractions: Vec<BridgeRow>,
     pub new_relevant: Vec<BridgeRow>,
     pub lost_relevant: Vec<BridgeRow>,
+    // L11-16 / AUD-111: a real bridge -- periodo_anterior_mxn + expansion_mxn +
+    // contraction_mxn + new_mxn + lost_mxn + estable_mxn == periodo_actual_mxn, exactly
+    // (trap 1). `estable_mxn` isn't one of the four highlighted drivers but still has to be
+    // in the sum -- an "Estable" counterparty's delta is small (within the +-5% band) but
+    // not literally zero, and leaving it out would make the four components not close.
+    pub periodo_anterior_mxn: f64,
+    pub periodo_actual_mxn: f64,
+    pub expansion_mxn: f64,
+    pub contraction_mxn: f64,
+    pub new_mxn: f64,
+    pub lost_mxn: f64,
+    pub estable_mxn: f64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -392,7 +404,16 @@ pub async fn get(
             0.0
         };
 
-        // Status: compare with previous year in sorted list
+        // L11-15 / AUD-110: this used to be its own classification (>1.05x / <0.95x of
+        // prev_total) -- a different formula than CMP04's bridge (delta > prev*0.05 /
+        // delta < -prev*0.05, plus an explicit "Perdido" case for curr_total==0), so the
+        // SAME counterparty in the SAME year could be "Expansión" here and "Nuevo" there.
+        // CMP04 is the one that wins (compares against the same adjacent year, same
+        // exclusions, same tipo_comprobante filter as year_cp_totals below -- verified the
+        // two totals match). Not a shared computation (this stays a separate query, Query 3
+        // vs CMP04's Query 5), but the exact same formula against the exact same numbers
+        // gives the exact same answer, which is the point -- CMP06 has no classification
+        // logic of its own left to disagree with.
         let status = {
             let prev_year_idx = sorted_years
                 .iter()
@@ -405,11 +426,14 @@ pub async fn get(
                     .and_then(|m| m.get(&cp_rfc))
                     .copied()
                     .unwrap_or(0.0);
+                let delta = total - prev_total;
                 if prev_total == 0.0 {
                     "Nuevo"
-                } else if total > prev_total * 1.05 {
+                } else if total == 0.0 {
+                    "Perdido"
+                } else if delta > prev_total * 0.05 {
                     "Expansión"
-                } else if total < prev_total * 0.95 {
+                } else if delta < -(prev_total * 0.05) {
                     "Contracción"
                 } else {
                     "Estable"
@@ -470,19 +494,21 @@ pub async fn get(
                    COALESCE(c.total, 0.0) AS curr_total,
                    COALESCE(p.total, 0.0) AS prev_total
             FROM curr c FULL OUTER JOIN prev p ON c.cp_rfc = p.cp_rfc
-            ORDER BY ABS(COALESCE(c.total, 0.0) - COALESCE(p.total, 0.0)) DESC
-            LIMIT $6
             "#
         );
 
-        let bridge_limit = limit * 4;
+        // L11-16 trap 1: the four bridge components have to sum to the EXACT variación --
+        // the old `LIMIT $6` (top `limit*4` counterparties by |delta|) cut off small-delta
+        // ("Estable") counterparties before they ever reached the aggregate, so the four
+        // displayed buckets never actually summed to periodo_actual - periodo_anterior. No
+        // limit here now; `rows`/top_expansions/etc. below still truncate in Rust for
+        // display, but the aggregate totals are computed from this full universe first.
         let bridge_raw = sqlx::query(&q5)
             .bind(rfc)
             .bind(year_current)
             .bind(from_month)
             .bind(to_month)
             .bind(year_prev)
-            .bind(bridge_limit)
             .fetch_all(pool)
             .await?;
 
@@ -589,6 +615,25 @@ pub async fn get(
         });
         rows.truncate(limit as usize);
 
+        // L11-16 trap 2: a counterparty that drops to zero is "Perdido", not "Contracción" --
+        // already enforced by the status classification above (curr_total == 0.0 check
+        // comes before the delta-threshold checks), so these sums-by-status don't double
+        // up a departing counterparty into both buckets.
+        let periodo_anterior_mxn: f64 = all_rows.iter().map(|r| r.prev_mxn).sum();
+        let periodo_actual_mxn: f64 = all_rows.iter().map(|r| r.current_mxn).sum();
+        let sum_by = |status: &str| -> f64 {
+            all_rows
+                .iter()
+                .filter(|r| r.status == status)
+                .map(|r| r.delta_mxn)
+                .sum()
+        };
+        let expansion_mxn = sum_by("Expansión");
+        let contraction_mxn = sum_by("Contracción");
+        let new_mxn = sum_by("Nuevo");
+        let lost_mxn = sum_by("Perdido");
+        let estable_mxn = sum_by("Estable");
+
         bridges.push(BridgeEntry {
             year_current,
             year_prev,
@@ -597,6 +642,13 @@ pub async fn get(
             top_contractions,
             new_relevant,
             lost_relevant,
+            periodo_anterior_mxn,
+            periodo_actual_mxn,
+            expansion_mxn,
+            contraction_mxn,
+            new_mxn,
+            lost_mxn,
+            estable_mxn,
         });
     }
 

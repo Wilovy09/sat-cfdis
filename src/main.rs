@@ -1308,6 +1308,10 @@ async fn main() -> std::io::Result<()> {
                 web::scope("/api/v1/analytics/{rfc}")
                     .route("/summary", web::get().to(analytics_routes::get_summary))
                     .route(
+                        "/summary/month-contributor",
+                        web::get().to(analytics_routes::get_month_contributor),
+                    )
+                    .route(
                         "/data-quality",
                         web::get().to(analytics_routes::get_data_quality),
                     )
@@ -1318,6 +1322,10 @@ async fn main() -> std::io::Result<()> {
                     .route(
                         "/counterparties/evolution",
                         web::get().to(analytics_routes::get_counterparties_evolution),
+                    )
+                    .route(
+                        "/counterparties/selector",
+                        web::get().to(analytics_routes::get_counterparties_selector),
                     )
                     .route(
                         "/counterparties/ltm",
@@ -1341,6 +1349,10 @@ async fn main() -> std::io::Result<()> {
                     )
                     .route("/retention", web::get().to(analytics_routes::get_retention))
                     .route("/geography", web::get().to(analytics_routes::get_geography))
+                    .route(
+                        "/hallazgos-egresos",
+                        web::get().to(analytics_routes::get_hallazgos_egresos),
+                    )
                     .route("/concepts", web::get().to(analytics_routes::get_concepts))
                     .route("/fiscal", web::get().to(analytics_routes::get_fiscal))
                     .route("/payments", web::get().to(analytics_routes::get_payments))

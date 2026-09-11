@@ -10,7 +10,6 @@ pub struct RecurrenceResponse {
     pub from_period: String,
     pub to_period: String,
     pub by_active_months: Vec<ActiveMonthsBucket>,
-    pub scores_by_year: Vec<YearScore>,
     pub top_recurrent: Vec<RecurrentCp>,
 }
 
@@ -20,17 +19,6 @@ pub struct ActiveMonthsBucket {
     pub cp_count: i64,
     pub total_mxn: f64,
     pub pct_of_total: f64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct YearScore {
-    pub year: i32,
-    pub score: f64,
-    // L7-07: the same denominator q2 already computes internally (months of that year,
-    // within the window, that have comprobantes) -- not calendar months, so a year with
-    // one unbilled month gives 11, not 12. The frontend needs it to mark a truncated
-    // window year instead of recomputing its own guess.
-    pub months_avail: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,7 +85,6 @@ pub async fn get(
             from_period: String::new(),
             to_period: String::new(),
             by_active_months: vec![],
-            scores_by_year: vec![],
             top_recurrent: vec![],
         });
     }
@@ -183,69 +170,6 @@ pub async fn get(
         })
         .collect();
 
-    // Q2: recurrence score per year (revenue-weighted per-year continuity).
-    // ratio_rec = months_active_in_year / months_available_in_year (matches Python).
-    // score_year = weighted_average(ratio_rec, weight=year_total/year_total_all) * 100
-    let q2 = format!(
-        r#"
-        WITH months_avail_year AS (
-            -- L7-07: numerator (cp_year below) applies the exclusion filter, denominator
-            -- didn't -- the ratio crossed two different universes. Needs its own alias to
-            -- add the NOT EXISTS (there was none to hang it on before).
-            SELECT year,
-                   COUNT(DISTINCT month)::float8 AS months_avail
-            FROM pulso.cfdis c2
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
-              AND year * 100 + month >= $2 AND year * 100 + month <= $3
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c2.uuid
-              )
-            GROUP BY year
-        ),
-        cp_year AS (
-            SELECT year, ({cp_key_expr}) AS cp_key,
-                   COUNT(DISTINCT month)::float8                                   AS cp_months_in_year,
-                   GREATEST(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8), 0)::float8   AS year_total
-            FROM pulso.cfdis_ajustado c
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
-              AND year * 100 + month >= $2 AND year * 100 + month <= $3
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
-              )
-            GROUP BY year, ({cp_key_expr})
-        ),
-        year_totals AS (
-            SELECT year, GREATEST(SUM(year_total), 1) AS yt FROM cp_year GROUP BY year
-        )
-        SELECT cy.year,
-               LEAST(100.0,
-                 SUM(
-                   (cy.cp_months_in_year / ma.months_avail)
-                   * (cy.year_total / yt.yt)
-                 ) * 100
-               )::float8 AS score,
-               ma.months_avail::bigint AS months_avail
-        FROM cp_year cy
-        JOIN months_avail_year ma ON ma.year = cy.year
-        JOIN year_totals yt ON yt.year = cy.year
-        GROUP BY cy.year, ma.months_avail ORDER BY cy.year
-    "#
-    );
-    let rows2 = sqlx::query(&q2)
-        .bind(rfc)
-        .bind(from_yyyymm)
-        .bind(max_period)
-        .fetch_all(pool)
-        .await?;
-    let scores_by_year: Vec<YearScore> = rows2
-        .iter()
-        .map(|r| YearScore {
-            year: r.try_get::<i64, _>("year").unwrap_or(0) as i32,
-            score: get_f64(r, "score"),
-            months_avail: r.try_get("months_avail").unwrap_or(0),
-        })
-        .collect();
-
     // Q3: top recurrent counterparties (>= 75% of window, min 1, capped at 18)
     let min_months: i64 = (actual_window * 3 / 4).clamp(1, 18);
     let q3 = format!(
@@ -309,7 +233,6 @@ pub async fn get(
         from_period,
         to_period,
         by_active_months,
-        scores_by_year,
         top_recurrent,
     })
 }

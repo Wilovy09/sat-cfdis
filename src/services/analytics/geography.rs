@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, get_f64, parse_ym, rfc_column};
+use super::summary::{RFC_EXTRANJERO_GENERICO, dl_type_filter, get_f64, parse_ym, rfc_column};
 /// Geography: breakdown by lugar_expedicion (postal code) and state.
 use crate::db::DbPool;
 use serde::Serialize;
@@ -9,7 +9,25 @@ use std::collections::{HashMap, HashSet};
 pub struct GeographyResponse {
     pub by_state: Vec<StateRow>,
     pub by_postal_code: Vec<PostalCodeRow>,
-    pub unknown_pct: f64,
+    pub total_mxn: f64,
+    // L11-31: distinct counterparty RFCs across the WHOLE universe (states + unassigned +
+    // extranjero) -- a client billing from two states is one client here, not two. Summing
+    // each state row's own `unique_counterparties` over-counts by exactly that overlap.
+    pub total_unique_counterparties: i64,
+    // L11-29 / DEC-063 / L11-R3: invoices with no resolvable counterparty state -- either no
+    // CP at all, or a CP whose prefix doesn't parse as a number. Always returned (no 5%
+    // threshold): the frontend closes the table with this as its own row, unconditionally.
+    pub unassigned_mxn: f64,
+    pub unassigned_invoice_count: i64,
+    pub unassigned_unique_counterparties: i64,
+    pub unassigned_pct: f64,
+    // L11-30 / DEC-062 / DEC-068: XEXX010101000 (extranjero) is classified by RFC, never by
+    // CP -- even when domicilio_fiscal_receptor happens to carry a Mexican CP (11560) or is
+    // empty. Excluded from `by_state` (and therefore from the map, which is Mexico-only).
+    pub extranjero_mxn: f64,
+    pub extranjero_invoice_count: i64,
+    pub extranjero_unique_counterparties: i64,
+    pub extranjero_pct: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,7 +105,15 @@ pub async fn get(
     let mut state_map: HashMap<String, (f64, i64, HashSet<String>, HashSet<String>)> =
         Default::default();
     let mut by_postal_code = Vec::new();
-    let mut unknown_total = 0.0f64;
+    let mut all_rfcs: HashSet<String> = HashSet::new();
+
+    let mut unassigned_total = 0.0f64;
+    let mut unassigned_count: i64 = 0;
+    let mut unassigned_rfcs: HashSet<String> = HashSet::new();
+
+    let mut extranjero_total = 0.0f64;
+    let mut extranjero_count: i64 = 0;
+    let mut extranjero_rfcs: HashSet<String> = HashSet::new();
 
     for r in &rows {
         let cp: String = r.try_get("cp").unwrap_or_default();
@@ -95,12 +121,36 @@ pub async fn get(
         let total: f64 = get_f64(r, "total");
         let cnt: i64 = r.try_get("cnt").unwrap_or(0);
 
-        if cp == "UNKNOWN" {
-            unknown_total += total;
+        all_rfcs.insert(counterparty_rfc.clone());
+
+        // L11-30 trap 3: extranjero is classified by RFC, not CP -- even the rows that come
+        // in with no CP at all still go to "Extranjero", never to "Sin estado asignado".
+        if counterparty_rfc == RFC_EXTRANJERO_GENERICO {
+            extranjero_total += total;
+            extranjero_count += cnt;
+            extranjero_rfcs.insert(counterparty_rfc);
             continue;
         }
 
-        let state = postal_to_state(&cp).to_string();
+        if cp == "UNKNOWN" {
+            unassigned_total += total;
+            unassigned_count += cnt;
+            unassigned_rfcs.insert(counterparty_rfc);
+            continue;
+        }
+
+        // L11-29 trap 2: a CP whose prefix doesn't parse as a number used to default to 99
+        // (Zacatecas) -- a silent real-state misattribution. It now falls to "unassigned",
+        // same as a missing CP. A CP that parses but maps to no known range ("OTR"/"Otro")
+        // is a different, legitimate bucket and is left alone (trap 3).
+        let Some(state) = postal_to_state(&cp) else {
+            unassigned_total += total;
+            unassigned_count += cnt;
+            unassigned_rfcs.insert(counterparty_rfc);
+            continue;
+        };
+        let state = state.to_string();
+
         let e = state_map
             .entry(state.clone())
             .or_insert((0.0, 0, HashSet::new(), HashSet::new()));
@@ -135,21 +185,36 @@ pub async fn get(
         .collect();
     by_state.sort_by(|a, b| b.total_mxn.partial_cmp(&a.total_mxn).unwrap());
 
+    let pct_of = |v: f64| {
+        if grand_total > 0.0 {
+            v / grand_total * 100.0
+        } else {
+            0.0
+        }
+    };
+
     Ok(GeographyResponse {
         by_state,
         by_postal_code,
-        unknown_pct: if grand_total > 0.0 {
-            unknown_total / grand_total * 100.0
-        } else {
-            0.0
-        },
+        total_mxn: grand_total,
+        total_unique_counterparties: all_rfcs.len() as i64,
+        unassigned_mxn: unassigned_total,
+        unassigned_invoice_count: unassigned_count,
+        unassigned_unique_counterparties: unassigned_rfcs.len() as i64,
+        unassigned_pct: pct_of(unassigned_total),
+        extranjero_mxn: extranjero_total,
+        extranjero_invoice_count: extranjero_count,
+        extranjero_unique_counterparties: extranjero_rfcs.len() as i64,
+        extranjero_pct: pct_of(extranjero_total),
     })
 }
 
-/// Map Mexican postal code prefix → state code.
-fn postal_to_state(cp: &str) -> &'static str {
-    let prefix: u32 = cp[..2.min(cp.len())].parse().unwrap_or(99);
-    match prefix {
+/// Map Mexican postal code prefix → state code. `None` when the prefix isn't a parseable
+/// number at all (L11-29 trap 2) -- distinct from `Some("OTR")`, a prefix that parses fine
+/// but maps to no known range (trap 3: that's a real "Otro" bucket, not "sin asignar").
+fn postal_to_state(cp: &str) -> Option<&'static str> {
+    let prefix: u32 = cp[..2.min(cp.len())].parse().ok()?;
+    Some(match prefix {
         0..=16 => "CDMX",
         20 => "AGS",
         21..=22 => "BCN",
@@ -183,7 +248,7 @@ fn postal_to_state(cp: &str) -> &'static str {
         97 => "YUC",
         98..=99 => "ZAC",
         _ => "OTR",
-    }
+    })
 }
 
 fn state_name(code: &str) -> &'static str {

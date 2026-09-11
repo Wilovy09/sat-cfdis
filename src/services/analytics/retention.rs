@@ -42,7 +42,12 @@ pub struct IncompleteYear {
     pub months: i32,
 }
 
-pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<RetentionResponse> {
+pub async fn get(
+    pool: &DbPool,
+    rfc: &str,
+    dl_type: &str,
+    to: Option<&str>,
+) -> anyhow::Result<RetentionResponse> {
     let owner_col = rfc_column(dl_type);
     let dl_filter = dl_type_filter(dl_type);
     let cp_col = if dl_type == "recibidos" {
@@ -61,6 +66,19 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
     // to the bare RFC on the "recibidos" side, where rfc_emisor never carries a generic RFC.
     let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
 
+    // L11-22 / DEC-064: Retención era el único bloque de Ingresos/Egresos sin fecha de
+    // corte -- leía la tabla completa y arrastraba el mes en curso (incompleto) mientras el
+    // resto del módulo ya cerraba en el último mes calendario cerrado. Mismo cutoff que
+    // todo lo demás, y nunca más reciente que ese aunque el caller pida algo posterior.
+    let parse_yyyymm = |s: &str| -> i64 {
+        let parts: Vec<&str> = s.splitn(2, '-').collect();
+        let y: i64 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let m: i64 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(1);
+        y * 100 + m
+    };
+    let cutoff = crate::routes::analytics::current_month_yyyymm();
+    let cutoff_period = to.map(|t| parse_yyyymm(t).min(cutoff)).unwrap_or(cutoff);
+
     // Q1: distinct months per year (for incomplete detection). L9-05 / AUD-074: aligned to
     // Q2/Q3's universe (cfdis_ajustado + exclusions) -- it used to read raw pulso.cfdis
     // with no exclusion filter, a strictly BIGGER universe than the one Q2/Q3 fill the
@@ -71,10 +89,15 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
         "SELECT year, COUNT(DISTINCT month)::bigint AS month_count \
          FROM pulso.cfdis_ajustado c \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T') AND NOT is_cancelled \
+           AND year * 100 + month <= $2 \
            AND NOT EXISTS (SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid) \
          GROUP BY year ORDER BY year"
     );
-    let rows1 = sqlx::query(&q1).bind(rfc).fetch_all(pool).await?;
+    let rows1 = sqlx::query(&q1)
+        .bind(rfc)
+        .bind(cutoff_period)
+        .fetch_all(pool)
+        .await?;
     let mut months_per_year: HashMap<i32, i32> = HashMap::new();
     for r in &rows1 {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
@@ -88,11 +111,16 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
                 SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total_mxn \
          FROM pulso.cfdis_ajustado c \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T') AND NOT is_cancelled \
+           AND year * 100 + month <= $2 \
            AND NOT EXISTS (SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid) \
          GROUP BY year, ({cp_key_expr}) \
          ORDER BY year"
     );
-    let rows2 = sqlx::query(&q2).bind(rfc).fetch_all(pool).await?;
+    let rows2 = sqlx::query(&q2)
+        .bind(rfc)
+        .bind(cutoff_period)
+        .fetch_all(pool)
+        .await?;
 
     // Build: year -> HashMap<cp_key, (nombre, total_mxn)>
     let mut year_clients: HashMap<i32, HashMap<String, (String, f64)>> = HashMap::new();
@@ -115,10 +143,15 @@ pub async fn get(pool: &DbPool, rfc: &str, dl_type: &str) -> anyhow::Result<Rete
         "SELECT year, SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total_mxn \
          FROM pulso.cfdis_ajustado c \
          WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T') AND NOT is_cancelled \
+           AND year * 100 + month <= $2 \
            AND NOT EXISTS (SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid) \
          GROUP BY year ORDER BY year"
     );
-    let rows3 = sqlx::query(&q3).bind(rfc).fetch_all(pool).await?;
+    let rows3 = sqlx::query(&q3)
+        .bind(rfc)
+        .bind(cutoff_period)
+        .fetch_all(pool)
+        .await?;
     let mut year_totals: HashMap<i32, f64> = HashMap::new();
     for r in &rows3 {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;

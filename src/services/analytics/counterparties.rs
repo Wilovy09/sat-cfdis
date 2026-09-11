@@ -1,7 +1,7 @@
 use super::summary::{
-    LABEL_EXTRANJERO_GENERICO, LABEL_PUBLICO_GENERAL, RFC_EXTRANJERO_GENERICO, RFC_IMSS,
-    RFC_INFONAVIT, RFC_PUBLICO_GENERAL, cp_key_expr, cp_nombre_expr, current_month_yyyymm,
-    dl_type_filter, get_f64, get_f64_opt, normalized_name_expr, parse_ym, rfc_column,
+    LABEL_EXTRANJERO_GENERICO, LABEL_PUBLICO_GENERAL, RFC_EXTRANJERO_GENERICO, RFC_PUBLICO_GENERAL,
+    cp_key_expr, cp_nombre_expr, current_month_yyyymm, dl_type_filter, get_f64, get_f64_opt,
+    normalized_name_expr, parse_ym, rfc_column,
 };
 use crate::db::DbPool;
 use serde::Serialize;
@@ -54,59 +54,41 @@ pub async fn get(
     let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
     let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
-    // L10-10 / AUD-099, AUD-102: IMSS/Infonavit aren't sourcing decisions and the two
-    // generic RFCs ("público en general", "residente extranjero") aren't single
-    // counterparties -- excluded from the ranked universe itself, not just the displayed
-    // percentage, so a real counterparty sitting just below them moves into the top 10 and
-    // `total_counterparties` reflects the same universe the ranking and top10_pct do. One
-    // definition, used by clientes and proveedores alike (trap 2) -- CFE is deliberately
-    // not in this list, it counts on both sides.
-    //
-    // L10-10 proposed matching IMS/INF by PREFIX -- not implemented that way: L8-07 (see
-    // compute_h8 in hallazgos.rs, and RFC_IMSS/RFC_INFONAVIT's own comment in summary.rs)
-    // already found that exact false positive once, a real manufacturing supplier of the
-    // RFC de control excluded because its RFC happened to start the same way. Exact match
-    // against the team-confirmed RFCs instead.
-    //
-    // First attempt (do not repeat): put this filter straight into the WHERE clause, which
-    // also shrank `grand_total` -- caught by number_contract.rs's ingresos_netos_tres_pantallas
-    // cross-check against Resumen trimestral, which doesn't exclude regulatorias and
-    // shouldn't (that screen is "total money", not "vendor concentration"). `grand_total`
-    // stays the full population; only which rows can be ranked/counted as counterparties
-    // narrows.
-    let regulatory_filter = format!(
-        "cp_rfc NOT IN ('{RFC_IMSS}', '{RFC_INFONAVIT}', '{RFC_PUBLICO_GENERAL}', '{RFC_EXTRANJERO_GENERICO}')"
-    );
-
+    // L11-33 / DEC-069: no counterparty is excluded by default here -- neither IMSS,
+    // Infonavit, nor the generic RFCs, on either clientes or proveedores. Reverts L10-10's
+    // resolution (which excluded them by exact RFC match). Two things changed the decision:
+    // a prefix-based version of that filter (`isRegulatory` on the frontend, before L10-10)
+    // was already misclassifying a real company (`IMS2003263P4`, a manufacturing supplier)
+    // as a regulatory authority just for its RFC prefix, and the symmetric risk was worse --
+    // Nubarium's single largest supplier (18.85% of spend) has an RFC starting with `SAT`,
+    // so any future "for consistency" prefix rule would silently disappear it. Product
+    // decision on top of that risk: a real counterparty with real weight not showing up in
+    // a Top 10 is worse for an analyst than seeing it there -- the money left the company
+    // either way, and the analyst decides what to do with that row. No filter at all is
+    // simpler than any filter, and cannot misclassify anyone.
     let rows = sqlx::query(&format!(
         r#"
-        WITH per_cp AS (
-            SELECT
-                ({cp_key_expr})                                        AS cp_rfc,
-                {cp_nombre_expr}                                       AS cp_nombre,
-                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total,
-                COUNT(*)                                               AS cnt,
-                MIN(fecha_emision)                                     AS first_inv,
-                MAX(fecha_emision)                                     AS last_inv,
-                COUNT(DISTINCT year * 100 + month)                     AS months_active
-            FROM pulso.cfdis_ajustado c
-            WHERE {owner_col} = $1
-              AND {dl_filter}
-              AND tipo_comprobante NOT IN ('P','N','T')
-              AND NOT is_cancelled
-              AND (year > $2 OR (year = $2 AND month >= $3))
-              AND (year < $4 OR (year = $4 AND month <= $5))
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
-              )
-            GROUP BY ({cp_key_expr})
-        )
         SELECT
-            cp_rfc, cp_nombre, total, cnt, first_inv, last_inv, months_active,
-            (SELECT SUM(total) FROM per_cp)::float8 AS grand_total,
-            (SELECT COUNT(*) FROM per_cp WHERE {regulatory_filter}) AS cp_count
-        FROM per_cp
-        WHERE {regulatory_filter}
+            ({cp_key_expr})                                        AS cp_rfc,
+            {cp_nombre_expr}                                       AS cp_nombre,
+            SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8                          AS total,
+            COUNT(*)                                               AS cnt,
+            MIN(fecha_emision)                                     AS first_inv,
+            MAX(fecha_emision)                                     AS last_inv,
+            COUNT(DISTINCT year * 100 + month)                     AS months_active,
+            SUM(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)) OVER ()::float8 AS grand_total,
+            COUNT(*) OVER ()                                       AS cp_count
+        FROM pulso.cfdis_ajustado c
+        WHERE {owner_col} = $1
+          AND {dl_filter}
+          AND tipo_comprobante NOT IN ('P','N','T')
+          AND NOT is_cancelled
+          AND (year > $2 OR (year = $2 AND month >= $3))
+          AND (year < $4 OR (year = $4 AND month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
+        GROUP BY ({cp_key_expr})
         ORDER BY total DESC
         LIMIT $6
         "#
@@ -147,12 +129,11 @@ pub async fn get(
               )
             GROUP BY ({cp_key_expr})
         )
-        -- L10-10: HHI measures concentration among real vendors/clients, so regulatorias
-        -- are excluded here too -- but only after `cp_rfc` exists (this CTE's own output
-        -- column), not inside per_cp's WHERE where only the raw {cp_col} exists.
+        -- L11-33 / DEC-069: no regulatory exclusion here either -- same reasoning as the
+        -- main query above.
         SELECT COALESCE(SUM(POWER(total, 2)) / NULLIF(POWER(SUM(total), 2), 0) * 10000, 0)::float8 AS hhi
         FROM per_cp
-        WHERE total > 0 AND {regulatory_filter}
+        WHERE total > 0
         "#
     ))
     .bind(rfc)
@@ -219,7 +200,81 @@ pub struct CpEvolutionRow {
     pub years: HashMap<String, f64>,
     pub total_acumulado: f64,
     pub cagr_pct: Option<f64>,
-    pub tendencia: String,
+    // L11-09 / AUD-106: None when there's no complete year to compare against (a
+    // counterparty whose only activity is the in-progress current year) -- not a label
+    // guessed by omission. This was the C8-03 bug this item traces back to.
+    pub tendencia: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CounterpartySelectorRow {
+    pub rfc: String,
+    pub nombre: String,
+    pub total_mxn: f64,
+}
+
+// L11-08 / AUD-105: the CNT07 selector used to be fed from evolution()'s own Top-20-and-
+// exclusion-filtered rows, so a normalized counterparty could never be opened in the
+// individual view -- exactly the screen that would explain why it's normalized -- and only
+// 20 of (say) 306 counterparties were reachable at all. This is the full universe: no
+// exclusion filter (a normalized counterparty is a real counterparty, just one whose
+// figures don't count toward the aggregate) and no Top-N cap.
+pub async fn list_selector(
+    pool: &DbPool,
+    rfc: &str,
+    dl_type: &str,
+    from: &str,
+    to: &str,
+) -> anyhow::Result<Vec<CounterpartySelectorRow>> {
+    let (from_y, from_m) = parse_ym(from);
+    let (to_y, to_m) = parse_ym(to);
+    let dl_filter = dl_type_filter(dl_type);
+    let owner_col = rfc_column(dl_type);
+    let cp_col = if dl_type == "recibidos" {
+        "rfc_emisor"
+    } else {
+        "rfc_receptor"
+    };
+    let cp_name_col = if dl_type == "recibidos" {
+        "nombre_emisor"
+    } else {
+        "nombre_receptor"
+    };
+    let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
+    let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
+
+    let rows = sqlx::query(&format!(
+        r#"
+        SELECT ({cp_key_expr}) AS cp_rfc,
+               {cp_nombre_expr} AS cp_nombre,
+               SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total
+        FROM pulso.cfdis_ajustado c
+        WHERE {owner_col} = $1
+          AND {dl_filter}
+          AND tipo_comprobante NOT IN ('P','N','T')
+          AND NOT is_cancelled
+          AND (year > $2 OR (year = $2 AND month >= $3))
+          AND (year < $4 OR (year = $4 AND month <= $5))
+        GROUP BY ({cp_key_expr})
+        ORDER BY total DESC
+        "#
+    ))
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| CounterpartySelectorRow {
+            rfc: r.try_get("cp_rfc").unwrap_or_default(),
+            nombre: r.try_get("cp_nombre").unwrap_or_default(),
+            total_mxn: get_f64(r, "total"),
+        })
+        .collect())
 }
 
 pub async fn get_evolution(
@@ -328,8 +383,17 @@ pub async fn get_evolution(
             // only, same as L8-08 -- a counterparty can end up with a tendencia label and
             // no CAGR (fewer than 2 years in the capped series but 2+ in the full one);
             // that's correct, not a bug to paper over by computing CAGR on the full series.
+            //
+            // L11-09 / AUD-106: this series now also excludes the current (partial) year
+            // entirely, same principle as CAGR's own capping -- comparing a complete 2023
+            // against an eight-month 2026 labeled a real +48.5% CAGR client "Deterioro"
+            // because $1,955,000-annualized-equivalent still undercuts a full year's total.
+            // Unlike CAGR (which caps the current year to Jan-M so it stays comparable),
+            // tendencia just drops it -- there's no "capped label", only complete-year
+            // history or no label at all.
             let mut nonzero_full: Vec<(i32, f64)> = year_map
                 .iter()
+                .filter(|&(&y, _)| y != current_year)
                 .map(|(&y, &(full, _))| (y, full))
                 .filter(|&(_, v)| v > 0.0)
                 .collect();
@@ -361,24 +425,31 @@ pub async fn get_evolution(
             };
 
             // L8-11: "Nuevo" requires the single year of activity to BE the most recent
-            // year in the series -- a counterparty whose only invoice was years ago, with
-            // nothing since (up to and including the last year), is a dead account, not a
-            // new one. An EMPTY series is not "Nuevo" either (is_some_and, not is_none_or --
-            // that was the bug: on an empty capped series it returned true unconditionally,
-            // labeling dead accounts with zero Jan-M activity as "Nuevo").
-            let tendencia = if nonzero_full.len() <= 1 {
+            // COMPLETE year in the series -- a counterparty whose only invoice was years
+            // ago, with nothing since (up to and including the last complete year), is a
+            // dead account, not a new one. An EMPTY series is not "Nuevo" either (is_some_and,
+            // not is_none_or -- that was the bug: on an empty capped series it returned true
+            // unconditionally, labeling dead accounts with zero Jan-M activity as "Nuevo").
+            //
+            // L11-09 / AUD-106 trap 2: a counterparty with NO complete-year history at all
+            // (only ever active in the still-partial current year) gets no tendencia label,
+            // not "Nuevo" by omission -- there's nothing to compare it against yet.
+            let last_complete_year = years_sorted.iter().filter(|&&y| y != current_year).max();
+            let tendencia = if nonzero_full.is_empty() {
+                None
+            } else if nonzero_full.len() == 1 {
                 let is_most_recent = nonzero_full
                     .first()
-                    .is_some_and(|&(y, _)| Some(&y) == years_sorted.last());
-                if is_most_recent {
+                    .is_some_and(|&(y, _)| Some(&y) == last_complete_year);
+                Some(if is_most_recent {
                     "Nuevo".to_string()
                 } else {
                     "↓ En declive".to_string()
-                }
+                })
             } else {
                 let first_val = nonzero_full.first().unwrap().1;
                 let last_val = nonzero_full.last().unwrap().1;
-                if last_val > first_val {
+                Some(if last_val > first_val {
                     "↑ Crecimiento".to_string()
                 } else if last_val < first_val * 0.5 {
                     "↓ En declive".to_string()
@@ -386,7 +457,7 @@ pub async fn get_evolution(
                     "↓ Deterioro".to_string()
                 } else {
                     "Estable".to_string()
-                }
+                })
             };
 
             // L8-08: the painted column stays the full-year total -- only CAGR/tendencia
@@ -426,9 +497,18 @@ pub async fn get_evolution(
 
 #[derive(Debug, Serialize)]
 pub struct LtmComparisonResponse {
+    // Display only -- capped to the top 20 by ltm_mxn. The quick-read fields below are
+    // computed over the full universe, before this cap.
     pub rows: Vec<LtmRow>,
     pub ltm_total: f64,
     pub ltm_prev_total: f64,
+    // L11-11 / AUD-108: full-universe counterparty movement, not just what survived the
+    // top-20 display cap. `new_mxn`/`lost_mxn` let the frontend report the net, not just
+    // the counts, in monto.
+    pub new_count: i64,
+    pub new_mxn: f64,
+    pub lost_count: i64,
+    pub lost_mxn: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -558,7 +638,12 @@ pub async fn get_ltm_comparison(
             let ltm_mxn: f64 = get_f64(r, "ltm_total");
             let prev_ltm_mxn: f64 = prev_map.get(&cp_rfc).map(|(_, v)| *v).unwrap_or(0.0);
             let delta_mxn = ltm_mxn - prev_ltm_mxn;
-            let delta_pct = if prev_ltm_mxn > 0.0 {
+            // L11-10 / AUD-107: a percentage against a near-zero base is unreadable, not
+            // informative -- a client's LTM previo of $4,000 turned a real $1.58M swing into
+            // "+39,599.2%". Below this floor the cell shows "n/m" (frontend renders None as
+            // "—") instead of a five-figure percentage; declared here, not implied.
+            const MATERIALITY_FLOOR_MXN: f64 = 10_000.0;
+            let delta_pct = if prev_ltm_mxn > MATERIALITY_FLOOR_MXN {
                 Some(delta_mxn / prev_ltm_mxn * 100.0)
             } else {
                 None
@@ -615,12 +700,39 @@ pub async fn get_ltm_comparison(
             .partial_cmp(&a.ltm_mxn)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // L11-11 / AUD-108: computed over the FULL universe, before the display truncate below.
+    // "Perdida" rows always carry ltm_mxn=0.0, so they always sort to the bottom -- with
+    // more than 20 counterparties active in the current LTM, truncate(20) silently dropped
+    // every lost counterparty (and any small "new" one ranked below the top 20 by LTM
+    // total), which is exactly why the quick-read's own count only ever matched what was
+    // left in the truncated `rows` instead of the whole portfolio.
+    let new_count = rows.iter().filter(|r| r.status == "Nueva en LTM").count() as i64;
+    let new_mxn: f64 = rows
+        .iter()
+        .filter(|r| r.status == "Nueva en LTM")
+        .map(|r| r.ltm_mxn)
+        .sum();
+    let lost_count = rows
+        .iter()
+        .filter(|r| r.status == "Perdida vs LTM previo")
+        .count() as i64;
+    let lost_mxn: f64 = rows
+        .iter()
+        .filter(|r| r.status == "Perdida vs LTM previo")
+        .map(|r| r.prev_ltm_mxn)
+        .sum();
+
     rows.truncate(20);
 
     Ok(LtmComparisonResponse {
         rows,
         ltm_total: ltm_grand_total,
         ltm_prev_total: prev_grand_total,
+        new_count,
+        new_mxn,
+        lost_count,
+        lost_mxn,
     })
 }
 
@@ -640,6 +752,10 @@ pub struct CpPaymentRow {
     pub facturado_mxn: f64,
     pub cobrado_mxn: f64,
     pub saldo_pendiente_mxn: f64,
+    // L11-13 / AUD-109: facturado - cobrado - notas_credito_mxn = saldo_pendiente_mxn,
+    // always -- see the comment where this is computed for why it's a residual, not an
+    // independent query.
+    pub notas_credito_mxn: f64,
     pub pct_cobrado: f64,
     pub facturas_ppd: i64,
     pub facturas_abiertas: i64,
@@ -822,6 +938,11 @@ pub async fn get_payments_detail(
                 facturado_mxn: facturado,
                 cobrado_mxn: cobrado,
                 saldo_pendiente_mxn: saldo_pendiente,
+                // L11-13 / AUD-109: closes the subtraction on screen instead of leaving it
+                // to look like an error. facturado - cobrado - notas_credito = saldo,
+                // exactly, by construction (the residual of the same three numbers already
+                // computed above, not a separately-queried figure that could drift from them).
+                notas_credito_mxn: facturado - cobrado - saldo_pendiente,
                 pct_cobrado,
                 facturas_ppd: r.try_get("facturas_ppd").unwrap_or(0),
                 facturas_abiertas: r.try_get("facturas_abiertas").unwrap_or(0),
@@ -968,6 +1089,11 @@ pub struct CpIndividualResponse {
     pub saldo_pendiente_mxn: f64,
     pub pct_cobrado: f64,
     pub dias_cobro_ppd: Option<f64>,
+    // L11-08 / AUD-105: true when this counterparty has at least one normalization-excluded
+    // invoice -- drives the "cliente excluido de los totales" warning pill. This view's own
+    // figures above are NOT filtered by that exclusion (see yearly_rows' comment); the
+    // aggregate screens the pill points to are.
+    pub is_excluded: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1034,11 +1160,27 @@ pub async fn get_individual(
     let name_filter_expr_c = normalized_name_expr(&format!("c.{cp_name_col}"));
     let name_filter_expr_inv = normalized_name_expr(&format!("inv.{cp_name_col}"));
 
+    // L11-07 / AUD-104: CAGR needs the SAME capped-current-year series L8-08 already gave
+    // evolution() (CNT03) -- yr_total_capped, months 1..cap_month, fed to CAGR only. This
+    // used to compare full years unconditionally, 8 points off CNT03 for the same
+    // counterparty on the same screen.
+    let current_ym = current_month_yyyymm();
+    let cap_month = (current_ym % 100) as i32;
+    let current_year_i32 = (current_ym / 100) as i32;
+
     // 1. Yearly totals for this counterparty
+    // L11-08 / AUD-105: unlike every OTHER counterparty query in this file, this one does
+    // NOT filter cfdi_exclusion. This is the drill-down for a single, specifically-selected
+    // counterparty -- if they're 100% normalization-excluded, filtering here would zero out
+    // exactly the client the analyst most wants to inspect. `is_excluded` below tells the
+    // frontend to show the warning pill; `owner_yearly_rows` (the denominator for
+    // pct_of_year) stays filtered, so the aggregate-vs-this-client comparison is still
+    // apples-to-apples with what every other screen shows.
     let yearly_rows = sqlx::query(&format!(
         r#"
         SELECT year,
                SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS yr_total,
+               SUM(COALESCE(total_neto_mxn_ajustado,0)::float8) FILTER (WHERE month <= $8)::float8 AS yr_total_capped,
                COUNT(*) AS cnt
         FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T')
@@ -1046,9 +1188,6 @@ pub async fn get_individual(
           AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
           AND (year > $4 OR (year = $4 AND month >= $5))
           AND (year < $6 OR (year = $6 AND month <= $7))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
-          )
         GROUP BY year
         ORDER BY year
         "#
@@ -1060,6 +1199,7 @@ pub async fn get_individual(
     .bind(from_m)
     .bind(to_y)
     .bind(to_m)
+    .bind(cap_month as i64)
     .fetch_all(pool)
     .await?;
 
@@ -1091,21 +1231,36 @@ pub async fn get_individual(
         }
     };
 
-    let mut raw_years: Vec<(i32, f64, i64)> = yearly_rows
+    let mut raw_years: Vec<(i32, f64, i64, f64)> = yearly_rows
         .iter()
         .map(|r| {
             let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
             let total: f64 = get_f64(r, "yr_total");
+            let capped: f64 = get_f64(r, "yr_total_capped");
             let cnt: i64 = r.try_get("cnt").unwrap_or(0);
-            (year, total, cnt)
+            (year, total, cnt, capped)
         })
         .collect();
-    raw_years.sort_by_key(|(y, _, _)| *y);
+    raw_years.sort_by_key(|(y, _, _, _)| *y);
+
+    // L11-07 / AUD-104: value used for CAGR only -- the current (partial) year
+    // contributes its capped (Jan-M) total instead of the full year, the same rule L8-08
+    // already applies to CNT03/evolution(). None when the current year has fewer than 3
+    // closed months (not a usable CAGR base), matching evolution()'s own floor. `total_mxn`
+    // and `crecimiento_pct` (year-over-year growth) are untouched by this -- they stay the
+    // real full-year totals; only `cagr_pct` reads the capped value.
+    let cagr_value = |year: i32, total: f64, capped: f64| -> Option<f64> {
+        if year == current_year_i32 {
+            if cap_month < 3 { None } else { Some(capped) }
+        } else {
+            Some(total)
+        }
+    };
 
     let yearly_totals: Vec<CpYearRow> = raw_years
         .iter()
         .enumerate()
-        .map(|(i, &(year, total_mxn, invoice_count))| {
+        .map(|(i, &(year, total_mxn, invoice_count, capped_mxn))| {
             let crecimiento_pct = if i > 0 {
                 let prev_total = raw_years[i - 1].1;
                 if prev_total > 0.0 {
@@ -1117,14 +1272,16 @@ pub async fn get_individual(
                 None
             };
 
-            // CAGR from first year to this year
+            // CAGR from first year to this year, capped-current-year aware (cagr_value).
             let cagr_pct = if i > 0 {
-                let first_total = raw_years[0].1;
+                let first_val = cagr_value(raw_years[0].0, raw_years[0].1, raw_years[0].3);
+                let this_val = cagr_value(year, total_mxn, capped_mxn);
                 let n_years = i as f64;
-                if first_total > 0.0 && total_mxn > 0.0 {
-                    Some(((total_mxn / first_total).powf(1.0 / n_years) - 1.0) * 100.0)
-                } else {
-                    None
+                match (first_val, this_val) {
+                    (Some(f), Some(t)) if f > 0.0 && t > 0.0 => {
+                        Some(((t / f).powf(1.0 / n_years) - 1.0) * 100.0)
+                    }
+                    _ => None,
                 }
             } else {
                 None
@@ -1153,9 +1310,6 @@ pub async fn get_individual(
           AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr} = $3)
           AND (year > $4 OR (year = $4 AND month >= $5))
           AND (year < $6 OR (year = $6 AND month <= $7))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
-          )
         GROUP BY year, month
         ORDER BY year, month
         "#
@@ -1195,9 +1349,6 @@ pub async fn get_individual(
           AND c.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_c} = $3)
           AND (c.year > $4 OR (c.year = $4 AND c.month >= $5))
           AND (c.year < $6 OR (c.year = $6 AND c.month <= $7))
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
-          )
         GROUP BY SUBSTRING(cc.descripcion, 1, 80), c.year
         "#
     ))
@@ -1281,7 +1432,7 @@ pub async fn get_individual(
 
     let pct_of_year: HashMap<String, f64> = raw_years
         .iter()
-        .map(|&(year, cp_total, _)| {
+        .map(|&(year, cp_total, _, _)| {
             let owner_total = *owner_year_map.get(&year).unwrap_or(&0.0);
             let pct = if owner_total > 0.0 {
                 cp_total / owner_total * 100.0
@@ -1294,9 +1445,11 @@ pub async fn get_individual(
 
     // Cobranza for this specific counterparty — full universe (no date filter).
     // L2-01/L2-03: shared base instead of re-deriving pagado/saldo.
-    // L9-04 / DEC-045: facturado/cobrado are ventas -- exclusion-filtered (L7-06 unchanged).
-    // saldo is cartera -- a balance -- and gets its own, unfiltered query below: a 100%-
-    // excluded counterparty still owes what it owes, same reasoning as get_payments_detail.
+    // L11-08 / AUD-105: facturado/cobrado no longer exclusion-filtered either (L7-06's
+    // filter removed here) -- same reasoning as yearly_rows above, this drill-down shows
+    // this one counterparty's real activity regardless of normalization status. saldo
+    // (cartera, a balance) was already unfiltered before this item, for the same reason
+    // get_payments_detail's saldo is: a 100%-excluded counterparty still owes what it owes.
     let cobranza_row = sqlx::query(&format!(
         r#"
         WITH ppd_detail AS (
@@ -1306,10 +1459,6 @@ pub async fn get_individual(
             WHERE b.{owner_col} = $1 AND b.{dl_filter}
               AND b.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_inv} = $3)
               AND b.metodo_pago = 'PPD'
-              -- L7-06: same clause as the RFC predicate, see all_inv above for why.
-              AND NOT EXISTS (
-                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = b.uuid
-              )
         )
         -- L7-04 / DEC-040: "cobrado" is real collection (LEAST(pagado_mxn, inv_total)), not
         -- saldo's derived "paid" -- see cobrado_by_cp in get_payments_detail above for why.
@@ -1360,11 +1509,6 @@ pub async fn get_individual(
           AND b.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_inv} = $3)
           AND b.metodo_pago = 'PPD'
           AND b.ultimo_pago_fecha IS NOT NULL
-          -- L7-06: no CTE here, so it goes directly in this WHERE (same clause as the
-          -- RFC predicate), see all_inv above for why.
-          AND NOT EXISTS (
-              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = b.uuid
-          )
         "#
     ))
     .bind(owner_rfc)
@@ -1374,6 +1518,27 @@ pub async fn get_individual(
     .await?;
 
     let dias_cobro_ppd: Option<f64> = get_f64_opt(&dias_row, "dias");
+
+    // L11-08 / AUD-105: tells the frontend to show the "cliente excluido de los totales"
+    // warning pill -- true when at least one of this counterparty's invoices is subject to
+    // a normalization exclusion rule (the same relation every OTHER screen filters through,
+    // checked here instead of filtered out).
+    let is_excluded_row = sqlx::query(&format!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM pulso.cfdis_ajustado c
+            JOIN pulso.cfdi_exclusion ex ON ex.owner_rfc = $1 AND ex.uuid = c.uuid
+            WHERE {owner_col} = $1 AND {cp_col} = $2 AND ($3 = '' OR {name_filter_expr_c} = $3)
+        ) AS is_excluded
+        "#
+    ))
+    .bind(owner_rfc)
+    .bind(base_rfc)
+    .bind(name_filter)
+    .fetch_one(pool)
+    .await?;
+    let is_excluded: bool = is_excluded_row.try_get("is_excluded").unwrap_or(false);
 
     Ok(CpIndividualResponse {
         rfc: cp_rfc.to_string(),
@@ -1387,5 +1552,6 @@ pub async fn get_individual(
         saldo_pendiente_mxn: saldo,
         pct_cobrado,
         dias_cobro_ppd,
+        is_excluded,
     })
 }

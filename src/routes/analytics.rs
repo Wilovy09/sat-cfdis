@@ -6,8 +6,8 @@ use crate::{
     errors::AppError,
     services::analytics::{
         cashflow, concepts, counterparties, data_quality, fiscal, geography, hallazgos,
-        normalization, payments, payroll, period_comparison, quarterly, recurrence, retention,
-        summary, xml_breakdown, xml_count,
+        hallazgos_egresos, normalization, payments, payroll, period_comparison, quarterly,
+        recurrence, retention, summary, xml_breakdown, xml_count,
     },
 };
 
@@ -155,6 +155,59 @@ pub async fn get_summary(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/summary/month-contributor
+// L11-02: on-demand lookup for RES04's quick-read -- only called for a month the frontend
+// has already flagged as atypical, never for every month up front.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct MonthContributorParams {
+    pub dl_type: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub year: i64,
+    pub month: i64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/analytics/{rfc}/summary/month-contributor",
+    tag = "Analytics",
+    params(
+        ("rfc" = String, Path, description = "RFC del contribuyente"),
+        ("dl_type" = Option<String>, Query, description = "emitidos|recibidos|ambos"),
+        ("from" = Option<String>, Query, description = "YYYY-MM"),
+        ("to" = Option<String>, Query, description = "YYYY-MM"),
+        ("year" = i64, Query, description = "Año del mes atípico"),
+        ("month" = i64, Query, description = "Mes atípico (1-12)"),
+    ),
+    responses((status = 200, description = "Contraparte que explica el exceso del mes"))
+)]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
+pub async fn get_month_contributor(
+    req: HttpRequest,
+    path: web::Path<String>,
+    query: web::Query<MonthContributorParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", rfc.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let p = summary::SummaryParams {
+        dl_type: query
+            .dl_type
+            .clone()
+            .unwrap_or_else(|| "emitidos".to_string()),
+        from: query.from.clone().unwrap_or_else(default_from),
+        to: query.to.clone().unwrap_or_else(current_month),
+    };
+    let result = summary::month_top_contributor(&pool, &rfc, &p, query.year, query.month)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/v1/analytics/{rfc}/data-quality
 // ---------------------------------------------------------------------------
 
@@ -271,6 +324,7 @@ pub async fn get_recurrence(
     params(
         ("rfc" = String, Path, description = "RFC del propietario"),
         ("dl_type" = Option<String>, Query, description = "emitidos|recibidos"),
+        ("to" = Option<String>, Query, description = "YYYY-MM, corte superior (por defecto el último mes cerrado)"),
     ),
     responses((status = 200, description = "Retention analysis"))
 )]
@@ -286,7 +340,8 @@ pub async fn get_retention(
         .get("dl_type")
         .map(|s| s.as_str())
         .unwrap_or("emitidos");
-    let result = retention::get(&pool, &rfc, dl_type)
+    let to = query.get("to").map(|s| s.as_str());
+    let result = retention::get(&pool, &rfc, dl_type, to)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
@@ -319,6 +374,36 @@ pub async fn get_geography(
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
     let result = geography::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/hallazgos-egresos
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/analytics/{rfc}/hallazgos-egresos",
+    tag = "Analytics",
+    params(
+        ("rfc" = String, Path, description = "RFC del propietario"),
+        ("to" = Option<String>, Query, description = "YYYY-MM, corte superior (por defecto el último mes cerrado)"),
+    ),
+    responses((status = 200, description = "Hallazgos de Egresos (Lote 12): H-E1/H-E2/H-E3"))
+)]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
+pub async fn get_hallazgos_egresos(
+    req: HttpRequest,
+    path: web::Path<String>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", rfc.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let result = hallazgos_egresos::get(&pool, &rfc, query.to.as_deref())
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))
@@ -1086,6 +1171,27 @@ pub async fn get_counterparties_evolution(
     check_rfc_access(&pool, &req, &rfc).await?;
     let result =
         counterparties::get_evolution(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(result))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/analytics/{rfc}/counterparties/selector
+// L11-08: full-universe counterparty list (no exclusion filter, no Top-N cap) for the
+// CNT07 "buscar y seleccionar" dropdown.
+// ---------------------------------------------------------------------------
+
+pub async fn get_counterparties_selector(
+    req: HttpRequest,
+    path: web::Path<String>,
+    query: web::Query<AnalyticsParams>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    check_rfc_access(&pool, &req, &rfc).await?;
+    let result =
+        counterparties::list_selector(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
             .await
             .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(HttpResponse::Ok().json(result))

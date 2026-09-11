@@ -5,6 +5,7 @@ pub mod data_quality;
 pub mod fiscal;
 pub mod geography;
 pub mod hallazgos;
+pub mod hallazgos_egresos;
 pub mod normalization;
 pub mod payments;
 pub mod payroll;

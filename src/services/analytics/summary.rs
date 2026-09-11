@@ -218,6 +218,118 @@ pub async fn get(pool: &DbPool, rfc: &str, p: &SummaryParams) -> anyhow::Result<
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct MonthContributor {
+    pub rfc: String,
+    pub nombre: String,
+    pub month_total_mxn: f64,
+    pub other_months_avg_mxn: f64,
+    // Signed pesos this counterparty came in above (or, negative, below) its OWN average in
+    // the other months of the query window. Deliberately not a percentage: the frontend
+    // already knows the RFC's own month total and its own other-months average (same
+    // `by_month` data that flagged the month as atypical in the first place), so it divides
+    // this figure by that same RFC-level excess to get the share -- one definition of "the
+    // month's excess" instead of two (this endpoint summing every counterparty's own excess
+    // would count more than the RFC's actual excess, since counterparties can move in
+    // opposite directions the same month and net out at the RFC level).
+    pub excess_mxn: f64,
+}
+
+// L11-02 / DEC-057: RES04's quick-read names the counterparty that explains most of an
+// atypical month's excess over its OWN average in the other months of the query window --
+// factually, never causally (never "a new client's invoice moved the number", only what
+// the numbers show). Called only for months the frontend has already flagged as atypical
+// (rare), so this extra round trip isn't worth folding into `get` itself.
+pub async fn month_top_contributor(
+    pool: &DbPool,
+    rfc: &str,
+    p: &SummaryParams,
+    target_year: i64,
+    target_month: i64,
+) -> anyhow::Result<Option<MonthContributor>> {
+    let dl_filter = dl_type_filter(&p.dl_type);
+    let rfc_col = rfc_column(&p.dl_type);
+    let (from_y, from_m) = parse_ym(&p.from);
+    let (to_y, to_m) = parse_ym(&p.to);
+
+    let cp_col = if p.dl_type == "recibidos" {
+        "rfc_emisor"
+    } else {
+        "rfc_receptor"
+    };
+    let cp_name_col = if p.dl_type == "recibidos" {
+        "nombre_emisor"
+    } else {
+        "nombre_receptor"
+    };
+    let cp_key = cp_key_expr(cp_col, cp_name_col);
+    let cp_nombre = cp_nombre_expr(cp_col, cp_name_col);
+
+    let row = sqlx::query(&format!(
+        r#"
+        WITH per_cp AS (
+            SELECT
+                ({cp_key}) AS cp_rfc,
+                {cp_nombre} AS cp_nombre,
+                SUM(CASE WHEN year = $6 AND month = $7 THEN COALESCE(total_neto_mxn_ajustado,0)::float8 ELSE 0 END) AS month_total,
+                SUM(CASE WHEN NOT (year = $6 AND month = $7) THEN COALESCE(total_neto_mxn_ajustado,0)::float8 ELSE 0 END) AS other_total,
+                COUNT(DISTINCT CASE WHEN NOT (year = $6 AND month = $7) THEN year * 100 + month END) AS other_months
+            FROM pulso.cfdis_ajustado c
+            WHERE {rfc_col} = $1
+              AND {dl_filter}
+              AND tipo_comprobante NOT IN ('P','N','T')
+              AND NOT is_cancelled
+              AND (year > $2 OR (year = $2 AND month >= $3))
+              AND (year < $4 OR (year = $4 AND month <= $5))
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+              )
+            GROUP BY ({cp_key})
+        ),
+        -- L11-02 trap 3: an atypical month can be low, not just high -- excess is signed
+        -- (never floored at 0) and ranked by magnitude, so a client that did unusually
+        -- LESS than its own norm can explain a below-average month the same way a client
+        -- doing unusually more explains an above-average one.
+        scored AS (
+            SELECT cp_rfc, cp_nombre, month_total,
+                   (other_total / NULLIF(other_months, 0))::float8 AS other_avg,
+                   (month_total - (other_total / NULLIF(other_months, 0))::float8) AS excess
+            FROM per_cp
+            WHERE other_months > 0
+        )
+        SELECT cp_rfc, cp_nombre, month_total, other_avg, excess
+        FROM scored
+        ORDER BY ABS(excess) DESC
+        LIMIT 1
+        "#
+    ))
+    .bind(rfc)
+    .bind(from_y)
+    .bind(from_m)
+    .bind(to_y)
+    .bind(to_m)
+    .bind(target_year)
+    .bind(target_month)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let excess = get_f64(&row, "excess");
+    if excess == 0.0 {
+        return Ok(None);
+    }
+
+    Ok(Some(MonthContributor {
+        rfc: row.try_get("cp_rfc").unwrap_or_default(),
+        nombre: row.try_get("cp_nombre").unwrap_or_default(),
+        month_total_mxn: get_f64(&row, "month_total"),
+        other_months_avg_mxn: get_f64(&row, "other_avg"),
+        excess_mxn: excess,
+    }))
+}
+
 fn aggregate_yearly(months: &[MonthlyTotal]) -> Vec<YearlyTotal> {
     let mut map: std::collections::BTreeMap<i64, YearlyTotal> = Default::default();
     for m in months {

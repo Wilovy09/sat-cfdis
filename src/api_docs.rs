@@ -43,10 +43,12 @@ pub const SCALAR_HTML: &str = r#"<!doctype html>
         crate::routes::queue::cancel_job,
         // Analytics
         crate::routes::analytics::get_summary,
+        crate::routes::analytics::get_month_contributor,
         crate::routes::analytics::get_counterparties,
         crate::routes::analytics::get_recurrence,
         crate::routes::analytics::get_retention,
         crate::routes::analytics::get_geography,
+        crate::routes::analytics::get_hallazgos_egresos,
         crate::routes::analytics::get_concepts,
         crate::routes::analytics::get_fiscal,
         crate::routes::analytics::get_payments,
