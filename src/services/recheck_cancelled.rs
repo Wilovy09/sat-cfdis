@@ -276,5 +276,11 @@ async fn recheck_chunk(
             "Recheck-cancelled: {reverted} invoice(s) reverted from Cancelado to Vigente this cycle"
         );
     }
+    // SAT confirmed a fresh estado_sat for at least one UUID -- this owner's cfdis
+    // changed (even a same-value rewrite refreshes estado_sat_checked_at), so its
+    // cached analytics responses can no longer be trusted as-is.
+    if !found.is_empty() {
+        crate::services::response_cache::bump_version(pool, owner_rfc).await?;
+    }
     Ok(())
 }

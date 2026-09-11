@@ -4,10 +4,13 @@ use serde::Deserialize;
 use crate::{
     db::DbPool,
     errors::AppError,
-    services::analytics::{
-        cashflow, concepts, counterparties, data_quality, fiscal, geography, hallazgos,
-        hallazgos_egresos, normalization, payments, payroll, period_comparison, quarterly,
-        recurrence, retention, summary, xml_breakdown, xml_count,
+    services::{
+        analytics::{
+            cashflow, concepts, counterparties, data_quality, fiscal, geography, hallazgos,
+            hallazgos_egresos, normalization, payments, payroll, period_comparison, quarterly,
+            recurrence, retention, summary, xml_breakdown, xml_count,
+        },
+        response_cache,
     },
 };
 
@@ -102,6 +105,17 @@ pub struct AnalyticsParams {
     pub limit: Option<i64>,      // for counterparties, default 50
 }
 
+/// Builds a response-cache `params_key` from the query fields an endpoint actually reads
+/// -- deliberately not every field on whatever query struct the handler happens to use, so
+/// an unrelated param the endpoint ignores can't fragment the cache.
+fn cache_key(parts: &[(&str, &str)]) -> String {
+    parts
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 impl AnalyticsParams {
     fn dl_type(&self) -> String {
         self.dl_type.clone().unwrap_or_else(|| "emitidos".into())
@@ -148,10 +162,13 @@ pub async fn get_summary(
         from: query.from(),
         to: query.to(),
     };
-    let result = summary::get(&pool, &rfc, &p)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let key = cache_key(&[("dl_type", &p.dl_type), ("from", &p.from), ("to", &p.to)]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "summary", &key, || async {
+        summary::get(&pool, &rfc, &p).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -227,10 +244,12 @@ pub async fn get_data_quality(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = data_quality::get(&pool, &rfc)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let value = response_cache::get_or_compute(&pool, &rfc, "data-quality", "", || async {
+        data_quality::get(&pool, &rfc).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -260,17 +279,19 @@ pub async fn get_counterparties(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = counterparties::get(
-        &pool,
-        &rfc,
-        &query.dl_type(),
-        &query.from(),
-        &query.to(),
-        query.limit(),
-    )
+    let (dl_type, from, to, limit) = (query.dl_type(), query.from(), query.to(), query.limit());
+    let key = cache_key(&[
+        ("dl_type", &dl_type),
+        ("from", &from),
+        ("to", &to),
+        ("limit", &limit.to_string()),
+    ]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "counterparties", &key, || async {
+        counterparties::get(&pool, &rfc, &dl_type, &from, &to, limit).await
+    })
     .await
     .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -307,10 +328,18 @@ pub async fn get_recurrence(
         .clamp(6, 60);
     let from = query.get("from").map(|s| s.as_str());
     let to = query.get("to").map(|s| s.as_str());
-    let result = recurrence::get(&pool, &rfc, dl_type, window_months, from, to)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let key = cache_key(&[
+        ("dl_type", dl_type),
+        ("window_months", &window_months.to_string()),
+        ("from", from.unwrap_or("")),
+        ("to", to.unwrap_or("")),
+    ]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "recurrence", &key, || async {
+        recurrence::get(&pool, &rfc, dl_type, window_months, from, to).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -341,10 +370,13 @@ pub async fn get_retention(
         .map(|s| s.as_str())
         .unwrap_or("emitidos");
     let to = query.get("to").map(|s| s.as_str());
-    let result = retention::get(&pool, &rfc, dl_type, to)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let key = cache_key(&[("dl_type", dl_type), ("to", to.unwrap_or(""))]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "retention", &key, || async {
+        retention::get(&pool, &rfc, dl_type, to).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -373,10 +405,14 @@ pub async fn get_geography(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = geography::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
+    let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "geography", &key, || async {
+        geography::get(&pool, &rfc, &dl_type, &from, &to).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -403,10 +439,13 @@ pub async fn get_hallazgos_egresos(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = hallazgos_egresos::get(&pool, &rfc, query.to.as_deref())
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let key = cache_key(&[("to", query.to.as_deref().unwrap_or(""))]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "hallazgos-egresos", &key, || async {
+        hallazgos_egresos::get(&pool, &rfc, query.to.as_deref()).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -435,10 +474,14 @@ pub async fn get_concepts(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = concepts::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
+    let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "concepts", &key, || async {
+        concepts::get(&pool, &rfc, &dl_type, &from, &to).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -467,10 +510,14 @@ pub async fn get_fiscal(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = fiscal::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
+    let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "fiscal", &key, || async {
+        fiscal::get(&pool, &rfc, &dl_type, &from, &to).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -499,10 +546,14 @@ pub async fn get_payments(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = payments::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
+    let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "payments", &key, || async {
+        payments::get(&pool, &rfc, &dl_type, &from, &to).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -531,10 +582,14 @@ pub async fn get_cashflow(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = cashflow::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
+    let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "cashflow", &key, || async {
+        cashflow::get(&pool, &rfc, &dl_type, &from, &to).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -562,10 +617,14 @@ pub async fn get_payroll(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = payroll::get(&pool, &rfc, &query.from(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (from, to) = (query.from(), query.to());
+    let key = cache_key(&[("from", &from), ("to", &to)]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "payroll", &key, || async {
+        payroll::get(&pool, &rfc, &from, &to).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -588,10 +647,12 @@ pub async fn get_payroll_snapshot(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = payroll::get_snapshot(&pool, &rfc)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let value = response_cache::get_or_compute(&pool, &rfc, "payroll-snapshot", "", || async {
+        payroll::get_snapshot(&pool, &rfc).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -614,10 +675,12 @@ pub async fn get_hallazgos(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = hallazgos::get(&pool, &rfc)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let value = response_cache::get_or_compute(&pool, &rfc, "hallazgos", "", || async {
+        hallazgos::get(&pool, &rfc).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,11 +1232,15 @@ pub async fn get_counterparties_evolution(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result =
-        counterparties::get_evolution(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
+    let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
+    let value =
+        response_cache::get_or_compute(&pool, &rfc, "counterparties-evolution", &key, || async {
+            counterparties::get_evolution(&pool, &rfc, &dl_type, &from, &to).await
+        })
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,11 +1257,15 @@ pub async fn get_counterparties_selector(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result =
-        counterparties::list_selector(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
+    let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
+    let value =
+        response_cache::get_or_compute(&pool, &rfc, "counterparties-selector", &key, || async {
+            counterparties::list_selector(&pool, &rfc, &dl_type, &from, &to).await
+        })
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,10 +1280,14 @@ pub async fn get_counterparties_ltm(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = counterparties::get_ltm_comparison(&pool, &rfc, &query.dl_type(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (dl_type, to) = (query.dl_type(), query.to());
+    let key = cache_key(&[("dl_type", &dl_type), ("to", &to)]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "counterparties-ltm", &key, || async {
+        counterparties::get_ltm_comparison(&pool, &rfc, &dl_type, &to).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,16 +1302,18 @@ pub async fn get_counterparties_payments_detail(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = counterparties::get_payments_detail(
+    let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
+    let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
+    let value = response_cache::get_or_compute(
         &pool,
         &rfc,
-        &query.dl_type(),
-        &query.from(),
-        &query.to(),
+        "counterparties-payments-detail",
+        &key,
+        || async { counterparties::get_payments_detail(&pool, &rfc, &dl_type, &from, &to).await },
     )
     .await
     .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,11 +1328,15 @@ pub async fn get_counterparties_atypical(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result =
-        counterparties::get_atypical(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
+    let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
+    let value =
+        response_cache::get_or_compute(&pool, &rfc, "counterparties-atypical", &key, || async {
+            counterparties::get_atypical(&pool, &rfc, &dl_type, &from, &to).await
+        })
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,17 +1353,20 @@ pub async fn get_counterparty_individual(
     let rfc = rfc.to_uppercase();
     let cp_rfc = cp_rfc.to_uppercase();
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = counterparties::get_individual(
-        &pool,
-        &rfc,
-        &cp_rfc,
-        &query.dl_type(),
-        &query.from(),
-        &query.to(),
-    )
-    .await
-    .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
+    let key = cache_key(&[
+        ("cp_rfc", &cp_rfc),
+        ("dl_type", &dl_type),
+        ("from", &from),
+        ("to", &to),
+    ]);
+    let value =
+        response_cache::get_or_compute(&pool, &rfc, "counterparty-individual", &key, || async {
+            counterparties::get_individual(&pool, &rfc, &cp_rfc, &dl_type, &from, &to).await
+        })
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,10 +1409,14 @@ pub async fn get_quarterly(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = quarterly::get(&pool, &rfc, &query.dl_type(), &query.from(), &query.to())
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
+    let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "quarterly", &key, || async {
+        quarterly::get(&pool, &rfc, &dl_type, &from, &to).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,10 +1454,24 @@ pub async fn get_period_comparison(
         .collect();
     let limit = query.limit.unwrap_or(10).clamp(1, 50);
 
-    let result = period_comparison::get(&pool, &rfc, &dl_type, from_month, to_month, &years, limit)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let years_key = years
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let key = cache_key(&[
+        ("dl_type", &dl_type),
+        ("from_month", &from_month.to_string()),
+        ("to_month", &to_month.to_string()),
+        ("years", &years_key),
+        ("limit", &limit.to_string()),
+    ]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "period-comparison", &key, || async {
+        period_comparison::get(&pool, &rfc, &dl_type, from_month, to_month, &years, limit).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 #[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
@@ -1386,10 +1488,13 @@ pub async fn get_xml_count(
         .get("dl_type")
         .map(|s| s.as_str())
         .unwrap_or("emitidos");
-    let result = xml_count::get(&pool, &rfc, dl_type)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let key = cache_key(&[("dl_type", dl_type)]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "xml-count", &key, || async {
+        xml_count::get(&pool, &rfc, dl_type).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
 }
 
 pub async fn get_xml_breakdown(
@@ -1400,8 +1505,39 @@ pub async fn get_xml_breakdown(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let result = xml_breakdown::get(&pool, &rfc)
-        .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(HttpResponse::Ok().json(result))
+    let value = response_cache::get_or_compute(&pool, &rfc, "xml-breakdown", "", || async {
+        xml_breakdown::get(&pool, &rfc).await
+    })
+    .await
+    .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(value))
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::cache_key;
+
+    #[test]
+    fn joins_parts_in_order() {
+        assert_eq!(
+            cache_key(&[
+                ("dl_type", "emitidos"),
+                ("from", "2025-01"),
+                ("to", "2026-08")
+            ]),
+            "dl_type=emitidos|from=2025-01|to=2026-08"
+        );
+    }
+
+    #[test]
+    fn different_values_never_collide() {
+        let a = cache_key(&[("from", "2025-01"), ("to", "2026-08")]);
+        let b = cache_key(&[("from", "2025-02"), ("to", "2026-08")]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn empty_parts_is_empty_string() {
+        assert_eq!(cache_key(&[]), "");
+    }
 }

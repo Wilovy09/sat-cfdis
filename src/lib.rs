@@ -37,4 +37,7 @@ pub mod services {
     }
     // `db::cfdis` (pulled in by `pub mod db` above) depends on this for XML parsing.
     pub mod xml_parser;
+    // `db::jobs::complete` (pulled in by `pub mod db` above) bumps the response cache's
+    // data version on it. Only depends on `crate::db::DbPool`, no binary-only dependency.
+    pub mod response_cache;
 }

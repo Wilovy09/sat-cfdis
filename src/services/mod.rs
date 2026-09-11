@@ -6,6 +6,7 @@ pub mod fiel;
 pub mod gap_detector;
 pub mod php_cli;
 pub mod recheck_cancelled;
+pub mod response_cache;
 pub mod s3;
 pub mod storage;
 pub mod xml_parser;
