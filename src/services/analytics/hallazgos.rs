@@ -812,7 +812,7 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
         )
         SELECT
             lo.sueldo,
-            (((date_trunc('month', CURRENT_DATE) - interval '1 day')::date) - sd.start_date) / 365.25 AS antiguedad_years
+            ((((date_trunc('month', CURRENT_DATE) - interval '1 day')::date) - sd.start_date) / 365.25)::float8 AS antiguedad_years
         FROM last_ordinario lo
         JOIN start_dates sd ON sd.rfc_receptor = lo.rfc_receptor
         WHERE lo.sueldo > 0
@@ -910,7 +910,7 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
             sd.start_date::text AS start_date,
             lr.fecha_final_pago::text AS fecha_final_pago,
             lo.sueldo,
-            (make_date((t.last_period/100)::int, (t.last_period%100)::int, 1) - sd.start_date) / 365.25 AS antiguedad_al_baja
+            ((make_date((t.last_period/100)::int, (t.last_period%100)::int, 1) - sd.start_date) / 365.25)::float8 AS antiguedad_al_baja
         FROM term t
         JOIN last_row lr ON lr.rfc_receptor = t.rfc_receptor
         JOIN last_ordinario lo ON lo.rfc_receptor = t.rfc_receptor
