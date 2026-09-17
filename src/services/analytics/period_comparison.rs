@@ -86,6 +86,37 @@ pub struct BridgeRow {
     pub status: String,
 }
 
+/// If -- and only if -- `years` includes the year of the last closed calendar month, the
+/// effective `to_month` drops to `min(to_month, that month)`, applied to ALL compared
+/// years so the comparison stays over the same period for every year.
+///
+/// C14-03/AUD-147: the caller (`routes::analytics::get_period_comparison`) must build its
+/// cache key from THIS value, not the raw `to_month` query param -- otherwise a response
+/// cached in September under `to_month=12` (clamped to 9 internally) keeps its key frozen
+/// at "12" and gets served unchanged in October, even though the clamp would by then
+/// resolve to 10. One definition, two callers (this function and the cache key), per
+/// DEC-084's "one definition per number".
+#[must_use]
+pub fn effective_to_month(to_month: i32, years: &[i32]) -> i32 {
+    clamp_to_month(
+        to_month,
+        years,
+        crate::routes::analytics::current_month_yyyymm(),
+    )
+}
+
+/// Pure clamp logic behind `effective_to_month`, with the wall-clock cutoff as a plain
+/// argument so it's testable without mocking the clock.
+fn clamp_to_month(to_month: i32, years: &[i32], last_closed_yyyymm: i64) -> i32 {
+    let last_closed_year = (last_closed_yyyymm / 100) as i32;
+    let last_closed_month = (last_closed_yyyymm % 100) as i32;
+    if years.contains(&last_closed_year) {
+        to_month.min(last_closed_month)
+    } else {
+        to_month
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main function
 // ---------------------------------------------------------------------------
@@ -116,19 +147,11 @@ pub async fn get(
 
     let years_vec: Vec<i32> = years.to_vec();
 
-    // L7-01: if -- and only if -- the compared years include the year of the last closed
-    // calendar month, the effective to_month drops to min(to_month, that month), applied to
-    // ALL compared years so the comparison stays over the same period for every year. Must
-    // land before period_label is built below, or CMP02's "Periodo" column would keep saying
-    // the untopped range while the queries already use the topped one.
-    let last_closed_yyyymm = crate::routes::analytics::current_month_yyyymm();
-    let last_closed_year = (last_closed_yyyymm / 100) as i32;
-    let last_closed_month = (last_closed_yyyymm % 100) as i32;
-    let to_month = if years_vec.contains(&last_closed_year) {
-        to_month.min(last_closed_month)
-    } else {
-        to_month
-    };
+    // L7-01 / C14-03: must land before period_label is built below, or CMP02's "Periodo"
+    // column would keep saying the untopped range while the queries already use the
+    // topped one. See `effective_to_month`'s own doc for why the caller's cache key must
+    // apply this same clamp too.
+    let to_month = effective_to_month(to_month, &years_vec);
 
     // Month abbreviations in Spanish
     const MONTHS: [&str; 12] = [
@@ -698,4 +721,28 @@ pub async fn get(
         effective_from_month: from_month,
         effective_to_month: to_month,
     })
+}
+
+#[cfg(test)]
+mod effective_to_month_tests {
+    use super::*;
+
+    #[test]
+    fn clamps_when_compared_years_include_the_cutoff_year() {
+        // Cutoff 2026-09 (last closed month), years compared include 2026 -- to_month=12
+        // must drop to 9.
+        assert_eq!(clamp_to_month(12, &[2024, 2025, 2026], 202609), 9);
+    }
+
+    #[test]
+    fn leaves_to_month_untouched_when_cutoff_year_not_compared() {
+        // Comparing only 2023/2024/2025 -- the 2026 cutoff is irrelevant to this range.
+        assert_eq!(clamp_to_month(12, &[2023, 2024, 2025], 202609), 12);
+    }
+
+    #[test]
+    fn never_raises_to_month_past_what_was_asked() {
+        // to_month already below the cutoff month -- min() leaves it as-is.
+        assert_eq!(clamp_to_month(3, &[2026], 202609), 3);
+    }
 }

@@ -1121,6 +1121,9 @@ async fn main() -> std::io::Result<()> {
             redl_pool, redl_cfg, redl_s3,
         ));
     }
+    {
+        tokio::spawn(services::response_cache::cleanup_worker(bg_pool.clone()));
+    }
 
     // ── HTTP server ─────────────────────────────────────────────────────────
     let allowed_origins = cfg.allowed_origins.clone();

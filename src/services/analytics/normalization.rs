@@ -1,7 +1,7 @@
 /// Normalization rules CRUD: counterparty grouping/exclusion and payroll adjustments.
 use crate::db::DbPool;
 use crate::services::analytics::summary::{
-    cp_key_expr, cp_nombre_expr, get_f64, get_f64_opt, rfc_column,
+    cp_key_expr, cp_nombre_expr, get_f64, get_f64_opt, normalize_name_key, rfc_column,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -19,6 +19,9 @@ pub struct NormalizationRule {
     pub dl_type: String,
     pub source_rfc: Option<String>,
     pub source_name: Option<String>,
+    // C14-07/DEC-088: normalized name key that narrows a generic-RFC (XAXX/XEXX) rule to
+    // one real counterparty -- see split_source_rfc. Always None for an ordinary-RFC rule.
+    pub source_name_key: Option<String>,
     pub group_name: Option<String>,
     pub action: String,
     pub label: Option<String>,
@@ -173,8 +176,8 @@ pub async fn list_rules(pool: &DbPool, owner_rfc: &str) -> anyhow::Result<Vec<No
         // L5-01: capex_useful_life_years/capex_annual_dep_mxn are NUMERIC -- sqlx's f64
         // only decodes FLOAT8, so an uncast read here silently failed and .ok() turned it
         // into a null the frontend could never tell apart from "not captured".
-        "SELECT id, owner_rfc, dl_type, source_rfc, source_name, group_name, action, label,
-                rule_name, cfdi_uuid,
+        "SELECT id, owner_rfc, dl_type, source_rfc, source_name, source_name_key, group_name,
+                action, label, rule_name, cfdi_uuid,
                 accounting_line, motivo, impacts_ebitda, capex_estimate_dep,
                 capex_asset_type, capex_useful_life_years::float8 AS capex_useful_life_years,
                 capex_annual_dep_mxn::float8 AS capex_annual_dep_mxn,
@@ -194,6 +197,7 @@ pub async fn list_rules(pool: &DbPool, owner_rfc: &str) -> anyhow::Result<Vec<No
             dl_type: r.try_get("dl_type").unwrap_or_default(),
             source_rfc: r.try_get("source_rfc").ok(),
             source_name: r.try_get("source_name").ok(),
+            source_name_key: r.try_get("source_name_key").ok(),
             group_name: r.try_get("group_name").ok(),
             action: r.try_get("action").unwrap_or_default(),
             label: r.try_get("label").ok(),
@@ -214,6 +218,30 @@ pub async fn list_rules(pool: &DbPool, owner_rfc: &str) -> anyhow::Result<Vec<No
         .collect())
 }
 
+/// Splits a `source_rfc` that may carry a composite `GENERIC_RFC||NORMALIZED_NAME` key
+/// (see `cp_key_expr`) into the bare RFC to store and the name key to narrow it by
+/// (C14-07/DEC-088). An ordinary RFC never contains `"||"`, so it passes through
+/// unchanged with no name key -- narrowing a normal-RFC rule by name would silently
+/// shrink coverage nobody asked to shrink, since the same real counterparty can appear
+/// under more than one name.
+///
+/// Returns `(bare_rfc, had_separator, name_key)`. `had_separator` is what `update_rule`
+/// needs to tell "this source_rfc carried a fresh split" apart from "this source_rfc was
+/// already bare" -- only the former should overwrite an existing `source_name_key`.
+fn split_source_rfc(source_rfc: Option<&str>) -> (Option<String>, bool, Option<String>) {
+    match source_rfc {
+        None => (None, false, None),
+        Some(s) => match s.split_once("||") {
+            Some((rfc, name)) => {
+                let key = normalize_name_key(name);
+                let key = if key.is_empty() { None } else { Some(key) };
+                (Some(rfc.to_string()), true, key)
+            }
+            None => (Some(s.to_string()), false, None),
+        },
+    }
+}
+
 pub async fn create_rule(
     pool: &DbPool,
     owner_rfc: &str,
@@ -221,20 +249,22 @@ pub async fn create_rule(
 ) -> anyhow::Result<NormalizationRule> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = utc_now();
+    let (bare_source_rfc, _, source_name_key) = split_source_rfc(req.source_rfc.as_deref());
 
     sqlx::query(
         r#"INSERT INTO pulso.normalization_rules
-            (id, owner_rfc, dl_type, source_rfc, source_name, group_name, action, label,
-             rule_name, cfdi_uuid, accounting_line, motivo, impacts_ebitda,
+            (id, owner_rfc, dl_type, source_rfc, source_name, source_name_key, group_name,
+             action, label, rule_name, cfdi_uuid, accounting_line, motivo, impacts_ebitda,
              capex_estimate_dep, capex_asset_type, capex_useful_life_years,
              capex_annual_dep_mxn, period_start, period_end, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)"#,
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)"#,
     )
     .bind(&id)
     .bind(owner_rfc)
     .bind(&req.dl_type)
-    .bind(&req.source_rfc)
+    .bind(&bare_source_rfc)
     .bind(&req.source_name)
+    .bind(&source_name_key)
     .bind(&req.group_name)
     .bind(&req.action)
     .bind(&req.label)
@@ -258,8 +288,9 @@ pub async fn create_rule(
         id,
         owner_rfc: owner_rfc.to_string(),
         dl_type: req.dl_type.clone(),
-        source_rfc: req.source_rfc.clone(),
+        source_rfc: bare_source_rfc,
         source_name: req.source_name.clone(),
+        source_name_key,
         group_name: req.group_name.clone(),
         action: req.action.clone(),
         label: req.label.clone(),
@@ -301,21 +332,31 @@ pub async fn update_rule(
     req: &CreateRuleRequest,
 ) -> anyhow::Result<Option<NormalizationRule>> {
     let now = utc_now();
+    let (bare_source_rfc, had_separator, source_name_key) =
+        split_source_rfc(req.source_rfc.as_deref());
 
+    // C14-07 trap 3: source_name_key is only overwritten when this source_rfc carried a
+    // fresh "||" split. An edit that resubmits an already-bare source_rfc (the common case
+    // -- the edit form shows the bare RFC back, it isn't reconstructing the composite key)
+    // must leave whatever source_name_key the rule already has untouched, or it would go
+    // NULL and silently widen a generic-RFC exclusion to every counterparty behind it.
     let row = sqlx::query(
         r#"UPDATE pulso.normalization_rules
-           SET dl_type = $1, source_rfc = $2, source_name = $3, group_name = $4,
-               action = $5, label = $6, rule_name = $7, cfdi_uuid = $8,
-               accounting_line = $9, motivo = $10, impacts_ebitda = $11,
-               capex_estimate_dep = $12, capex_asset_type = $13,
-               capex_useful_life_years = $14, capex_annual_dep_mxn = $15,
-               period_start = $16, period_end = $17, updated_at = $18
-           WHERE id = $19 AND owner_rfc = $20
-           RETURNING created_at"#,
+           SET dl_type = $1, source_rfc = $2, source_name = $3,
+               source_name_key = CASE WHEN $4 THEN $5 ELSE source_name_key END,
+               group_name = $6, action = $7, label = $8, rule_name = $9, cfdi_uuid = $10,
+               accounting_line = $11, motivo = $12, impacts_ebitda = $13,
+               capex_estimate_dep = $14, capex_asset_type = $15,
+               capex_useful_life_years = $16, capex_annual_dep_mxn = $17,
+               period_start = $18, period_end = $19, updated_at = $20
+           WHERE id = $21 AND owner_rfc = $22
+           RETURNING created_at, source_name_key"#,
     )
     .bind(&req.dl_type)
-    .bind(&req.source_rfc)
+    .bind(&bare_source_rfc)
     .bind(&req.source_name)
+    .bind(had_separator)
+    .bind(&source_name_key)
     .bind(&req.group_name)
     .bind(&req.action)
     .bind(&req.label)
@@ -340,13 +381,15 @@ pub async fn update_rule(
         return Ok(None);
     };
     let created_at: String = row.try_get("created_at").unwrap_or_default();
+    let source_name_key: Option<String> = row.try_get("source_name_key").ok();
 
     Ok(Some(NormalizationRule {
         id: id.to_string(),
         owner_rfc: owner_rfc.to_string(),
         dl_type: req.dl_type.clone(),
-        source_rfc: req.source_rfc.clone(),
+        source_rfc: bare_source_rfc,
         source_name: req.source_name.clone(),
+        source_name_key,
         group_name: req.group_name.clone(),
         action: req.action.clone(),
         label: req.label.clone(),
@@ -1915,5 +1958,46 @@ mod payroll_lock_tests {
     fn payroll_motivos_has_exactly_the_seven_dec_033_values() {
         assert_eq!(PAYROLL_MOTIVOS.len(), 7);
         assert!(PAYROLL_MOTIVOS.contains(&"Otro"));
+    }
+}
+
+#[cfg(test)]
+mod source_rfc_split_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_rfc_passes_through_with_no_name_key() {
+        assert_eq!(
+            split_source_rfc(Some("RAZR811011KI1")),
+            (Some("RAZR811011KI1".to_string()), false, None)
+        );
+    }
+
+    #[test]
+    fn composite_key_splits_and_normalizes_the_name() {
+        assert_eq!(
+            split_source_rfc(Some("XAXX010101000||  Acme   Corp.  ")),
+            (
+                Some("XAXX010101000".to_string()),
+                true,
+                Some("ACME CORP".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn composite_key_with_blank_name_yields_no_key_but_still_had_separator() {
+        // A generic RFC whose name normalizes to empty is a fresh split with nothing to
+        // narrow by -- distinct from "no separator at all" (which must preserve whatever
+        // source_name_key the rule already has, see update_rule's trap 3).
+        assert_eq!(
+            split_source_rfc(Some("XAXX010101000||")),
+            (Some("XAXX010101000".to_string()), true, None)
+        );
+    }
+
+    #[test]
+    fn none_source_rfc_is_a_no_op() {
+        assert_eq!(split_source_rfc(None), (None, false, None));
     }
 }

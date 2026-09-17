@@ -237,12 +237,6 @@ pub async fn complete(
     let final_status: String = row.try_get("status")?;
     if final_status == "completed" {
         heal_stale_credential_flag(pool, rfc, job_id).await?;
-        // New invoices actually landed for this RFC -- every cached analytics response
-        // for it is now stale. found == 0 (e.g. a resumed job with nothing left to
-        // fetch) changes nothing, so skip the bump.
-        if found > 0 {
-            crate::services::response_cache::bump_version(pool, rfc).await?;
-        }
     }
     Ok(())
 }

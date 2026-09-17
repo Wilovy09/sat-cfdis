@@ -115,19 +115,23 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
     // with to look the UUID up. Rows where neither side is tracked anymore
     // (RFC removed after ingestion) can't be checked; mark them seen so they
     // stop resurfacing every cycle.
-    let mut groups: HashMap<(String, &'static str), Vec<String>> = HashMap::new();
+    //
+    // C14-05: each uuid carries its OTHER side's RFC through the grouping (not just the
+    // owner's) -- a CFDI between two tracked RFCs still only groups under one, but
+    // recheck_chunk needs the other side to invalidate it too when both are tracked.
+    let mut groups: HashMap<(String, &'static str), Vec<(String, String)>> = HashMap::new();
     let mut orphaned: Vec<String> = Vec::new();
     for (uuid, rfc_emisor, rfc_receptor) in candidates {
         if creds.contains_key(&rfc_emisor) {
             groups
                 .entry((rfc_emisor, "emitidos"))
                 .or_default()
-                .push(uuid);
+                .push((uuid, rfc_receptor));
         } else if creds.contains_key(&rfc_receptor) {
             groups
                 .entry((rfc_receptor, "recibidos"))
                 .or_default()
-                .push(uuid);
+                .push((uuid, rfc_emisor));
         } else {
             orphaned.push(uuid);
         }
@@ -175,8 +179,16 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
         };
 
         for chunk in uuids.chunks(CHUNK_SIZE) {
-            if let Err(e) =
-                recheck_chunk(pool, cfg, &owner_rfc, download_type, &auth_payload, chunk).await
+            if let Err(e) = recheck_chunk(
+                pool,
+                cfg,
+                &owner_rfc,
+                download_type,
+                &auth_payload,
+                chunk,
+                &creds,
+            )
+            .await
             {
                 tracing::error!(rfc = %owner_rfc, "Recheck-cancelled: chunk failed: {e}");
             }
@@ -192,8 +204,10 @@ async fn recheck_chunk(
     owner_rfc: &str,
     download_type: &str,
     auth_payload: &serde_json::Value,
-    uuids: &[String],
+    items: &[(String, String)],
+    creds: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
+    let uuids: Vec<&str> = items.iter().map(|(uuid, _)| uuid.as_str()).collect();
     let payload = serde_json::json!({
         "command": "list",
         "auth": auth_payload,
@@ -242,10 +256,17 @@ async fn recheck_chunk(
     }
 
     let mut reverted = 0usize;
-    for uuid in uuids {
+    // C14-05: RFCs on the OTHER side of a matched uuid, when that side is also tracked --
+    // their cached figures change here too, same as owner_rfc's.
+    let mut other_side_touched: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for (uuid, other_rfc) in items {
         match found.get(uuid.as_str()) {
             Some(new_estado) => {
                 db::cfdis::update_estado_sat(pool, uuid, new_estado).await?;
+                if creds.contains_key(other_rfc) {
+                    other_side_touched.insert(other_rfc.clone());
+                }
                 if !new_estado.contains("cancel") {
                     reverted += 1;
                     tracing::info!(
@@ -281,6 +302,9 @@ async fn recheck_chunk(
     // cached analytics responses can no longer be trusted as-is.
     if !found.is_empty() {
         crate::services::response_cache::bump_version(pool, owner_rfc).await?;
+    }
+    for rfc in other_side_touched {
+        crate::services::response_cache::bump_version(pool, &rfc).await?;
     }
     Ok(())
 }

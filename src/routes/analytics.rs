@@ -328,11 +328,16 @@ pub async fn get_recurrence(
         .clamp(6, 60);
     let from = query.get("from").map(|s| s.as_str());
     let to = query.get("to").map(|s| s.as_str());
+    // C14-03/AUD-146: `to` omitted means the service falls back to the current cutoff
+    // internally -- the key must carry that resolved value, not an empty placeholder, or
+    // it freezes at whatever cutoff was in effect the first time this combination was
+    // requested with no `to` at all.
+    let to_key = to.map_or_else(|| current_month_yyyymm().to_string(), str::to_string);
     let key = cache_key(&[
         ("dl_type", dl_type),
         ("window_months", &window_months.to_string()),
         ("from", from.unwrap_or("")),
-        ("to", to.unwrap_or("")),
+        ("to", &to_key),
     ]);
     let value = response_cache::get_or_compute(&pool, &rfc, "recurrence", &key, || async {
         recurrence::get(&pool, &rfc, dl_type, window_months, from, to).await
@@ -370,7 +375,10 @@ pub async fn get_retention(
         .map(|s| s.as_str())
         .unwrap_or("emitidos");
     let to = query.get("to").map(|s| s.as_str());
-    let key = cache_key(&[("dl_type", dl_type), ("to", to.unwrap_or(""))]);
+    // C14-03/AUD-146: same fix as recurrence -- an omitted `to` must key on the resolved
+    // cutoff, not an empty placeholder that never changes as the real cutoff moves.
+    let to_key = to.map_or_else(|| current_month_yyyymm().to_string(), str::to_string);
+    let key = cache_key(&[("dl_type", dl_type), ("to", &to_key)]);
     let value = response_cache::get_or_compute(&pool, &rfc, "retention", &key, || async {
         retention::get(&pool, &rfc, dl_type, to).await
     })
@@ -439,7 +447,13 @@ pub async fn get_hallazgos_egresos(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let key = cache_key(&[("to", query.to.as_deref().unwrap_or(""))]);
+    // C14-03/AUD-146: same fix as recurrence/retention -- an omitted `to` must key on the
+    // resolved cutoff, not an empty placeholder.
+    let to_key = query
+        .to
+        .as_deref()
+        .map_or_else(|| current_month_yyyymm().to_string(), str::to_string);
+    let key = cache_key(&[("to", &to_key)]);
     let value = response_cache::get_or_compute(&pool, &rfc, "hallazgos-egresos", &key, || async {
         hallazgos_egresos::get(&pool, &rfc, query.to.as_deref()).await
     })
@@ -647,7 +661,13 @@ pub async fn get_payroll_snapshot(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let value = response_cache::get_or_compute(&pool, &rfc, "payroll-snapshot", "", || async {
+    // C14-03/AUD-145: get_snapshot reads CURRENT_DATE five times internally -- an empty
+    // key never invalidated across a month boundary. Month granularity (not daily) is
+    // enough: everything it computes is anchored to month-end by design (DEC's tenure/
+    // pasivo laboral reproducibility within the month); the one daily-sensitive bit (a
+    // future-dated alta sanity check) only ever changes on anomalous data.
+    let key = cache_key(&[("month", &today_yyyymm().to_string())]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "payroll-snapshot", &key, || async {
         payroll::get_snapshot(&pool, &rfc).await
     })
     .await
@@ -675,7 +695,10 @@ pub async fn get_hallazgos(
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     check_rfc_access(&pool, &req, &rfc).await?;
-    let value = response_cache::get_or_compute(&pool, &rfc, "hallazgos", "", || async {
+    // C14-03/AUD-145: same fix as payroll-snapshot -- 3 uses of today's date and 3 of the
+    // last closed month, an empty key never invalidated across a month boundary.
+    let key = cache_key(&[("month", &today_yyyymm().to_string())]);
+    let value = response_cache::get_or_compute(&pool, &rfc, "hallazgos", &key, || async {
         hallazgos::get(&pool, &rfc).await
     })
     .await
@@ -1395,6 +1418,21 @@ fn default_from() -> String {
     format!("{fy:04}-{fm:02}")
 }
 
+/// C14-03/AUD-145: today's REAL calendar month (unlike `current_month_yyyymm()`, which is
+/// deliberately one month behind) -- only for keying a cache entry whose query reads
+/// `CURRENT_DATE` internally, so it invalidates at the same month boundary the query
+/// itself is sensitive to. Never read by the query -- that still calls `CURRENT_DATE`
+/// itself, in SQL.
+fn today_yyyymm() -> i64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    let (y, m, _) = days_to_ymd(days);
+    (y * 100 + m) as i64
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/v1/analytics/{rfc}/quarterly
 // ---------------------------------------------------------------------------
@@ -1454,6 +1492,10 @@ pub async fn get_period_comparison(
         .collect();
     let limit = query.limit.unwrap_or(10).clamp(1, 50);
 
+    // C14-03/AUD-147: keyed on the EFFECTIVE (clamped) to_month, computed the same way
+    // `period_comparison::get` clamps it internally -- not the raw query param, or the
+    // key stays frozen at a cutoff the calendar has already moved past.
+    let effective_to_month = period_comparison::effective_to_month(to_month, &years);
     let years_key = years
         .iter()
         .map(i32::to_string)
@@ -1462,7 +1504,7 @@ pub async fn get_period_comparison(
     let key = cache_key(&[
         ("dl_type", &dl_type),
         ("from_month", &from_month.to_string()),
-        ("to_month", &to_month.to_string()),
+        ("to_month", &effective_to_month.to_string()),
         ("years", &years_key),
         ("limit", &limit.to_string()),
     ]);

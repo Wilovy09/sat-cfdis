@@ -54,6 +54,13 @@ pub async fn worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
 }
 
 async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyhow::Result<()> {
+    // C14-04/C14-05: one bump per RFC actually touched by a recovery, at the close of this
+    // cycle -- not per chunk, and not just the group's owner_rfc. A recovered CFDI can sit
+    // between two tracked RFCs; the `else if` below only ever groups it under one of them
+    // (same shape as recheck_cancelled.rs's), so the other side needs checking separately
+    // per item, against `creds` (this cycle's tracked/credentialed RFCs).
+    let mut touched_rfcs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     let candidates = db::cfdis::find_needing_redownload(pool, MAX_ATTEMPTS, BATCH_LIMIT).await?;
     if candidates.is_empty() {
         return Ok(());
@@ -138,11 +145,19 @@ async fn run_cycle(pool: &DbPool, cfg: &Arc<Config>, s3: &Arc<S3Client>) -> anyh
                 download_type,
                 &auth_payload,
                 chunk,
+                &creds,
+                &mut touched_rfcs,
             )
             .await
             {
                 tracing::error!(rfc = %owner_rfc, "Xml-redownload: chunk failed: {e}");
             }
+        }
+    }
+
+    for rfc in touched_rfcs {
+        if let Err(e) = crate::services::response_cache::bump_version(pool, &rfc).await {
+            tracing::warn!(rfc = %rfc, "Xml-redownload: failed to bump cache version: {e}");
         }
     }
 
@@ -159,6 +174,8 @@ async fn redownload_chunk(
     download_type: &str,
     auth_payload: &serde_json::Value,
     items: &[(String, String)],
+    creds: &HashMap<String, String>,
+    touched_rfcs: &mut std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     let work_dir = tempfile::TempDir::new()?;
     let output_dir = work_dir.path().join("xml");
@@ -219,6 +236,18 @@ async fn redownload_chunk(
 
         if etl::apply_xml_bytes(pool, uuid, metadata, &bytes).await {
             recovered += 1;
+            touched_rfcs.insert(owner_rfc.to_string());
+            // C14-05: the recovered CFDI's other side, if it's also a tracked RFC, sees
+            // this same real subtotal/currency/nomina change -- the grouping above only
+            // ever attributes the item to one owner_rfc.
+            let other_side = if download_type == "emitidos" {
+                &rfc_r
+            } else {
+                &rfc_e
+            };
+            if creds.contains_key(other_side) {
+                touched_rfcs.insert(other_side.clone());
+            }
         } else {
             let _ = db::cfdis::record_redownload_miss(pool, uuid).await;
             missed += 1;

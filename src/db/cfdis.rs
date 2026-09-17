@@ -636,6 +636,10 @@ pub async fn concepts_exist(pool: &PgPool, uuid: &str) -> bool {
 /// Clears all parsed data (taxes, concepts, payments, nomina, relacionados) and sets
 /// xml_available=0 so the enrichment worker picks them up again.
 /// Returns the number of CFDIs queued for reprocessing.
+/// Returns the `(rfc_emisor, rfc_receptor)` pair of every row reset -- C14-05: `rfc` is the
+/// scope this admin action was aimed at, but a reset invoice's OTHER side can
+/// independently be a different, also-tracked Pulso RFC whose own cached figures just
+/// changed too.
 pub async fn reset_for_reprocessing(
     pool: &PgPool,
     rfc: &str,
@@ -644,7 +648,8 @@ pub async fn reset_for_reprocessing(
     from_month: Option<i32>,
     to_year: Option<i32>,
     to_month: Option<i32>,
-) -> Result<u64, sqlx::Error> {
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    use sqlx::Row;
     let emit = dl_type != "recibidos";
     let recv = dl_type != "emitidos";
 
@@ -664,7 +669,7 @@ pub async fn reset_for_reprocessing(
         (true, true) => "(c.rfc_emisor = $1 OR c.rfc_receptor = $1)".to_string(),
         (true, false) => "c.rfc_emisor = $1".to_string(),
         (false, true) => "c.rfc_receptor = $1".to_string(),
-        _ => return Ok(0),
+        _ => return Ok(Vec::new()),
     };
 
     let sql = format!(
@@ -686,17 +691,34 @@ pub async fn reset_for_reprocessing(
         del_nom     AS (DELETE FROM pulso.cfdi_nomina               WHERE uuid         IN (SELECT uuid FROM targets))
         UPDATE pulso.cfdis SET xml_available = 0
         WHERE uuid IN (SELECT uuid FROM targets)
+        RETURNING rfc_emisor, rfc_receptor
         "#,
     );
 
-    let result = sqlx::query(&sql).bind(rfc).execute(pool).await?;
-    Ok(result.rows_affected())
+    let result = sqlx::query(&sql).bind(rfc).fetch_all(pool).await?;
+    Ok(result
+        .iter()
+        .map(|r| {
+            (
+                r.try_get("rfc_emisor").unwrap_or_default(),
+                r.try_get("rfc_receptor").unwrap_or_default(),
+            )
+        })
+        .collect())
 }
 
 /// Mark all xml_available=0 CFDIs in a job as permanently unavailable (xml_available=-1).
 /// Also backfills subtotal from total when subtotal is NULL so that the STORED GENERATED
 /// column total_neto_mxn has a meaningful value instead of 0 for analytics.
-pub async fn mark_xml_unavailable_for_job(pool: &PgPool, job_id: &str) -> Result<u64, sqlx::Error> {
+/// Returns the `(rfc_emisor, rfc_receptor)` pair of every row marked -- C14-05: the caller
+/// needs both sides, not just the count, to invalidate a counterparty that's also a
+/// tracked Pulso RFC (this UPDATE is scoped by job_id, i.e. one owner's own sync job, but
+/// the invoice's other side can independently be a different owner's own tracked RFC).
+pub async fn mark_xml_unavailable_for_job(
+    pool: &PgPool,
+    job_id: &str,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    use sqlx::Row;
     // subtotal has no real value to fall back on here — SAT's metadata listing
     // (see Metadata.php) never exposes SubTotal, only the IVA-inclusive Total.
     // Approximate with the standard 16% rate rather than using Total outright:
@@ -722,12 +744,21 @@ pub async fn mark_xml_unavailable_for_job(pool: &PgPool, job_id: &str) -> Result
                    ELSE c.descuento
                END
            FROM pulso.job_invoices ji
-           WHERE c.uuid = ji.uuid AND ji.job_id = $1 AND c.xml_available = 0"#,
+           WHERE c.uuid = ji.uuid AND ji.job_id = $1 AND c.xml_available = 0
+           RETURNING c.rfc_emisor, c.rfc_receptor"#,
     )
     .bind(job_id)
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(result.rows_affected())
+    Ok(result
+        .iter()
+        .map(|r| {
+            (
+                r.try_get("rfc_emisor").unwrap_or_default(),
+                r.try_get("rfc_receptor").unwrap_or_default(),
+            )
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------

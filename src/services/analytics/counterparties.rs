@@ -756,6 +756,10 @@ pub async fn get_payments_detail(
     let cp_key_bare = cp_key_expr(cp_col, cp_name_col);
     let cp_nombre_bare = cp_nombre_expr(cp_col, cp_name_col);
     let cp_key_inv = cp_key_expr(&format!("inv.{cp_col}"), &format!("inv.{cp_name_col}"));
+    // C14-07 trap 1: source_rfc alone matches every real counterparty behind a generic
+    // RFC, not just the one the rule actually names -- same source_name_key predicate
+    // pulso.cfdi_exclusion and list_counterparties_for_normalization already use.
+    let cp_name_normalized = normalized_name_expr(cp_name_col);
 
     // L2-01/L2-03: universe and per-invoice state both come from the shared base
     // (pulso.cfdi_cobro_estado) instead of re-deriving pagado/saldo here. Full universe
@@ -836,6 +840,7 @@ pub async fn get_payments_detail(
                          AND nr.action = 'exclude'
                          AND nr.cfdi_uuid IS NULL
                          AND nr.source_rfc = {cp_col}
+                         AND (nr.source_name_key IS NULL OR nr.source_name_key = {cp_name_normalized})
                          AND nr.{dl_filter}
                    )) AS normalizada
             FROM all_inv

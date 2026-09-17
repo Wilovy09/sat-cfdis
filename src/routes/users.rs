@@ -1803,8 +1803,43 @@ pub async fn admin_reprocess(
     )
     .await
     {
-        Ok(count) => {
+        Ok(pairs) => {
+            let count = pairs.len();
             tracing::info!(rfc = %rfc, count, "Admin reprocess queued");
+            if count > 0 {
+                // C14-04/DEC-084: this DELETEs concepts/taxes/nomina and flips
+                // xml_available to pending right here -- the figures already changed at
+                // this moment, not when the ETL eventually repopulates them (that second
+                // bump is C14-02's).
+                if let Err(e) = crate::services::response_cache::bump_version(&pool, &rfc).await {
+                    tracing::warn!(rfc = %rfc, "admin_reprocess: failed to bump cache version: {e}");
+                }
+                // C14-05: the other side of each reset invoice, when it's also a tracked
+                // Pulso RFC -- this action is scoped to `rfc`, but the counterparty is an
+                // independent RFC's own egresos/ingresos.
+                let creds: std::collections::HashMap<String, String> =
+                    crate::db::users::get_all_with_credentials(&pool)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
+                let mut other_sides: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for (rfc_emisor, rfc_receptor) in &pairs {
+                    for side in [rfc_emisor, rfc_receptor] {
+                        if side != &rfc && creds.contains_key(side) {
+                            other_sides.insert(side.clone());
+                        }
+                    }
+                }
+                for side in other_sides {
+                    if let Err(e) =
+                        crate::services::response_cache::bump_version(&pool, &side).await
+                    {
+                        tracing::warn!(rfc = %side, "admin_reprocess: failed to bump cache version: {e}");
+                    }
+                }
+            }
             HttpResponse::Ok().json(serde_json::json!({
                 "ok": true,
                 "count": count,

@@ -474,10 +474,45 @@ pub const RFC_INFONAVIT: &str = "INF7205011ZA";
 /// Row-level (non-aggregate) name normalization: upper, trim, collapse internal
 /// whitespace, strip punctuation other than `&` and `-`. Mirrors the normalization
 /// used by the Python reference implementation (xml-dashboard-mvp).
+///
+/// [`normalize_name_key`] is the Rust-side mirror of this same transform, byte-for-byte
+/// -- keep the two in sync; a divergence would make a `normalization_rules.source_name_key`
+/// written by Rust fail to match `pulso.cfdi_exclusion`'s SQL comparison against it.
 pub fn normalized_name_expr(name_col: &str) -> String {
     format!(
         r#"REGEXP_REPLACE(REGEXP_REPLACE(TRIM(UPPER(COALESCE({name_col}, ''))), '\s+', ' ', 'g'), '[^A-Z0-9 &\-]', '', 'g')"#
     )
+}
+
+/// Rust-side mirror of [`normalized_name_expr`] -- same transform, same order (collapse
+/// whitespace first, then strip disallowed characters), so a value normalized here and
+/// compared against `normalized_name_expr`'s SQL output always matches byte-for-byte.
+/// Used by `normalization.rs` to derive `source_name_key` from a client-supplied name at
+/// write time (C14-07/DEC-088), instead of trusting whatever normalization the client
+/// happened to apply.
+#[must_use]
+pub fn normalize_name_key(name: &str) -> String {
+    let upper = name.to_uppercase();
+    let trimmed = upper.trim();
+
+    let mut collapsed = String::with_capacity(trimmed.len());
+    let mut last_was_space = false;
+    for c in trimmed.chars() {
+        if c.is_whitespace() {
+            if !last_was_space {
+                collapsed.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            collapsed.push(c);
+            last_was_space = false;
+        }
+    }
+
+    collapsed
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '&' || *c == '-')
+        .collect()
 }
 
 /// Row-level counterparty grouping key: the bare RFC for ordinary counterparties
@@ -620,5 +655,20 @@ mod generic_rfc_tests {
             Some(("XAXX010101000", "ACME CORP"))
         );
         assert_eq!("REAL0101010AB1".split_once("||"), None);
+    }
+
+    #[test]
+    fn normalize_name_key_matches_sql_transform_shape() {
+        assert_eq!(normalize_name_key("  acme   corp.  "), "ACME CORP");
+        assert_eq!(
+            normalize_name_key("Acme & Sons - S.A. de C.V."),
+            "ACME & SONS - SA DE CV"
+        );
+        assert_eq!(normalize_name_key(""), "");
+        assert_eq!(normalize_name_key("   "), "");
+        // Non-ASCII letters are stripped (same as the SQL regex, an ASCII-only character
+        // class) but the spaces between them survive -- matches normalized_name_expr's
+        // literal behavior, not something this function newly introduces.
+        assert_eq!(normalize_name_key("Á É Ñ"), "  ");
     }
 }
