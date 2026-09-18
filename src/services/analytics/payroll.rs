@@ -1035,11 +1035,11 @@ pub async fn get(
                MAX(n.departamento) AS dpto,
                MAX(n.puesto) AS puesto,
                n.year_devengo AS year,
-               SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * n.factor)
-                 FILTER (WHERE p.tipo_percepcion = '001')                    AS sueldo_base,
-               SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * n.factor)
+               COALESCE(SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * n.factor)
+                 FILTER (WHERE p.tipo_percepcion = '001'), 0)                 AS sueldo_base,
+               COALESCE(SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * n.factor)
                  FILTER (WHERE p.tipo_percepcion NOT IN
-                         ({percepciones_eventuales_sql}))                    AS compensacion_ordinaria,
+                         ({percepciones_eventuales_sql})), 0)                 AS compensacion_ordinaria,
                COUNT(DISTINCT n.month_devengo) AS months_active,
                AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi
         FROM pulso.cfdi_nomina_percepciones p
