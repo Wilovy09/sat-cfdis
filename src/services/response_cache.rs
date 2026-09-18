@@ -159,11 +159,16 @@ where
 /// as its own background worker (spawned in `main.rs` alongside the others), outside any
 /// request path.
 pub async fn cleanup_worker(pool: DbPool) {
+    // V14-05: a first pass right at startup, not after CLEANUP_INTERVAL_SECS -- a deploy is
+    // exactly when the table is most likely to be carrying a previous process's dead rows
+    // (superseded by `process_start()`), and there's no reason to make it wait 6h to clear
+    // them. Never serves a stale row either way (`computed_at > process_start()` already
+    // guards every read), this just keeps the table's actual size honest sooner.
     loop {
-        tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
         if let Err(e) = run_cleanup(&pool).await {
             tracing::error!("response_cache: cleanup cycle error: {e}");
         }
+        tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
     }
 }
 

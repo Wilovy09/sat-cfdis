@@ -1,5 +1,6 @@
 //! CRUD operations for `sync_jobs` and `job_invoices`.
 
+use crate::services::response_cache::bump_version;
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 
@@ -122,6 +123,13 @@ pub fn utc_offset(offset_secs: u64) -> String {
 // ---------------------------------------------------------------------------
 
 /// Insert a new job record. Returns the job id.
+///
+/// V14-02: bumps `rfc`'s cache version here, at the one place every job row is born.
+/// The "calidad de datos" coverage panel (rango analizado, meses esperados/vacíos) reads
+/// straight off `sync_jobs`, not off `cfdis` -- a new job changes what it returns even
+/// before the ETL touches a single invoice, most visibly when a historical download turns
+/// up zero invoices: nothing lands for `process_job`/`enrich_job` to invalidate, so this is
+/// the only bump that scenario ever gets.
 pub async fn insert(
     pool: &PgPool,
     rfc: &str,
@@ -150,6 +158,9 @@ pub async fn insert(
     .bind(&now)
     .execute(pool)
     .await?;
+    if let Err(e) = bump_version(pool, rfc).await {
+        tracing::warn!(rfc = %rfc, "jobs::insert: failed to bump cache version: {e}");
+    }
     Ok(id)
 }
 
@@ -607,6 +618,8 @@ pub async fn set_running(pool: &PgPool, job_id: &str) -> Result<(), sqlx::Error>
 
 /// Insert a new job with status 'queued' (will be picked up by the background worker).
 /// `job_type`: `"list"` for manual jobs, `"auto_daily"` for automatic daily sync.
+///
+/// V14-02: see `insert`'s doc -- same reason to bump here.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_queued(
     pool: &PgPool,
@@ -638,6 +651,9 @@ pub async fn insert_queued(
     .bind(&now)
     .execute(pool)
     .await?;
+    if let Err(e) = bump_version(pool, rfc).await {
+        tracing::warn!(rfc = %rfc, "jobs::insert_queued: failed to bump cache version: {e}");
+    }
     Ok(id)
 }
 
@@ -796,6 +812,7 @@ pub async fn find_failed_retryable(
 /// `gap_retry_count + 1` so the cap in `find_failed_retryable` eventually
 /// stops it. Returns the new job's id.
 #[allow(clippy::too_many_arguments)]
+/// V14-02: see `insert`'s doc -- same reason to bump here.
 pub async fn insert_gap_continuation(
     pool: &PgPool,
     rfc: &str,
@@ -826,6 +843,9 @@ pub async fn insert_gap_continuation(
     .bind(&now)
     .execute(pool)
     .await?;
+    if let Err(e) = bump_version(pool, rfc).await {
+        tracing::warn!(rfc = %rfc, "jobs::insert_gap_continuation: failed to bump cache version: {e}");
+    }
     Ok(id)
 }
 

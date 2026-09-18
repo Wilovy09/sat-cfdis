@@ -37,7 +37,10 @@ pub mod services {
     }
     // `db::cfdis` (pulled in by `pub mod db` above) depends on this for XML parsing.
     pub mod xml_parser;
-    // `db::jobs::complete` (pulled in by `pub mod db` above) bumps the response cache's
-    // data version on it. Only depends on `crate::db::DbPool`, no binary-only dependency.
+    // `db::jobs` (pulled in by `pub mod db` above) depends on this: V14-02, its `insert`/
+    // `insert_queued`/`insert_gap_continuation` bump the response cache's data version when
+    // a job is created. `jobs::complete` no longer does (C14-02/DEC-084 -- invalidation
+    // belongs where data actually lands, not at job-complete before the ETL runs). Only
+    // depends on `crate::db::DbPool`, no binary-only dependency.
     pub mod response_cache;
 }

@@ -45,11 +45,17 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
             .collect();
 
         // Normal ETL: insert new invoices not yet in cfdis
+        //
+        // V14-03: a bare `continue` on either query below would skip the round-closing bump
+        // loop at the bottom, along with it every RFC already touched earlier in this same
+        // round (a job's invoices land, then the enrichment-jobs query happens to fail --
+        // those insertions never get a bump, and the next round finds nothing pending, so
+        // the cache never self-heals). An empty Vec falls through to that bump loop instead.
         let job_ids = match db::cfdis::jobs_needing_etl(&pool).await {
             Ok(ids) => ids,
             Err(e) => {
                 tracing::error!("ETL: DB error finding jobs: {e}");
-                continue;
+                Vec::new()
             }
         };
         for job_id in job_ids {
@@ -71,7 +77,7 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
             Ok(ids) => ids,
             Err(e) => {
                 tracing::error!("ETL: DB error finding enrichment jobs: {e}");
-                continue;
+                Vec::new()
             }
         };
         for job_id in enrich_ids {
@@ -83,12 +89,12 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
                 continue;
             }
 
-            let (enriched, sat_failed, owner_rfc) =
-                match enrich_job(&pool, &cfg, &s3, &job_id).await {
+            let (enriched, sat_failed, owner_rfc, other_side_touched) =
+                match enrich_job(&pool, &cfg, &s3, &job_id, &creds).await {
                     Ok(result) => result,
                     Err(e) => {
                         tracing::error!(job_id = %job_id, "ETL: error enriching job: {e}");
-                        (0, 0, None)
+                        (0, 0, None, std::collections::HashSet::new())
                     }
                 };
 
@@ -100,6 +106,10 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
                 if let Some(rfc) = owner_rfc {
                     touched_rfcs.insert(rfc);
                 }
+                // V14-01: this is enrich_job's own gemela of the SAT-give-up branch below --
+                // enrichment rewrites subtotal/currency/nomina for real, the same figure
+                // change that branch already invalidates on both sides.
+                touched_rfcs.extend(other_side_touched);
             } else {
                 // No enrichment this round — apply backoff
                 let rounds = enrich_fail_rounds.entry(job_id.clone()).or_insert(0);
@@ -312,31 +322,48 @@ async fn process_invoice(
 
 /// Re-processes invoices that were parsed from metadata only.
 /// First tries storage, then downloads from SAT.
-/// Returns (enriched, sat_failed, owner_rfc). `owner_rfc` is `None` on the rare race where
-/// the job itself no longer exists -- C14-02's round-end bump has nothing to attribute an
-/// enrichment to in that case and skips it.
+/// Returns (enriched, sat_failed, owner_rfc, other_side_touched). `owner_rfc` is `None` on
+/// the rare race where the job itself no longer exists -- C14-02's round-end bump has
+/// nothing to attribute an enrichment to in that case and skips it. `other_side_touched`
+/// (V14-01) is the gemela of the SAT-give-up branch's own pairs check in `etl_worker`: an
+/// enriched invoice rewrites subtotal/currency/nomina for real, and its counterparty is an
+/// independent RFC's own egresos/ingresos whenever that counterparty is also tracked.
 async fn enrich_job(
     pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
     job_id: &str,
-) -> anyhow::Result<(usize, usize, Option<String>)> {
+    creds: &HashMap<String, String>,
+) -> anyhow::Result<(
+    usize,
+    usize,
+    Option<String>,
+    std::collections::HashSet<String>,
+)> {
     let pending = db::cfdis::find_needs_enrichment(pool, job_id, ENRICH_BATCH).await?;
     if pending.is_empty() {
-        return Ok((0, 0, None));
+        return Ok((0, 0, None, std::collections::HashSet::new()));
     }
 
     // Load job for auth credentials (needed for SAT download fallback)
     let job = db::jobs::get_by_id(pool, job_id).await?;
+    let owner_rfc = job.as_ref().map(|j| j.rfc.clone());
 
     tracing::info!(job_id = %job_id, count = pending.len(), "ETL: enriching invoices");
 
     let mut enriched = 0usize;
     let mut sat_failed = 0usize;
+    let mut other_side_touched = std::collections::HashSet::new();
     for (uuid, metadata) in &pending {
         let (ok, tried_sat) = enrich_invoice(pool, cfg, s3, job.as_ref(), uuid, metadata).await;
         if ok {
             enriched += 1;
+            let (rfc_e, rfc_r, ..) = extract_path_from_meta(metadata);
+            for side in [&rfc_e, &rfc_r] {
+                if owner_rfc.as_deref() != Some(side.as_str()) && creds.contains_key(side) {
+                    other_side_touched.insert(side.clone());
+                }
+            }
         } else if tried_sat {
             sat_failed += 1;
         }
@@ -346,7 +373,7 @@ async fn enrich_job(
         tracing::info!(job_id = %job_id, enriched, "ETL: enrichment batch done");
     }
 
-    Ok((enriched, sat_failed, job.map(|j| j.rfc)))
+    Ok((enriched, sat_failed, owner_rfc, other_side_touched))
 }
 
 /// Returns (enriched, tried_sat). Tries storage first, then SAT download.

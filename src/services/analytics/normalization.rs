@@ -1301,10 +1301,13 @@ pub async fn list_counterparties_for_normalization(
         entry.invoice_count += year_count;
     }
 
-    // Look up RFC-level exclusion rules for each counterparty, keyed the same way the
-    // map above is: bare RFC for an ordinary rule, RFC||NAME_KEY for a generic-RFC rule
-    // narrowed by L3-02 (a generic-RFC rule with no name key still matches the bare key,
-    // i.e. every counterparty behind that RFC -- same as before L3-02 existed).
+    // Look up RFC-level exclusion rules for each counterparty. `map`'s own keys are always
+    // the composite RFC||NAME_KEY cp_key_expr produces (L3-02, one row per real company
+    // behind a generic SAT RFC) -- but a rule with no source_name_key (DEC-088: the normal
+    // case for an ordinary, non-generic RFC) produces a bare `cp_key` here with no "||"
+    // suffix, which then matches nothing in `map`, not everything. V14-08: this screen's
+    // own display code still assumes the old "bare RFC matches every row behind it"
+    // semantics for that case -- tracked as debt, not fixed here.
     let dl_rule_filter = match dl_type {
         "recibidos" => "nr.dl_type IN ('recibidos','ambos')",
         _ => "nr.dl_type IN ('emitidos','ambos')",
@@ -1968,8 +1971,8 @@ mod source_rfc_split_tests {
     #[test]
     fn ordinary_rfc_passes_through_with_no_name_key() {
         assert_eq!(
-            split_source_rfc(Some("RAZR811011KI1")),
-            (Some("RAZR811011KI1".to_string()), false, None)
+            split_source_rfc(Some("AAAA010101AAA")),
+            (Some("AAAA010101AAA".to_string()), false, None)
         );
     }
 
