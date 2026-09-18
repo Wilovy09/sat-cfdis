@@ -14,6 +14,39 @@ use super::summary::{get_f64, parse_ym};
 /// Claves validadas contra pulso-adquiere/src/utils/nomina.ts::SAT_PERCEPCIONES.
 pub const PERCEPCIONES_EVENTUALES: &[&str] = &["002", "003", "021", "022", "023", "025"];
 
+/// L15-08/AUD-160/DEC-097: valores que el patrón escribe en el XML cuando el campo no
+/// aplica -- "Ninguno" no es una categoría de Pulso, es texto libre que significa lo
+/// mismo que el campo vacío. Coincidencia EXACTA contra esta lista cerrada, nunca
+/// LIKE/substring (un departamento genuinamente llamado, p.ej., "Ninguno" desaparecería
+/// bajo una regla de substring).
+pub const MISSING_DEPT_PUESTO_VALUES: &[&str] = &[
+    "NINGUNO",
+    "NINGUNA",
+    "N/A",
+    "NA",
+    "NO APLICA",
+    "NONE",
+    "-",
+    ".",
+];
+
+/// SQL expression: `col` normalized to `label` when blank OR when it matches (after
+/// folding accents/case/edge whitespace) one of `MISSING_DEPT_PUESTO_VALUES` -- the ONE
+/// function that normalizes departamento/puesto, used by every query that groups or
+/// displays either field. `col` must already be schema-qualified (e.g. `n.departamento`);
+/// `label` is a literal SQL string (`'Sin departamento'`/`'Sin puesto'`), not a bind param.
+fn missing_dept_puesto_expr(col: &str, label: &str) -> String {
+    let list = MISSING_DEPT_PUESTO_VALUES
+        .iter()
+        .map(|v| format!("'{v}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "COALESCE(NULLIF(CASE WHEN UPPER(TRANSLATE(TRIM({col}), 'ÁÉÍÓÚáéíóú', 'AEIOUaeiou')) \
+         IN ({list}) THEN '' ELSE TRIM({col}) END, ''), '{label}')"
+    )
+}
+
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -228,7 +261,11 @@ pub async fn monthly_series(
         SELECT
                n.year_devengo  AS year,
                n.month_devengo AS month,
-               SUM(n.total_percepciones) AS pagado,
+               -- L15-02/AUD-154/DEC-089: "Total pagado" = Percepciones + Otros pagos, el
+               -- costo bruto real para el patrón antes de las deducciones que se retienen
+               -- al trabajador. Antes era una segunda copia de "perc" -- otros_pagos nunca
+               -- entraba a ningún total.
+               SUM(n.total_percepciones) + SUM(n.total_otros_pagos) AS pagado,
                SUM(n.total_percepciones)               AS perc,
                SUM(n.total_deducciones)                AS ded,
                SUM(n.total_otros_pagos)                AS otros,
@@ -286,6 +323,19 @@ pub async fn monthly_series(
         .collect())
 }
 
+/// L15-07/DEC-096: raises `from_y`/`from_m` to January of `anio_piso` when the requested
+/// `from` reaches further back than the floor -- never the other way, and never past
+/// `anio_piso` itself. Extracted so the clamp is testable against a fixed floor instead
+/// of needing a real `anio_piso` row in the database.
+#[must_use]
+fn clamp_from_to_piso(from_y: i64, from_m: i64, anio_piso: i64) -> (i64, i64) {
+    if from_y < anio_piso {
+        (anio_piso, 1)
+    } else {
+        (from_y, from_m)
+    }
+}
+
 pub async fn get(
     pool: &DbPool,
     rfc: &str, // employer RFC (rfc_emisor for nomina)
@@ -295,11 +345,24 @@ pub async fn get(
     let (from_y, from_m) = parse_ym(from);
     let (to_y, to_m) = parse_ym(to);
 
+    // L15-07/AUD-159/DEC-095/DEC-096: devengo before anio_piso is out of every consultation
+    // this function makes, full stop -- not reassigned to the floor year, not summed into
+    // any total, not counted toward "personas distintas". The frontend always asks from
+    // '2000-01' (NominaView.vue), so this is the one place that actually enforces the
+    // floor; every one of the ~15 queries below shares `from_y`/`from_m`, so clamping them
+    // once here is DEC-096's single definition, not one check per query.
+    let anio_piso = crate::db::users::get_anio_piso_for_rfc(pool, rfc)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("anio_piso missing for rfc {rfc}"))?
+        as i64;
+    let (from_y, from_m) = clamp_from_to_piso(from_y, from_m, anio_piso);
+
     // Summary (all tipos, to match full payroll spend)
     let summary_row = sqlx::query(
         r#"
         SELECT
-            SUM(n.total_percepciones)                                            AS total_pagado,
+            -- L15-02/DEC-089: Percepciones + Otros pagos, not a second copy of Percepciones.
+            SUM(n.total_percepciones) + SUM(n.total_otros_pagos)                  AS total_pagado,
             SUM(n.total_percepciones)                                            AS total_perc,
             SUM(n.total_deducciones)                                             AS total_ded,
             SUM(n.total_otros_pagos)                                             AS total_otros,
@@ -365,13 +428,25 @@ pub async fn get(
 
     let by_month = monthly_series(pool, rfc, from_y, from_m, to_y, to_m).await?;
 
-    // By employee (top 100 by total paid) — latest dept/puesto/contrato via DISTINCT ON
-    let emp_rows = sqlx::query(r#"
+    // By employee — L15-03/AUD-155/DEC-090: every employee in range, no LIMIT. This fed
+    // Plantilla actual, its five KPIs, Altas, Bajas, Nómina por departamento, Personal
+    // clave, the individual-analysis selector, and Normalización's sidebar employee
+    // selector, all capped at whichever 100 had the highest total_pagado -- an RFC with
+    // more than 100 employees (358 on the largest one measured) silently dropped the rest
+    // everywhere at once, while other tables reading the SAME employer (e.g. by_employee_
+    // year, which has no cap) kept showing the true headcount, so one screen visibly
+    // disagreed with itself. Latest dept/puesto/contrato via DISTINCT ON. L15-08/DEC-097:
+    // departamento/puesto normalized right here, the one place both fields are picked for
+    // display -- every consumer of by_employee (Plantilla actual, PLA02, Personal clave,
+    // Altas, Bajas) inherits it for free instead of re-normalizing on its own.
+    let emp_dept_expr = missing_dept_puesto_expr("n.departamento", "Sin departamento");
+    let emp_puesto_expr = missing_dept_puesto_expr("n.puesto", "Sin puesto");
+    let emp_rows = sqlx::query(&format!(r#"
         WITH latest_attrs AS (
             SELECT DISTINCT ON (c.rfc_receptor)
                 c.rfc_receptor AS emp_rfc,
-                n.departamento,
-                n.puesto,
+                {emp_dept_expr} AS departamento,
+                {emp_puesto_expr} AS puesto,
                 n.tipo_contrato,
                 n.tipo_jornada,
                 n.tipo_regimen,
@@ -387,14 +462,32 @@ pub async fn get(
         earliest_attrs AS (
             SELECT DISTINCT ON (c.rfc_receptor)
                 c.rfc_receptor AS emp_rfc,
-                n.salario_diario_integrado AS sdi_at_first,
-                NULLIF(TRIM(COALESCE(n.fecha_inicio_rel_laboral, '')), '') AS fecha_inicio_rel_laboral
+                n.salario_diario_integrado AS sdi_at_first
             FROM pulso.cfdi_nomina n
             JOIN pulso.cfdis c ON c.uuid = n.uuid
             WHERE c.rfc_emisor = $1
               AND c.tipo_comprobante = 'N'
               AND NOT c.is_cancelled
             ORDER BY c.rfc_receptor, c.fecha_emision ASC
+        ),
+        -- L15-05/AUD-157/DEC-092: fecha_inicio_rel_laboral from the MOST RECENT receipt
+        -- that actually declares it, not from the employee's earliest receipt -- a blank
+        -- or wrong value on the very first receipt (33 people on the largest RFC measured
+        -- have at least one receipt missing it) must not shadow a later, correcting one.
+        -- Separate CTE from earliest_attrs on purpose: "first ever receipt" (for
+        -- sdi_at_first) and "most recent receipt that declares this one field" are
+        -- different receipts for the same employee more often than not.
+        alta_attrs AS (
+            SELECT DISTINCT ON (c.rfc_receptor)
+                c.rfc_receptor AS emp_rfc,
+                NULLIF(TRIM(n.fecha_inicio_rel_laboral), '') AS fecha_inicio_rel_laboral
+            FROM pulso.cfdi_nomina n
+            JOIN pulso.cfdis c ON c.uuid = n.uuid
+            WHERE c.rfc_emisor = $1
+              AND c.tipo_comprobante = 'N'
+              AND NOT c.is_cancelled
+              AND NULLIF(TRIM(COALESCE(n.fecha_inicio_rel_laboral, '')), '') IS NOT NULL
+            ORDER BY c.rfc_receptor, c.fecha_emision DESC
         )
         SELECT
             n.rfc_receptor                              AS emp_rfc,
@@ -408,8 +501,9 @@ pub async fn get(
             COALESCE(la.sdi_latest, 0)::float8          AS sdi_latest,
             la.fecha_final_pago,
             COALESCE(ea.sdi_at_first, 0)::float8        AS sdi_at_first,
-            ea.fecha_inicio_rel_laboral,
-            SUM(n.total_percepciones)                   AS pagado,
+            aa.fecha_inicio_rel_laboral,
+            -- L15-02/DEC-089: same fix as summary_row above.
+            SUM(n.total_percepciones) + SUM(n.total_otros_pagos) AS pagado,
             SUM(n.total_percepciones)                   AS perc,
             SUM(n.total_deducciones)                    AS ded,
             AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi,
@@ -424,15 +518,15 @@ pub async fn get(
         FROM pulso.nomina_normalizada n
         JOIN latest_attrs la ON la.emp_rfc = n.rfc_receptor
         LEFT JOIN earliest_attrs ea ON ea.emp_rfc = n.rfc_receptor
+        LEFT JOIN alta_attrs aa ON aa.emp_rfc = n.rfc_receptor
         WHERE n.rfc_emisor = $1
           AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
           AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         GROUP BY n.rfc_receptor, la.departamento, la.puesto, la.tipo_contrato, la.tipo_jornada, la.tipo_regimen,
-                 la.sdi_latest, la.fecha_final_pago, ea.sdi_at_first, ea.fecha_inicio_rel_laboral
+                 la.sdi_latest, la.fecha_final_pago, ea.sdi_at_first, aa.fecha_inicio_rel_laboral
         ORDER BY pagado DESC
-        LIMIT 100
-    "#)
+    "#))
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -443,37 +537,67 @@ pub async fn get(
 
     // Percepciones desglosadas — últimos 3 meses completos, tipo_nomina='O'
     // Usado para clasificación e sueldos promedio por clave SAT (001 = ordinario, 046 = asimilado)
+    //
+    // L15-01/AUD-153/DEC-089 companion: `dias` sums num_dias_pagados straight off
+    // nomina_normalizada, one row per receipt (no join to the percepcion line items), so a
+    // receipt with five percepcion rows (sueldo, horas extra, despensa, prima dominical,
+    // fondo de ahorro) counts its days once, not five times. Joining a receipt-level column
+    // through the percepciones breakdown -- the previous shape -- multiplied it by however
+    // many percepcion rows that receipt happened to have, which inflated every mensual
+    // average this table feeds by that same factor (measured 4.98x on the RFC grande).
+    // `percepciones` still needs the join, but only for the 001/046 breakdown, and is joined
+    // back to `dias` at the rfc_receptor level, never at the receipt level.
     let perc_3m_rows = sqlx::query(r#"
+        WITH bounds AS (
+            SELECT
+                EXTRACT(YEAR FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date - interval '2 months')::int * 100 +
+                EXTRACT(MONTH FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date - interval '2 months')::int AS from_ym,
+                EXTRACT(YEAR FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date)::int * 100 +
+                EXTRACT(MONTH FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date)::int AS to_ym
+        ),
+        dias AS (
+            SELECT n.rfc_receptor,
+                   SUM(COALESCE(n.num_dias_pagados,0)::float8)              AS total_dias,
+                   COUNT(DISTINCT (n.year_devengo * 100 + n.month_devengo)) AS meses_con_dato
+            FROM pulso.nomina_normalizada n, bounds b
+            WHERE n.rfc_emisor = $1
+              AND n.tipo_nomina = 'O'
+              AND NOT n.is_excluded
+              -- AUD-015/DEC-025: anchored to the last COMPLETE calendar month, not
+              -- CURRENT_DATE, so the window is reproducible across runs on different days
+              -- (same idiom as migrations 052's dias_antiguedad / rfc_as_of_cutoff).
+              -- L6C-04: compares against devengo now, same anchor formula.
+              AND (n.year_devengo * 100 + n.month_devengo) BETWEEN b.from_ym AND b.to_ym
+            GROUP BY n.rfc_receptor
+        ),
+        percepciones AS (
+            SELECT n.rfc_receptor,
+                SUM(CASE WHEN p.tipo_percepcion = '001'
+                         THEN (COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor
+                         ELSE 0.0 END)                                    AS total_001,
+                SUM(CASE WHEN p.tipo_percepcion = '046'
+                         THEN (COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor
+                         ELSE 0.0 END)                                    AS total_046,
+                BOOL_OR(p.tipo_percepcion = '001')                        AS has_001,
+                BOOL_OR(p.tipo_percepcion = '046')                        AS has_046
+            FROM pulso.cfdi_nomina_percepciones p
+            JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid, bounds b
+            WHERE n.rfc_emisor = $1
+              AND n.tipo_nomina = 'O'
+              AND NOT n.is_excluded
+              AND (n.year_devengo * 100 + n.month_devengo) BETWEEN b.from_ym AND b.to_ym
+            GROUP BY n.rfc_receptor
+        )
         SELECT
-            n.rfc_receptor                                                              AS emp_rfc,
-            SUM(CASE WHEN p.tipo_percepcion = '001'
-                     THEN (COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor
-                     ELSE 0.0 END)                                                      AS total_001,
-            SUM(CASE WHEN p.tipo_percepcion = '046'
-                     THEN (COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor
-                     ELSE 0.0 END)                                                      AS total_046,
-            SUM(COALESCE(n.num_dias_pagados,0)::float8)                                 AS total_dias,
-            COUNT(DISTINCT (n.year_devengo * 100 + n.month_devengo))                    AS meses_con_dato,
-            BOOL_OR(p.tipo_percepcion = '001')                                          AS has_001,
-            BOOL_OR(p.tipo_percepcion = '046')                                          AS has_046
-        FROM pulso.cfdi_nomina_percepciones p
-        JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid
-        WHERE n.rfc_emisor = $1
-          AND n.tipo_nomina = 'O'
-          AND NOT n.is_excluded
-          -- AUD-015/DEC-025: anchored to the last COMPLETE calendar month, not CURRENT_DATE,
-          -- so the window is reproducible across runs on different days (same idiom as
-          -- migrations 052's dias_antiguedad / rfc_as_of_cutoff). L6C-04: compares against
-          -- devengo now, same anchor formula.
-          AND (n.year_devengo * 100 + n.month_devengo) >= (
-              EXTRACT(YEAR FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date - interval '2 months')::int * 100 +
-              EXTRACT(MONTH FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date - interval '2 months')::int
-          )
-          AND (n.year_devengo * 100 + n.month_devengo) <= (
-              EXTRACT(YEAR FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date)::int * 100 +
-              EXTRACT(MONTH FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date)::int
-          )
-        GROUP BY n.rfc_receptor
+            d.rfc_receptor                       AS emp_rfc,
+            d.total_dias,
+            d.meses_con_dato,
+            COALESCE(pc.total_001, 0.0)          AS total_001,
+            COALESCE(pc.total_046, 0.0)          AS total_046,
+            COALESCE(pc.has_001, false)          AS has_001,
+            COALESCE(pc.has_046, false)          AS has_046
+        FROM dias d
+        LEFT JOIN percepciones pc ON pc.rfc_receptor = d.rfc_receptor
         "#)
     .bind(rfc)
     .fetch_all(pool)
@@ -792,7 +916,8 @@ pub async fn get(
         r#"
         SELECT
                n.year_devengo AS year,
-               SUM(n.total_percepciones) AS pagado,
+               -- L15-02/DEC-089: same fix as monthly_series/summary_row.
+               SUM(n.total_percepciones) + SUM(n.total_otros_pagos) AS pagado,
                SUM(n.total_percepciones) AS perc,
                SUM(n.total_deducciones) AS ded,
                SUM(n.total_otros_pagos) AS otros,
@@ -837,7 +962,8 @@ pub async fn get(
         SELECT
                n.year_devengo  AS year,
                n.month_devengo AS month,
-               SUM(n.total_percepciones) AS pagado,
+               -- L15-02/DEC-089: same fix as monthly_series/summary_row.
+               SUM(n.total_percepciones) + SUM(n.total_otros_pagos) AS pagado,
                SUM(n.total_percepciones)  AS perc,
                SUM(n.total_deducciones)   AS ded,
                SUM(n.total_otros_pagos)   AS otros,
@@ -987,10 +1113,13 @@ pub async fn get(
         })
         .collect();
 
-    // By department year
-    let dept_year_rows = sqlx::query(
+    // By department year — L15-08/DEC-097: departamento normalized through the one shared
+    // expression (also used by emp_rows's latest_attrs below), so "Ninguno" folds into
+    // "Sin departamento" here exactly the same way it does in Plantilla actual/PLA02.
+    let dept_expr = missing_dept_puesto_expr("n.departamento", "Sin departamento");
+    let dept_year_rows = sqlx::query(&format!(
         r#"
-        SELECT COALESCE(NULLIF(TRIM(n.departamento),''), 'Sin departamento') AS departamento,
+        SELECT {dept_expr} AS departamento,
                n.year_devengo AS year,
                SUM(n.total_percepciones) AS pagado,
                COUNT(DISTINCT n.rfc_receptor) AS emp_count
@@ -1001,9 +1130,8 @@ pub async fn get(
           AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
           AND NOT n.is_excluded
         GROUP BY departamento, n.year_devengo
-        ORDER BY n.year_devengo, pagado DESC
-    "#,
-    )
+        ORDER BY n.year_devengo, pagado DESC"#
+    ))
     .bind(rfc)
     .bind(from_y)
     .bind(from_m)
@@ -1676,4 +1804,51 @@ fn subtract_months(y: i64, m: i64, n: i64) -> (i64, i64) {
     let ry = total / 12;
     let rm = total % 12;
     if rm == 0 { (ry - 1, 12) } else { (ry, rm) }
+}
+
+#[cfg(test)]
+mod l15_tests {
+    use super::*;
+
+    #[test]
+    fn clamp_from_to_piso_raises_a_from_before_the_floor() {
+        // Pre-piso trap (DEC-096): "año actual - 3" gives the same 2023 as today's floor,
+        // which is exactly why a formula here instead of a stored value is dangerous --
+        // this test pins the floor itself, not "today minus 3".
+        assert_eq!(clamp_from_to_piso(2000, 1, 2023), (2023, 1));
+        assert_eq!(clamp_from_to_piso(2022, 12, 2023), (2023, 1));
+    }
+
+    #[test]
+    fn clamp_from_to_piso_leaves_a_from_at_or_after_the_floor_untouched() {
+        assert_eq!(clamp_from_to_piso(2023, 1, 2023), (2023, 1));
+        assert_eq!(clamp_from_to_piso(2024, 6, 2023), (2024, 6));
+    }
+
+    #[test]
+    fn missing_dept_puesto_expr_folds_the_closed_list_case_and_edge_whitespace() {
+        let expr = missing_dept_puesto_expr("n.departamento", "Sin departamento");
+        // Shape checks only -- byte-for-byte behavior against Postgres (TRANSLATE,
+        // exact-match-not-LIKE) is verified live, same as summary.rs's generic_rfc_tests.
+        assert!(expr.contains("'NINGUNO'"));
+        assert!(expr.contains("'Sin departamento'"));
+        assert!(expr.contains("TRANSLATE(TRIM(n.departamento)"));
+        // Every entry in the closed list appears verbatim -- a future edit to the list
+        // that forgets to also touch this function's IN(...) would show up here.
+        for v in MISSING_DEPT_PUESTO_VALUES {
+            assert!(
+                expr.contains(&format!("'{v}'")),
+                "missing '{v}' in generated SQL"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_dept_puesto_expr_is_a_distinct_call_per_column_and_label() {
+        let dept = missing_dept_puesto_expr("n.departamento", "Sin departamento");
+        let puesto = missing_dept_puesto_expr("n.puesto", "Sin puesto");
+        assert_ne!(dept, puesto);
+        assert!(puesto.contains("n.puesto"));
+        assert!(puesto.contains("'Sin puesto'"));
+    }
 }

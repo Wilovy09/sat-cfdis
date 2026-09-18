@@ -102,10 +102,15 @@ pub async fn create_pulso_user(
     }
 
     // Fresh insert.
+    // L15-07/DEC-096: "año de la primera carga de datos - 3", evaluated once, right now,
+    // for this brand-new RFC -- never recomputed from `today` again after this row exists.
+    // A restored (soft-deleted) row above keeps whatever anio_piso it already had; only a
+    // genuinely new row gets one assigned.
+    let anio_piso = time::OffsetDateTime::now_utc().year() - 3;
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        r#"INSERT INTO pulso.users (id, user_id, rfc, clave, initial_sync_job_id, priority_analysis, deleted_at)
-           VALUES ($1, $2, $3, $4, $5, $6, NULL)"#,
+        r#"INSERT INTO pulso.users (id, user_id, rfc, clave, initial_sync_job_id, priority_analysis, anio_piso, deleted_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)"#,
     )
     .bind(id)
     .bind(uid)
@@ -113,6 +118,7 @@ pub async fn create_pulso_user(
     .bind(clave_enc)
     .bind(initial_sync_job_id)
     .bind(priority_analysis)
+    .bind(anio_piso)
     .execute(pool)
     .await?;
     Ok(true)
@@ -379,13 +385,17 @@ pub async fn add_viewer_rfc(pool: &PgPool, user_id: &str, rfc: &str) -> Result<(
         return Ok(());
     }
 
+    // L15-07/DEC-096: anio_piso is NOT NULL on pulso.users -- same one-time assignment as
+    // create_pulso_user's fresh-insert path.
+    let anio_piso = time::OffsetDateTime::now_utc().year() - 3;
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO pulso.users (id, user_id, rfc, clave, initial_sync_job_id, deleted_at) VALUES ($1, $2, $3, '', NULL, NULL)",
+        "INSERT INTO pulso.users (id, user_id, rfc, clave, initial_sync_job_id, anio_piso, deleted_at) VALUES ($1, $2, $3, '', NULL, $4, NULL)",
     )
     .bind(id)
     .bind(uid)
     .bind(&rfc_upper)
+    .bind(anio_piso)
     .execute(pool)
     .await?;
     Ok(())
@@ -536,6 +546,20 @@ pub async fn update_rfc_clave(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// L15-07/DEC-096: the stored floor year of this RFC's analysis window. `NOT NULL` at the
+/// column level (migration 078) -- `None` here means no active row exists for this RFC at
+/// all, which callers should treat as an error (DEC-096: "el módulo no renderiza y
+/// registra el error", never a silent on-the-fly fallback).
+pub async fn get_anio_piso_for_rfc(pool: &PgPool, rfc: &str) -> Result<Option<i32>, sqlx::Error> {
+    let row: Option<(i32,)> = sqlx::query_as(
+        "SELECT anio_piso FROM pulso.users WHERE rfc = $1 AND deleted_at IS NULL LIMIT 1",
+    )
+    .bind(rfc.to_uppercase())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(v,)| v))
 }
 
 /// Onboarding "priority analysis" answer for an active RFC, if answered.
