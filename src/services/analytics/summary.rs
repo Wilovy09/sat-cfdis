@@ -382,6 +382,28 @@ pub fn parse_ym(s: &str) -> (i64, i64) {
     (y, m)
 }
 
+/// L16-01/L16-04/AUD-161/AUD-164/DEC-096: the one place every caller that needs `anio_piso`
+/// reads it -- `payroll::get`, `payroll::get_snapshot`, and `hallazgos::nomina_por_year` all
+/// go through this now, instead of each hand-rolling its own fetch-or-error. Two things this
+/// fixes that a naive inline version got wrong (both found live, in production, on the RFC
+/// with the fewest employees of the seven measured):
+/// - No `deleted_at IS NULL` filter: a soft-deleted RFC still has its own piso, and dropping
+///   this filter here (not at the caller) is what makes every caller correct at once.
+/// - The error, if the RFC genuinely has no row at all, is logged here with the RFC (so an
+///   operator can find it) but returned to the caller WITHOUT it -- callers propagate this
+///   through `AppError::internal(e.to_string())`, which serializes the message straight into
+///   the JSON body the browser receives. A raw RFC in a client-visible error is exactly the
+///   kind of thing `AppError` exists to keep out of a response.
+pub async fn anio_piso_for_rfc(pool: &DbPool, rfc: &str) -> anyhow::Result<i64> {
+    match crate::db::users::get_anio_piso_for_rfc(pool, rfc).await? {
+        Some(v) => Ok(v as i64),
+        None => {
+            tracing::error!(rfc = %rfc, "anio_piso_for_rfc: no row in pulso.users for this RFC");
+            anyhow::bail!("no se pudo determinar el año piso de análisis para este RFC")
+        }
+    }
+}
+
 pub fn rfc_column(dl_type: &str) -> &'static str {
     match dl_type {
         "recibidos" => "rfc_receptor",
