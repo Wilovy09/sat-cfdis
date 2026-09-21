@@ -63,9 +63,14 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
             enrich_skip.remove(&job_id);
             enrich_fail_rounds.remove(&job_id);
             enrich_sat_fail_rounds.remove(&job_id);
-            match process_job(&pool, &cfg, &s3, &job_id).await {
-                Ok((rfc, processed)) if processed > 0 => {
+            match process_job(&pool, &cfg, &s3, &job_id, &creds).await {
+                Ok((rfc, processed, other_side_touched)) if processed > 0 => {
                     touched_rfcs.insert(rfc);
+                    // L16-11/AUD-170: the gemela of enrich_job's own dual-side check below --
+                    // normal insertion is the path that puts a brand-new invoice's figures in
+                    // front of BOTH sides for the first time, and it's the busiest of the six
+                    // write paths that move a factura's numbers.
+                    touched_rfcs.extend(other_side_touched);
                 }
                 Ok(_) => {}
                 Err(e) => tracing::error!(job_id = %job_id, "ETL: error processing job: {e}"),
@@ -181,24 +186,28 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
     }
 }
 
-/// Returns the job's owner RFC and how many of its pending invoices actually got a header
-/// row written (C14-02: the caller uses this, not the candidate count, to decide whether
-/// this RFC's cached analytics need invalidating this round).
+/// Returns the job's owner RFC, how many of its pending invoices actually got a header row
+/// written (C14-02: the caller uses this, not the candidate count, to decide whether this
+/// RFC's cached analytics need invalidating this round), and (L16-11/AUD-170/C14-05) the set
+/// of counterparty RFCs also tracked by Pulso whose own figures this round's inserts moved --
+/// insertion is a factura appearing for the first time, so unlike enrichment (a correction)
+/// it puts real numbers in front of the other side for the very first time.
 async fn process_job(
     pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
     job_id: &str,
-) -> anyhow::Result<(String, usize)> {
+    creds: &HashMap<String, String>,
+) -> anyhow::Result<(String, usize, std::collections::HashSet<String>)> {
     // Get job metadata (dl_type, rfc)
     let job = match db::jobs::get_by_id(pool, job_id).await? {
         Some(j) => j,
-        None => return Ok((String::new(), 0)),
+        None => return Ok((String::new(), 0, std::collections::HashSet::new())),
     };
 
     let pending = db::cfdis::find_pending_etl(pool, job_id).await?;
     if pending.is_empty() {
-        return Ok((job.rfc, 0));
+        return Ok((job.rfc, 0, std::collections::HashSet::new()));
     }
 
     tracing::info!(
@@ -209,15 +218,22 @@ async fn process_job(
     );
 
     let mut processed = 0usize;
+    let mut other_side_touched = std::collections::HashSet::new();
     for chunk in pending.chunks(BATCH_SIZE) {
         for (uuid, metadata) in chunk {
             if process_invoice(pool, cfg, s3, job_id, uuid, metadata, &job.dl_type).await {
                 processed += 1;
+                let (rfc_e, rfc_r, ..) = extract_path_from_meta(metadata);
+                for side in [&rfc_e, &rfc_r] {
+                    if job.rfc != *side && creds.contains_key(side) {
+                        other_side_touched.insert(side.clone());
+                    }
+                }
             }
         }
     }
 
-    Ok((job.rfc, processed))
+    Ok((job.rfc, processed, other_side_touched))
 }
 
 /// Returns `true` once the header row is written -- the point at which this invoice
