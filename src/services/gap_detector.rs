@@ -159,7 +159,12 @@ async fn requeue_failed_jobs(
         let auth_json = serde_json::to_string(&auth_payload)?;
         let auth_enc = crypto::encrypt(&key, &auth_json).map_err(|e| anyhow::anyhow!(e))?;
 
-        let new_id = db::jobs::insert_gap_continuation(
+        // L16-12/AUD-171/DEC-084: bump only if this job actually widens the RFC's known
+        // coverage -- see `ensancha_rango`'s own doc for why.
+        let current_range = db::jobs::rfc_job_range(pool, &job.rfc).await?;
+        let ensancha = ensancha_rango(current_range.as_ref(), &gap_start, &job.period_to);
+
+        let new_id = db::jobs::insert_gap_continuation_row(
             pool,
             &job.rfc,
             &auth_type_label,
@@ -170,6 +175,11 @@ async fn requeue_failed_jobs(
             job.gap_retry_count + 1,
         )
         .await?;
+        if ensancha
+            && let Err(e) = crate::services::response_cache::bump_version(pool, &job.rfc).await
+        {
+            tracing::warn!(rfc = %job.rfc, "Gap-detector: failed to bump cache version: {e}");
+        }
         db::jobs::mark_superseded(pool, &job.id, &new_id).await?;
         tracing::warn!(
             job_id = %job.id, new_job_id = %new_id, rfc = %job.rfc,
@@ -260,7 +270,15 @@ async fn scan_activity_gaps(
             let period_from = format!("{day} 00:00:00");
             let period_to = format!("{day} 23:59:59");
 
-            let new_id = db::jobs::insert_queued(
+            // L16-12/AUD-171/DEC-084: measured live -- 1,612 gap-resync jobs, up to 130/hour
+            // for one RFC, and 0 of them widened the RFC's coverage range (every one was a
+            // day inside a range Pulso already considered synced -- that's the whole point
+            // of a resync). Bumping on every one of those was 130 cache invalidations in an
+            // hour for a coverage panel whose four numbers hadn't moved.
+            let current_range = db::jobs::rfc_job_range(pool, &rfc).await?;
+            let ensancha = ensancha_rango(current_range.as_ref(), &period_from, &period_to);
+
+            let new_id = db::jobs::insert_queued_row(
                 pool,
                 "gap_resync",
                 &rfc,
@@ -271,12 +289,33 @@ async fn scan_activity_gaps(
                 &period_to,
             )
             .await?;
+            if ensancha
+                && let Err(e) = crate::services::response_cache::bump_version(pool, &rfc).await
+            {
+                tracing::warn!(rfc = %rfc, "Gap-detector: failed to bump cache version: {e}");
+            }
             tracing::warn!(rfc = %rfc, day = %day, job_id = %new_id, "Gap-detector: requeued zero-activity day for resync");
         }
 
         db::jobs::set_gap_scan_progress(pool, &rfc, &end).await?;
     }
     Ok(())
+}
+
+/// L16-12/AUD-171/DEC-084: true when a job covering `[new_from, new_to]` would actually
+/// widen `current` (this RFC's existing `[min(period_from), max(period_to)]` across every
+/// job it's ever had, any status -- `db::jobs::rfc_job_range`). `current: None` (no job at
+/// all yet) is deliberately always `true`, not skipped as a no-op: comparing a real date
+/// against a null min/max would read as "not wider" and a brand-new RFC's very first job
+/// would never bump its own cache. `rfc_job_range` mixes formats across job types (a bare
+/// "YYYY-MM-DD" from most jobs, "YYYY-MM-DD HH:MM:SS" from this file's own gap-resync
+/// jobs) -- the same lexicographic string comparison the rest of this file already trusts
+/// elsewhere (e.g. `gap_start > job.period_to` above), not something new here.
+fn ensancha_rango(current: Option<&(String, String)>, new_from: &str, new_to: &str) -> bool {
+    match current {
+        None => true,
+        Some((min_from, max_to)) => new_from < min_from.as_str() || new_to > max_to.as_str(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,4 +374,42 @@ fn ymd_from_epoch_secs(secs: u64) -> String {
         d -= dim;
     }
     format!("{y:04}-{:02}-{:02}", m + 1, d + 1)
+}
+
+#[cfg(test)]
+mod l16_tests {
+    use super::*;
+
+    fn range(from: &str, to: &str) -> (String, String) {
+        (from.to_string(), to.to_string())
+    }
+
+    #[test]
+    fn ensancha_rango_true_when_rfc_has_no_prior_job() {
+        // Trap called out by the item itself: comparing against a null min/max reads as
+        // "not wider", which would leave a brand-new RFC's very first job unbumped.
+        assert!(ensancha_rango(None, "2026-01-01", "2026-01-01"));
+    }
+
+    #[test]
+    fn ensancha_rango_false_for_a_day_already_inside_the_covered_range() {
+        let current = range("2023-01-01", "2026-08-31");
+        assert!(!ensancha_rango(
+            Some(&current),
+            "2025-06-15 00:00:00",
+            "2025-06-15 23:59:59"
+        ));
+    }
+
+    #[test]
+    fn ensancha_rango_true_when_the_new_period_starts_earlier() {
+        let current = range("2023-01-01", "2026-08-31");
+        assert!(ensancha_rango(Some(&current), "2022-12-01", "2023-01-01"));
+    }
+
+    #[test]
+    fn ensancha_rango_true_when_the_new_period_ends_later() {
+        let current = range("2023-01-01", "2026-08-31");
+        assert!(ensancha_rango(Some(&current), "2026-09-01", "2026-09-30"));
+    }
 }
