@@ -257,30 +257,24 @@ fn h4_interpretacion(nivel: &str) -> &'static str {
     }
 }
 
+/// L16-09/AUD-168/DEC-094: cortes movidos a la referencia nacional que Nómina ya usa --
+/// Pulso no conoce el sector, y los cortes anteriores (20% medio, 35% alto, 50% crítico)
+/// etiquetaban "Alto" a una tasa que el propio Lote 15 documenta como normal en manufactura
+/// (30%-50%). Dentro de la referencia (hasta el 50% de manufactura, la más ancha de las dos
+/// bandas nacionales) el hallazgo se queda en un solo nivel informativo -- Pulso no tiene
+/// con qué distinguir un 8% de un 45% sin saber el giro, así que no finge que sí puede.
+/// Sólo por encima de esa banda hay algo que de verdad se sale de lo esperable en cualquier
+/// sector.
 fn h5a_nivel(tasa_pct: f64) -> &'static str {
-    if tasa_pct < 10.0 {
-        "muy_bajo"
-    } else if tasa_pct < 20.0 {
-        "bajo"
-    } else if tasa_pct < 35.0 {
-        "medio"
-    } else if tasa_pct < 50.0 {
-        "alto"
-    } else {
-        "critico"
-    }
+    if tasa_pct > 50.0 { "alto" } else { "muy_bajo" }
 }
 
-fn h5a_interpretacion(nivel: &str) -> &'static str {
-    match nivel {
-        "critico" | "alto" => {
-            "Rotación elevada — señal de inestabilidad operativa o condiciones laborales que requieren validación. Revisar distribución por departamento y nivel salarial en módulo de Nómina."
-        }
-        "medio" => {
-            "Rotación moderada. Verificar si se concentra en áreas críticas o corresponde a patrones estacionales."
-        }
-        _ => "Plantilla estable en el período analizado.",
-    }
+/// L16-09: ya no emite veredicto por nivel ("rotación elevada", "señal de inestabilidad")
+/// -- el mismo texto de referencia que Nómina, copiado tal cual (DEC-094), para cualquier
+/// tasa. El nivel (`h5a_nivel`) sigue existiendo para el badge de color; el texto no repite
+/// lo que el badge ya dice.
+fn h5a_interpretacion() -> &'static str {
+    "Referencia nacional: 17% a 25%; manufactura, 30% a 50%."
 }
 
 /// C8-04 (opcional): H6 and H7 measure a saldo/ingreso ratio with the same shape now
@@ -595,6 +589,11 @@ pub async fn nomina_por_year(
     pool: &DbPool,
     rfc: &str,
 ) -> anyhow::Result<std::collections::HashMap<i64, f64>> {
+    // L16-04/AUD-164/DEC-095/DEC-096: same floor payroll::get enforces -- this had none, so
+    // the Dashboard's nómina hallazgo/bridge kept a pre-piso year (2022, $590,664.16 on the
+    // RFC grande measured) alive after L15-07 had already taken it out of the rest of the
+    // module.
+    let anio_piso = super::summary::anio_piso_for_rfc(pool, rfc).await?;
     let rows = sqlx::query(
         r#"
         SELECT n.year_devengo AS year,
@@ -602,10 +601,12 @@ pub async fn nomina_por_year(
         FROM pulso.nomina_normalizada n
         WHERE n.rfc_emisor = $1
           AND NOT n.is_excluded
+          AND n.year_devengo >= $2
         GROUP BY n.year_devengo
         "#,
     )
     .bind(rfc)
+    .bind(anio_piso)
     .fetch_all(pool)
     .await?;
 
@@ -740,7 +741,7 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
 
     let tasa_pct = bajas as f64 / avg_hc * 100.0;
     let nivel = h5a_nivel(tasa_pct);
-    let interp = h5a_interpretacion(nivel);
+    let interp = h5a_interpretacion();
 
     // L10-09: one figure, one semáforo -- the by-tipo-de-contrato breakdown belongs in
     // Nómina > Altas y bajas, not here. The second sentence only appears when there's
@@ -771,7 +772,12 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
         metrica_principal: Some(tasa_pct),
         cuerpo,
         interpretacion: interp.to_string(),
-        disclaimer: None,
+        // L16-09/AUD-168 punto 3: esta tasa usa su propia ventana (12 meses móviles, no año
+        // calendario) y su propio universo (sólo contratos 01/02) -- distinto de la que
+        // reporta el módulo de Nómina (año calendario, toda la plantilla). Antes el texto
+        // mandaba al usuario "al módulo de Nómina" sin avisar que el número que iba a ver
+        // ahí no es el mismo número, ni es comparable.
+        disclaimer: Some("Esta tasa cubre los últimos 12 meses y sólo plantilla permanente. El módulo de Nómina reporta la rotación por año calendario, sobre toda la plantilla: los dos números no son comparables entre sí.".to_string()),
         nota_fija: Some("Estimado a partir de CFDIs de nómina. Puede no reflejar movimientos que no se timbraron, o puede contener errores en el timbrado de CFDIs de nómina.".to_string()),
         datos_tabla: None,
     }))
