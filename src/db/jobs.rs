@@ -616,12 +616,16 @@ pub async fn set_running(pool: &PgPool, job_id: &str) -> Result<(), sqlx::Error>
     Ok(())
 }
 
-/// Insert a new job with status 'queued' (will be picked up by the background worker).
-/// `job_type`: `"list"` for manual jobs, `"auto_daily"` for automatic daily sync.
-///
-/// V14-02: see `insert`'s doc -- same reason to bump here.
+/// V14-02/L16-12: the INSERT alone, no bump. `insert_queued` (below) is this plus an
+/// unconditional bump, for its six callers where every new job is real new coverage
+/// (alta de RFC, sync manual, validación de credencial, descarga de admin, el worker
+/// diario). `gap_detector.rs`'s own resync call is the seventh and the odd one out --
+/// it creates a job per day already inside a covered range far more often than not (a
+/// gap resync, almost by definition, resyncs a day Pulso already believes it has),
+/// so it calls this directly and bumps itself, only when the new job's period
+/// actually widens the RFC's known coverage (L16-12's own condition).
 #[allow(clippy::too_many_arguments)]
-pub async fn insert_queued(
+pub(crate) async fn insert_queued_row(
     pool: &PgPool,
     job_type: &str,
     rfc: &str,
@@ -650,6 +654,35 @@ pub async fn insert_queued(
     .bind(&now)
     .bind(&now)
     .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Insert a new job with status 'queued' (will be picked up by the background worker).
+/// `job_type`: `"list"` for manual jobs, `"auto_daily"` for automatic daily sync.
+///
+/// V14-02: see `insert`'s doc -- same reason to bump here.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_queued(
+    pool: &PgPool,
+    job_type: &str,
+    rfc: &str,
+    auth_type: &str,
+    auth_enc: &str,
+    dl_type: &str,
+    period_from: &str,
+    period_to: &str,
+) -> Result<String, sqlx::Error> {
+    let id = insert_queued_row(
+        pool,
+        job_type,
+        rfc,
+        auth_type,
+        auth_enc,
+        dl_type,
+        period_from,
+        period_to,
+    )
     .await?;
     if let Err(e) = bump_version(pool, rfc).await {
         tracing::warn!(rfc = %rfc, "jobs::insert_queued: failed to bump cache version: {e}");
@@ -811,9 +844,14 @@ pub async fn find_failed_retryable(
 /// Queues a fresh job covering a failed job's unfinished range, inheriting
 /// `gap_retry_count + 1` so the cap in `find_failed_retryable` eventually
 /// stops it. Returns the new job's id.
-#[allow(clippy::too_many_arguments)]
-/// V14-02: see `insert`'s doc -- same reason to bump here.
-pub async fn insert_gap_continuation(
+///
+/// L16-12/AUD-171: the INSERT alone, no bump -- see `insert_queued_row`'s doc for why
+/// `gap_detector.rs` (this function's only caller) calls this directly and bumps itself,
+/// conditionally, instead of going through a variant that always bumps.
+// Only caller (gap_detector.rs) lives in the bin-only module tree, not lib.rs's -- same
+// lib/bin split as `add_viewer_rfc` above.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) async fn insert_gap_continuation_row(
     pool: &PgPool,
     rfc: &str,
     auth_type: &str,
@@ -843,9 +881,6 @@ pub async fn insert_gap_continuation(
     .bind(&now)
     .execute(pool)
     .await?;
-    if let Err(e) = bump_version(pool, rfc).await {
-        tracing::warn!(rfc = %rfc, "jobs::insert_gap_continuation: failed to bump cache version: {e}");
-    }
     Ok(id)
 }
 
