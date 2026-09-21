@@ -552,14 +552,22 @@ pub async fn update_rfc_clave(
 /// column level (migration 078) -- `None` here means no active row exists for this RFC at
 /// all, which callers should treat as an error (DEC-096: "el módulo no renderiza y
 /// registra el error", never a silent on-the-fly fallback).
+/// L16-01/AUD-161: no `deleted_at IS NULL` filter -- a soft-deleted RFC still has its own
+/// year piso, and `payroll::get` is this function's only caller in the whole backend, so a
+/// baja lógica RFC hit `None` here and the whole request aborted (Nómina, the Dashboard's
+/// "Resumen financiero" table and its "Ingresos, Egresos y Nómina" chart, all down for that
+/// RFC). `MIN`, not the first row an unordered query happens to return: `users_rfc_global_
+/// unique` (migration 019) is a PARTIAL unique index -- it only covers live rows -- so two
+/// rows for the same RFC (one live, one soft-deleted) is already possible today, and the
+/// piso never moves forward, so the smaller one is always the right answer regardless of
+/// which row is "the" owner right now.
 pub async fn get_anio_piso_for_rfc(pool: &PgPool, rfc: &str) -> Result<Option<i32>, sqlx::Error> {
-    let row: Option<(i32,)> = sqlx::query_as(
-        "SELECT anio_piso FROM pulso.users WHERE rfc = $1 AND deleted_at IS NULL LIMIT 1",
-    )
-    .bind(rfc.to_uppercase())
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(v,)| v))
+    let row: (Option<i32>,) =
+        sqlx::query_as("SELECT MIN(anio_piso) FROM pulso.users WHERE rfc = $1")
+            .bind(rfc.to_uppercase())
+            .fetch_one(pool)
+            .await?;
+    Ok(row.0)
 }
 
 /// Onboarding "priority analysis" answer for an active RFC, if answered.
