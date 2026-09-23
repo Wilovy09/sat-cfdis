@@ -134,9 +134,9 @@ async fn requeue_failed_jobs(
                 None => job.period_from.clone(),
             }
         };
-        // Same direct string comparison resume_worker already uses for the
-        // equivalent "anything left?" check on cursor vs period_to.
-        if gap_start > job.period_to {
+        // L17-10: date_prefix, not a raw comparison -- see that fn's doc for why a bare
+        // "YYYY-MM-DD" and a "YYYY-MM-DD HH:MM:SS" for the same day can't compare directly.
+        if date_prefix(&gap_start) > date_prefix(&job.period_to) {
             tracing::info!(
                 job_id = %job.id, rfc = %job.rfc,
                 "Gap-detector: failed job's cursor already reached period_to, nothing to continue"
@@ -219,10 +219,11 @@ async fn scan_activity_gaps(
                 None => continue,
             },
         };
-        if start > yesterday {
+        if date_prefix(&start) > date_prefix(&yesterday) {
             continue; // fully caught up, nothing new to scan yet
         }
-        let end = std::cmp::min(add_days(&start, SCAN_WINDOW_DAYS), yesterday.clone());
+        let candidate_end = add_days(&start, SCAN_WINDOW_DAYS);
+        let end = date_min(&candidate_end, &yesterday).to_string();
 
         let gap_days = db::jobs::find_activity_gap_days(pool, &rfc, &start, &end).await?;
         if !gap_days.is_empty() {
@@ -302,19 +303,47 @@ async fn scan_activity_gaps(
     Ok(())
 }
 
+/// L17-10: `period_from`/`period_to`/cursor dates mix two formats across job types --
+/// "YYYY-MM-DD" (10 chars) from most jobs, "YYYY-MM-DD HH:MM:SS" (19 chars) from this
+/// file's own gap-resync jobs (`period_from`/`period_to` built as `"{day} 00:00:00"`/
+/// `"{day} 23:59:59"` in `scan_activity_gaps` below). Comparing the two AS-IS is wrong: a
+/// bare date always sorts less than the same day's `23:59:59` timestamp, so a job whose
+/// coverage ends exactly on the last day of an already-covered range would read as "ends
+/// later" (an unnecessary cache bump) purely from the trailing time-of-day, not because it
+/// covers anything new. This file's own concept of "coverage" is day-granularity
+/// throughout, never sub-day -- truncating both sides to their date-only prefix before
+/// comparing makes that format-independent. Measured live: 0 of today's 1,613 resync jobs
+/// currently hit the exact combination that would flip a verdict, but 6 jobs already carry
+/// mismatched formats on start/end, so the trap exists in the data, just not triggered yet.
+pub(crate) fn date_prefix(s: &str) -> &str {
+    &s[..10.min(s.len())]
+}
+
+/// Same idea as `date_prefix`, for a `min()`-style pick that has to return one of the two
+/// ORIGINAL strings (not a truncated copy) -- `scan_activity_gaps` persists whichever one
+/// wins as gap-scan progress, so it needs the real value, only *compared* at date
+/// granularity.
+fn date_min<'a>(a: &'a str, b: &'a str) -> &'a str {
+    if date_prefix(a) <= date_prefix(b) {
+        a
+    } else {
+        b
+    }
+}
+
 /// L16-12/AUD-171/DEC-084: true when a job covering `[new_from, new_to]` would actually
 /// widen `current` (this RFC's existing `[min(period_from), max(period_to)]` across every
 /// job it's ever had, any status -- `db::jobs::rfc_job_range`). `current: None` (no job at
 /// all yet) is deliberately always `true`, not skipped as a no-op: comparing a real date
 /// against a null min/max would read as "not wider" and a brand-new RFC's very first job
-/// would never bump its own cache. `rfc_job_range` mixes formats across job types (a bare
-/// "YYYY-MM-DD" from most jobs, "YYYY-MM-DD HH:MM:SS" from this file's own gap-resync
-/// jobs) -- the same lexicographic string comparison the rest of this file already trusts
-/// elsewhere (e.g. `gap_start > job.period_to` above), not something new here.
+/// would never bump its own cache.
 fn ensancha_rango(current: Option<&(String, String)>, new_from: &str, new_to: &str) -> bool {
     match current {
         None => true,
-        Some((min_from, max_to)) => new_from < min_from.as_str() || new_to > max_to.as_str(),
+        Some((min_from, max_to)) => {
+            date_prefix(new_from) < date_prefix(min_from)
+                || date_prefix(new_to) > date_prefix(max_to)
+        }
     }
 }
 
@@ -411,5 +440,50 @@ mod l16_tests {
     fn ensancha_rango_true_when_the_new_period_ends_later() {
         let current = range("2023-01-01", "2026-08-31");
         assert!(ensancha_rango(Some(&current), "2026-09-01", "2026-09-30"));
+    }
+
+    // L17-10: the same day, on the `to` boundary, in all four short/long combinations --
+    // a job covering exactly the last day of an already-covered range never "ensancha",
+    // regardless of which format either side happens to be stored in. Before date_prefix,
+    // 2 of these 4 gave the wrong answer (corto-contra-largo and largo-contra-corto): a
+    // shorter string always sorts less than a longer one with the same prefix, so
+    // "2025-06-15" < "2025-06-15 23:59:59" reads as "ends later" purely from string length,
+    // even though both name the identical calendar day.
+    #[test]
+    fn ensancha_rango_same_day_on_the_to_boundary_agrees_across_formats() {
+        let corto = "2025-06-15";
+        let largo = "2025-06-15 23:59:59";
+
+        let current_corto = range("2023-01-01", corto);
+        let current_largo = range("2023-01-01", largo);
+
+        // new_from stays inside the current range so only the `to` boundary is on trial.
+        let new_from = "2023-06-01";
+
+        // corto contra corto -- already correct before this item, included for symmetry.
+        assert!(!ensancha_rango(Some(&current_corto), new_from, corto));
+        // corto contra largo -- one of the two that used to fail.
+        assert!(!ensancha_rango(Some(&current_corto), new_from, largo));
+        // largo contra corto -- the other one that used to fail.
+        assert!(!ensancha_rango(Some(&current_largo), new_from, corto));
+        // largo contra largo -- already correct before this item, included for symmetry.
+        assert!(!ensancha_rango(Some(&current_largo), new_from, largo));
+    }
+
+    #[test]
+    fn date_prefix_truncates_long_format_and_passes_short_format_through() {
+        assert_eq!(date_prefix("2025-06-15"), "2025-06-15");
+        assert_eq!(date_prefix("2025-06-15 23:59:59"), "2025-06-15");
+    }
+
+    #[test]
+    fn date_min_compares_at_day_granularity_not_string_length() {
+        // Same trap as ensancha_rango: a bare date must not lose to a longer timestamp
+        // naming the same or an earlier day.
+        assert_eq!(date_min("2025-06-15", "2025-06-15 23:59:59"), "2025-06-15");
+        assert_eq!(
+            date_min("2025-06-14 23:59:59", "2025-06-15"),
+            "2025-06-14 23:59:59"
+        );
     }
 }

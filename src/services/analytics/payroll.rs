@@ -183,8 +183,6 @@ pub struct PercepcionRow {
 pub struct HeadcountMonth {
     pub period: String,
     pub headcount: i64,
-    pub new_employees: i64,
-    pub departures: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1303,74 +1301,14 @@ pub async fn get(
         })
         .collect();
 
-    // New employees per month: first-ever payslip from this employer is within range
-    let new_emp_rows = sqlx::query(
-        r#"
-        SELECT yr AS year, mo AS month, COUNT(*) AS new_emp
-        FROM (
-            SELECT n2.rfc_receptor,
-                   (MIN(n2.year_devengo * 100 + n2.month_devengo) / 100)::bigint AS yr,
-                   (MIN(n2.year_devengo * 100 + n2.month_devengo) % 100)::bigint AS mo
-            FROM pulso.nomina_normalizada n2
-            WHERE n2.rfc_emisor = $1
-              AND NOT n2.is_excluded
-            GROUP BY n2.rfc_receptor
-        ) sub
-        WHERE (yr > $2 OR (yr = $2 AND mo >= $3))
-          AND (yr < $4 OR (yr = $4 AND mo <= $5))
-        GROUP BY yr, mo
-        "#,
-    )
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_all(pool)
-    .await?;
-
-    let new_emp_map: std::collections::HashMap<(i64, i64), i64> = new_emp_rows
-        .iter()
-        .map(|r| {
-            let yr: i64 = r.try_get("year").unwrap_or(0);
-            let mo: i64 = r.try_get("month").unwrap_or(0);
-            let n: i64 = r.try_get("new_emp").unwrap_or(0);
-            ((yr, mo), n)
-        })
-        .collect();
-
-    // All (year, month, rfc_receptor) in range — used to compute departures
-    let emp_month_rows = sqlx::query(
-        r#"
-        SELECT DISTINCT n.year_devengo AS year, n.month_devengo AS month, n.rfc_receptor
-        FROM pulso.nomina_normalizada n
-        WHERE n.rfc_emisor = $1
-          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
-          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
-          AND NOT n.is_excluded
-        ORDER BY n.year_devengo, n.month_devengo
-        "#,
-    )
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_all(pool)
-    .await?;
-
-    // Build month → set<rfc> and sorted period list
-    let mut emp_by_period: std::collections::BTreeMap<
-        (i64, i64),
-        std::collections::HashSet<String>,
-    > = std::collections::BTreeMap::new();
-    for r in &emp_month_rows {
-        let yr: i64 = r.try_get("year").unwrap_or(0);
-        let mo: i64 = r.try_get("month").unwrap_or(0);
-        let emp: String = r.try_get("rfc_receptor").unwrap_or_default();
-        emp_by_period.entry((yr, mo)).or_default().insert(emp);
-    }
-
+    // L17-07: this used to also compute two counters nothing reads -- `new_employees`
+    // (its own dedicated query, "first-ever payslip within range") and `departures`
+    // (diffed from `emp_by_period`, a month→set<rfc> map built from a third query just for
+    // this). Confirmed via repo-wide grep: no file under pulso-adquiere/src reads either
+    // field, only the TS type declares them. `bajaYear()` (see NominaView.vue's ABJ01
+    // comment) replaced departures as the real rotación source back in L15; this series
+    // now only ever needed to answer "headcount, by period."
+    //
     // Headcount by month (distinct employees per month)
     let hc_rows = sqlx::query(
         r#"
@@ -1392,36 +1330,14 @@ pub async fn get(
     .fetch_all(pool)
     .await?;
 
-    let periods: Vec<(i64, i64)> = emp_by_period.keys().cloned().collect();
-
     let headcount_by_month: Vec<HeadcountMonth> = hc_rows
         .iter()
         .map(|r| {
             let year: i64 = r.try_get("year").unwrap_or(0);
             let month: i64 = r.try_get("month").unwrap_or(0);
-            let key = (year, month);
-
-            let prev_key = periods.iter().rev().find(|&&k| k < key).cloned();
-
-            let departures = match prev_key {
-                Some(pk) => {
-                    let prev_set = emp_by_period.get(&pk);
-                    let curr_set = emp_by_period.get(&key);
-                    match (prev_set, curr_set) {
-                        (Some(prev), Some(curr)) => {
-                            prev.iter().filter(|e| !curr.contains(*e)).count() as i64
-                        }
-                        _ => 0,
-                    }
-                }
-                None => 0,
-            };
-
             HeadcountMonth {
                 period: format!("{year}-{month:02}"),
                 headcount: r.try_get("hc").unwrap_or(0),
-                new_employees: *new_emp_map.get(&key).unwrap_or(&0),
-                departures,
             }
         })
         .collect();
@@ -1484,7 +1400,12 @@ fn tipo_nomina_label(t: &str) -> &str {
 pub struct PayrollSnapshotResponse {
     pub has_data: bool,
     pub headcount_actual: i64,
-    pub run_rate_mensual_ltm_mxn: f64,
+    /// L17-05: `None` when the LTM window has zero months of nómina ordinaria to average
+    /// over -- distinct from a genuine $0 run-rate, which can't happen (a month with
+    /// ordinaria payroll and $0 total isn't realistic). The frontend shows "—" only for
+    /// `None`, never for headcount_actual == 0 alone: a company can be between hires
+    /// (headcount 0 this month) while its LTM window still has real months to average.
+    pub run_rate_mensual_ltm_mxn: Option<f64>,
     pub yoy_masa_salarial_pct: Option<f64>,
     pub pasivo_laboral_estimado_mxn: f64,
     pub months_of_data: i64,
@@ -1507,7 +1428,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     let empty = || PayrollSnapshotResponse {
         has_data: false,
         headcount_actual: 0,
-        run_rate_mensual_ltm_mxn: 0.0,
+        run_rate_mensual_ltm_mxn: None,
         yoy_masa_salarial_pct: None,
         pasivo_laboral_estimado_mxn: 0.0,
         months_of_data: 0,
@@ -1649,7 +1570,15 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     .fetch_one(pool)
     .await?;
     let total_regular: f64 = get_f64(&rr_row, "total_regular");
-    let run_rate_mensual_ltm_mxn = total_regular / (meses_con_nomina_ltm.max(1) as f64);
+    // L17-05: None, not 0.0, when the window has no mes con nómina ordinaria -- the old
+    // `.max(1)` divisor-floor made "no data" and "genuinely $0" indistinguishable in the
+    // response, which is what let the Dashboard's headcount==0 branch hide this KPI
+    // instead of showing it whenever real months exist to average.
+    let run_rate_mensual_ltm_mxn = if meses_con_nomina_ltm > 0 {
+        Some(total_regular / meses_con_nomina_ltm as f64)
+    } else {
+        None
+    };
 
     // Labor liability (pasivo laboral): per active employee
     // SDI = salario diario integrado (daily rate for benefit provisioning)
@@ -1886,7 +1815,16 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     // per its own prior comment, to count "every month nómina data has ever existed for");
     // a month whose only rows are excluded by a normalization rule no longer counts as a
     // month "of data" here, consistent with every other figure in this module.
-    let months_of_data = months_with_data.len() as i64;
+    // L17-06: `months_with_data` itself has no upper bound (it's shared with the gap-walk
+    // above, which supplies its own to/from range and doesn't need one baked into the
+    // query) -- `.len()` alone let an in-progress, partially-timbrado current month count
+    // as a whole month of data. Capped at the anchor here, the one place in get_snapshot
+    // that was still missing it (measured live: RFC grande read 45, not the 44 every other
+    // figure in this response already agrees on).
+    let months_of_data = months_with_data
+        .iter()
+        .filter(|&&(y, m)| (y, m) <= (anchor_y, anchor_m))
+        .count() as i64;
 
     Ok(PayrollSnapshotResponse {
         has_data: true,
@@ -1941,7 +1879,7 @@ fn subtract_months(y: i64, m: i64, n: i64) -> (i64, i64) {
 /// regardless of how few rows come back. `get_snapshot`'s own `months_of_data` used to be a
 /// THIRD such round trip (a plain `COUNT(DISTINCT ...)` over the same predicate) -- this
 /// result's own length already answers it, so that round trip is gone too, not just merged.
-async fn nomina_months_with_data(
+pub(crate) async fn nomina_months_with_data(
     pool: &DbPool,
     rfc: &str,
     anio_piso: i64,

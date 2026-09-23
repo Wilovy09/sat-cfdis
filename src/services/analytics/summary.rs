@@ -619,7 +619,7 @@ pub(crate) fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 }
 
 /// Returns the last fully-closed month (i.e. never the current in-progress month).
-pub(crate) fn current_month() -> String {
+pub fn current_month() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -636,7 +636,7 @@ pub(crate) fn current_month() -> String {
 /// Same cutoff as `current_month()`, as YYYYMM — for callers that compare against
 /// `year*100+month` integers instead of formatted strings (e.g. `recurrence.rs`,
 /// `period_comparison.rs`, `hallazgos.rs`, `payments.rs`, `cashflow.rs`).
-pub(crate) fn current_month_yyyymm() -> i64 {
+pub fn current_month_yyyymm() -> i64 {
     let s = current_month();
     let y: i64 = s[0..4].parse().unwrap_or(0);
     let m: i64 = s[5..7].parse().unwrap_or(0);

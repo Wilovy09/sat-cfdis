@@ -25,11 +25,16 @@
 //! coincidental cancellation doesn't hide a real mismatch in a different year.
 use pulso_backend::config::Config;
 use pulso_backend::db::{self, DbPool};
-use pulso_backend::services::analytics::{hallazgos, payroll};
+use pulso_backend::services::analytics::{hallazgos, payroll, summary};
 use sqlx::Row;
 
 const RFC_PRUEBA: &str = "NUB170623KI3";
 const RFC_GRANDE: &str = "CES100706U65";
+// L17-09: the one RFC in the seven control companies with zero plantilla by this
+// invariant's own definition (0 activos, 0 history depth) -- used to confirm the
+// non-vacuity guard actually rejects an empty case instead of passing 0 == 0, which would
+// prove nothing. Never used as a company name in output, only as an id.
+const RFC_SIN_PLANTILLA: &str = "ALA2409253U7";
 
 async fn connect() -> DbPool {
     dotenvy::dotenv().ok();
@@ -271,4 +276,83 @@ async fn invariante_una_sola_definicion_mes_de_nomina() {
             scoped.summary.total_pagado_mxn
         );
     }
+}
+
+/// Plantilla activa by DEC-091: last receipt on/after the shared cutoff (`>=`, not `==` --
+/// timbrado can run ahead of the anchor). Uses `summary::current_month()` directly, the
+/// same function `payroll::get_snapshot`'s own headcount_actual is built on -- there is no
+/// third re-derivation of the anchor here, only a second COUNT over `full.by_employee`
+/// (already fetched by `payroll::get`, no extra round trip).
+fn plantilla_activa_count(by_employee: &[payroll::EmployeeRow]) -> i64 {
+    let anchor = summary::current_month();
+    by_employee
+        .iter()
+        .filter(|e| e.last_payroll.len() >= 7 && e.last_payroll[..7] >= anchor[..])
+        .count() as i64
+}
+
+/// L17-09: no hay ninguna marca del L16 (DEC-098/DEC-100) en las pruebas del backend --
+/// nada compara el Headcount del snapshot contra el conteo de Plantilla actual. This is
+/// that check, calling the two REAL service functions (`payroll::get_snapshot`,
+/// `payroll::get`) rather than re-deriving either side's logic inline -- same pattern
+/// `invariante_una_sola_definicion_mes_de_nomina` above already established for this file.
+///
+/// Declared asymmetry (not fixed here, per this item's own scope): `get_snapshot` builds
+/// its plantilla over the RFC's full history, `payroll::get` (called here with a wide
+/// 2000-2100 window, matching this file's other invariants) effectively does too for this
+/// purpose -- so in practice both sides see the same population today. If `payroll::get`
+/// is ever called with a narrower window elsewhere, that call site would need its own
+/// comparison; this test exercises the wide-window path only.
+#[tokio::test]
+async fn invariante_snapshot_headcount_vs_plantilla_actual() {
+    let pool = connect().await;
+    for rfc in [RFC_GRANDE] {
+        let snap = payroll::get_snapshot(&pool, rfc)
+            .await
+            .expect("payroll::get_snapshot failed");
+        let full = payroll::get(&pool, rfc, "2000-01", "2100-12")
+            .await
+            .expect("payroll::get failed");
+
+        let plantilla = plantilla_activa_count(&full.by_employee);
+
+        // Non-vacuity guard: a 0/0 match proves nothing about whether the two definitions
+        // agree, only that neither side found anyone -- see the dedicated negative-case
+        // test below, which confirms the guard actually catches that instead of silently
+        // passing.
+        assert!(
+            plantilla > 0,
+            "for {rfc}: plantilla activa count is 0 -- a 0 == 0 match against \
+             headcount_actual wouldn't verify anything. Pick an RFC with real plantilla."
+        );
+
+        assert_eq!(
+            snap.headcount_actual,
+            plantilla,
+            "for {rfc}: snapshot headcount_actual ({}) != plantilla activa count from \
+             payroll::get's by_employee, last_payroll >= {} ({plantilla}). Change the \
+             criterio de activo on either side and this should go red.",
+            snap.headcount_actual,
+            summary::current_month()
+        );
+    }
+}
+
+/// The negative case L17-09 explicitly asks for: the RFC with zero plantilla by this same
+/// definition must be REJECTED by the non-vacuity guard above, not silently pass a 0 == 0
+/// comparison. This test intentionally does NOT assert headcount_actual == plantilla for
+/// this RFC -- it only proves the guard would catch it if something tried to.
+#[tokio::test]
+async fn invariante_snapshot_headcount_guard_rejects_rfc_sin_plantilla() {
+    let pool = connect().await;
+    let full = payroll::get(&pool, RFC_SIN_PLANTILLA, "2000-01", "2100-12")
+        .await
+        .expect("payroll::get failed");
+    let plantilla = plantilla_activa_count(&full.by_employee);
+    assert_eq!(
+        plantilla, 0,
+        "expected this RFC to have zero plantilla activa by the DEC-091 definition today -- \
+         if this changed, swap RFC_SIN_PLANTILLA for a different empty case so the guard's \
+         own negative test keeps meaning something."
+    );
 }

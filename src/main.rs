@@ -204,7 +204,13 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                 None => job.period_from.clone(),
             };
 
-            if resume_from > job.period_to {
+            // L17-10: date_prefix, not a raw comparison -- period_from/period_to and the
+            // resume cursor mix "YYYY-MM-DD" and "YYYY-MM-DD HH:MM:SS" across job types
+            // (see gap_detector::date_prefix's own doc); a bare date always sorts less than
+            // the same day's 23:59:59 timestamp regardless of which day either names.
+            if services::gap_detector::date_prefix(&resume_from)
+                > services::gap_detector::date_prefix(&job.period_to)
+            {
                 let _ = db::jobs::complete(
                     &pool,
                     &job.id,
@@ -381,7 +387,12 @@ async fn daily_sync_worker(pool: DbPool) {
                 Ok(false) => match db::jobs::latest_historical_period_to(&pool, &rfc).await {
                     Ok(Some(hist_to)) => {
                         let gap_start = next_day(&hist_to);
-                        if gap_start < period_from {
+                        // L17-10: date_prefix, not a raw comparison -- see
+                        // gap_detector::date_prefix's own doc for why "YYYY-MM-DD" and
+                        // "YYYY-MM-DD HH:MM:SS" for the same day can't compare directly.
+                        if services::gap_detector::date_prefix(&gap_start)
+                            < services::gap_detector::date_prefix(&period_from)
+                        {
                             gap_start
                         } else {
                             period_from.clone()

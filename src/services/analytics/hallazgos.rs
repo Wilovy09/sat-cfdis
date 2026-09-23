@@ -117,7 +117,11 @@ fn severity_score(nivel: &str) -> u8 {
         "alto" | "negativo" => 1,
         "medio" | "neutral" => 2,
         "bajo" | "positivo" => 3,
-        "muy_bajo" | "muy_positivo" => 4,
+        // L17-04/DEC-101: `informativo` (nivel nuevo, rotación) ranks exactly like
+        // `muy_bajo` on purpose -- rotación ya ocupaba este escalón en 6 de 7 empresas de
+        // control antes de este ítem; un escalón distinto movería qué hallazgos se ven en
+        // el Dashboard, y este ítem cambia lo que el badge dice, no qué hallazgos se ven.
+        "muy_bajo" | "muy_positivo" | "informativo" => 4,
         _ => 5,
     }
 }
@@ -289,14 +293,57 @@ fn h4_interpretacion(nivel: &str) -> &'static str {
 /// con qué distinguir un 8% de un 45% sin saber el giro, así que no finge que sí puede.
 /// Sólo por encima de esa banda hay algo que de verdad se sale de lo esperable en cualquier
 /// sector.
-fn h5a_nivel(tasa_pct: f64) -> &'static str {
-    if tasa_pct > 50.0 { "alto" } else { "muy_bajo" }
+///
+/// L17-04/DEC-101: no hay nivel "bajo" ni "muy_bajo" -- por abajo no hay corte defendible
+/// (industria/banca/técnico operan estructuralmente bajo el promedio nacional; un 15.8%
+/// puede ser bajo en manufactura y alto en banca), y el único caso que un corte bajo
+/// premiaría -- cero bajas en doce meses -- casi siempre es timbrado incompleto, no
+/// estabilidad. Sólo dos salidas: `alto` (>50%, fuera de cualquier banda documentada en
+/// cualquier sector) o `informativo` para todo lo demás, incluidas tres guardas evaluadas
+/// EN ESTE ORDEN -- la primera que aplique gana, y ninguna deja pasar a la siguiente:
+///   1. El mes ancla no tiene ningún CFDI de nómina para este RFC -- la tasa sería
+///      timbrado atrasado, no rotación (medido: RFC servicios A a un mes de dispararla).
+///   2. Menos de 6 de los 12 meses de la ventana tienen nómina -- no hay historia para
+///      promediar.
+///   3. Plantilla promedio (ya con los meses hueco contados como cero, no omitidos) menor
+///      a 5 personas -- una tasa sobre 1-4 personas no es una tasa.
+fn h5a_nivel_e_interpretacion(
+    tasa_pct: f64,
+    avg_hc: f64,
+    meses_con_nomina_en_ventana: usize,
+    ancla_tiene_nomina: bool,
+) -> (&'static str, String) {
+    if !ancla_tiene_nomina {
+        return (
+            "informativo",
+            "Sin CFDI de nómina en el último mes cerrado: esta tasa refleja timbrado pendiente, no rotación."
+                .to_string(),
+        );
+    }
+    if meses_con_nomina_en_ventana < 6 {
+        return (
+            "informativo",
+            "Menos de seis meses con nómina en el período: no hay historia suficiente para una tasa anual."
+                .to_string(),
+        );
+    }
+    if avg_hc < 5.0 {
+        return (
+            "informativo",
+            "Plantilla promedio menor a cinco personas: la tasa no es representativa.".to_string(),
+        );
+    }
+    let nivel = if tasa_pct > 50.0 {
+        "alto"
+    } else {
+        "informativo"
+    };
+    (nivel, h5a_interpretacion().to_string())
 }
 
-/// L16-09: ya no emite veredicto por nivel ("rotación elevada", "señal de inestabilidad")
-/// -- el mismo texto de referencia que Nómina, copiado tal cual (DEC-094), para cualquier
-/// tasa. El nivel (`h5a_nivel`) sigue existiendo para el badge de color; el texto no repite
-/// lo que el badge ya dice.
+/// L16-09: el mismo texto de referencia que Nómina, copiado tal cual (DEC-094), para
+/// cualquier tasa sin guarda -- ver `h5a_nivel_e_interpretacion` para el texto que sí
+/// cambia por guarda.
 fn h5a_interpretacion() -> &'static str {
     "Referencia nacional: 17% a 25%; manufactura, 30% a 50%."
 }
@@ -645,7 +692,24 @@ pub async fn nomina_por_year(
         .collect())
 }
 
-async fn nomina_last_period(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<(i64, i64)>> {
+/// L17-02/DEC-100: H5A/H5B anchor on `current_month_yyyymm()` PLAIN -- the shared "último
+/// mes cerrado" cutoff itself, not this RFC's own most-recent devengo month capped at that
+/// cutoff. Those are different anchors whenever this RFC's own nómina lags the shared
+/// cutoff (the common case: most RFC haven't timbrado the just-closed month yet at the
+/// moment this runs). `min(own_max, cutoff)` would pick the EARLIER of the two -- this
+/// RFC's own (older) last month -- silently reintroducing a per-RFC anchor by the back
+/// door. Measured live: the RFC unipersonal's own nómina reaches July 2026; the shared
+/// cutoff is August. Anchoring on the shared cutoff (plain) reads August as the reference
+/// month, where this RFC has zero rows -- 100% rotación, correctly, since its one employee
+/// has no recibo in the anchor month. `min()`-ing back down to July (where that employee
+/// does have a recibo) reads 0% -- wrong, and indistinguishable from "no rotación" instead
+/// of "nómina timbrado behind."
+///
+/// The existence check this fn already did is kept as-is and stays load-bearing: `None`
+/// still short-circuits both hallazgos before they run their full queries, for an RFC with
+/// literally zero nómina ever -- the cheap query below is now ONLY that existence check,
+/// never a source for the anchor value itself.
+async fn nomina_hallazgo_anchor(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<(i64, i64)>> {
     let row = sqlx::query(
         r#"
         SELECT MAX(year_devengo * 100 + month_devengo)::bigint AS max_ym
@@ -657,14 +721,33 @@ async fn nomina_last_period(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<(
     .fetch_one(pool)
     .await?;
     let max_ym: Option<i64> = row.try_get("max_ym").ok().flatten();
-    Ok(max_ym.filter(|ym| *ym > 0).map(|ym| (ym / 100, ym % 100)))
+    if max_ym.filter(|ym| *ym > 0).is_none() {
+        return Ok(None);
+    }
+    let ym = current_month_yyyymm();
+    Ok(Some((ym / 100, ym % 100)))
 }
 
 async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo>> {
-    let Some((ltm_end_y, ltm_end_m)) = nomina_last_period(pool, rfc).await? else {
+    let Some((ltm_end_y, ltm_end_m)) = nomina_hallazgo_anchor(pool, rfc).await? else {
         return Ok(None);
     };
     let (ltm_start_y, ltm_start_m) = subtract_months(ltm_end_y, ltm_end_m, 11);
+
+    // L17-04/DEC-101 guardas 1 y 2: same shared month-detector DEC-099 already uses for
+    // meses_sin_nomina (one definition of "meses con nómina", not a second one just for
+    // this hallazgo) -- fetched from ltm_start_y onward (no upper bound of its own) and
+    // clipped to this 12-month window here.
+    let months_with_data: std::collections::HashSet<(i64, i64)> =
+        super::payroll::nomina_months_with_data(pool, rfc, ltm_start_y)
+            .await?
+            .into_iter()
+            .filter(|&(y, m)| {
+                (y, m) >= (ltm_start_y, ltm_start_m) && (y, m) <= (ltm_end_y, ltm_end_m)
+            })
+            .collect();
+    let ancla_tiene_nomina = months_with_data.contains(&(ltm_end_y, ltm_end_m));
+    let meses_con_nomina_en_ventana = months_with_data.len();
 
     // L10-09 / AUD-098, DEC-053: rotación used to count every termination the same way,
     // blending contratos de obra/tiempo determinado (which end by design) with real
@@ -675,13 +758,19 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     // permanent staff as temporary. Only tipo_contrato 01/02 (indeterminado/determinado)
     // count as "plantilla permanente"; 03/04/99 are tracked separately below for the
     // context sentence, never silently dropped.
+    // L17-01: fecha_pago alone doesn't break every tie -- two receipts on the same
+    // fecha_pago with different tipo_contrato used to leave the winner up to the query
+    // plan (measured live: 97 vs 93 bajas permanentes for the same RFC on two runs).
+    // fecha_emision DESC, then uuid, make it the same answer every time. This exact CTE is
+    // duplicated (not shared) across five sites in H5A/H5B on purpose, per the doc this
+    // fixes -- all five need the same tiebreak, not just this one.
     let month_rows = sqlx::query(
         r#"
         WITH emp_tipo AS (
             SELECT DISTINCT ON (rfc_receptor) rfc_receptor, tipo_contrato
             FROM pulso.nomina_normalizada
             WHERE rfc_emisor = $1 AND NOT is_excluded
-            ORDER BY rfc_receptor, fecha_pago DESC
+            ORDER BY rfc_receptor, fecha_pago DESC, fecha_emision DESC, uuid
         )
         SELECT n.year_devengo AS year, n.month_devengo AS month, COUNT(DISTINCT n.rfc_receptor)::bigint AS hc
         FROM pulso.nomina_normalizada n
@@ -702,10 +791,6 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     .fetch_all(pool)
     .await?;
 
-    if month_rows.is_empty() {
-        return Ok(None);
-    }
-
     let hc_per_month: Vec<i64> = month_rows
         .iter()
         .map(|r| r.try_get::<i64, _>("hc").unwrap_or(0))
@@ -713,7 +798,13 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     // L10-09: one decimal on the average headcount -- rounding it to a whole number (as
     // before) is what let a reader's own bajas/headcount division disagree with the
     // displayed percentage (L10-06 / AUD-094).
-    let avg_hc = hc_per_month.iter().sum::<i64>() as f64 / hc_per_month.len() as f64;
+    // L17-04: divides by the window's 12 calendar months, not `hc_per_month.len()` -- that
+    // used to only count months that had a qualifying (01/02) row, so a hueco month
+    // dropped out of the divisor instead of counting as zero, inflating the average and
+    // understating the rate (measured live: one RFC moved from 91.7% to 100.0% once its
+    // one hueco month counted as zero headcount instead of being omitted).
+    const ROTACION_WINDOW_MONTHS: f64 = 12.0;
+    let avg_hc = hc_per_month.iter().sum::<i64>() as f64 / ROTACION_WINDOW_MONTHS;
 
     // P-01 / AUD-075: latest-period headcount and bajas used to be two separate queries,
     // the second a correlated NOT EXISTS that rebuilt the whole nomina_normalizada view
@@ -729,7 +820,7 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
             SELECT DISTINCT ON (rfc_receptor) rfc_receptor, tipo_contrato
             FROM pulso.nomina_normalizada
             WHERE rfc_emisor = $1 AND NOT is_excluded
-            ORDER BY rfc_receptor, fecha_pago DESC
+            ORDER BY rfc_receptor, fecha_pago DESC, fecha_emision DESC, uuid
         )
         SELECT
             COUNT(*) FILTER (WHERE active_latest AND tipo_contrato IN ('01', '02'))       AS latest_hc,
@@ -759,13 +850,21 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     let bajas: i64 = emp_rows.try_get("bajas_permanentes").unwrap_or(0);
     let bajas_temporales: i64 = emp_rows.try_get("bajas_temporales").unwrap_or(0);
 
-    if avg_hc <= 0.0 {
-        return Ok(None);
-    }
-
-    let tasa_pct = bajas as f64 / avg_hc * 100.0;
-    let nivel = h5a_nivel(tasa_pct);
-    let interp = h5a_interpretacion();
+    // L17-04: no early `None` return on avg_hc<=0 anymore -- an RFC with real nómina
+    // history but zero plantilla permanente in this window is exactly guarda 3's job
+    // (avg_hc < 5.0 covers avg_hc == 0.0 too), which shows `informativo` with an
+    // explanation instead of silently hiding the hallazgo.
+    let tasa_pct = if avg_hc > 0.0 {
+        bajas as f64 / avg_hc * 100.0
+    } else {
+        0.0
+    };
+    let (nivel, interp) = h5a_nivel_e_interpretacion(
+        tasa_pct,
+        avg_hc,
+        meses_con_nomina_en_ventana,
+        ancla_tiene_nomina,
+    );
 
     // L10-09: one figure, one semáforo -- the by-tipo-de-contrato breakdown belongs in
     // Nómina > Altas y bajas, not here. The second sentence only appears when there's
@@ -795,7 +894,7 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
         nivel: nivel.to_string(),
         metrica_principal: Some(tasa_pct),
         cuerpo,
-        interpretacion: interp.to_string(),
+        interpretacion: interp,
         // L16-09/AUD-168 punto 3: esta tasa usa su propia ventana (12 meses móviles, no año
         // calendario) y su propio universo (sólo contratos 01/02) -- distinto de la que
         // reporta el módulo de Nómina (año calendario, toda la plantilla). Antes el texto
@@ -812,7 +911,7 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
 // ---------------------------------------------------------------------------
 
 async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo>> {
-    let Some((ltm_end_y, ltm_end_m)) = nomina_last_period(pool, rfc).await? else {
+    let Some((ltm_end_y, ltm_end_m)) = nomina_hallazgo_anchor(pool, rfc).await? else {
         return Ok(None);
     };
     let (win_start_y, win_start_m) = subtract_months(ltm_end_y, ltm_end_m, 23);
@@ -825,7 +924,8 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
         r#"
         WITH base AS MATERIALIZED (
             SELECT n.rfc_receptor, n.year_devengo, n.month_devengo, n.tipo_nomina,
-                   n.total_sueldos, n.num_dias_pagados, n.fecha_pago, n.fecha_inicio_rel_laboral
+                   n.total_sueldos, n.num_dias_pagados, n.fecha_pago, n.fecha_inicio_rel_laboral,
+                   n.fecha_emision, n.uuid
             FROM pulso.nomina_normalizada n
             WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
         ),
@@ -833,12 +933,14 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
             SELECT DISTINCT rfc_receptor FROM base
             WHERE year_devengo = $2 AND month_devengo = $3
         ),
+        -- L17-01: same deterministic tiebreak as the emp_tipo CTEs above (H5A) -- see that
+        -- comment for why fecha_pago alone isn't enough.
         last_ordinario AS (
             SELECT DISTINCT ON (b.rfc_receptor) b.rfc_receptor,
                 (COALESCE(b.total_sueldos, 0)::float8 / NULLIF(b.num_dias_pagados, 0)::float8 * 30.0) AS sueldo
             FROM base b
             WHERE b.rfc_receptor IN (SELECT rfc_receptor FROM active_emps) AND b.tipo_nomina = 'O'
-            ORDER BY b.rfc_receptor, b.fecha_pago DESC
+            ORDER BY b.rfc_receptor, b.fecha_pago DESC, b.fecha_emision DESC, b.uuid
         ),
         start_dates AS (
             SELECT b.rfc_receptor,
@@ -905,7 +1007,8 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
         WITH base AS MATERIALIZED (
             SELECT n.rfc_receptor, n.nombre_receptor, n.year_devengo, n.month_devengo,
                    n.tipo_nomina, n.tipo_contrato, n.total_sueldos, n.num_dias_pagados,
-                   n.fecha_pago, n.fecha_final_pago, n.fecha_inicio_rel_laboral
+                   n.fecha_pago, n.fecha_final_pago, n.fecha_inicio_rel_laboral,
+                   n.fecha_emision, n.uuid
             FROM pulso.nomina_normalizada n
             WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
         ),
@@ -918,12 +1021,16 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
             GROUP BY rfc_receptor
             HAVING MAX(year_devengo * 100 + month_devengo) < $4 * 100 + $5
         ),
+        -- L17-01: same deterministic tiebreak as the emp_tipo CTEs above (H5A) -- this is
+        -- the one that decides tipo_contrato for the "personal clave" table's name/fecha
+        -- rows, the most visible of the five sites (measured: 21 people flip sides of the
+        -- filter without this tiebreak).
         last_row AS (
             SELECT DISTINCT ON (b.rfc_receptor)
                 b.rfc_receptor, b.nombre_receptor, b.tipo_contrato, b.fecha_final_pago
             FROM base b
             JOIN term t ON t.rfc_receptor = b.rfc_receptor
-            ORDER BY b.rfc_receptor, b.fecha_pago DESC
+            ORDER BY b.rfc_receptor, b.fecha_pago DESC, b.fecha_emision DESC, b.uuid
         ),
         last_ordinario AS (
             SELECT DISTINCT ON (b.rfc_receptor) b.rfc_receptor,
@@ -931,7 +1038,7 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
             FROM base b
             JOIN term t ON t.rfc_receptor = b.rfc_receptor
             WHERE b.tipo_nomina = 'O'
-            ORDER BY b.rfc_receptor, b.fecha_pago DESC
+            ORDER BY b.rfc_receptor, b.fecha_pago DESC, b.fecha_emision DESC, b.uuid
         ),
         start_dates AS (
             SELECT b.rfc_receptor,
@@ -1464,8 +1571,14 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     let max_ym: Option<i64> = max_ym_row.try_get("max_ym").ok().flatten();
     // L8-01: anchor at the last CLOSED calendar month, not the last month with any
     // comprobante -- 5 of 6 RFC anchored on the in-progress current month (a handful of
-    // days of data) before this. This one line reaches all ten hallazgos below, not just
-    // H1/H2/H8/H9: H6/H7 (L7-03) and H3/H5A/H5B (Lote 6) all inherit it too, correctly.
+    // days of data) before this. This one line reaches H1/H2/H8/H9 and H6/H7 (L7-03) below,
+    // via the ltm_end_y/ltm_end_m this fn returns to its caller.
+    // L17-02 correction: H3/H5A/H5B do NOT inherit THIS variable -- H3 uses this window's
+    // min-of-cutoff-and-last-invoice-month logic too (correct for facturación), but H5A/H5B
+    // independently call `nomina_hallazgo_anchor`, which anchors on `current_month_yyyymm()`
+    // directly (DEC-100), not this fn's min. That distinction matters: an RFC current on
+    // nómina but behind on facturación would get its nómina hallazgos wrongly anchored to
+    // the facturación lag if they used this window instead of their own.
     let (ltm_end_y, ltm_end_m) = match max_ym {
         Some(ym) if ym > 0 => {
             let ym = ym.min(current_month_yyyymm());
@@ -1707,10 +1820,12 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
                 .unwrap_or(0.0);
         if ltm_ingreso > 0.0 {
             let ratio_pct = snap.pasivo_laboral_estimado_mxn / ltm_ingreso * 100.0;
-            let meses_equiv = if snap.run_rate_mensual_ltm_mxn > 0.0 {
-                snap.pasivo_laboral_estimado_mxn / snap.run_rate_mensual_ltm_mxn
-            } else {
-                0.0
+            // L17-05: run_rate_mensual_ltm_mxn is Option now (None = no mes con nómina
+            // ordinaria en la ventana, not a real $0) -- H4 is dead code today (DEC-043
+            // strips it before the response ships) but still needs to compile.
+            let meses_equiv = match snap.run_rate_mensual_ltm_mxn {
+                Some(rr) if rr > 0.0 => snap.pasivo_laboral_estimado_mxn / rr,
+                _ => 0.0,
             };
             let nivel = h4_nivel(ratio_pct);
             let interp = h4_interpretacion(nivel);
