@@ -171,7 +171,7 @@ Cada módulo bajo `src/services/analytics/` calcula un reporte, y casi siempre t
 | Facturas (manual) | `/api/v1/invoices/list/stream`, `/captcha/solve`, `/download` |
 | Cola | `/api/v1/queue`, `/queue/{id}` |
 | Analítica | `/api/v1/analytics/{rfc}/summary`, `/payroll`, `/cashflow`, `/hallazgos`, … |
-| Admin | `/api/v1/admin/reprocess`, `/admin/rfcs`, `/admin/users` |
+| Admin | `/api/v1/admin/reprocess`, `/admin/rfcs`, `/admin/users`, `/admin/logs` |
 
 ---
 
@@ -313,6 +313,9 @@ SENDGRID_FROM=...
 # CORS
 ALLOWED_ORIGINS=...
 ALLOWED_METHODS=...
+
+# pm2 (nombre con el que corre --name <esto>; localiza sus logs para GET /api/v1/admin/logs)
+PM2_APP_NAME=pulso-backend
 ```
 
 > `BOXFACTURA_CONFIG_PATH` activa la resolución automática de captchas con el modelo ONNX local. Si no se configura, el captcha se mostrará al usuario para resolverlo manualmente.

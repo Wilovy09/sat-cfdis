@@ -21,7 +21,8 @@ use config::Config;
 use db::DbPool;
 use routes::{
     analytics as analytics_routes, auth as auth_routes, billing as billing_routes,
-    fiel as fiel_routes, invoices, queue as queue_routes, users as users_routes,
+    fiel as fiel_routes, invoices, logs as logs_routes, queue as queue_routes,
+    users as users_routes,
 };
 use services::etl;
 use state::CaptchaMap;
@@ -1307,6 +1308,8 @@ async fn main() -> std::io::Result<()> {
                         web::get().to(queue_routes::get_job_results),
                     ),
             )
+            // Admin
+            .route("/api/v1/admin/logs", web::get().to(logs_routes::get_logs))
             // Analytics API
             .service(
                 web::scope("/api/v1/analytics/{rfc}")

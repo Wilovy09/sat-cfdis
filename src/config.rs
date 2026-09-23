@@ -47,6 +47,11 @@ pub struct Config {
     pub jwt_secret: String,
     #[allow(dead_code)]
     pub app_base_url: String,
+    /// pm2 process name for this app, e.g. what `pm2 start ... --name <this>` used --
+    /// locates its log files on disk (/root/.pm2/logs/<name>-out.log and -error.log) for
+    /// the admin-only GET /api/v1/admin/logs endpoint. Defaults to the name this app is
+    /// actually registered under on the current server.
+    pub pm2_app_name: String,
 }
 
 impl Config {
@@ -111,6 +116,7 @@ impl Config {
             jwt_secret: env::var("JWT_SECRET").unwrap_or_else(|_| "jwtsecret".to_string()),
             app_base_url: env::var("APP_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),
+            pm2_app_name: env::var("PM2_APP_NAME").unwrap_or_else(|_| "pulso-backend".to_string()),
         }
     }
 }
