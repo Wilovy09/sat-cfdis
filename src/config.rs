@@ -52,6 +52,12 @@ pub struct Config {
     /// the admin-only GET /api/v1/admin/logs endpoint. Defaults to the name this app is
     /// actually registered under on the current server.
     pub pm2_app_name: String,
+    /// Shared secret that lets a trusted log-aggregator (adquiere-logs) call GET
+    /// /api/v1/admin/logs without a per-environment admin JWT -- see
+    /// `routes::logs::admin_logs_key_matches` for why a personal JWT can't do this job
+    /// across environments. `None` (unset) disables the bypass entirely; only the
+    /// existing per-user JWT + DB admin check applies.
+    pub admin_logs_key: Option<String>,
 }
 
 impl Config {
@@ -117,6 +123,7 @@ impl Config {
             app_base_url: env::var("APP_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),
             pm2_app_name: env::var("PM2_APP_NAME").unwrap_or_else(|_| "pulso-backend".to_string()),
+            admin_logs_key: env::var("ADMIN_LOGS_KEY").ok(),
         }
     }
 }

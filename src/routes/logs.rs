@@ -57,7 +57,34 @@ fn jwt_user_id(token: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-async fn require_admin(req: &HttpRequest, pool: &DbPool) -> Result<(), AppError> {
+/// A per-user admin JWT only means something inside the environment that issued it -- a
+/// person who's admin in prod's `public.users`/`user_roles` has a *different* id (and no
+/// row at all) in test's, since each environment provisions accounts independently. That
+/// makes a personal JWT useless for a tool like adquiere-logs that aggregates logs across
+/// environments: whichever environment issued the token, every OTHER environment's DB
+/// lookup fails, regardless of whether the person really is an admin everywhere.
+///
+/// `ADMIN_LOGS_KEY` is the fix: a shared secret configured identically here and in
+/// adquiere-logs. It authorizes the aggregator itself (a trusted service, already gating
+/// humans at its own login) rather than re-deriving admin status from a token whose
+/// identity this environment's DB was never going to recognize. The per-user JWT path
+/// below is untouched and still works exactly as before for anyone hitting this endpoint
+/// directly with their own token.
+fn admin_logs_key_matches(req: &HttpRequest, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    req.headers()
+        .get("x-admin-logs-key")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|got| got == expected)
+}
+
+async fn require_admin(req: &HttpRequest, pool: &DbPool, cfg: &Config) -> Result<(), AppError> {
+    if admin_logs_key_matches(req, cfg.admin_logs_key.as_deref()) {
+        return Ok(());
+    }
+
     let token = bearer_token(req).ok_or_else(|| AppError::unauthorized("Token requerido"))?;
     let user_id = jwt_user_id(&token).ok_or_else(|| AppError::unauthorized("Token inválido"))?;
     let is_admin = crate::db::users::is_user_admin(pool, &user_id)
@@ -173,7 +200,7 @@ pub async fn get_logs(
     cfg: web::Data<Config>,
     query: web::Query<LogsQuery>,
 ) -> Result<HttpResponse, AppError> {
-    require_admin(&req, pool.get_ref()).await?;
+    require_admin(&req, pool.get_ref(), cfg.get_ref()).await?;
 
     let n = query.lines.clamp(1, MAX_LINES);
     let stream = query.stream.as_str();
@@ -248,5 +275,41 @@ mod tail_lines_tests {
     #[test]
     fn missing_file_is_an_error_not_a_panic() {
         assert!(tail_lines(Path::new("/does/not/exist.log"), 10).is_err());
+    }
+}
+
+#[cfg(test)]
+mod admin_logs_key_tests {
+    use super::admin_logs_key_matches;
+    use actix_web::test::TestRequest;
+
+    #[test]
+    fn no_configured_key_never_matches_even_with_a_header() {
+        let req = TestRequest::default()
+            .insert_header(("x-admin-logs-key", "anything"))
+            .to_http_request();
+        assert!(!admin_logs_key_matches(&req, None));
+    }
+
+    #[test]
+    fn missing_header_does_not_match_a_configured_key() {
+        let req = TestRequest::default().to_http_request();
+        assert!(!admin_logs_key_matches(&req, Some("secret")));
+    }
+
+    #[test]
+    fn wrong_header_value_does_not_match() {
+        let req = TestRequest::default()
+            .insert_header(("x-admin-logs-key", "wrong"))
+            .to_http_request();
+        assert!(!admin_logs_key_matches(&req, Some("secret")));
+    }
+
+    #[test]
+    fn exact_match_succeeds() {
+        let req = TestRequest::default()
+            .insert_header(("x-admin-logs-key", "secret"))
+            .to_http_request();
+        assert!(admin_logs_key_matches(&req, Some("secret")));
     }
 }

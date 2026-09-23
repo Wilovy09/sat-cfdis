@@ -316,6 +316,10 @@ ALLOWED_METHODS=...
 
 # pm2 (nombre con el que corre --name <esto>; localiza sus logs para GET /api/v1/admin/logs)
 PM2_APP_NAME=pulso-backend
+
+# Llave compartida con adquiere-logs para GET /api/v1/admin/logs -- mismo valor en cada
+# ambiente que adquiere-logs agregue (un JWT de un ambiente no es admin en la DB de otro).
+ADMIN_LOGS_KEY=...
 ```
 
 > `BOXFACTURA_CONFIG_PATH` activa la resolución automática de captchas con el modelo ONNX local. Si no se configura, el captcha se mostrará al usuario para resolverlo manualmente.
