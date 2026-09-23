@@ -770,8 +770,15 @@ pub async fn rfc_job_range(
     pool: &PgPool,
     rfc: &str,
 ) -> Result<Option<(String, String)>, sqlx::Error> {
+    // L17-10: `period_from`/`period_to` mix "YYYY-MM-DD" (most jobs) and
+    // "YYYY-MM-DD HH:MM:SS" (gap-resync jobs, see gap_detector.rs) -- MIN/MAX on the raw
+    // TEXT column compares lexicographically, so an earlier day stored with a trailing
+    // timestamp could out-rank a later day stored as a bare date, picking the wrong end of
+    // the range. Aggregating over LEFT(..., 10) instead of the raw column fixes the
+    // aggregation itself, not just how its result gets compared afterward -- truncating
+    // only the *output* would leave a wrongly-picked MIN/MAX unfixed underneath.
     let row: (Option<String>, Option<String>) = sqlx::query_as(
-        r#"SELECT MIN(period_from), MAX(period_to) FROM pulso.sync_jobs WHERE rfc = $1"#,
+        r#"SELECT MIN(LEFT(period_from, 10)), MAX(LEFT(period_to, 10)) FROM pulso.sync_jobs WHERE rfc = $1"#,
     )
     .bind(rfc.to_uppercase())
     .fetch_one(pool)
