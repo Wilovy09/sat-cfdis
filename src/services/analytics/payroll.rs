@@ -363,36 +363,25 @@ pub async fn get(
 
     // L16-03/AUD-163/DEC-099: same detector, same anchor (the shared último-mes-cerrado, not
     // whatever `to` the caller happened to request) as `get_snapshot`'s own call -- see
-    // `meses_sin_nomina`'s doc comment. Uses this RFC's own first nómina month at or after
-    // the piso, not `from_y`/`from_m` above (those reflect what the caller asked for, which
-    // NominaView.vue always widens to '2000-01').
-    let meses_sin_nomina = {
-        let first_row = sqlx::query(
-            r#"
-            SELECT MIN(n.year_devengo * 100 + n.month_devengo) AS first_period
-            FROM pulso.nomina_normalizada n
-            WHERE n.rfc_emisor = $1 AND NOT n.is_excluded AND n.year_devengo >= $2
-            "#,
-        )
-        .bind(rfc)
-        .bind(anio_piso)
-        .fetch_one(pool)
-        .await?;
-        let first_period: Option<i64> = first_row.try_get("first_period").ok().flatten();
-        match first_period {
-            None => Vec::new(),
-            Some(first_period) => {
-                let anchor_ym = current_month_yyyymm();
-                meses_sin_nomina(
-                    pool,
-                    rfc,
-                    first_period / 100,
-                    first_period % 100,
-                    anchor_ym / 100,
-                    anchor_ym % 100,
-                )
-                .await?
-            }
+    // `nomina_months_with_data`'s doc comment. Uses this RFC's own first nómina month at or
+    // after the piso, not `from_y`/`from_m` above (those reflect what the caller asked for,
+    // which NominaView.vue always widens to '2000-01').
+    let months_with_data: std::collections::HashSet<(i64, i64)> =
+        nomina_months_with_data(pool, rfc, anio_piso)
+            .await?
+            .into_iter()
+            .collect();
+    let meses_sin_nomina = match months_with_data.iter().min() {
+        None => Vec::new(),
+        Some(&(first_y, first_m)) => {
+            let anchor_ym = current_month_yyyymm();
+            gaps_in_range(
+                &months_with_data,
+                first_y,
+                first_m,
+                anchor_ym / 100,
+                anchor_ym % 100,
+            )
         }
     };
 
@@ -478,36 +467,43 @@ pub async fn get(
     // departamento/puesto normalized right here, the one place both fields are picked for
     // display -- every consumer of by_employee (Plantilla actual, PLA02, Personal clave,
     // Altas, Bajas) inherits it for free instead of re-normalizing on its own.
-    let emp_dept_expr = missing_dept_puesto_expr("n.departamento", "Sin departamento");
-    let emp_puesto_expr = missing_dept_puesto_expr("n.puesto", "Sin puesto");
+    // L16-perf/AUD-172: same MATERIALIZED-base fix as emp_year_rows below -- three DISTINCT
+    // ON CTEs over the identical `cfdi_nomina JOIN cfdis` join, each re-evaluated separately,
+    // for what is otherwise the same base rows. Raw tables (not the LATERAL-joined
+    // `nomina_normalizada` view), so the per-scan cost here is smaller, but still three scans
+    // of the same ~11k-row join instead of one.
+    let emp_dept_expr = missing_dept_puesto_expr("departamento", "Sin departamento");
+    let emp_puesto_expr = missing_dept_puesto_expr("puesto", "Sin puesto");
     let emp_rows = sqlx::query(&format!(r#"
-        WITH latest_attrs AS (
-            SELECT DISTINCT ON (c.rfc_receptor)
-                c.rfc_receptor AS emp_rfc,
+        WITH cn_base AS MATERIALIZED (
+            SELECT c.rfc_receptor, c.fecha_emision, n.departamento, n.puesto, n.tipo_contrato,
+                   n.tipo_jornada, n.tipo_regimen, n.salario_diario_integrado, n.fecha_final_pago,
+                   n.fecha_inicio_rel_laboral
+            FROM pulso.cfdi_nomina n
+            JOIN pulso.cfdis c ON c.uuid = n.uuid
+            WHERE c.rfc_emisor = $1
+              AND c.tipo_comprobante = 'N'
+              AND NOT c.is_cancelled
+        ),
+        latest_attrs AS (
+            SELECT DISTINCT ON (rfc_receptor)
+                rfc_receptor AS emp_rfc,
                 {emp_dept_expr} AS departamento,
                 {emp_puesto_expr} AS puesto,
-                n.tipo_contrato,
-                n.tipo_jornada,
-                n.tipo_regimen,
-                n.salario_diario_integrado AS sdi_latest,
-                n.fecha_final_pago
-            FROM pulso.cfdi_nomina n
-            JOIN pulso.cfdis c ON c.uuid = n.uuid
-            WHERE c.rfc_emisor = $1
-              AND c.tipo_comprobante = 'N'
-              AND NOT c.is_cancelled
-            ORDER BY c.rfc_receptor, c.fecha_emision DESC
+                tipo_contrato,
+                tipo_jornada,
+                tipo_regimen,
+                salario_diario_integrado AS sdi_latest,
+                fecha_final_pago
+            FROM cn_base
+            ORDER BY rfc_receptor, fecha_emision DESC
         ),
         earliest_attrs AS (
-            SELECT DISTINCT ON (c.rfc_receptor)
-                c.rfc_receptor AS emp_rfc,
-                n.salario_diario_integrado AS sdi_at_first
-            FROM pulso.cfdi_nomina n
-            JOIN pulso.cfdis c ON c.uuid = n.uuid
-            WHERE c.rfc_emisor = $1
-              AND c.tipo_comprobante = 'N'
-              AND NOT c.is_cancelled
-            ORDER BY c.rfc_receptor, c.fecha_emision ASC
+            SELECT DISTINCT ON (rfc_receptor)
+                rfc_receptor AS emp_rfc,
+                salario_diario_integrado AS sdi_at_first
+            FROM cn_base
+            ORDER BY rfc_receptor, fecha_emision ASC
         ),
         -- L15-05/AUD-157/DEC-092: fecha_inicio_rel_laboral from the MOST RECENT receipt
         -- that actually declares it, not from the employee's earliest receipt -- a blank
@@ -517,16 +513,12 @@ pub async fn get(
         -- sdi_at_first) and "most recent receipt that declares this one field" are
         -- different receipts for the same employee more often than not.
         alta_attrs AS (
-            SELECT DISTINCT ON (c.rfc_receptor)
-                c.rfc_receptor AS emp_rfc,
-                NULLIF(TRIM(n.fecha_inicio_rel_laboral), '') AS fecha_inicio_rel_laboral
-            FROM pulso.cfdi_nomina n
-            JOIN pulso.cfdis c ON c.uuid = n.uuid
-            WHERE c.rfc_emisor = $1
-              AND c.tipo_comprobante = 'N'
-              AND NOT c.is_cancelled
-              AND NULLIF(TRIM(COALESCE(n.fecha_inicio_rel_laboral, '')), '') IS NOT NULL
-            ORDER BY c.rfc_receptor, c.fecha_emision DESC
+            SELECT DISTINCT ON (rfc_receptor)
+                rfc_receptor AS emp_rfc,
+                NULLIF(TRIM(fecha_inicio_rel_laboral), '') AS fecha_inicio_rel_laboral
+            FROM cn_base
+            WHERE NULLIF(TRIM(COALESCE(fecha_inicio_rel_laboral, '')), '') IS NOT NULL
+            ORDER BY rfc_receptor, fecha_emision DESC
         )
         SELECT
             n.rfc_receptor                              AS emp_rfc,
@@ -586,6 +578,10 @@ pub async fn get(
     // average this table feeds by that same factor (measured 4.98x on the RFC grande).
     // `percepciones` still needs the join, but only for the 001/046 breakdown, and is joined
     // back to `dias` at the rfc_receptor level, never at the receipt level.
+    // L16-perf/AUD-172: `dias` and `percepciones` each used to scan `nomina_normalizada`
+    // independently for the identical (rfc_emisor, tipo_nomina='O', 3-month window)
+    // predicate -- same fix as emp_year_rows/emp_rows above, one shared base instead of two
+    // separate evaluations of the view's own per-row LATERAL joins.
     let perc_3m_rows = sqlx::query(r#"
         WITH bounds AS (
             SELECT
@@ -594,38 +590,39 @@ pub async fn get(
                 EXTRACT(YEAR FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date)::int * 100 +
                 EXTRACT(MONTH FROM (date_trunc('month', CURRENT_DATE) - interval '1 day')::date)::int AS to_ym
         ),
-        dias AS (
-            SELECT n.rfc_receptor,
-                   SUM(COALESCE(n.num_dias_pagados,0)::float8)              AS total_dias,
-                   COUNT(DISTINCT (n.year_devengo * 100 + n.month_devengo)) AS meses_con_dato
+        base AS MATERIALIZED (
+            -- AUD-015/DEC-025: anchored to the last COMPLETE calendar month, not
+            -- CURRENT_DATE, so the window is reproducible across runs on different days
+            -- (same idiom as migrations 052's dias_antiguedad / rfc_as_of_cutoff).
+            -- L6C-04: compares against devengo now, same anchor formula.
+            SELECT n.rfc_receptor, n.year_devengo, n.month_devengo, n.num_dias_pagados,
+                   n.uuid, n.factor
             FROM pulso.nomina_normalizada n, bounds b
             WHERE n.rfc_emisor = $1
               AND n.tipo_nomina = 'O'
               AND NOT n.is_excluded
-              -- AUD-015/DEC-025: anchored to the last COMPLETE calendar month, not
-              -- CURRENT_DATE, so the window is reproducible across runs on different days
-              -- (same idiom as migrations 052's dias_antiguedad / rfc_as_of_cutoff).
-              -- L6C-04: compares against devengo now, same anchor formula.
               AND (n.year_devengo * 100 + n.month_devengo) BETWEEN b.from_ym AND b.to_ym
-            GROUP BY n.rfc_receptor
+        ),
+        dias AS (
+            SELECT rfc_receptor,
+                   SUM(COALESCE(num_dias_pagados,0)::float8)              AS total_dias,
+                   COUNT(DISTINCT (year_devengo * 100 + month_devengo)) AS meses_con_dato
+            FROM base
+            GROUP BY rfc_receptor
         ),
         percepciones AS (
-            SELECT n.rfc_receptor,
+            SELECT b.rfc_receptor,
                 SUM(CASE WHEN p.tipo_percepcion = '001'
-                         THEN (COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor
+                         THEN (COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * b.factor
                          ELSE 0.0 END)                                    AS total_001,
                 SUM(CASE WHEN p.tipo_percepcion = '046'
-                         THEN (COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * n.factor
+                         THEN (COALESCE(p.importe_gravado,0)::float8 + COALESCE(p.importe_exento,0)::float8) * b.factor
                          ELSE 0.0 END)                                    AS total_046,
                 BOOL_OR(p.tipo_percepcion = '001')                        AS has_001,
                 BOOL_OR(p.tipo_percepcion = '046')                        AS has_046
-            FROM pulso.cfdi_nomina_percepciones p
-            JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid, bounds b
-            WHERE n.rfc_emisor = $1
-              AND n.tipo_nomina = 'O'
-              AND NOT n.is_excluded
-              AND (n.year_devengo * 100 + n.month_devengo) BETWEEN b.from_ym AND b.to_ym
-            GROUP BY n.rfc_receptor
+            FROM base b
+            JOIN pulso.cfdi_nomina_percepciones p ON p.uuid = b.uuid
+            GROUP BY b.rfc_receptor
         )
         SELECT
             d.rfc_receptor                       AS emp_rfc,
@@ -1219,49 +1216,59 @@ pub async fn get(
     // the alphabetical MAX). Two separate CTEs, same shape as L15-05's alta_attrs: a
     // department and a puesto can each be declared on a different receipt than the other,
     // so picking one row for both would silently borrow one field's date for the other.
+    // L16-perf/AUD-172: dept_attrs/puesto_attrs used to each scan `nomina_normalizada` fresh
+    // (the view's own per-row LATERAL joins re-evaluated in full, independently of the main
+    // aggregation's own scan below) -- three evaluations of the same view in one query,
+    // measured live at 1068ms; one shared `MATERIALIZED` base brings that same query to
+    // 407ms. `base` deliberately carries no `tipo_nomina`/window filter of its own (the
+    // attrs CTEs need every year this employee has, not just the requested window or
+    // ordinaria payroll) -- those filters stay on the main aggregation below, same as before.
     let dept_expr = missing_dept_puesto_expr("n.departamento", "Sin departamento");
     let puesto_expr = missing_dept_puesto_expr("n.puesto", "Sin puesto");
     let emp_year_rows = sqlx::query(&format!(
         r#"
-        WITH dept_attrs AS (
-            SELECT DISTINCT ON (n.rfc_receptor, n.year_devengo)
-                n.rfc_receptor, n.year_devengo AS year, {dept_expr} AS departamento
+        WITH base AS MATERIALIZED (
+            SELECT n.rfc_receptor, n.year_devengo, n.month_devengo, n.tipo_nomina, n.uuid,
+                   n.fecha_emision, n.departamento, n.puesto, n.nombre_receptor,
+                   n.salario_diario_integrado, n.factor
             FROM pulso.nomina_normalizada n
             WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
-              AND NULLIF(TRIM(COALESCE(n.departamento, '')), '') IS NOT NULL
-            ORDER BY n.rfc_receptor, n.year_devengo, n.fecha_emision DESC
+        ),
+        dept_attrs AS (
+            SELECT DISTINCT ON (rfc_receptor, year_devengo)
+                rfc_receptor, year_devengo AS year, {dept_expr} AS departamento
+            FROM base
+            WHERE NULLIF(TRIM(COALESCE(departamento, '')), '') IS NOT NULL
+            ORDER BY rfc_receptor, year_devengo, fecha_emision DESC
         ),
         puesto_attrs AS (
-            SELECT DISTINCT ON (n.rfc_receptor, n.year_devengo)
-                n.rfc_receptor, n.year_devengo AS year, {puesto_expr} AS puesto
-            FROM pulso.nomina_normalizada n
-            WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
-              AND NULLIF(TRIM(COALESCE(n.puesto, '')), '') IS NOT NULL
-            ORDER BY n.rfc_receptor, n.year_devengo, n.fecha_emision DESC
+            SELECT DISTINCT ON (rfc_receptor, year_devengo)
+                rfc_receptor, year_devengo AS year, {puesto_expr} AS puesto
+            FROM base
+            WHERE NULLIF(TRIM(COALESCE(puesto, '')), '') IS NOT NULL
+            ORDER BY rfc_receptor, year_devengo, fecha_emision DESC
         )
-        SELECT n.rfc_receptor AS rfc,
-               MAX(n.nombre_receptor) AS nombre,
+        SELECT b.rfc_receptor AS rfc,
+               MAX(b.nombre_receptor) AS nombre,
                COALESCE(MAX(da.departamento), 'Sin departamento') AS dpto,
                COALESCE(MAX(pa.puesto), 'Sin puesto') AS puesto,
-               n.year_devengo AS year,
-               COALESCE(SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * n.factor)
+               b.year_devengo AS year,
+               COALESCE(SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * b.factor)
                  FILTER (WHERE p.tipo_percepcion = '001'), 0)                 AS sueldo_base,
-               COALESCE(SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * n.factor)
+               COALESCE(SUM((COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 * b.factor)
                  FILTER (WHERE p.tipo_percepcion NOT IN
                          ({percepciones_eventuales_sql})), 0)                 AS compensacion_ordinaria,
-               COUNT(DISTINCT n.month_devengo) AS months_active,
-               AVG(COALESCE(n.salario_diario_integrado,0)::float8) AS avg_sdi
-        FROM pulso.cfdi_nomina_percepciones p
-        JOIN pulso.nomina_normalizada n ON n.uuid = p.uuid
-        LEFT JOIN dept_attrs da ON da.rfc_receptor = n.rfc_receptor AND da.year = n.year_devengo
-        LEFT JOIN puesto_attrs pa ON pa.rfc_receptor = n.rfc_receptor AND pa.year = n.year_devengo
-        WHERE n.rfc_emisor = $1
-          AND n.tipo_nomina = 'O'
-          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
-          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
-          AND NOT n.is_excluded
-        GROUP BY n.rfc_receptor, n.year_devengo
-        ORDER BY n.rfc_receptor, n.year_devengo
+               COUNT(DISTINCT b.month_devengo) AS months_active,
+               AVG(COALESCE(b.salario_diario_integrado,0)::float8) AS avg_sdi
+        FROM base b
+        JOIN pulso.cfdi_nomina_percepciones p ON p.uuid = b.uuid
+        LEFT JOIN dept_attrs da ON da.rfc_receptor = b.rfc_receptor AND da.year = b.year_devengo
+        LEFT JOIN puesto_attrs pa ON pa.rfc_receptor = b.rfc_receptor AND pa.year = b.year_devengo
+        WHERE b.tipo_nomina = 'O'
+          AND (b.year_devengo > $2 OR (b.year_devengo = $2 AND b.month_devengo >= $3))
+          AND (b.year_devengo < $4 OR (b.year_devengo = $4 AND b.month_devengo <= $5))
+        GROUP BY b.rfc_receptor, b.year_devengo
+        ORDER BY b.rfc_receptor, b.year_devengo
     "#,
     ))
     .bind(rfc).bind(from_y).bind(from_m).bind(to_y).bind(to_m)
@@ -1515,32 +1522,21 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     let anchor_y = anchor_ym / 100;
     let anchor_m = anchor_ym % 100;
 
-    // First month this RFC has payroll data for, at or after the year piso (DEC-095: a
-    // pre-piso month was never really "the start" as far as this module is concerned).
-    // `has_data` and the floor of the gap-month scan (L16-03/DEC-099) both need it; nothing
-    // else does.
-    let first_row = sqlx::query(
-        r#"
-        SELECT MIN(n.year_devengo * 100 + n.month_devengo) AS first_period
-        FROM pulso.nomina_normalizada n
-        WHERE n.rfc_emisor = $1
-          AND NOT n.is_excluded
-          AND n.year_devengo >= $2
-        "#,
-    )
-    .bind(rfc)
-    .bind(anio_piso)
-    .fetch_one(pool)
-    .await?;
-
-    let first_period: Option<i64> = first_row.try_get("first_period").ok().flatten();
-    let Some(first_period) = first_period else {
+    // L16-perf/AUD-172: one fetch covers `has_data`, the gap-month scan floor (L16-03/
+    // DEC-099), AND `months_of_data` below (its own length) -- this used to be three
+    // separate round trips against `pulso.nomina_normalizada`, each paying that view's own
+    // per-row LATERAL joins independently (~300-570ms apiece measured live against the RFC
+    // grande, regardless of row count).
+    let months_with_data: std::collections::HashSet<(i64, i64)> =
+        nomina_months_with_data(pool, rfc, anio_piso)
+            .await?
+            .into_iter()
+            .collect();
+    let Some(&(first_y, first_m)) = months_with_data.iter().min() else {
         return Ok(empty());
     };
-    let (first_y, first_m) = (first_period / 100, first_period % 100);
 
-    let meses_sin_nomina =
-        meses_sin_nomina(pool, rfc, first_y, first_m, anchor_y, anchor_m).await?;
+    let meses_sin_nomina = gaps_in_range(&months_with_data, first_y, first_m, anchor_y, anchor_m);
 
     // LTM window: 12 months ending at the anchor
     let (ltm_from_y, ltm_from_m) = subtract_months(anchor_y, anchor_m, 11);
@@ -1879,19 +1875,12 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     // L16-04/AUD-164/DEC-095/DEC-096: same floor as everything else in the module -- this
     // was the one query in get_snapshot still counting pre-piso months (47 vs. the 44 the
     // rest of the analysis window uses, on the RFC grande measured).
-    let months_row = sqlx::query(
-        r#"
-        SELECT COUNT(DISTINCT n.year_devengo * 100 + n.month_devengo) AS cnt
-        FROM pulso.nomina_normalizada n
-        WHERE n.rfc_emisor = $1
-          AND n.year_devengo >= $2
-        "#,
-    )
-    .bind(rfc)
-    .bind(anio_piso)
-    .fetch_one(pool)
-    .await?;
-    let months_of_data: i64 = months_row.try_get("cnt").unwrap_or(0);
+    // L16-perf/AUD-172: same fetch as `meses_sin_nomina` above, not a fourth round trip.
+    // Narrows slightly from the old dedicated query (which didn't filter `is_excluded`,
+    // per its own prior comment, to count "every month nómina data has ever existed for");
+    // a month whose only rows are excluded by a normalization rule no longer counts as a
+    // month "of data" here, consistent with every other figure in this module.
+    let months_of_data = months_with_data.len() as i64;
 
     Ok(PayrollSnapshotResponse {
         has_data: true,
@@ -1937,42 +1926,54 @@ fn subtract_months(y: i64, m: i64, n: i64) -> (i64, i64) {
 /// `get_snapshot()` call, so a month either shows up as a gap in both places or in neither --
 /// two independent scans of the same question is exactly the class of bug this lote exists to
 /// close (L16-05/L16-06/L16-07 are all the same shape: one number, described two ways).
-async fn meses_sin_nomina(
+/// L16-perf/AUD-172: every distinct (year_devengo, month_devengo) this RFC has non-excluded
+/// nómina for, at or after the piso, no upper bound. One query -- the ONLY read against
+/// `pulso.nomina_normalizada` this feature needs. It used to be two: a `MIN(...)` round trip
+/// to find the first month, then a second `SELECT DISTINCT` for the gap scan -- both paying
+/// this view's own per-row LATERAL joins (payroll-rule/exclusion resolution baked into the
+/// view definition) independently, ~300-570ms each measured live against the RFC grande,
+/// regardless of how few rows come back. `get_snapshot`'s own `months_of_data` used to be a
+/// THIRD such round trip (a plain `COUNT(DISTINCT ...)` over the same predicate) -- this
+/// result's own length already answers it, so that round trip is gone too, not just merged.
+async fn nomina_months_with_data(
     pool: &DbPool,
     rfc: &str,
+    anio_piso: i64,
+) -> anyhow::Result<Vec<(i64, i64)>> {
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT year_devengo, month_devengo
+        FROM pulso.nomina_normalizada
+        WHERE rfc_emisor = $1 AND NOT is_excluded AND year_devengo >= $2
+        "#,
+    )
+    .bind(rfc)
+    .bind(anio_piso)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// L16-03/AUD-163/DEC-099: pure gap-walk over an already-fetched set of months with data --
+/// no DB access of its own, so `get()` and `get_snapshot()` both build `with_data` once (via
+/// `nomina_months_with_data`) and call this, instead of each re-querying. Kept separate from
+/// the fetch above specifically so it stays unit-testable without a pool.
+fn gaps_in_range(
+    with_data: &std::collections::HashSet<(i64, i64)>,
     from_y: i64,
     from_m: i64,
     to_y: i64,
     to_m: i64,
-) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(i64,)> = sqlx::query_as(
-        r#"
-        SELECT DISTINCT year_devengo * 100 + month_devengo
-        FROM pulso.nomina_normalizada
-        WHERE rfc_emisor = $1
-          AND NOT is_excluded
-          AND (year_devengo > $2 OR (year_devengo = $2 AND month_devengo >= $3))
-          AND (year_devengo < $4 OR (year_devengo = $4 AND month_devengo <= $5))
-        "#,
-    )
-    .bind(rfc)
-    .bind(from_y)
-    .bind(from_m)
-    .bind(to_y)
-    .bind(to_m)
-    .fetch_all(pool)
-    .await?;
-    let with_data: std::collections::HashSet<i64> = rows.into_iter().map(|(ym,)| ym).collect();
-
+) -> Vec<String> {
     let mut gaps = Vec::new();
     let (mut y, mut m) = (from_y, from_m);
     while (y, m) <= (to_y, to_m) {
-        if !with_data.contains(&(y * 100 + m)) {
+        if !with_data.contains(&(y, m)) {
             gaps.push(format!("{y:04}-{m:02}"));
         }
         (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
     }
-    Ok(gaps)
+    gaps
 }
 
 #[cfg(test)]

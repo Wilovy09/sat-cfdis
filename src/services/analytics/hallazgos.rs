@@ -47,13 +47,32 @@ fn subtract_months(y: i64, m: i64, n: i64) -> (i64, i64) {
     (total / 12, total % 12 + 1)
 }
 
+/// L16-design/AUD-173: `format!` never groups thousands -- Rust has no built-in digit
+/// grouping. Every money figure a hallazgo bakes into its narrative text (`cuerpo`) goes
+/// through this, never a bare `format!("${v}...")`: once a number is baked into a sentence
+/// STRING, the frontend's fmx* helpers can never reformat it the way they can a struct's own
+/// numeric field (confirmed live: `$175617.45 MXN` reached the Dashboard with no comma,
+/// H5B's single-employee narrative, because that money was already text by the time it left
+/// this function).
+fn group_thousands(integer_part: &str) -> String {
+    let bytes = integer_part.as_bytes();
+    let mut out = String::with_capacity(integer_part.len() + integer_part.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
 fn fmt_mxn(v: f64) -> String {
     if v >= 1_000_000.0 {
         format!("${:.1}M MXN", v / 1_000_000.0)
     } else if v >= 1_000.0 {
         format!("${:.0}K MXN", v / 1_000.0)
     } else {
-        format!("${:.0} MXN", v)
+        format!("${} MXN", group_thousands(&format!("{:.0}", v.abs())))
     }
 }
 
@@ -61,7 +80,12 @@ fn fmt_mxn(v: f64) -> String {
 // full precision doesn't fix that on its own, but it's the format that lets an analyst
 // actually reconcile the number against a payslip, which "$140K" doesn't.
 fn fmt_mxn_full(v: f64) -> String {
-    format!("${v:.2} MXN")
+    let sign = if v < 0.0 { "-" } else { "" };
+    let formatted = format!("{:.2}", v.abs());
+    let (int_part, dec_part) = formatted
+        .split_once('.')
+        .unwrap_or((formatted.as_str(), "00"));
+    format!("{sign}${}.{dec_part} MXN", group_thousands(int_part))
 }
 
 /// Linear-interpolated percentile of a value already sorted ascending (0.5 = median).
@@ -1846,4 +1870,51 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     visible.extend(others.into_iter().take(remaining));
 
     Ok(HallazgosResponse { visible, all })
+}
+
+#[cfg(test)]
+mod l16_design_tests {
+    use super::*;
+
+    #[test]
+    fn fmt_mxn_full_groups_thousands() {
+        // The bug measured live: H5B's single-employee narrative shipped
+        // "$175617.45 MXN" to the Dashboard, no comma, because `format!("${v:.2} MXN")`
+        // never groups digits -- Rust has none of that built in.
+        assert_eq!(fmt_mxn_full(175_617.45), "$175,617.45 MXN");
+    }
+
+    #[test]
+    fn fmt_mxn_full_handles_millions_and_small_values() {
+        assert_eq!(fmt_mxn_full(1_234_567.89), "$1,234,567.89 MXN");
+        assert_eq!(fmt_mxn_full(999.5), "$999.50 MXN");
+        assert_eq!(fmt_mxn_full(0.0), "$0.00 MXN");
+    }
+
+    #[test]
+    fn fmt_mxn_full_handles_negative() {
+        assert_eq!(fmt_mxn_full(-12_345.0), "-$12,345.00 MXN");
+    }
+
+    #[test]
+    fn fmt_mxn_below_thousand_still_groups_correctly() {
+        // Never actually reaches 4+ digits here (the `< 1_000.0` branch), but should stay
+        // correct if that boundary ever moves.
+        assert_eq!(fmt_mxn(623.0), "$623 MXN");
+    }
+
+    #[test]
+    fn fmt_mxn_abbreviates_thousands_and_millions() {
+        assert_eq!(fmt_mxn(5_200_000.0), "$5.2M MXN");
+        assert_eq!(fmt_mxn(140_000.0), "$140K MXN");
+    }
+
+    #[test]
+    fn group_thousands_handles_short_and_long_integers() {
+        assert_eq!(group_thousands("1"), "1");
+        assert_eq!(group_thousands("100"), "100");
+        assert_eq!(group_thousands("1000"), "1,000");
+        assert_eq!(group_thousands("175617"), "175,617");
+        assert_eq!(group_thousands("1234567"), "1,234,567");
+    }
 }
