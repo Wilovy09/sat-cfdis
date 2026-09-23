@@ -13,7 +13,7 @@ use aws_sdk_s3::Client as S3Client;
 use std::sync::Arc;
 use tracing::info;
 use tracing_actix_web::TracingLogger;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::format};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
@@ -1032,6 +1032,7 @@ async fn run_worker_chunk(
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
+        .event_format(format().json())
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
 

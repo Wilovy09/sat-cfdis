@@ -174,6 +174,34 @@ pub async fn cleanup_worker(pool: DbPool) {
 
 async fn run_cleanup(pool: &DbPool) -> Result<(), sqlx::Error> {
     let cutoff = process_start();
+    // AUD-183: this used to be one query, "computed_at < $1 OR stale_data_version" behind
+    // a single LEFT JOIN. Postgres can't push an index into that OR -- the second half
+    // depends on a value from the joined table, not a constant -- so it fell back to a
+    // full Seq Scan of endpoint_response_cache every 6h regardless of what was indexed
+    // here (confirmed live via EXPLAIN). Split into two DELETEs so the common, cheap case
+    // (stale process on every deploy) gets an index scan (idx_endpoint_response_cache_
+    // computed_at, migration 079) instead of paying for the join-based check every time.
+    let deleted_stale_process = delete_stale_by_computed_at(pool, cutoff).await?;
+    let deleted_stale_version = delete_stale_by_data_version(pool).await?;
+    let total_deleted = deleted_stale_process + deleted_stale_version;
+
+    if total_deleted > 0 {
+        tracing::info!(
+            deleted = total_deleted,
+            deleted_stale_process,
+            deleted_stale_version,
+            "response_cache: cleanup sweep done"
+        );
+    }
+    Ok(())
+}
+
+/// Rows written by a previous process (superseded by `process_start()`) -- the common case
+/// right after a deploy. Indexable: a plain "computed_at < $1" with no join.
+async fn delete_stale_by_computed_at(
+    pool: &DbPool,
+    cutoff: OffsetDateTime,
+) -> Result<u64, sqlx::Error> {
     let mut total_deleted = 0u64;
     loop {
         // trap 2: no ORDER BY total-row-count or size-based cutoff -- batched purely to
@@ -181,10 +209,9 @@ async fn run_cleanup(pool: &DbPool) -> Result<(), sqlx::Error> {
         let result = sqlx::query(
             r#"DELETE FROM pulso.endpoint_response_cache
                WHERE (rfc, endpoint, params_key) IN (
-                   SELECT c.rfc, c.endpoint, c.params_key
-                   FROM pulso.endpoint_response_cache c
-                   LEFT JOIN pulso.rfc_data_version v ON v.rfc = c.rfc
-                   WHERE c.computed_at < $1 OR COALESCE(v.version, 0) <> c.data_version
+                   SELECT rfc, endpoint, params_key
+                   FROM pulso.endpoint_response_cache
+                   WHERE computed_at < $1
                    LIMIT $2
                )"#,
         )
@@ -198,15 +225,42 @@ async fn run_cleanup(pool: &DbPool) -> Result<(), sqlx::Error> {
         if deleted < CLEANUP_BATCH_SIZE as u64 {
             break;
         }
-        // Yield between batches rather than holding the pool in a tight loop.
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    Ok(total_deleted)
+}
 
-    if total_deleted > 0 {
-        tracing::info!(
-            deleted = total_deleted,
-            "response_cache: cleanup sweep done"
-        );
+/// Rows whose RFC has since moved to a newer data_version. Not indexable either way (the
+/// comparison is against another table's current value, not a constant) -- an RFC only
+/// ever appears in `rfc_data_version` once it's been bumped at least once (INSERT ON
+/// CONFLICT, never deleted), so a cache row for an RFC that was never bumped has no match
+/// here at all and is left for `delete_stale_by_computed_at` to eventually reclaim on the
+/// next deploy -- same as the old LEFT JOIN + COALESCE(v.version, 0) did, since a row
+/// cached with data_version = 0 (the `current_version` default for "never bumped") never
+/// compared unequal to that same COALESCE(NULL, 0) either.
+async fn delete_stale_by_data_version(pool: &DbPool) -> Result<u64, sqlx::Error> {
+    let mut total_deleted = 0u64;
+    loop {
+        let result = sqlx::query(
+            r#"DELETE FROM pulso.endpoint_response_cache
+               WHERE (rfc, endpoint, params_key) IN (
+                   SELECT c.rfc, c.endpoint, c.params_key
+                   FROM pulso.endpoint_response_cache c
+                   JOIN pulso.rfc_data_version v ON v.rfc = c.rfc
+                   WHERE v.version <> c.data_version
+                   LIMIT $1
+               )"#,
+        )
+        .bind(CLEANUP_BATCH_SIZE)
+        .execute(pool)
+        .await?;
+
+        let deleted = result.rows_affected();
+        total_deleted += deleted;
+        if deleted < CLEANUP_BATCH_SIZE as u64 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Ok(())
+    Ok(total_deleted)
 }
