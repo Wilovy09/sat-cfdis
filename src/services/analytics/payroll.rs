@@ -33,8 +33,11 @@ pub const MISSING_DEPT_PUESTO_VALUES: &[&str] = &[
 /// SQL expression: `col` normalized to `label` when blank OR when it matches (after
 /// folding accents/case/edge whitespace) one of `MISSING_DEPT_PUESTO_VALUES` -- the ONE
 /// function that normalizes departamento/puesto, used by every query that groups or
-/// displays either field. `col` must already be schema-qualified (e.g. `n.departamento`);
-/// `label` is a literal SQL string (`'Sin departamento'`/`'Sin puesto'`), not a bind param.
+/// displays either field. `col` is spliced verbatim into the expression -- alias-qualify
+/// it (e.g. `n.departamento`) when the enclosing query's FROM has more than one table in
+/// scope, leave it plain (`departamento`) when there's only one; a stale alias here is a
+/// silent "missing FROM-clause entry" at query time, not a compile error. `label` is a
+/// literal SQL string (`'Sin departamento'`/`'Sin puesto'`), not a bind param.
 fn missing_dept_puesto_expr(col: &str, label: &str) -> String {
     let list = MISSING_DEPT_PUESTO_VALUES
         .iter()
@@ -1223,8 +1226,11 @@ pub async fn get(
     // 407ms. `base` deliberately carries no `tipo_nomina`/window filter of its own (the
     // attrs CTEs need every year this employee has, not just the requested window or
     // ordinaria payroll) -- those filters stay on the main aggregation below, same as before.
-    let dept_expr = missing_dept_puesto_expr("n.departamento", "Sin departamento");
-    let puesto_expr = missing_dept_puesto_expr("n.puesto", "Sin puesto");
+    // L16-perf bug: dept_attrs/puesto_attrs read from `base` (this CTE has no `n` alias in
+    // scope), not from `nomina_normalizada n` directly -- unlike dept_year_rows's dept_expr
+    // above, which does scan `... nomina_normalizada n` and needs the qualified column.
+    let dept_expr = missing_dept_puesto_expr("departamento", "Sin departamento");
+    let puesto_expr = missing_dept_puesto_expr("puesto", "Sin puesto");
     let emp_year_rows = sqlx::query(&format!(
         r#"
         WITH base AS MATERIALIZED (
