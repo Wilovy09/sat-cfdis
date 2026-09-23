@@ -289,6 +289,15 @@ async fn process_invoice(
         return false;
     }
 
+    // migration 080: this is the "now visible to analytics" moment this fn's own doc
+    // comment already names -- also the moment jobs_needing_etl/find_pending_etl should
+    // stop counting this row as pending. Best-effort like the child-table inserts below:
+    // if this write is lost, the row just gets picked up again next round (same outcome
+    // as before this migration, just for one row instead of a full-table rescan).
+    if let Err(e) = db::cfdis::mark_etl_processed(pool, job_id, uuid).await {
+        tracing::warn!(uuid = %uuid, "ETL: mark_etl_processed: {e}");
+    }
+
     // Insert taxes
     if !cfdi.taxes.is_empty()
         && let Err(e) = db::cfdis::insert_taxes(pool, &cfdi.uuid, &cfdi.taxes).await

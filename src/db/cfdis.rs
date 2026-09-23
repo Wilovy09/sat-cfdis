@@ -532,10 +532,9 @@ pub async fn find_pending_etl(
     use sqlx::Row;
     let rows = sqlx::query(
         r#"
-        SELECT ji.uuid, ji.metadata
-        FROM pulso.job_invoices ji
-        LEFT JOIN pulso.cfdis c ON c.uuid = ji.uuid
-        WHERE ji.job_id = $1 AND c.uuid IS NULL
+        SELECT uuid, metadata
+        FROM pulso.job_invoices
+        WHERE job_id = $1 AND NOT etl_processed
         "#,
     )
     .bind(job_id)
@@ -551,15 +550,40 @@ pub async fn find_pending_etl(
         .collect())
 }
 
+/// Marks a job_invoices row as ETL'd, once its cfdis header row has been written --
+/// mirrors the point `process_invoice` (services/etl.rs) already treats as "this invoice
+/// is now visible to analytics." Keeps `jobs_needing_etl`/`find_pending_etl`'s
+/// `etl_processed` flag as the single source of truth, rather than re-deriving it from a
+/// join against cfdis every time.
+pub async fn mark_etl_processed(
+    pool: &PgPool,
+    job_id: &str,
+    uuid: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE pulso.job_invoices SET etl_processed = true WHERE job_id = $1 AND uuid = $2"#,
+    )
+    .bind(job_id)
+    .bind(uuid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Job IDs that have invoice rows not yet ETL'd into cfdis.
+///
+/// migration 080: filters on `etl_processed` (set by `mark_etl_processed` once a row's
+/// cfdis header is written) instead of a `LEFT JOIN cfdis ... WHERE c.uuid IS NULL`
+/// anti-join -- that join re-scanned every job_invoices row ever inserted, every 30s,
+/// forever (measured live at 2-11s per run); the partial index behind `NOT etl_processed`
+/// stays bounded by however much work is actually still pending, not by total history.
 pub async fn jobs_needing_etl(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     use sqlx::Row;
     let rows = sqlx::query(
         r#"
-        SELECT DISTINCT ji.job_id
-        FROM pulso.job_invoices ji
-        LEFT JOIN pulso.cfdis c ON c.uuid = ji.uuid
-        WHERE c.uuid IS NULL
+        SELECT DISTINCT job_id
+        FROM pulso.job_invoices
+        WHERE NOT etl_processed
         "#,
     )
     .fetch_all(pool)
