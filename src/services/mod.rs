@@ -4,6 +4,7 @@ pub mod email;
 pub mod etl;
 pub mod fiel;
 pub mod gap_detector;
+pub mod nomina_refresh;
 pub mod php_cli;
 pub mod recheck_cancelled;
 pub mod response_cache;

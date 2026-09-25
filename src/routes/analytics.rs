@@ -10,7 +10,7 @@ use crate::{
             hallazgos_egresos, normalization, payments, payroll, period_comparison, quarterly,
             recurrence, retention, summary, xml_breakdown, xml_count,
         },
-        response_cache,
+        nomina_refresh, response_cache,
     },
 };
 
@@ -1034,6 +1034,56 @@ pub async fn delete_payroll_normalization(
         Ok(HttpResponse::NoContent().finish())
     } else {
         Err(AppError::not_found("Payroll rule not found"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/analytics/{rfc}/normalization/payroll/refresh-nomina
+//
+// PULSO_Plan_Mejoras_SQL.md, punto #6 / decisión del CEO: nomina_normalizada refresca
+// sola cada 23h (nomina_refresh::worker), pero alguien que acaba de crear/editar/borrar
+// un ajuste de nómina quiere ver el número corregido ahora, no en hasta 23h -- esta es
+// esa salida manual. Refresca la materialized view completa (no solo la RFC de la URL:
+// no existe refresh parcial), por eso vive bajo el scope de una RFC solo por
+// consistencia de auth con el resto de /normalization/payroll, no porque el efecto sea
+// específico de esa RFC.
+// ---------------------------------------------------------------------------
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/analytics/{rfc}/normalization/payroll/refresh-nomina",
+    tag = "Normalization",
+    params(("rfc" = String, Path, description = "RFC del contribuyente")),
+    responses(
+        (status = 200, description = "Refrescado, o ya había uno en curso"),
+    )
+)]
+#[tracing::instrument(skip_all, fields(rfc = tracing::field::Empty))]
+pub async fn refresh_nomina_normalizada(
+    req: HttpRequest,
+    path: web::Path<String>,
+    pool: web::Data<DbPool>,
+    state: web::Data<std::sync::Arc<nomina_refresh::NominaRefreshState>>,
+) -> Result<HttpResponse, AppError> {
+    let rfc = path.into_inner().to_uppercase();
+    tracing::Span::current().record("rfc", rfc.as_str());
+    check_rfc_access(&pool, &req, &rfc).await?;
+
+    match nomina_refresh::refresh_guarded(&pool, &state)
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?
+    {
+        nomina_refresh::RefreshOutcome::Refreshed(elapsed) => {
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "status": "refreshed",
+                "elapsed_ms": elapsed.as_millis() as u64,
+            })))
+        }
+        nomina_refresh::RefreshOutcome::AlreadyInProgress => {
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "status": "already_in_progress",
+            })))
+        }
     }
 }
 

@@ -1137,6 +1137,14 @@ async fn main() -> std::io::Result<()> {
     {
         tokio::spawn(services::response_cache::cleanup_worker(bg_pool.clone()));
     }
+    let nomina_refresh_state = services::nomina_refresh::NominaRefreshState::new();
+    {
+        tokio::spawn(services::nomina_refresh::worker(
+            bg_pool.clone(),
+            nomina_refresh_state.clone(),
+        ));
+    }
+    let nomina_refresh_state_data = web::Data::new(nomina_refresh_state);
 
     // ── HTTP server ─────────────────────────────────────────────────────────
     let allowed_origins = cfg.allowed_origins.clone();
@@ -1166,6 +1174,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(captcha_map.clone())
             .app_data(s3_data.clone())
             .app_data(pool_data.clone())
+            .app_data(nomina_refresh_state_data.clone())
             .app_data(web::JsonConfig::default().limit(10 * 1024 * 1024))
             .wrap(cors)
             .wrap(TracingLogger::default())
@@ -1423,6 +1432,10 @@ async fn main() -> std::io::Result<()> {
                     .route(
                         "/normalization/payroll/{rule_id}",
                         web::delete().to(analytics_routes::delete_payroll_normalization),
+                    )
+                    .route(
+                        "/normalization/payroll/refresh-nomina",
+                        web::post().to(analytics_routes::refresh_nomina_normalizada),
                     )
                     .route(
                         "/normalization/excluded",
