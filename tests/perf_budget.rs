@@ -3,11 +3,11 @@
 //!
 //! `list_payroll_rules`'s per-rule factor-warning re-evaluation (L5-14) only runs its
 //! extra query for rules in the `adjust_to_amount_mxn` family, and today there are none
-//! platform-wide -- so the budget seeds 60 synthetic rows under `BIG_RFC` itself (real
+//! platform-wide -- so the budget seeds 60 synthetic rows under `big_rfc` itself (real
 //! employees sampled from its own nómina, so the factor lookup hits real percepciones data
 //! -- an earlier version seeded under a fake owner RFC instead, which made that lookup
 //! resolve to nothing for all 60 rules every run) to exercise that loop for real, and tears
-//! them down by a synthetic id prefix (never by owner_rfc -- BIG_RFC is a real, heavily-used
+//! them down by a synthetic id prefix (never by owner_rfc -- big_rfc is a real, heavily-used
 //! RFC) before any assertion that could panic (see
 //! `list_payroll_rules_with_seeded_adjust_rules_stays_within_budget`).
 
@@ -17,8 +17,15 @@ use pulso_backend::db::{self, DbPool};
 use pulso_backend::services::analytics::{hallazgos, normalization, payroll, summary};
 use sqlx::Row;
 
+mod common;
+
 /// The RFC with the most data in the shared test database (per `PULSO_Correcciones_Lote6.md`).
-const BIG_RFC: &str = "CES100706U65";
+/// L18-25 point 3: read from the test environment's own env var (regla 7), not hardcoded --
+/// cached in a `OnceLock` so every call site below keeps using it as a plain `&'static str`.
+fn big_rfc() -> &'static str {
+    static CELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| common::control_rfc("TEST_RFC_GRANDE")).as_str()
+}
 
 /// Doc's own ceiling: "deja margen y detiene una regresión ... entre 50 y 500 segundos."
 const BUDGET: Duration = Duration::from_millis(1000);
@@ -91,17 +98,18 @@ async fn connect() -> DbPool {
 #[tokio::test]
 async fn payroll_monthly_series_stays_within_budget() {
     let pool = connect().await;
+    let big_rfc = big_rfc();
     let (from_y, from_m) = summary::parse_ym("2000-01");
     let (to_y, to_m) = summary::parse_ym("2030-12");
 
     let start = Instant::now();
-    let months = payroll::monthly_series(&pool, BIG_RFC, from_y, from_m, to_y, to_m)
+    let months = payroll::monthly_series(&pool, big_rfc, from_y, from_m, to_y, to_m)
         .await
         .expect("payroll::monthly_series query failed");
     let elapsed = start.elapsed();
 
     println!(
-        "[L6-04] payroll::monthly_series({BIG_RFC}) took {elapsed:?} ({} months)",
+        "[L6-04] payroll::monthly_series({big_rfc}) took {elapsed:?} ({} months)",
         months.len()
     );
     assert!(
@@ -118,15 +126,16 @@ async fn payroll_monthly_series_stays_within_budget() {
 #[tokio::test]
 async fn payroll_get_stays_within_budget() {
     let pool = connect().await;
+    let big_rfc = big_rfc();
 
     let start = Instant::now();
-    let response = payroll::get(&pool, BIG_RFC, "2000-01", "2030-12")
+    let response = payroll::get(&pool, big_rfc, "2000-01", "2030-12")
         .await
         .expect("payroll::get query failed");
     let elapsed = start.elapsed();
 
     println!(
-        "[L6C-08] payroll::get({BIG_RFC}) took {elapsed:?} ({} months, {} employees)",
+        "[L6C-08] payroll::get({big_rfc}) took {elapsed:?} ({} months, {} employees)",
         response.by_month.len(),
         response.by_employee.len()
     );
@@ -143,15 +152,16 @@ async fn payroll_get_stays_within_budget() {
 #[tokio::test]
 async fn payroll_get_snapshot_stays_within_budget() {
     let pool = connect().await;
+    let big_rfc = big_rfc();
 
     let start = Instant::now();
-    let snapshot = payroll::get_snapshot(&pool, BIG_RFC)
+    let snapshot = payroll::get_snapshot(&pool, big_rfc)
         .await
         .expect("payroll::get_snapshot query failed");
     let elapsed = start.elapsed();
 
     println!(
-        "[L6C-08] payroll::get_snapshot({BIG_RFC}) took {elapsed:?} \
+        "[L6C-08] payroll::get_snapshot({big_rfc}) took {elapsed:?} \
          (headcount_actual={}, months_of_data={})",
         snapshot.headcount_actual, snapshot.months_of_data
     );
@@ -165,15 +175,16 @@ async fn payroll_get_snapshot_stays_within_budget() {
 #[tokio::test]
 async fn hallazgos_get_stays_within_budget() {
     let pool = connect().await;
+    let big_rfc = big_rfc();
 
     let start = Instant::now();
-    let response = hallazgos::get(&pool, BIG_RFC)
+    let response = hallazgos::get(&pool, big_rfc)
         .await
         .expect("hallazgos::get query failed");
     let elapsed = start.elapsed();
 
     println!(
-        "[L6C-08] hallazgos::get({BIG_RFC}) took {elapsed:?} ({} hallazgos)",
+        "[L6C-08] hallazgos::get({big_rfc}) took {elapsed:?} ({} hallazgos)",
         response.all.len()
     );
     assert!(
@@ -185,15 +196,16 @@ async fn hallazgos_get_stays_within_budget() {
 #[tokio::test]
 async fn payroll_employee_catalog_stays_within_budget() {
     let pool = connect().await;
+    let big_rfc = big_rfc();
 
     let start = Instant::now();
-    let employees = normalization::list_payroll_employees(&pool, BIG_RFC)
+    let employees = normalization::list_payroll_employees(&pool, big_rfc)
         .await
         .expect("normalization::list_payroll_employees query failed");
     let elapsed = start.elapsed();
 
     println!(
-        "[L6-04] list_payroll_employees({BIG_RFC}) took {elapsed:?} ({} employees)",
+        "[L6-04] list_payroll_employees({big_rfc}) took {elapsed:?} ({} employees)",
         employees.len()
     );
     assert!(
@@ -202,26 +214,27 @@ async fn payroll_employee_catalog_stays_within_budget() {
     );
 }
 
-/// Real employee RFCs from `BIG_RFC`'s own nómina population, so the seeded rules bind to
+/// Real employee RFCs from `big_rfc`'s own nómina population, so the seeded rules bind to
 /// employees who actually have real CFDIs to look up.
 ///
 /// Per Rob's review: the previous version of this test bound the synthetic rules'
 /// `owner_rfc` to `SYNTHETIC_OWNER_RFC` (a fake RFC with zero real CFDIs) instead of
-/// `BIG_RFC` -- `batch_adjust_factor_sources`'s `WHERE c.rfc_emisor = $1` never matched a
+/// `big_rfc` -- `batch_adjust_factor_sources`'s `WHERE c.rfc_emisor = $1` never matched a
 /// single row regardless of which real `employee_rfc` a rule named, so the per-rule
 /// percepciones lookup resolved to nothing for all 60 rules, every run. The budget measured
 /// ~0ms of the actual cost path (confirmed: "0 carrying a factor warning" every time this
 /// ran) -- exactly the kind of blind spot that let the real regression this same review
 /// found (compute_adjust_factor_warnings/batch_adjust_factor_sources joining the whole view
-/// for two columns, 385x slower) go uncaught. Rules now seed under `BIG_RFC` itself, so the
+/// for two columns, 385x slower) go uncaught. Rules now seed under `big_rfc` itself, so the
 /// lookup hits real rows.
 async fn sample_employee_rfcs(pool: &DbPool, count: i64) -> Vec<String> {
+    let big_rfc = big_rfc();
     let rows = sqlx::query(
         "SELECT DISTINCT rfc_receptor FROM pulso.nomina_normalizada
          WHERE rfc_emisor = $1 AND rfc_receptor IS NOT NULL AND rfc_receptor != ''
          LIMIT $2",
     )
-    .bind(BIG_RFC)
+    .bind(big_rfc)
     .bind(count)
     .fetch_all(pool)
     .await
@@ -234,11 +247,12 @@ async fn sample_employee_rfcs(pool: &DbPool, count: i64) -> Vec<String> {
 
 /// ID prefix for every synthetic rule this test seeds -- distinct enough that no real rule
 /// (production IDs are UUIDs) could ever collide, and used as the ONLY key `cleanup_adjust_
-/// rules` deletes by. Deliberately not `owner_rfc = BIG_RFC` (a real, heavily-used RFC) --
+/// rules` deletes by. Deliberately not `owner_rfc = big_rfc` (a real, heavily-used RFC) --
 /// deleting by owner_rfc here would risk a real client rule if one existed at cleanup time.
 const SYNTHETIC_RULE_ID_PREFIX: &str = "l6-04-synthetic-";
 
 async fn seed_adjust_rules(pool: &DbPool, employee_rfcs: &[String]) -> Result<(), sqlx::Error> {
+    let big_rfc = big_rfc();
     for (i, employee_rfc) in employee_rfcs.iter().enumerate() {
         sqlx::query(
             "INSERT INTO pulso.payroll_normalization_rules
@@ -247,7 +261,7 @@ async fn seed_adjust_rules(pool: &DbPool, employee_rfcs: &[String]) -> Result<()
              VALUES ($1, $2, 'adjust_to_amount_mxn', $3, $4, 'adjust', $5, NOW()::text, NOW()::text)",
         )
         .bind(format!("{SYNTHETIC_RULE_ID_PREFIX}{i}"))
-        .bind(BIG_RFC)
+        .bind(big_rfc)
         .bind(employee_rfc)
         .bind(format!("L6-04 synthetic employee {i}"))
         .bind(15_000.0_f64)
@@ -260,7 +274,7 @@ async fn seed_adjust_rules(pool: &DbPool, employee_rfcs: &[String]) -> Result<()
 /// Deletes every synthetic row by id prefix, regardless of how many made it in. Called
 /// unconditionally before any assertion in the seeded test below, so a budget failure (an
 /// `assert!` that panics) still leaves the shared test database clean. By id, not by
-/// `owner_rfc = BIG_RFC` -- BIG_RFC is a real, heavily-used RFC; deleting by owner_rfc would
+/// `owner_rfc = big_rfc` -- big_rfc is a real, heavily-used RFC; deleting by owner_rfc would
 /// risk a real client rule.
 async fn cleanup_adjust_rules(pool: &DbPool) {
     let result = sqlx::query("DELETE FROM pulso.payroll_normalization_rules WHERE id LIKE $1")
@@ -282,6 +296,7 @@ async fn list_payroll_rules_with_seeded_adjust_rules_stays_within_budget() {
     const RULE_COUNT_USIZE: usize = RULE_COUNT as usize;
 
     let pool = connect().await;
+    let big_rfc = big_rfc();
 
     let already_seeded: i64 =
         sqlx::query("SELECT COUNT(*) AS n FROM pulso.payroll_normalization_rules WHERE id LIKE $1")
@@ -293,7 +308,7 @@ async fn list_payroll_rules_with_seeded_adjust_rules_stays_within_budget() {
             .unwrap_or(0);
     assert_eq!(
         already_seeded, 0,
-        "rows with id LIKE '{SYNTHETIC_RULE_ID_PREFIX}%' already exist under {BIG_RFC} -- a \
+        "rows with id LIKE '{SYNTHETIC_RULE_ID_PREFIX}%' already exist under {big_rfc} -- a \
          previous run's cleanup may have failed; clear them by hand before re-running"
     );
 
@@ -301,14 +316,14 @@ async fn list_payroll_rules_with_seeded_adjust_rules_stays_within_budget() {
     assert_eq!(
         employee_rfcs.len(),
         RULE_COUNT_USIZE,
-        "expected {RULE_COUNT} distinct employee RFCs under {BIG_RFC} to seed against"
+        "expected {RULE_COUNT} distinct employee RFCs under {big_rfc} to seed against"
     );
 
     let seed_result = seed_adjust_rules(&pool, &employee_rfcs).await;
 
     let measurement = if seed_result.is_ok() {
         let start = Instant::now();
-        let read = normalization::list_payroll_rules(&pool, BIG_RFC).await;
+        let read = normalization::list_payroll_rules(&pool, big_rfc).await;
         Some((start.elapsed(), read))
     } else {
         None
@@ -330,14 +345,14 @@ async fn list_payroll_rules_with_seeded_adjust_rules_stays_within_budget() {
     // checking) let every rule's factor lookup silently resolve to zero rows -- seeding
     // under a fake owner_rfc meant zero real percepciones could ever match, so "0 carrying
     // a factor warning" was indistinguishable from the real cost path never running at all.
-    // Seeded against BIG_RFC's own real employees now (`sample_employee_rfcs`), so each of
+    // Seeded against big_rfc's own real employees now (`sample_employee_rfcs`), so each of
     // the 60 lookups should find real percepciones data -- asserting that directly here,
     // not just hoping the elapsed time reflects real work.
     let checked_percepciones: i64 = sqlx::query(
         "SELECT COUNT(DISTINCT rfc_receptor) AS n FROM pulso.nomina_normalizada
          WHERE rfc_emisor = $1 AND rfc_receptor = ANY($2)",
     )
-    .bind(BIG_RFC)
+    .bind(big_rfc)
     .bind(&employee_rfcs)
     .fetch_one(&pool)
     .await
@@ -347,7 +362,7 @@ async fn list_payroll_rules_with_seeded_adjust_rules_stays_within_budget() {
     assert_eq!(
         checked_percepciones, RULE_COUNT,
         "expected all {RULE_COUNT} seeded employee RFCs to have real nomina_normalizada rows \
-         under {BIG_RFC} -- if this is 0, the factor lookup this budget measures resolves to \
+         under {big_rfc} -- if this is 0, the factor lookup this budget measures resolves to \
          nothing again, same blind spot as before"
     );
     let warned = rules
@@ -355,7 +370,7 @@ async fn list_payroll_rules_with_seeded_adjust_rules_stays_within_budget() {
         .filter(|r| !r.factor_warnings.is_empty())
         .count();
     println!(
-        "[L6-04] list_payroll_rules({BIG_RFC}) with {RULE_COUNT} adjust_to_amount_mxn \
+        "[L6-04] list_payroll_rules({big_rfc}) with {RULE_COUNT} adjust_to_amount_mxn \
          rules took {elapsed:?} ({warned} carrying a factor warning, {checked_percepciones} \
          of {RULE_COUNT} employees confirmed to have real nomina data)"
     );

@@ -25,6 +25,25 @@ use std::time::Duration;
 
 const REFRESH_INTERVAL_SECS: u64 = 23 * 3600;
 
+/// L18-26 point 2: set by any ETL/enrichment/redownload path right after it successfully
+/// writes a nomina row, so `etl_worker`'s own round-end can trigger an out-of-band refresh
+/// instead of waiting up to `REFRESH_INTERVAL_SECS`. A plain flag, not a per-invoice queue
+/// or a counter -- the round-end check only needs "did anything land since last time," and
+/// a whole round's worth of nomina writes collapse into at most one refresh either way
+/// (grouped per the doc's own suggestion, not one refresh per invoice).
+static NOMINA_TOUCHED: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_touched() {
+    NOMINA_TOUCHED.store(true, Ordering::Relaxed);
+}
+
+/// Clears the flag and reports whether it was set since the last call. `etl_worker` calls
+/// this once per round; nothing else should, or two consumers could each see `false` right
+/// after the other already claimed the pending refresh.
+pub fn take_touched() -> bool {
+    NOMINA_TOUCHED.swap(false, Ordering::Relaxed)
+}
+
 /// Shared between the periodic worker and the manual-refresh route so only one
 /// REFRESH MATERIALIZED VIEW CONCURRENTLY runs at a time -- Postgres itself would just
 /// serialize a second one behind the first (same relation, can't refresh twice at once),
@@ -98,5 +117,12 @@ async fn refresh(pool: &DbPool) -> Result<Duration, sqlx::Error> {
     sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY pulso.nomina_normalizada")
         .execute(pool)
         .await?;
+    // L18-26 point 1: without this, a fresher view sits behind a cache that only
+    // invalidates on data ingestion or a rule edit -- neither of which "the view just
+    // refreshed" is. Best-effort like the rest of this file's cache bumps: the view itself
+    // already refreshed either way, so a failure here costs staleness, not correctness.
+    if let Err(e) = crate::services::response_cache::bump_version_all(pool).await {
+        tracing::warn!("nomina_refresh: bump_version_all after refresh failed: {e}");
+    }
     Ok(start.elapsed())
 }

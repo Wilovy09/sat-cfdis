@@ -475,9 +475,17 @@ pub async fn get(
     // of the same ~11k-row join instead of one.
     let emp_dept_expr = missing_dept_puesto_expr("departamento", "Sin departamento");
     let emp_puesto_expr = missing_dept_puesto_expr("puesto", "Sin puesto");
+    // L18-22: shared "recibo vigente" tiebreak for the three DISTINCT ON CTEs below --
+    // ordinario primero (cae a extraordinario sólo si la persona no tiene ninguno), luego
+    // fin de período pagado / fecha de pago / fecha de emisión / uuid. `_asc` is the same
+    // priority with the date tiebreak reversed, for "más antiguos" (el recibo ordinario más
+    // antiguo, no el extraordinario más viejo por casualidad).
+    let latest_order = recibo_vigente_order("");
+    let earliest_order = recibo_vigente_order_asc("");
     let emp_rows = sqlx::query(&format!(r#"
         WITH cn_base AS MATERIALIZED (
-            SELECT c.rfc_receptor, c.fecha_emision, n.departamento, n.puesto, n.tipo_contrato,
+            SELECT c.rfc_receptor, c.fecha_emision, n.uuid, n.tipo_nomina, n.fecha_pago,
+                   n.departamento, n.puesto, n.tipo_contrato,
                    n.tipo_jornada, n.tipo_regimen, n.salario_diario_integrado, n.fecha_final_pago,
                    n.fecha_inicio_rel_laboral
             FROM pulso.cfdi_nomina n
@@ -485,6 +493,12 @@ pub async fn get(
             WHERE c.rfc_emisor = $1
               AND c.tipo_comprobante = 'N'
               AND NOT c.is_cancelled
+              -- L18-23 point 2: same anchor cutoff as the rest of this table (n.year_devengo/
+              -- n.month_devengo below, via $4/$5) -- this CTE reads the raw comprobante
+              -- instead of nomina_normalizada's own devengo columns, so it caps on
+              -- fecha_emision (ISO text, sorts correctly as a string) against the same
+              -- to_y/to_m the caller already bound.
+              AND c.fecha_emision < (make_date($4::int, $5::int, 1) + interval '1 month')::date::text
         ),
         latest_attrs AS (
             SELECT DISTINCT ON (rfc_receptor)
@@ -497,29 +511,29 @@ pub async fn get(
                 salario_diario_integrado AS sdi_latest,
                 fecha_final_pago
             FROM cn_base
-            ORDER BY rfc_receptor, fecha_emision DESC
+            ORDER BY rfc_receptor, {latest_order}
         ),
         earliest_attrs AS (
             SELECT DISTINCT ON (rfc_receptor)
                 rfc_receptor AS emp_rfc,
                 salario_diario_integrado AS sdi_at_first
             FROM cn_base
-            ORDER BY rfc_receptor, fecha_emision ASC
+            ORDER BY rfc_receptor, {earliest_order}
         ),
-        -- L15-05/AUD-157/DEC-092: fecha_inicio_rel_laboral from the MOST RECENT receipt
-        -- that actually declares it, not from the employee's earliest receipt -- a blank
-        -- or wrong value on the very first receipt (33 people on the largest RFC measured
-        -- have at least one receipt missing it) must not shadow a later, correcting one.
+        -- L15-05/AUD-157/DEC-092: fecha_inicio_rel_laboral from the recibo vigente that
+        -- actually declares it, not from the employee's earliest receipt -- a blank or
+        -- wrong value on the very first receipt (33 people on the largest RFC measured have
+        -- at least one receipt missing it) must not shadow a later, correcting one.
         -- Separate CTE from earliest_attrs on purpose: "first ever receipt" (for
-        -- sdi_at_first) and "most recent receipt that declares this one field" are
-        -- different receipts for the same employee more often than not.
+        -- sdi_at_first) and "recibo vigente that declares this one field" are different
+        -- receipts for the same employee more often than not.
         alta_attrs AS (
             SELECT DISTINCT ON (rfc_receptor)
                 rfc_receptor AS emp_rfc,
                 NULLIF(TRIM(fecha_inicio_rel_laboral), '') AS fecha_inicio_rel_laboral
             FROM cn_base
             WHERE NULLIF(TRIM(COALESCE(fecha_inicio_rel_laboral, '')), '') IS NOT NULL
-            ORDER BY rfc_receptor, fecha_emision DESC
+            ORDER BY rfc_receptor, {latest_order}
         )
         SELECT
             n.rfc_receptor                              AS emp_rfc,
@@ -1229,12 +1243,15 @@ pub async fn get(
     // above, which does scan `... nomina_normalizada n` and needs the qualified column.
     let dept_expr = missing_dept_puesto_expr("departamento", "Sin departamento");
     let puesto_expr = missing_dept_puesto_expr("puesto", "Sin puesto");
+    // L18-22: same shared tiebreak as emp_rows above, per-year here (DISTINCT ON includes
+    // year_devengo) since departamento/puesto can legitimately change year to year.
+    let year_attrs_order = recibo_vigente_order("");
     let emp_year_rows = sqlx::query(&format!(
         r#"
         WITH base AS MATERIALIZED (
             SELECT n.rfc_receptor, n.year_devengo, n.month_devengo, n.tipo_nomina, n.uuid,
-                   n.fecha_emision, n.departamento, n.puesto, n.nombre_receptor,
-                   n.salario_diario_integrado, n.factor
+                   n.fecha_emision, n.fecha_pago, n.fecha_final_pago, n.departamento, n.puesto,
+                   n.nombre_receptor, n.salario_diario_integrado, n.factor
             FROM pulso.nomina_normalizada n
             WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
         ),
@@ -1243,14 +1260,14 @@ pub async fn get(
                 rfc_receptor, year_devengo AS year, {dept_expr} AS departamento
             FROM base
             WHERE NULLIF(TRIM(COALESCE(departamento, '')), '') IS NOT NULL
-            ORDER BY rfc_receptor, year_devengo, fecha_emision DESC
+            ORDER BY rfc_receptor, year_devengo, {year_attrs_order}
         ),
         puesto_attrs AS (
             SELECT DISTINCT ON (rfc_receptor, year_devengo)
                 rfc_receptor, year_devengo AS year, {puesto_expr} AS puesto
             FROM base
             WHERE NULLIF(TRIM(COALESCE(puesto, '')), '') IS NOT NULL
-            ORDER BY rfc_receptor, year_devengo, fecha_emision DESC
+            ORDER BY rfc_receptor, year_devengo, {year_attrs_order}
         )
         SELECT b.rfc_receptor AS rfc,
                MAX(b.nombre_receptor) AS nombre,
@@ -1499,6 +1516,15 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
                   AND (year_devengo > $4 OR (year_devengo = $4 AND month_devengo >= $5))
                   AND (year_devengo < $2 OR (year_devengo = $2 AND month_devengo <= $3))
             ) AS meses_ltm,
+            -- L18-19: the gemela of meses_ltm above, over the PRIOR 12-month window --
+            -- needed so YoY compares monthly averages (masa / meses con nómina) instead of
+            -- raw totals, and so a prior window with less history than the guard 2 (rotación)
+            -- already uses can show "--" instead of an inflated coverage-driven percentage.
+            COUNT(DISTINCT year_devengo * 100 + month_devengo) FILTER (
+                WHERE tipo_nomina = 'O'
+                  AND (year_devengo > $6 OR (year_devengo = $6 AND month_devengo >= $7))
+                  AND (year_devengo < $8 OR (year_devengo = $8 AND month_devengo <= $9))
+            ) AS meses_prior,
             COALESCE(SUM(total_percepciones) FILTER (
                 WHERE (year_devengo > $4 OR (year_devengo = $4 AND month_devengo >= $5))
                   AND (year_devengo < $2 OR (year_devengo = $2 AND month_devengo <= $3))
@@ -1530,12 +1556,25 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     // own with an empty active-employee set; `meses_sin_nomina` (already computed) is what
     // tells the caller why.
     let meses_con_nomina_ltm: i64 = combined_row.try_get("meses_ltm").unwrap_or(0);
+    let meses_con_nomina_prior: i64 = combined_row.try_get("meses_prior").unwrap_or(0);
     let ltm_masa: f64 = get_f64(&combined_row, "ltm_masa");
     let prior_masa: f64 = get_f64(&combined_row, "prior_masa");
-    let yoy_masa_salarial_pct = if prior_masa > 0.0 {
-        Some((ltm_masa - prior_masa) / prior_masa * 100.0)
-    } else {
+    // L18-19: compares the monthly AVERAGE of each period, not the raw 12-month total --
+    // otherwise an empresa with 11 months of nómina this period and 6 the year before (still
+    // building up coverage, not growing headcount) shows a YoY that's mostly a coverage
+    // artifact. Same guard as rotación (H5A): under 6 months with nómina in the prior
+    // window means not enough history for an annual comparison, so "--" (None) instead of a
+    // number.
+    let yoy_masa_salarial_pct = if meses_con_nomina_prior < 6 {
         None
+    } else {
+        let prior_avg = prior_masa / meses_con_nomina_prior as f64;
+        if prior_avg > 0.0 && meses_con_nomina_ltm > 0 {
+            let ltm_avg = ltm_masa / meses_con_nomina_ltm as f64;
+            Some((ltm_avg - prior_avg) / prior_avg * 100.0)
+        } else {
+            None
+        }
     };
 
     // Run-rate LTM: exclude eventual percepciones (DEC-020, PERCEPCIONES_EVENTUALES) and
@@ -1896,6 +1935,42 @@ pub(crate) async fn nomina_months_with_data(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// L18-22: single "recibo vigente" tiebreak, shared by every `DISTINCT ON` query that needs
+/// "this person's current receipt" to read an attribute off it -- tipo_contrato, sueldo,
+/// departamento, puesto, fecha de alta, whatever the caller selects. The question underneath
+/// all ten sites this replaces is the same one ("which receipt do we look at"), not ten
+/// different ones, so this is the one place that answers it.
+///
+/// `(tipo_nomina = 'O') DESC` sorts ordinario (true) before extraordinario (false, i.e.
+/// finiquito/aguinaldo/PTU) -- `DISTINCT ON` only reaches an extraordinario row when a
+/// person has no ordinario receipt at all to prefer instead, exactly the doc's "salvo que la
+/// persona no tenga ningún recibo ordinario". Among receipts of the same ordinario-ness:
+/// fin del período pagado (fecha_final_pago) first, then fecha de pago, then fecha de
+/// emisión, then uuid as a final deterministic tiebreak -- two receipts can share every date
+/// and still be different rows, and an unstable tiebreak here is what made 21 people flip
+/// sides of a filter between two runs of the same query before this item.
+///
+/// `prefix` is whatever table alias the caller's FROM clause already uses for these columns
+/// (`"b."`, `"n."`, or `""` for an unaliased `FROM pulso.nomina_normalizada`), so this drops
+/// into any of the ten CTEs unchanged.
+pub(crate) fn recibo_vigente_order(prefix: &str) -> String {
+    format!(
+        "({prefix}tipo_nomina = 'O') DESC, {prefix}fecha_final_pago DESC NULLS LAST, \
+         {prefix}fecha_pago DESC, {prefix}fecha_emision DESC, {prefix}uuid"
+    )
+}
+
+/// L18-22: same priority (ordinario primero) as `recibo_vigente_order`, but for "el recibo
+/// ordinario más antiguo" -- oldest instead of newest among receipts of the same
+/// ordinario-ness. Used where a selection wants the FIRST vigente receipt (e.g. "más
+/// antiguos"), not the latest.
+pub(crate) fn recibo_vigente_order_asc(prefix: &str) -> String {
+    format!(
+        "({prefix}tipo_nomina = 'O') DESC, {prefix}fecha_final_pago ASC NULLS LAST, \
+         {prefix}fecha_pago ASC, {prefix}fecha_emision ASC, {prefix}uuid"
+    )
 }
 
 /// L16-03/AUD-163/DEC-099: pure gap-walk over an already-fetched set of months with data --

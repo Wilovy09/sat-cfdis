@@ -2,7 +2,6 @@ mod api_docs;
 mod config;
 mod db;
 mod errors;
-mod models;
 mod routes;
 mod services;
 mod state;
@@ -51,14 +50,14 @@ pub(crate) async fn try_fiel_auth(
     let cert_bytes = services::s3::get_fiel(s3, bucket, &row.cert_s3_key)
         .await
         .or_else(|| {
-            tracing::error!(rfc = %rfc, key = %row.cert_s3_key, "FIEL: S3 cert download failed");
+            tracing::error!(rfc = %rfc, "FIEL: S3 cert download failed");
             None
         })?;
 
     let key_bytes = services::s3::get_fiel(s3, bucket, &row.key_s3_key)
         .await
         .or_else(|| {
-            tracing::error!(rfc = %rfc, key = %row.key_s3_key, "FIEL: S3 key download failed");
+            tracing::error!(rfc = %rfc, "FIEL: S3 key download failed");
             None
         })?;
 
@@ -204,13 +203,10 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                 None => job.period_from.clone(),
             };
 
-            // L17-10: date_prefix, not a raw comparison -- period_from/period_to and the
-            // resume cursor mix "YYYY-MM-DD" and "YYYY-MM-DD HH:MM:SS" across job types
-            // (see gap_detector::date_prefix's own doc); a bare date always sorts less than
-            // the same day's 23:59:59 timestamp regardless of which day either names.
-            if services::gap_detector::date_prefix(&resume_from)
-                > services::gap_detector::date_prefix(&job.period_to)
-            {
+            // L17-10/L18-25: extracted to gap_detector::job_is_complete so this comparison
+            // has a real test -- see that function's own doc for why date_prefix, not a raw
+            // comparison, decides it.
+            if services::gap_detector::job_is_complete(&resume_from, &job.period_to) {
                 let _ = db::jobs::complete(
                     &pool,
                     &job.id,
@@ -1050,6 +1046,20 @@ async fn main() -> std::io::Result<()> {
 
     dotenvy::dotenv().ok();
     let cfg = Config::from_env();
+
+    // L18-03: JWT_SECRET used to fall back to a 9-character literal baked into the
+    // binary. Harmless while L18-02's verifiers didn't check signatures at all -- once
+    // they do, that default becomes the key to forge any session, admin included. The
+    // check lives here (server startup), not inside Config::from_env, because the four
+    // test suites call from_env() directly and would break if it required the variable.
+    if cfg.jwt_secret.len() < 32 {
+        tracing::error!(
+            "JWT_SECRET is missing or shorter than 32 characters -- refusing to start. \
+             Set a real secret (>= 32 chars) in this environment's .env."
+        );
+        std::process::exit(1);
+    }
+
     let bind_addr = format!("{}:{}", cfg.host, cfg.port);
 
     // ── Database ────────────────────────────────────────────────────────────
@@ -1101,11 +1111,13 @@ async fn main() -> std::io::Result<()> {
         let worker_s3 = s3_client.clone();
         tokio::spawn(resume_worker(worker_pool, worker_cfg, worker_s3));
     }
+    let nomina_refresh_state = services::nomina_refresh::NominaRefreshState::new();
     {
         let etl_pool = bg_pool.clone();
         let etl_cfg = Arc::new(cfg.clone());
         let etl_s3 = s3_client.clone();
-        tokio::spawn(etl::etl_worker(etl_pool, etl_cfg, etl_s3));
+        let etl_nomina_state = nomina_refresh_state.clone();
+        tokio::spawn(etl::etl_worker(etl_pool, etl_cfg, etl_s3, etl_nomina_state));
     }
     {
         tokio::spawn(daily_sync_worker(bg_pool.clone()));
@@ -1137,7 +1149,6 @@ async fn main() -> std::io::Result<()> {
     {
         tokio::spawn(services::response_cache::cleanup_worker(bg_pool.clone()));
     }
-    let nomina_refresh_state = services::nomina_refresh::NominaRefreshState::new();
     {
         tokio::spawn(services::nomina_refresh::worker(
             bg_pool.clone(),
@@ -1169,7 +1180,7 @@ async fn main() -> std::io::Result<()> {
             }
         };
 
-        App::new()
+        let app = App::new()
             .app_data(cfg_data.clone())
             .app_data(captcha_map.clone())
             .app_data(s3_data.clone())
@@ -1177,12 +1188,22 @@ async fn main() -> std::io::Result<()> {
             .app_data(nomina_refresh_state_data.clone())
             .app_data(web::JsonConfig::default().limit(10 * 1024 * 1024))
             .wrap(cors)
-            .wrap(TracingLogger::default())
-            // Docs
-            .service(
-                Scalar::with_url("/docs", api_docs::ApiDoc::openapi())
-                    .custom_html(api_docs::SCALAR_HTML),
-            )
+            .wrap(TracingLogger::default());
+        // L18-01: /docs describes every route, including the seven invoices ones this
+        // same item just closed -- an open API reference is itself part of the exposure.
+        // Every deployed environment (test and prod) runs a --release binary, so this
+        // only ever registers for a developer's own `cargo run`/`cargo build` -- same
+        // debug_assertions convention this codebase already uses for storage.rs/
+        // invoices.rs's local-vs-S3 switch, not a new mechanism. A real `#[cfg]` (not a
+        // runtime `cfg!()` branch) because `App<T>`'s type changes with every `.service()`
+        // call -- an `if`/`else` adding it on only one side wouldn't type-check; `#[cfg]`
+        // on the `let` means only one variant of this code ever exists per build.
+        #[cfg(debug_assertions)]
+        let app = app.service(
+            Scalar::with_url("/docs", api_docs::ApiDoc::openapi())
+                .custom_html(api_docs::SCALAR_HTML),
+        );
+        app
             // Health check
             .route("/health", web::get().to(invoices::health))
             // Billing
@@ -1303,20 +1324,13 @@ async fn main() -> std::io::Result<()> {
                     .route(web::get().to(fiel_routes::get_status))
                     .route(web::delete().to(fiel_routes::delete)),
             )
-            // Invoice API
-            .service(
-                web::scope("/api/v1/invoices")
-                    .route("/list", web::post().to(invoices::list_invoices))
-                    .route("/list/stream", web::post().to(invoices::list_stream))
-                    .route("/captcha/solve", web::post().to(invoices::solve_captcha))
-                    .route("/download", web::post().to(invoices::download_invoices))
-                    .route(
-                        "/download/stream",
-                        web::post().to(invoices::download_stream),
-                    )
-                    .route("/xml-content", web::post().to(invoices::xml_content))
-                    .route("/bulk/stream", web::post().to(invoices::bulk_stream)),
-            )
+            // L18-01: the seven /api/v1/invoices/* routes took no session at all -- any
+            // visitor could read a stored CFDI's full XML (payroll receipts included) or
+            // use the server as a SAT downloader with credentials they supplied, FIEL
+            // included, encrypted into the jobs table. Not called from the frontend (0
+            // references in pulso-adquiere). The handlers stay in routes/invoices.rs
+            // unchanged -- the sync worker still calls into that module directly; only the
+            // HTTP surface is gone.
             // Queue API
             .service(
                 web::scope("/api/v1/queue")

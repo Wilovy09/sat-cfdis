@@ -13,6 +13,10 @@ pub struct CounterpartiesResponse {
     pub top: Vec<CounterpartyRow>,
     pub total_counterparties: i64,
     pub top10_pct: f64, // % of total from top 10
+    // L18-17: same period/universe as top10_pct, over every counterparty (not just the
+    // `limit` rows returned in `top`) -- a KPI reading "100% · Top 10" says nothing when
+    // almost all of it is Público en General, which doesn't describe a real concentration.
+    pub peg_pct: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,8 +63,8 @@ pub async fn get(
     // a prefix-based version of that filter (`isRegulatory` on the frontend, before L10-10)
     // was already misclassifying a real company (`IMS2003263P4`, a manufacturing supplier)
     // as a regulatory authority just for its RFC prefix, and the symmetric risk was worse --
-    // Nubarium's single largest supplier (18.85% of spend) has an RFC starting with `SAT`,
-    // so any future "for consistency" prefix rule would silently disappear it. Product
+    // el RFC de prueba's single largest supplier (18.85% of spend) has an RFC starting with
+    // `SAT`, so any future "for consistency" prefix rule would silently disappear it. Product
     // decision on top of that risk: a real counterparty with real weight not showing up in
     // a Top 10 is worse for an analyst than seeing it there -- the money left the company
     // either way, and the analyst decides what to do with that row. No filter at all is
@@ -76,7 +80,13 @@ pub async fn get(
             MAX(fecha_emision)                                     AS last_inv,
             COUNT(DISTINCT year * 100 + month)                     AS months_active,
             SUM(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)) OVER ()::float8 AS grand_total,
-            COUNT(*) OVER ()                                       AS cp_count
+            COUNT(*) OVER ()                                       AS cp_count,
+            -- L18-17: computed over the same window (every group, before LIMIT truncates
+            -- the returned rows), keyed off the raw {cp_col} rather than cp_key_expr's
+            -- disambiguated composite -- Público en General can land as several distinct
+            -- groups (C13-04/DEC-080 splits it by counterparty name), so this has to sum
+            -- across all of them, not read off a single row.
+            SUM(SUM(CASE WHEN {cp_col} = $7 THEN COALESCE(total_neto_mxn_ajustado,0)::float8 ELSE 0 END)) OVER ()::float8 AS peg_total
         FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
@@ -98,6 +108,7 @@ pub async fn get(
     .bind(to_y)
     .bind(to_m)
     .bind(limit)
+    .bind(RFC_PUBLICO_GENERAL)
     .fetch_all(pool)
     .await?;
 
@@ -105,6 +116,12 @@ pub async fn get(
     let cp_count: i64 = rows
         .first()
         .map_or(0, |r| r.try_get("cp_count").unwrap_or(0));
+    let peg_total: f64 = rows.first().map_or(0.0, |r| get_f64(r, "peg_total"));
+    let peg_pct = if grand_total > 0.0 {
+        peg_total / grand_total * 100.0
+    } else {
+        0.0
+    };
 
     let top: Vec<CounterpartyRow> = rows
         .iter()
@@ -140,6 +157,7 @@ pub async fn get(
         top,
         total_counterparties: cp_count,
         top10_pct,
+        peg_pct,
     })
 }
 
@@ -1054,6 +1072,12 @@ pub struct CpIndividualResponse {
     pub saldo_pendiente_mxn: f64,
     pub pct_cobrado: f64,
     pub dias_cobro_ppd: Option<f64>,
+    // L18-16: residual over this same PPD universe (facturado - cobrado - saldo), not
+    // get_payments_detail's "Cobranza por cliente" universe -- that table filters
+    // differently (see this fn's own cobranza_row comment above). Lets the new "Notas de
+    // crédito (MXN)" card reconcile with "Facturado PPD" and "Cobrado" on screen instead of
+    // a % Cobrado that looks wrong next to a near-zero saldo pendiente.
+    pub notas_credito_mxn: f64,
     // L11-08 / AUD-105: true when this counterparty has at least one normalization-excluded
     // invoice -- drives the "cliente excluido de los totales" warning pill. This view's own
     // figures above are NOT filtered by that exclusion (see yearly_rows' comment); the
@@ -1301,14 +1325,30 @@ pub async fn get_individual(
         .collect();
 
     // 3. Top concepts
+    // L18-15: monto = importe menos descuento, en pesos (mismo tipo de cambio que el total
+    // de la factura), con notas de crédito restando -- salvo las que cfdis_ajustado's own
+    // total_neto_mxn_ajustado ya deja en 0 (migration 051: 'E' con relación '02'/'07'), la
+    // misma regla, sólo que aplicada por concepto en vez de al total de la factura.
+    // "Facturas" cuenta comprobantes distintos (COUNT DISTINCT), no líneas de concepto.
     let concept_rows = sqlx::query(&format!(
         r#"
         SELECT SUBSTRING(cc.descripcion, 1, 80) AS desc_key,
                c.year,
-               SUM(COALESCE(cc.importe, 0)::float8)::float8 AS yr_amount,
-               COUNT(*) AS yr_count
+               SUM(
+                   (CASE
+                       WHEN c.tipo_comprobante = 'E' AND EXISTS (
+                           SELECT 1 FROM pulso.cfdi_relacionados r
+                           WHERE r.source_uuid = c.uuid AND r.tipo_relacion IN ('02', '07')
+                       ) THEN 0
+                       WHEN c.tipo_comprobante = 'E' THEN -1
+                       ELSE 1
+                   END)
+                   * (COALESCE(cc.importe, 0) - COALESCE(cc.descuento, 0))::float8
+                   * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)
+               )::float8 AS yr_amount,
+               COUNT(DISTINCT c.uuid) AS yr_count
         FROM pulso.cfdi_concepts cc
-        JOIN pulso.cfdis c ON c.uuid = cc.uuid
+        JOIN pulso.cfdis_ajustado c ON c.uuid = cc.uuid
         WHERE c.{owner_col} = $1 AND c.{dl_filter} AND c.tipo_comprobante NOT IN ('P','N','T')
           AND NOT c.is_cancelled
           AND c.{cp_col} = $2 AND ($3 = '' OR {name_filter_expr_c} = $3)
@@ -1517,6 +1557,7 @@ pub async fn get_individual(
         saldo_pendiente_mxn: saldo,
         pct_cobrado,
         dias_cobro_ppd,
+        notas_credito_mxn: facturado_ppd - cobrado_mxn - saldo,
         is_excluded,
     })
 }

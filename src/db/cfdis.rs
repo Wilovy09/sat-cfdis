@@ -11,7 +11,7 @@ use sqlx::PgPool;
 pub async fn upsert_cfdi(pool: &PgPool, c: &ParsedCfdi) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO pulso.cfdis (
+        INSERT INTO pulso.cfdis_raw (
             uuid, job_id, rfc_emisor, nombre_emisor, regimen_fiscal_emisor,
             rfc_receptor, nombre_receptor, uso_cfdi,
             domicilio_fiscal_receptor, regimen_fiscal_receptor,
@@ -31,17 +31,27 @@ pub async fn upsert_cfdi(pool: &PgPool, c: &ParsedCfdi) -> Result<(), sqlx::Erro
             domicilio_fiscal_receptor = excluded.domicilio_fiscal_receptor,
             regimen_fiscal_receptor   = excluded.regimen_fiscal_receptor,
             tipo_comprobante          = excluded.tipo_comprobante,
-            subtotal                  = excluded.subtotal,
-            descuento                 = excluded.descuento,
-            total                     = excluded.total,
-            moneda                    = excluded.moneda,
-            tipo_cambio               = excluded.tipo_cambio,
-            total_mxn                 = excluded.total_mxn,
+            -- L18-14: a reload that only has the SAT listing (no XML, excluded.xml_available
+            -- = 0) used to overwrite these unconditionally every time migration 080 made this
+            -- invoice reprocess on reappearing in a new listing. Two concrete harms: it put a
+            -- pending invoice that already had real XML back behind a listing-only pass (rare,
+            -- since a listing-only call only follows an XML one for a CFDI that stopped
+            -- offering XML -- see next point), and it erased the estimated subtotal a separate
+            -- process assigns to the ~1,197 CFDIs the SAT never delivers XML for, because the
+            -- listing itself carries no subtotal. Only a call that itself has real XML
+            -- (excluded.xml_available = 1) may set these now -- estado_sat is the one exception
+            -- the doc calls out, since a cancellation is real news even from a listing alone.
+            subtotal                  = CASE WHEN excluded.xml_available = 1 THEN excluded.subtotal      ELSE pulso.cfdis_raw.subtotal      END,
+            descuento                 = CASE WHEN excluded.xml_available = 1 THEN excluded.descuento     ELSE pulso.cfdis_raw.descuento     END,
+            total                     = CASE WHEN excluded.xml_available = 1 THEN excluded.total         ELSE pulso.cfdis_raw.total         END,
+            moneda                    = CASE WHEN excluded.xml_available = 1 THEN excluded.moneda        ELSE pulso.cfdis_raw.moneda        END,
+            tipo_cambio               = CASE WHEN excluded.xml_available = 1 THEN excluded.tipo_cambio   ELSE pulso.cfdis_raw.tipo_cambio   END,
+            total_mxn                 = CASE WHEN excluded.xml_available = 1 THEN excluded.total_mxn     ELSE pulso.cfdis_raw.total_mxn     END,
+            xml_available             = CASE WHEN excluded.xml_available = 1 THEN excluded.xml_available ELSE pulso.cfdis_raw.xml_available END,
             metodo_pago               = excluded.metodo_pago,
             forma_pago                = excluded.forma_pago,
             lugar_expedicion          = excluded.lugar_expedicion,
             estado_sat                = excluded.estado_sat,
-            xml_available             = excluded.xml_available,
             -- Per a later review: year/month were insert-only before this -- a nómina
             -- receipt first upserted via from_metadata (xml_available=0, no Nomina complement,
             -- year/month stuck at emisión) never got corrected once real XML arrived and
@@ -52,8 +62,8 @@ pub async fn upsert_cfdi(pool: &PgPool, c: &ParsedCfdi) -> Result<(), sqlx::Erro
             -- is false and year/month keep their existing (better) value instead of being
             -- degraded back to emisión. Same-or-better source quality is the only thing that
             -- gets to move year/month.
-            year  = CASE WHEN excluded.xml_available >= pulso.cfdis.xml_available THEN excluded.year  ELSE pulso.cfdis.year  END,
-            month = CASE WHEN excluded.xml_available >= pulso.cfdis.xml_available THEN excluded.month ELSE pulso.cfdis.month END
+            year  = CASE WHEN excluded.xml_available >= pulso.cfdis_raw.xml_available THEN excluded.year  ELSE pulso.cfdis_raw.year  END,
+            month = CASE WHEN excluded.xml_available >= pulso.cfdis_raw.xml_available THEN excluded.month ELSE pulso.cfdis_raw.month END
         "#,
     )
     .bind(&c.uuid)
@@ -602,7 +612,7 @@ pub async fn jobs_needing_enrichment(pool: &PgPool) -> Result<Vec<String>, sqlx:
         r#"
         SELECT DISTINCT ji.job_id
         FROM pulso.job_invoices ji
-        JOIN pulso.cfdis c ON c.uuid = ji.uuid
+        JOIN pulso.cfdis_raw c ON c.uuid = ji.uuid
         WHERE c.xml_available = 0
         "#,
     )
@@ -626,7 +636,7 @@ pub async fn find_needs_enrichment(
         r#"
         SELECT ji.uuid, ji.metadata
         FROM pulso.job_invoices ji
-        JOIN pulso.cfdis c ON c.uuid = ji.uuid
+        JOIN pulso.cfdis_raw c ON c.uuid = ji.uuid
         WHERE ji.job_id = $1 AND c.xml_available = 0
         ORDER BY ji.uuid
         LIMIT $2
@@ -699,7 +709,7 @@ pub async fn reset_for_reprocessing(
     let sql = format!(
         r#"
         WITH targets AS (
-            SELECT c.uuid FROM pulso.cfdis c
+            SELECT c.uuid FROM pulso.cfdis_raw c
             WHERE {owner_clause}
               AND c.xml_available IN (1, -1)
               {period_clause}
@@ -713,7 +723,7 @@ pub async fn reset_for_reprocessing(
         del_nomded  AS (DELETE FROM pulso.cfdi_nomina_deducciones   WHERE uuid         IN (SELECT uuid FROM targets)),
         del_nomop   AS (DELETE FROM pulso.cfdi_nomina_otros_pagos   WHERE uuid         IN (SELECT uuid FROM targets)),
         del_nom     AS (DELETE FROM pulso.cfdi_nomina               WHERE uuid         IN (SELECT uuid FROM targets))
-        UPDATE pulso.cfdis SET xml_available = 0
+        UPDATE pulso.cfdis_raw SET xml_available = 0
         WHERE uuid IN (SELECT uuid FROM targets)
         RETURNING rfc_emisor, rfc_receptor
         "#,
@@ -753,7 +763,7 @@ pub async fn mark_xml_unavailable_for_job(
     // meantime). Under-corrects 0%/8% invoices, but that's a smaller error
     // than counting the 16% IVA itself as revenue.
     let result = sqlx::query(
-        r#"UPDATE pulso.cfdis c
+        r#"UPDATE pulso.cfdis_raw c
            SET xml_available = -1,
                subtotal  = CASE
                    WHEN c.subtotal IS NULL AND c.total IS NOT NULL
@@ -883,7 +893,7 @@ pub async fn find_cancelled_recheck_candidates(
     let rows = sqlx::query(
         r#"
         SELECT uuid, rfc_emisor, rfc_receptor
-        FROM pulso.cfdis
+        FROM pulso.cfdis_raw
         WHERE is_cancelled
           AND (
               estado_sat_checked_at IS NULL
@@ -928,7 +938,7 @@ pub async fn find_vigente_recheck_candidates(
     let rows = sqlx::query(
         r#"
         SELECT uuid, rfc_emisor, rfc_receptor
-        FROM pulso.cfdis
+        FROM pulso.cfdis_raw
         WHERE NOT is_cancelled
           AND tipo_comprobante IN ('I', 'E')
           AND (
@@ -968,7 +978,7 @@ pub async fn update_estado_sat(
     estado_sat: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE pulso.cfdis SET estado_sat = $1, estado_sat_checked_at = NOW(), estado_sat_check_attempts = 0 WHERE uuid = $2",
+        "UPDATE pulso.cfdis_raw SET estado_sat = $1, estado_sat_checked_at = NOW(), estado_sat_check_attempts = 0 WHERE uuid = $2",
     )
     .bind(estado_sat)
     .bind(uuid)
@@ -985,7 +995,7 @@ pub async fn touch_estado_sat_checked(pool: &PgPool, uuids: &[String]) -> Result
         return Ok(());
     }
     sqlx::query(
-        "UPDATE pulso.cfdis SET estado_sat_checked_at = NOW() WHERE uuid = ANY($1::text[])",
+        "UPDATE pulso.cfdis_raw SET estado_sat_checked_at = NOW() WHERE uuid = ANY($1::text[])",
     )
     .bind(uuids)
     .execute(pool)
@@ -1007,7 +1017,7 @@ pub async fn record_estado_sat_miss(
     use sqlx::Row;
     let row = sqlx::query(
         r#"
-        UPDATE pulso.cfdis
+        UPDATE pulso.cfdis_raw
         SET estado_sat_check_attempts = estado_sat_check_attempts + 1,
             estado_sat_checked_at = CASE
                 WHEN estado_sat_check_attempts + 1 >= $2 THEN NOW()
@@ -1046,7 +1056,7 @@ pub async fn find_needing_redownload(
     let rows = sqlx::query(
         r#"
         SELECT DISTINCT ON (c.uuid) c.uuid, c.rfc_emisor, c.rfc_receptor, ji.metadata
-        FROM pulso.cfdis c
+        FROM pulso.cfdis_raw c
         JOIN pulso.job_invoices ji ON ji.uuid = c.uuid
         WHERE c.xml_available = -1
           AND c.xml_redownload_attempts < $1
@@ -1079,7 +1089,7 @@ pub async fn find_needing_redownload(
 pub async fn record_redownload_miss(pool: &PgPool, uuid: &str) -> Result<i32, sqlx::Error> {
     use sqlx::Row;
     let row = sqlx::query(
-        r#"UPDATE pulso.cfdis SET xml_redownload_attempts = xml_redownload_attempts + 1
+        r#"UPDATE pulso.cfdis_raw SET xml_redownload_attempts = xml_redownload_attempts + 1
            WHERE uuid = $1 RETURNING xml_redownload_attempts"#,
     )
     .bind(uuid)

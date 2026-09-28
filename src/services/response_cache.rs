@@ -63,6 +63,20 @@ fn process_start() -> OffsetDateTime {
 /// Rust function instead; a rule create/edit/delete must never also call it, or the same
 /// bump would happen twice under two different definitions (DEC-084's "one definition per
 /// number").
+/// L18-26 point 1: `pulso.nomina_normalizada` is one shared materialized view, not one per
+/// RFC, so a refresh (scheduled or the manual "Refrescar ahora") invalidates every RFC's
+/// cache at once rather than one `bump_version` call per RFC. This over-invalidates --
+/// every cached endpoint for every RFC recomputes on its next request, not only the ones
+/// that read the view -- but the cache has no finer-grained key than `rfc` to invalidate
+/// against, and building one is out of scope here. Called by `nomina_refresh::refresh`, so
+/// both triggers (the 23h tick and the manual route) go through this same path.
+pub async fn bump_version_all(pool: &DbPool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE pulso.rfc_data_version SET version = version + 1, updated_at = now()")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn bump_version(pool: &DbPool, rfc: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"INSERT INTO pulso.rfc_data_version (rfc, version)

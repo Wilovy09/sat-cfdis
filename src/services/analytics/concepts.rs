@@ -41,13 +41,27 @@ pub async fn get(
     let owner_col = rfc_column(dl_type);
 
     // By description (top 50 by amount)
+    // L18-15 point 4: same rule as counterparties::get_individual's top-concepts query --
+    // monto = importe menos descuento, en pesos, y una nota de crédito resta (0 en vez de
+    // negativo cuando su tipo_relacion es '02'/'07', igual que cfdis_ajustado's own
+    // total_neto_mxn_ajustado, migration 051).
     let desc_rows = sqlx::query(&format!(
         r#"
         SELECT
             UPPER(TRIM(COALESCE(cc.descripcion, '')))   AS desc,
             COALESCE(cc.clave_prod_serv, '')             AS clave,
-            SUM(COALESCE(cc.importe::float8, 0)
-                * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)) AS total,
+            SUM(
+                (CASE
+                    WHEN c.tipo_comprobante = 'E' AND EXISTS (
+                        SELECT 1 FROM pulso.cfdi_relacionados r
+                        WHERE r.source_uuid = c.uuid AND r.tipo_relacion IN ('02', '07')
+                    ) THEN 0
+                    WHEN c.tipo_comprobante = 'E' THEN -1
+                    ELSE 1
+                END)
+                * (COALESCE(cc.importe::float8, 0) - COALESCE(cc.descuento::float8, 0))
+                * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)
+            ) AS total,
             COUNT(DISTINCT c.uuid)                       AS cnt,
             AVG(COALESCE(cc.valor_unitario::float8, 0)
                 * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)) AS avg_precio
@@ -101,8 +115,18 @@ pub async fn get(
         r#"
         SELECT
             COALESCE(cc.clave_prod_serv, 'SIN_CLAVE') AS clave,
-            SUM(COALESCE(cc.importe::float8, 0)
-                * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)) AS total,
+            SUM(
+                (CASE
+                    WHEN c.tipo_comprobante = 'E' AND EXISTS (
+                        SELECT 1 FROM pulso.cfdi_relacionados r
+                        WHERE r.source_uuid = c.uuid AND r.tipo_relacion IN ('02', '07')
+                    ) THEN 0
+                    WHEN c.tipo_comprobante = 'E' THEN -1
+                    ELSE 1
+                END)
+                * (COALESCE(cc.importe::float8, 0) - COALESCE(cc.descuento::float8, 0))
+                * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)
+            ) AS total,
             COUNT(DISTINCT c.uuid)                     AS cnt
         FROM pulso.cfdi_concepts cc
         JOIN pulso.cfdis c ON c.uuid = cc.uuid

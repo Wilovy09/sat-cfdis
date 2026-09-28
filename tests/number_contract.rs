@@ -20,10 +20,18 @@ use pulso_backend::services::analytics::{
 };
 use sqlx::Row;
 
-/// "RFC de prueba" per the Lote 6 doc.
-const RFC_PRUEBA: &str = "NUB170623KI3";
+mod common;
+use common::control_rfc;
+
+/// "RFC de prueba" per the Lote 6 doc. L18-25 point 3: read from the test environment's own
+/// env var (regla 7), not hardcoded.
+fn rfc_prueba() -> String {
+    control_rfc("TEST_RFC_PRUEBA")
+}
 /// "RFC grande" per the Lote 6 doc.
-const RFC_GRANDE: &str = "CES100706U65";
+fn rfc_grande() -> String {
+    control_rfc("TEST_RFC_GRANDE")
+}
 
 async fn connect() -> DbPool {
     dotenvy::dotenv().ok();
@@ -39,16 +47,18 @@ fn get_f64_opt(row: &sqlx::postgres::PgRow, col: &str) -> Option<f64> {
 
 /// L6C-09: the Lote 5 photo (migration/script from L6-05), frozen the moment before this
 /// lote started. Six RFCs had nómina data then -- referenced by role only (regla 7), not by
-/// name; RFC_PRUEBA and RFC_GRANDE above are two of the six.
+/// name; the RFC de prueba and RFC grande above are two of the six.
 const SNAPSHOT_LABEL: &str = "lote6_pre";
-const SNAPSHOT_RFCS: [&str; 6] = [
-    RFC_PRUEBA,
-    RFC_GRANDE,
-    "ADC101206334",
-    "ALA2409253U7",
-    "CCO210630GE6",
-    "HTR200709GP5",
-];
+fn snapshot_rfcs() -> [String; 6] {
+    [
+        rfc_prueba(),
+        rfc_grande(),
+        control_rfc("TEST_RFC_SNAPSHOT_3"),
+        control_rfc("TEST_RFC_SNAPSHOT_4"),
+        control_rfc("TEST_RFC_SNAPSHOT_5"),
+        control_rfc("TEST_RFC_SIN_PLANTILLA"),
+    ]
+}
 
 /// Reads one cell of `pulso.lote5_snapshot_value` for the frozen `lote6_pre` label. Missing
 /// row (e.g. an RFC with zero `cfdi_exclusion` rows, never written) defaults to 0.0, matching
@@ -78,7 +88,8 @@ async fn snapshot_value(pool: &DbPool, control_key: &str, rfc: &str) -> f64 {
 #[tokio::test]
 async fn nomina_bruta_real_unfactored() {
     let pool = connect().await;
-    for rfc in SNAPSHOT_RFCS {
+    for rfc in snapshot_rfcs() {
+        let rfc = rfc.as_str();
         let expected = snapshot_value(&pool, "nomina_bruta_real", rfc).await;
         let row = sqlx::query(
             r#"SELECT SUM(n.total_percepciones)::float8 AS v
@@ -107,13 +118,14 @@ async fn nomina_bruta_real_unfactored() {
 
 /// Row 2: nomina normalizada no excluida -- sum of `nomina_normalizada.total_percepciones`
 /// (already factored) where not excluded, restricted to the same frozen population as row 1.
-/// L6C-09: same snapshot-driven rework. The RFC_PRUEBA-has-an-active-scale-rule check is kept
+/// L6C-09: same snapshot-driven rework. The RFC-de-prueba-has-an-active-scale-rule check is kept
 /// (row 1 and this row must genuinely differ for it), now computed fresh over the frozen
 /// population instead of two more hand-copied literals.
 #[tokio::test]
 async fn nomina_normalizada_no_excluida() {
     let pool = connect().await;
-    for rfc in SNAPSHOT_RFCS {
+    for rfc in snapshot_rfcs() {
+        let rfc = rfc.as_str();
         let expected = snapshot_value(&pool, "nomina_normalizada_no_excluida", rfc).await;
         let row = sqlx::query(
             r#"SELECT SUM(total_percepciones)::float8 AS v
@@ -137,13 +149,14 @@ async fn nomina_normalizada_no_excluida() {
         );
     }
 
-    let raw_prueba = snapshot_value(&pool, "nomina_bruta_real", RFC_PRUEBA).await;
+    let rfc_prueba = rfc_prueba();
+    let raw_prueba = snapshot_value(&pool, "nomina_bruta_real", &rfc_prueba).await;
     let normalizada_prueba =
-        snapshot_value(&pool, "nomina_normalizada_no_excluida", RFC_PRUEBA).await;
+        snapshot_value(&pool, "nomina_normalizada_no_excluida", &rfc_prueba).await;
     assert!(
         (raw_prueba - normalizada_prueba).abs() > 0.01,
-        "RFC_PRUEBA's raw and normalized nomina totals are equal -- its scale rule may have \
-         stopped applying, which would itself be worth investigating."
+        "RFC de prueba's raw and normalized nomina totals are equal -- its scale rule may \
+         have stopped applying, which would itself be worth investigating."
     );
 }
 
@@ -155,7 +168,8 @@ async fn nomina_normalizada_no_excluida() {
 #[tokio::test]
 async fn filas_de_la_vista_de_nomina() {
     let pool = connect().await;
-    for rfc in SNAPSHOT_RFCS {
+    for rfc in snapshot_rfcs() {
+        let rfc = rfc.as_str();
         let expected = snapshot_value(&pool, "nomina_filas_vista", rfc).await;
         let row = sqlx::query(
             r#"SELECT COUNT(*) AS v FROM pulso.nomina_normalizada
@@ -190,7 +204,8 @@ async fn filas_de_la_vista_de_nomina() {
 #[tokio::test]
 async fn filas_de_la_vista_igual_a_join_base() {
     let pool = connect().await;
-    for rfc in [RFC_PRUEBA, RFC_GRANDE] {
+    for rfc in [rfc_prueba(), rfc_grande()] {
+        let rfc = rfc.as_str();
         let view_row = sqlx::query(
             r#"SELECT COUNT(*) AS v FROM pulso.nomina_normalizada WHERE rfc_emisor = $1"#,
         )
@@ -227,7 +242,8 @@ async fn filas_de_la_vista_igual_a_join_base() {
 #[tokio::test]
 async fn filas_de_exclusiones() {
     let pool = connect().await;
-    for rfc in SNAPSHOT_RFCS {
+    for rfc in snapshot_rfcs() {
+        let rfc = rfc.as_str();
         let expected = snapshot_value(&pool, "cfdi_exclusion_filas", rfc).await;
         let row = sqlx::query(
             r#"SELECT COUNT(*) AS v FROM pulso.cfdi_exclusion
@@ -290,7 +306,8 @@ async fn puente_lado_comprobantes_igual_poblacion_excluida() {
 
     let pool = connect().await;
 
-    for rfc in [RFC_PRUEBA, RFC_GRANDE] {
+    for rfc in [rfc_prueba(), rfc_grande()] {
+        let rfc = rfc.as_str();
         // receipt_excl_rows (the other comprobante-rule source, N-type) must be empty for
         // this isolation-by-dl_type to be valid -- assert that precondition explicitly
         // rather than assuming it silently.
@@ -358,8 +375,9 @@ async fn puente_lado_comprobantes_igual_poblacion_excluida() {
 #[tokio::test]
 async fn mes_completo_igual_a_mes_solo() {
     let pool = connect().await;
-    // RFC_PRUEBA, 2023-01: a real month with nomina data (confirmed present 2026-09-03).
-    let rfc = RFC_PRUEBA;
+    // RFC de prueba, 2023-01: a real month with nomina data (confirmed present 2026-09-03).
+    let rfc = rfc_prueba();
+    let rfc = rfc.as_str();
     let (year, month) = (2023_i64, 1_i64);
 
     let full_range = payroll::monthly_series(&pool, rfc, 2000, 1, 2100, 12)
@@ -418,7 +436,8 @@ async fn ingresos_netos_tres_pantallas() {
 
     let pool = connect().await;
 
-    for rfc in [RFC_PRUEBA, RFC_GRANDE] {
+    for rfc in [rfc_prueba(), rfc_grande()] {
+        let rfc = rfc.as_str();
         for dl_type in ["emitidos", "ambos"] {
             let sp = summary::SummaryParams {
                 dl_type: dl_type.to_string(),

@@ -319,6 +319,17 @@ pub(crate) fn date_prefix(s: &str) -> &str {
     &s[..10.min(s.len())]
 }
 
+/// L17-10/L18-25: the download worker's "did this job finish" check -- true once
+/// `resume_from` (the cursor's next day, or the job's own `period_from` if it hasn't
+/// started) has passed `period_to`. Extracted from `main.rs`'s resume loop (it used to be
+/// inline there, untestable) -- same `date_prefix` reasoning as `ensancha_rango` above: a
+/// bare date always sorts less than the same day's `23:59:59` timestamp, so comparing raw
+/// strings would read a job as unfinished on its very last day if `period_to` carries a
+/// time-of-day and `resume_from` doesn't (or vice versa).
+pub(crate) fn job_is_complete(resume_from: &str, period_to: &str) -> bool {
+    date_prefix(resume_from) > date_prefix(period_to)
+}
+
 /// Same idea as `date_prefix`, for a `min()`-style pick that has to return one of the two
 /// ORIGINAL strings (not a truncated copy) -- `scan_activity_gaps` persists whichever one
 /// wins as gap-scan progress, so it needs the real value, only *compared* at date
@@ -468,6 +479,51 @@ mod l16_tests {
         assert!(!ensancha_rango(Some(&current_largo), new_from, corto));
         // largo contra largo -- already correct before this item, included for symmetry.
         assert!(!ensancha_rango(Some(&current_largo), new_from, largo));
+    }
+
+    // L18-25 point 2: the gemela of the `to`-boundary test above, on the `from`/min_from
+    // side, in all four short/long combinations -- the doc's own complaint was that the
+    // existing test only covered one punta (to). Same trap, mirrored: a job whose `new_from`
+    // names exactly the same calendar day as the current range's own start never "ensancha",
+    // regardless of which format either side stores.
+    #[test]
+    fn ensancha_rango_same_day_on_the_from_boundary_agrees_across_formats() {
+        let corto = "2023-01-01";
+        let largo = "2023-01-01 00:00:00";
+
+        let current_corto = range(corto, "2026-08-31");
+        let current_largo = range(largo, "2026-08-31");
+
+        // new_to stays inside the current range so only the `from` boundary is on trial.
+        let new_to = "2023-06-01";
+
+        assert!(!ensancha_rango(Some(&current_corto), corto, new_to));
+        assert!(!ensancha_rango(Some(&current_corto), largo, new_to));
+        assert!(!ensancha_rango(Some(&current_largo), corto, new_to));
+        assert!(!ensancha_rango(Some(&current_largo), largo, new_to));
+    }
+
+    // L17-10/L18-25: the download worker's "did this job finish" check, extracted from
+    // main.rs -- "la grave" the doc names, since it had no test at all before this.
+    #[test]
+    fn job_is_complete_true_once_resume_passes_period_to() {
+        assert!(!job_is_complete("2023-06-15", "2023-06-15"));
+        assert!(job_is_complete("2023-06-16", "2023-06-15"));
+        assert!(!job_is_complete("2023-06-14", "2023-06-15"));
+    }
+
+    #[test]
+    fn job_is_complete_same_day_on_the_boundary_agrees_across_formats() {
+        let corto = "2023-06-15";
+        let largo = "2023-06-15 23:59:59";
+        // Same calendar day named in every combination of formats must never read as
+        // "complete" on its own last day -- a bare date always sorts less than the same
+        // day's 23:59:59 timestamp, so mixing formats without date_prefix would give the
+        // wrong answer on 2 of these 4 (corto-contra-largo and largo-contra-corto).
+        assert!(!job_is_complete(corto, corto));
+        assert!(!job_is_complete(corto, largo));
+        assert!(!job_is_complete(largo, corto));
+        assert!(!job_is_complete(largo, largo));
     }
 
     #[test]

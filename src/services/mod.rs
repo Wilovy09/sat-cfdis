@@ -9,6 +9,7 @@ pub mod php_cli;
 pub mod recheck_cancelled;
 pub mod response_cache;
 pub mod s3;
+pub mod session;
 pub mod storage;
 pub mod xml_parser;
 pub mod xml_redownload;

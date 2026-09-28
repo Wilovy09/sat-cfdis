@@ -1395,7 +1395,7 @@ pub async fn list_cfdis_for_counterparty(
                COALESCE(c.fecha_emision::text, '') AS fecha_emision,
                COALESCE(c.total_neto_mxn_ajustado, c.total_mxn, 0)::float8 AS total_mxn,
                c.year::text || '-' || LPAD(c.month::text, 2, '0') AS period,
-               COALESCE((SELECT cc.descripcion FROM pulso.cfdi_concepts cc WHERE cc.uuid = c.uuid LIMIT 1), '') AS concepto,
+               COALESCE((SELECT cc.descripcion FROM pulso.cfdi_concepts cc WHERE cc.uuid = c.uuid ORDER BY cc.position NULLS LAST, cc.id LIMIT 1), '') AS concepto,
                CASE WHEN ex.rule_id IS NOT NULL THEN true ELSE false END AS is_excluded,
                ex.rule_id,
                nr.label

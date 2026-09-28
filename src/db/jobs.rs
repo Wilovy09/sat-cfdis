@@ -122,48 +122,6 @@ pub fn utc_offset(offset_secs: u64) -> String {
 // Write operations
 // ---------------------------------------------------------------------------
 
-/// Insert a new job record. Returns the job id.
-///
-/// V14-02: bumps `rfc`'s cache version here, at the one place every job row is born.
-/// The "calidad de datos" coverage panel (rango analizado, meses esperados/vacíos) reads
-/// straight off `sync_jobs`, not off `cfdis` -- a new job changes what it returns even
-/// before the ETL touches a single invoice, most visibly when a historical download turns
-/// up zero invoices: nothing lands for `process_job`/`enrich_job` to invalidate, so this is
-/// the only bump that scenario ever gets.
-pub async fn insert(
-    pool: &PgPool,
-    rfc: &str,
-    auth_type: &str,
-    auth_enc: &str,
-    dl_type: &str,
-    period_from: &str,
-    period_to: &str,
-) -> Result<String, sqlx::Error> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = now_utc();
-    sqlx::query(
-        r#"INSERT INTO pulso.sync_jobs
-           (id, job_type, rfc, auth_type, auth_enc, dl_type,
-            period_from, period_to, found, status, created_at, updated_at)
-           VALUES ($1, 'list', $2, $3, $4, $5, $6, $7, 0, 'running', $8, $9)"#,
-    )
-    .bind(&id)
-    .bind(rfc)
-    .bind(auth_type)
-    .bind(auth_enc)
-    .bind(dl_type)
-    .bind(period_from)
-    .bind(period_to)
-    .bind(&now)
-    .bind(&now)
-    .execute(pool)
-    .await?;
-    if let Err(e) = bump_version(pool, rfc).await {
-        tracing::warn!(rfc = %rfc, "jobs::insert: failed to bump cache version: {e}");
-    }
-    Ok(id)
-}
-
 /// Mark a job as paused due to SAT download limit (or a transient SAT
 /// connection error — see classifySatError() in cfdi-scraper).
 /// `cursor_date` = last date successfully processed (YYYY-MM-DD).
@@ -1005,14 +963,14 @@ pub async fn find_activity_gap_days(
         ),
         emit_activity AS (
             SELECT fecha_emision::date AS day, COUNT(*) AS cnt
-            FROM pulso.cfdis
+            FROM pulso.cfdis_raw
             WHERE rfc_emisor = $1
               AND fecha_emision::date BETWEEN $2::date AND $3::date
             GROUP BY fecha_emision::date
         ),
         recv_activity AS (
             SELECT fecha_emision::date AS day, COUNT(*) AS cnt
-            FROM pulso.cfdis
+            FROM pulso.cfdis_raw
             WHERE rfc_receptor = $1
               AND fecha_emision::date BETWEEN $2::date AND $3::date
             GROUP BY fecha_emision::date

@@ -18,7 +18,12 @@ const ENRICH_MAX_SKIP: u32 = 720;
 /// Rounds of failed SAT downloads before marking CFDIs as permanently unavailable.
 const ENRICH_MAX_SAT_FAIL: u32 = 5;
 
-pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
+pub async fn etl_worker(
+    pool: DbPool,
+    cfg: Arc<Config>,
+    s3: Arc<S3Client>,
+    nomina_state: Arc<crate::services::nomina_refresh::NominaRefreshState>,
+) {
     // Tracks remaining skip cycles per job_id. Doubles on each failed round, capped at ENRICH_MAX_SKIP.
     let mut enrich_skip: HashMap<String, u32> = HashMap::new();
     let mut enrich_fail_rounds: HashMap<String, u32> = HashMap::new();
@@ -183,6 +188,37 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
                 tracing::warn!(rfc = %rfc, "ETL: failed to bump cache version: {e}");
             }
         }
+
+        // L18-26 point 2: a round that landed nomina rows (normal load, enrichment, or a
+        // redownload applying real XML -- all three flow through the two `mark_touched`
+        // call sites) refreshes the view now instead of waiting up to 23h. Grouped at
+        // round-end rather than per-invoice: a round can carry hundreds of jobs (see this
+        // loop's own C14-02 comment above), and REFRESH MATERIALIZED VIEW CONCURRENTLY
+        // isn't cheap enough to run per invoice. `refresh_guarded` already serializes
+        // against the scheduled tick and the manual route, so this can't stack a second
+        // refresh on top of one already running.
+        if crate::services::nomina_refresh::take_touched() {
+            match crate::services::nomina_refresh::refresh_guarded(&pool, &nomina_state).await {
+                Ok(crate::services::nomina_refresh::RefreshOutcome::Refreshed(elapsed)) => {
+                    tracing::info!(
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "ETL: nomina_normalizada refreshed after this round's nomina writes"
+                    );
+                }
+                // Didn't actually refresh (someone else's cycle owns it, or it errored) --
+                // re-mark so the next round retries even if it lands no nomina writes of
+                // its own. Otherwise this round's writes could wait for the NEXT round to
+                // coincidentally touch nomina again before anything re-triggers a refresh.
+                Ok(crate::services::nomina_refresh::RefreshOutcome::AlreadyInProgress) => {
+                    crate::services::nomina_refresh::mark_touched();
+                    tracing::info!("ETL: nomina refresh already in progress, retrying next round");
+                }
+                Err(e) => {
+                    crate::services::nomina_refresh::mark_touched();
+                    tracing::error!("ETL: nomina_normalizada refresh failed: {e}");
+                }
+            }
+        }
     }
 }
 
@@ -258,12 +294,11 @@ async fn process_invoice(
         xml_parser::parse(bytes, job_id, dl_type, &estado)
     } else {
         // Fallback: build from metadata JSON (no XML)
-        let preview_end = metadata
-            .char_indices()
-            .nth(120)
-            .map(|(i, _)| i)
-            .unwrap_or(metadata.len());
-        tracing::warn!(uuid = %uuid, meta_preview = %&metadata[..preview_end], "ETL: no XML in storage, trying from_metadata");
+        // L18-05: used to log a metadata preview alongside the uuid -- that preview
+        // carries the SAT's rfc_emisor/rfc_receptor, most of what the (now-removed)
+        // xml-content route needed to hand out a stored CFDI's full XML to anyone. The
+        // uuid alone is enough to trace this in logs; the metadata isn't needed here.
+        tracing::warn!(uuid = %uuid, "ETL: no XML in storage, trying from_metadata");
         xml_parser::from_metadata(metadata, job_id, dl_type)
     };
 
@@ -305,9 +340,15 @@ async fn process_invoice(
         tracing::warn!(uuid = %uuid, "ETL: insert_taxes: {e}");
     }
 
-    // Insert concepts (only if XML was available to avoid duplicates)
+    // L18-12: this path used to insert concepts with no existence check at all -- the
+    // ON CONFLICT DO NOTHING below in insert_concepts has never had a unique index to
+    // conflict against, so it silently did nothing. Since migration 080, a CFDI is
+    // reprocessed every time it reappears in a new listing, so every extra pass through
+    // here without this check doubled its concepts again. concepts_exist matches the
+    // enrichment path's own guard (below) -- same check, both write paths now agree.
     if xml_bytes.is_some()
         && !cfdi.concepts.is_empty()
+        && !db::cfdis::concepts_exist(pool, &cfdi.uuid).await
         && let Err(e) = db::cfdis::insert_concepts(pool, &cfdi.uuid, &cfdi.concepts).await
     {
         tracing::warn!(uuid = %uuid, "ETL: insert_concepts: {e}");
@@ -336,10 +377,11 @@ async fn process_invoice(
     }
 
     // Insert nomina data
-    if let Some(nomina) = &cfdi.nomina
-        && let Err(e) = db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await
-    {
-        tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}");
+    if let Some(nomina) = &cfdi.nomina {
+        match db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await {
+            Ok(()) => crate::services::nomina_refresh::mark_touched(),
+            Err(e) => tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}"),
+        }
     }
 
     true
@@ -503,10 +545,11 @@ pub(crate) async fn apply_xml_bytes(
         tracing::warn!(uuid = %uuid, "ETL: insert_concepts: {e}");
     }
 
-    if let Some(nomina) = &cfdi.nomina
-        && let Err(e) = db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await
-    {
-        tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}");
+    if let Some(nomina) = &cfdi.nomina {
+        match db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await {
+            Ok(()) => crate::services::nomina_refresh::mark_touched(),
+            Err(e) => tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}"),
+        }
     }
 
     tracing::debug!(uuid = %uuid, "ETL: applied real XML");

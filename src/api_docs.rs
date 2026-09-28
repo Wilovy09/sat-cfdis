@@ -65,10 +65,6 @@ pub const SCALAR_HTML: &str = r#"<!doctype html>
         crate::routes::analytics::create_payroll_normalization,
         crate::routes::analytics::update_payroll_normalization,
         crate::routes::analytics::delete_payroll_normalization,
-        // Invoices
-        crate::routes::invoices::list_invoices,
-        crate::routes::invoices::download_invoices,
-        crate::routes::invoices::xml_content,
     ),
     components(schemas(
         crate::routes::auth::RegisterDto,
@@ -82,7 +78,6 @@ pub const SCALAR_HTML: &str = r#"<!doctype html>
         (name = "Queue",         description = "Jobs de descarga SAT"),
         (name = "Analytics",     description = "Analítica de CFDIs"),
         (name = "Normalization", description = "Reglas de normalización de contrapartes y nómina"),
-        (name = "Invoices",      description = "Descarga y consulta de CFDIs del SAT"),
     )
 )]
 pub struct ApiDoc;

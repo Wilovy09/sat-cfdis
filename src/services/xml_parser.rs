@@ -589,7 +589,7 @@ pub fn from_metadata(meta_json: &str, job_id: &str, dl_type: &str) -> Option<Par
 fn parse_comprobante_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedCfdi) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "Fecha" => {
                 let v = val();
@@ -626,10 +626,10 @@ fn parse_comprobante_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut Parsed
 fn parse_emisor_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedCfdi) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = String::from_utf8_lossy(&attr.value).to_uppercase();
+        let val = decode_attr(&attr.value).to_uppercase();
         match key.as_str() {
             "Rfc" => c.rfc_emisor = val.to_string(),
-            "Nombre" => c.nombre_emisor = Some(String::from_utf8_lossy(&attr.value).to_string()),
+            "Nombre" => c.nombre_emisor = Some(decode_attr(&attr.value)),
             "RegimenFiscal" => c.regimen_fiscal_emisor = Some(val.to_string()),
             _ => {}
         }
@@ -639,7 +639,7 @@ fn parse_emisor_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedCfdi)
 fn parse_receptor_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedCfdi) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "Rfc" => c.rfc_receptor = val().to_uppercase(),
             "Nombre" => c.nombre_receptor = Some(val()),
@@ -654,7 +654,7 @@ fn parse_receptor_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedCfd
 fn parse_concept_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedConcept) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "ClaveProdServ" => c.clave_prod_serv = Some(val()),
             "ClaveUnidad" => c.clave_unidad = Some(val()),
@@ -671,7 +671,7 @@ fn parse_concept_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedConc
 fn parse_tax_attrs(e: &quick_xml::events::BytesStart<'_>, t: &mut ParsedTax, is_ret: bool) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "Impuesto" => t.impuesto = Some(val()),
             "TipoFactor" => t.tipo_factor = Some(val()),
@@ -687,7 +687,7 @@ fn parse_tax_attrs(e: &quick_xml::events::BytesStart<'_>, t: &mut ParsedTax, is_
 fn parse_pago_attrs(e: &quick_xml::events::BytesStart<'_>, p: &mut ParsedPayment) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "FechaPago" => p.fecha_pago = Some(val()),
             "FormaDePagoP" => p.forma_pago = Some(val()),
@@ -703,7 +703,7 @@ fn parse_docto_relacionado(e: &quick_xml::events::BytesStart<'_>) -> ParsedPayme
     let mut d = ParsedPaymentDoc::default();
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "IdDocumento" => d.invoice_uuid = val().to_uppercase(),
             "NumParcialidad" => d.num_parcialidad = val().parse().ok(),
@@ -726,7 +726,7 @@ fn parse_docto_relacionado(e: &quick_xml::events::BytesStart<'_>) -> ParsedPayme
 fn parse_nomina_attrs(e: &quick_xml::events::BytesStart<'_>, n: &mut ParsedNomina) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "TipoNomina" => n.tipo_nomina = Some(val()),
             "FechaPago" => n.fecha_pago = Some(val()),
@@ -744,7 +744,7 @@ fn parse_nomina_attrs(e: &quick_xml::events::BytesStart<'_>, n: &mut ParsedNomin
 fn parse_nomina_receptor_attrs(e: &quick_xml::events::BytesStart<'_>, n: &mut ParsedNomina) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "Curp" => n.curp = Some(val()),
             "TipoContrato" => n.tipo_contrato = Some(val()),
@@ -766,7 +766,7 @@ fn parse_nomina_receptor_attrs(e: &quick_xml::events::BytesStart<'_>, n: &mut Pa
 fn parse_nomina_percepciones_totals(e: &quick_xml::events::BytesStart<'_>, n: &mut ParsedNomina) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "TotalSueldos" => n.total_sueldos = val().parse().ok(),
             "TotalGravado" => n.total_gravado = val().parse().ok(),
@@ -780,7 +780,7 @@ fn parse_nomina_percepcion(e: &quick_xml::events::BytesStart<'_>) -> ParsedNomin
     let mut p = ParsedNominaPercepcion::default();
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "TipoPercepcion" => p.tipo_percepcion = Some(val()),
             "Clave" => p.clave = Some(val()),
@@ -797,7 +797,7 @@ fn parse_nomina_deduccion(e: &quick_xml::events::BytesStart<'_>) -> ParsedNomina
     let mut d = ParsedNominaDeduccion::default();
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "TipoDeduccion" => d.tipo_deduccion = Some(val()),
             "Clave" => d.clave = Some(val()),
@@ -813,7 +813,7 @@ fn parse_nomina_otro_pago(e: &quick_xml::events::BytesStart<'_>) -> ParsedNomina
     let mut op = ParsedNominaOtroPago::default();
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "TipoOtroPago" => op.tipo_otro_pago = Some(val()),
             "Clave" => op.clave = Some(val()),
@@ -839,11 +839,29 @@ fn local_name(name: &[u8]) -> String {
     }
 }
 
+/// L18-13: an attribute's raw bytes are still XML-escaped -- quick-xml doesn't decode
+/// entities on its own. A name with a quote in it arrives here as the literal text
+/// `&quot;`, not a `"` character. This is the one shared decode point every attribute read
+/// in this file (15 of them, across 9 functions -- both the `attr()` lookup below and each
+/// `parse_*_attrs` function's own `String::from_utf8_lossy(&attr.value)` pattern) now goes
+/// through. `quick_xml::escape::unescape` resolves both the five predefined entities
+/// (&amp; &lt; &gt; &quot; &apos;) and numeric character references (&#10; etc, e.g.
+/// embedded newlines) per the doc's own "incluye las codificaciones numéricas"
+/// requirement. Malformed escape sequences fall back to the raw text rather than dropping
+/// the field -- a still-readable name beats losing the value entirely over one bad entity.
+fn decode_attr(bytes: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(bytes).to_string();
+    match quick_xml::escape::unescape(&raw) {
+        Ok(decoded) => decoded.into_owned(),
+        Err(_) => raw,
+    }
+}
+
 fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     for a in e.attributes().flatten() {
         let k = local_name(a.key.as_ref());
         if k.as_bytes() == key {
-            return Some(String::from_utf8_lossy(&a.value).to_string());
+            return Some(decode_attr(&a.value));
         }
     }
     None
@@ -1009,5 +1027,38 @@ mod aud010_retencion_tests {
         assert!(
             (subtotal - descuento + trasladados - retenidos - cfdi.total.unwrap()).abs() < 1e-6
         );
+    }
+}
+
+#[cfg(test)]
+mod l18_13_decode_attr_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_the_five_predefined_entities() {
+        assert_eq!(decode_attr(b"AT&amp;T"), "AT&T");
+        assert_eq!(decode_attr(b"&quot;ACME&quot;"), "\"ACME\"");
+        assert_eq!(decode_attr(b"O&apos;Brien"), "O'Brien");
+        assert_eq!(decode_attr(b"a &lt; b &gt; c"), "a < b > c");
+    }
+
+    #[test]
+    fn decodes_numeric_character_references_including_newlines() {
+        // The doc's own example: a newline stored as a numeric char ref.
+        assert_eq!(decode_attr(b"line1&#10;line2"), "line1\nline2");
+        assert_eq!(decode_attr(b"caf&#xe9;"), "caf\u{e9}");
+    }
+
+    #[test]
+    fn leaves_plain_text_unchanged() {
+        assert_eq!(decode_attr(b"ACME SA DE CV"), "ACME SA DE CV");
+    }
+
+    #[test]
+    fn falls_back_to_the_raw_text_on_a_malformed_entity_instead_of_dropping_it() {
+        // An unterminated/unrecognized entity must not turn a name into an empty
+        // string or panic -- better a still-readable (if imperfect) name.
+        let raw = "AT&INVALID;T";
+        assert_eq!(decode_attr(raw.as_bytes()), raw);
     }
 }

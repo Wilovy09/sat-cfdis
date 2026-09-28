@@ -9,11 +9,15 @@
 //!
 //! Deliberately NOT mirrored here: `api_docs`, `errors`, `models`, `routes`, `state`, and
 //! most of `services` (`crypto`, `email`, `etl`, `fiel`, `gap_detector`, `php_cli`,
-//! `recheck_cancelled`, `s3`, `storage`, `xml_redownload`, and
-//! `services::analytics::recurrence`). Several of those call back into helpers
-//! (`try_fiel_auth`, `next_day`, `routes::analytics::current_month_yyyymm`, …) that only
-//! exist in the binary crate — pulling them in here would fail to compile a crate whose
-//! root is `lib.rs`, not `main.rs`.
+//! `recheck_cancelled`, `xml_redownload`, and `services::analytics::recurrence`). Several
+//! of those call back into helpers (`try_fiel_auth`, `next_day`,
+//! `routes::analytics::current_month_yyyymm`, …) that only exist in the binary crate —
+//! pulling them in here would fail to compile a crate whose root is `lib.rs`, not
+//! `main.rs`.
+//!
+//! `s3`/`storage` ARE mirrored (L18-12): `src/bin/reconstruct_concepts.rs` needs to fetch
+//! stored XML the same way the server does, and neither module calls back into anything
+//! binary-only.
 
 pub mod config;
 pub mod db;
@@ -36,6 +40,8 @@ pub mod services {
         pub mod hallazgos;
     }
     // `db::cfdis` (pulled in by `pub mod db` above) depends on this for XML parsing.
+    pub mod s3;
+    pub mod storage;
     pub mod xml_parser;
     // `db::jobs` (pulled in by `pub mod db` above) depends on this: V14-02, its `insert`/
     // `insert_queued`/`insert_gap_continuation` bump the response cache's data version when

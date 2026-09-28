@@ -5,6 +5,7 @@ use utoipa::ToSchema;
 
 use crate::config::Config;
 use crate::db::DbPool;
+use crate::errors::GENERIC_INTERNAL_ERROR;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RegisterDto {
@@ -42,21 +43,28 @@ fn jwt_sub(token: &str) -> Option<String> {
 }
 
 /// After a successful Adquiere auth response, enrich the JSON body with
-/// `pulso_complete_profile` and `is_admin` queried from our local DB.
-async fn enrich_with_profile(pool: &DbPool, mut body: serde_json::Value) -> serde_json::Value {
-    if let Some(token) = body.get("access_token").and_then(|t| t.as_str())
-        && let Some(user_id) = jwt_sub(token)
-    {
-        let complete = crate::db::users::get_profile_complete(pool, &user_id)
+/// `pulso_complete_profile` and `is_admin` queried from our local DB. Also returns the
+/// user id extracted from the token -- L18-05: callers use it to record the span's
+/// `user_id` field instead of logging the email that used to identify the request.
+async fn enrich_with_profile(
+    pool: &DbPool,
+    mut body: serde_json::Value,
+) -> (serde_json::Value, Option<String>) {
+    let user_id = body
+        .get("access_token")
+        .and_then(|t| t.as_str())
+        .and_then(jwt_sub);
+    if let Some(user_id) = &user_id {
+        let complete = crate::db::users::get_profile_complete(pool, user_id)
             .await
             .unwrap_or(false);
-        let is_admin = crate::db::users::is_user_admin(pool, &user_id)
+        let is_admin = crate::db::users::is_user_admin(pool, user_id)
             .await
             .unwrap_or(false);
         body["pulso_complete_profile"] = serde_json::Value::Bool(complete);
         body["is_admin"] = serde_json::Value::Bool(is_admin);
     }
-    body
+    (body, user_id)
 }
 
 #[utoipa::path(
@@ -70,7 +78,7 @@ async fn enrich_with_profile(pool: &DbPool, mut body: serde_json::Value) -> serd
         (status = 502, description = "Error al conectar con Adquiere API"),
     )
 )]
-#[tracing::instrument(skip_all, fields(email = %body.email))]
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
 pub async fn register(
     cfg: web::Data<Config>,
     pool: web::Data<DbPool>,
@@ -80,8 +88,9 @@ pub async fn register(
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
         Err(e) => {
+            tracing::error!("register: reqwest client build failed: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
-                error: e.to_string(),
+                error: GENERIC_INTERNAL_ERROR.to_string(),
             });
         }
     };
@@ -105,8 +114,9 @@ pub async fn register(
     let resp = match client.post(&url).json(&payload).send().await {
         Ok(r) => r,
         Err(e) => {
+            tracing::error!("register: request to Adquiere API failed: {e}");
             return HttpResponse::BadGateway().json(ErrorBody {
-                error: e.to_string(),
+                error: GENERIC_INTERNAL_ERROR.to_string(),
             });
         }
     };
@@ -117,8 +127,11 @@ pub async fn register(
     match resp.json::<serde_json::Value>().await {
         Ok(json) => {
             if status.is_success() {
+                let (enriched, user_id) = enrich_with_profile(&pool, json).await;
+                if let Some(id) = &user_id {
+                    tracing::Span::current().record("user_id", id.as_str());
+                }
                 tracing::info!(status = %status.as_u16(), "Register successful");
-                let enriched = enrich_with_profile(&pool, json).await;
                 HttpResponse::build(status).json(enriched)
             } else {
                 tracing::warn!(status = %status.as_u16(), "Register rejected by upstream");
@@ -140,7 +153,7 @@ pub async fn register(
         (status = 502, description = "Error al conectar con Adquiere API"),
     )
 )]
-#[tracing::instrument(skip_all, fields(email = %body.email))]
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
 pub async fn login(
     cfg: web::Data<Config>,
     pool: web::Data<DbPool>,
@@ -150,8 +163,9 @@ pub async fn login(
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
         Err(e) => {
+            tracing::error!("login: reqwest client build failed: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
-                error: e.to_string(),
+                error: GENERIC_INTERNAL_ERROR.to_string(),
             });
         }
     };
@@ -166,8 +180,9 @@ pub async fn login(
     let resp = match client.post(&url).json(&payload).send().await {
         Ok(r) => r,
         Err(e) => {
+            tracing::error!("login: request to Adquiere API failed: {e}");
             return HttpResponse::BadGateway().json(ErrorBody {
-                error: e.to_string(),
+                error: GENERIC_INTERNAL_ERROR.to_string(),
             });
         }
     };
@@ -178,8 +193,11 @@ pub async fn login(
     match resp.json::<serde_json::Value>().await {
         Ok(json) => {
             if status.is_success() {
+                let (enriched, user_id) = enrich_with_profile(&pool, json).await;
+                if let Some(id) = &user_id {
+                    tracing::Span::current().record("user_id", id.as_str());
+                }
                 tracing::info!(status = %status.as_u16(), "Login successful");
-                let enriched = enrich_with_profile(&pool, json).await;
                 HttpResponse::build(status).json(enriched)
             } else {
                 tracing::warn!(status = %status.as_u16(), "Login rejected by upstream");
@@ -246,20 +264,6 @@ fn make_jwt(secret: &str, id: &str, email: &str, name: &str, is_admin: bool) -> 
         &EncodingKey::from_secret(secret.as_bytes()),
     )
     .unwrap_or_default()
-}
-
-fn bearer_token_auth(req: &HttpRequest) -> Option<String> {
-    let header = req
-        .headers()
-        .get(actix_web::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?;
-    let lower = header.to_lowercase();
-    let token = header[lower.find("bearer ")? + 7..].trim();
-    if token.is_empty() {
-        return None;
-    }
-    Some(token.to_string())
 }
 
 /// Exchange a Google authorization code for the user's profile.
@@ -352,7 +356,7 @@ pub async fn google_login(
             Err(e) => {
                 tracing::error!("DB error finding user by email: {e}");
                 return HttpResponse::InternalServerError().json(ErrorBody {
-                    error: e.to_string(),
+                    error: GENERIC_INTERNAL_ERROR.to_string(),
                 });
             }
         },
@@ -389,28 +393,21 @@ pub async fn google_login(
 }
 
 /// Link (or re-link) a Google account to the currently authenticated user.
+///
+/// L18-02 point 2 (the closed permanent backdoor): this is the route a forged/unverified
+/// token could reach before, letting an attacker link *their own* Google account to any
+/// victim user id and get a real, properly-signed Pulso session on demand from then on --
+/// signature verification everywhere else wouldn't have caught it retroactively. Now goes
+/// through the same verified session as every other route.
 pub async fn google_link(
     req: HttpRequest,
     cfg: web::Data<Config>,
     pool: web::Data<DbPool>,
     body: web::Json<GoogleCodeDto>,
 ) -> HttpResponse {
-    let token = match bearer_token_auth(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Missing token".to_string(),
-            });
-        }
-    };
-
-    let user_id = match jwt_sub(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Invalid token".to_string(),
-            });
-        }
+    let user_id = match crate::services::session::require_session(&req, &cfg) {
+        Ok(id) => id,
+        Err(e) => return actix_web::ResponseError::error_response(&e),
     };
 
     let google_user = match exchange_google_code(&cfg, &body.code).await {
@@ -429,16 +426,18 @@ pub async fn google_link(
             });
         }
         Err(e) => {
+            tracing::error!("google_link: DB error checking existing google_id link: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
-                error: e.to_string(),
+                error: GENERIC_INTERNAL_ERROR.to_string(),
             });
         }
         _ => {}
     }
 
     if let Err(e) = crate::db::users::set_google_id(&pool, &user_id, &google_user.sub).await {
+        tracing::error!(user_id = %user_id, "google_link: set_google_id failed: {e}");
         return HttpResponse::InternalServerError().json(ErrorBody {
-            error: e.to_string(),
+            error: GENERIC_INTERNAL_ERROR.to_string(),
         });
     }
 
@@ -447,29 +446,22 @@ pub async fn google_link(
 }
 
 /// Returns whether the current user has a Google account linked.
-pub async fn google_status(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
-    let token = match bearer_token_auth(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Missing token".to_string(),
-            });
-        }
-    };
-    let user_id = match jwt_sub(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Invalid token".to_string(),
-            });
-        }
+pub async fn google_status(
+    req: HttpRequest,
+    cfg: web::Data<Config>,
+    pool: web::Data<DbPool>,
+) -> HttpResponse {
+    let user_id = match crate::services::session::require_session(&req, &cfg) {
+        Ok(id) => id,
+        Err(e) => return actix_web::ResponseError::error_response(&e),
     };
 
     let linked = match crate::db::users::find_by_google_id_linked(&pool, &user_id).await {
         Ok(v) => v,
         Err(e) => {
+            tracing::error!(user_id = %user_id, "google_status: DB error: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
-                error: e.to_string(),
+                error: GENERIC_INTERNAL_ERROR.to_string(),
             });
         }
     };
@@ -478,27 +470,20 @@ pub async fn google_status(req: HttpRequest, pool: web::Data<DbPool>) -> HttpRes
 }
 
 /// Unlink Google from the current user's account.
-pub async fn google_unlink(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
-    let token = match bearer_token_auth(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Missing token".to_string(),
-            });
-        }
-    };
-    let user_id = match jwt_sub(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Invalid token".to_string(),
-            });
-        }
+pub async fn google_unlink(
+    req: HttpRequest,
+    cfg: web::Data<Config>,
+    pool: web::Data<DbPool>,
+) -> HttpResponse {
+    let user_id = match crate::services::session::require_session(&req, &cfg) {
+        Ok(id) => id,
+        Err(e) => return actix_web::ResponseError::error_response(&e),
     };
 
     if let Err(e) = crate::db::users::clear_google_id(&pool, &user_id).await {
+        tracing::error!(user_id = %user_id, "google_unlink: clear_google_id failed: {e}");
         return HttpResponse::InternalServerError().json(ErrorBody {
-            error: e.to_string(),
+            error: GENERIC_INTERNAL_ERROR.to_string(),
         });
     }
 

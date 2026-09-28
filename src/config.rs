@@ -44,7 +44,15 @@ pub struct Config {
     pub google_client_id: String,
     pub google_client_secret: String,
     pub google_redirect_uri: String,
+    /// L18-03: no fallback value -- an empty/short secret used to let the server start
+    /// with a 9-character default anyone could read off GitHub. Read raw here; the
+    /// length check (>= 32 chars, refuse to start otherwise) lives in main() so the four
+    /// test suites that call `Config::from_env()` directly don't need the variable set.
     pub jwt_secret: String,
+    /// L18-02: verifies a session token the Adquiere API issued (email register/login) --
+    /// see services::session for why this can't reuse `jwt_secret`. `None` (unset)
+    /// means that issuer's tokens are rejected, not trusted by default.
+    pub adquiere_jwt_secret: Option<String>,
     #[allow(dead_code)]
     pub app_base_url: String,
     /// pm2 process name for this app, e.g. what `pm2 start ... --name <this>` used --
@@ -57,6 +65,9 @@ pub struct Config {
     /// `routes::logs::admin_logs_key_matches` for why a personal JWT can't do this job
     /// across environments. `None` (unset) disables the bypass entirely; only the
     /// existing per-user JWT + DB admin check applies.
+    /// L18-04: an env var set but empty (e.g. `ADMIN_LOGS_KEY=`) used to leave the bypass
+    /// open to an equally-empty header -- filtering it out here means "configured" and
+    /// "non-empty" are the same thing everywhere downstream, not two checks to remember.
     pub admin_logs_key: Option<String>,
 }
 
@@ -119,11 +130,12 @@ impl Config {
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
-            jwt_secret: env::var("JWT_SECRET").unwrap_or_else(|_| "jwtsecret".to_string()),
+            jwt_secret: env::var("JWT_SECRET").unwrap_or_default(),
+            adquiere_jwt_secret: env::var("ADQUIERE_JWT_SECRET").ok(),
             app_base_url: env::var("APP_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),
             pm2_app_name: env::var("PM2_APP_NAME").unwrap_or_else(|_| "pulso-backend".to_string()),
-            admin_logs_key: env::var("ADMIN_LOGS_KEY").ok(),
+            admin_logs_key: env::var("ADMIN_LOGS_KEY").ok().filter(|s| !s.is_empty()),
         }
     }
 }

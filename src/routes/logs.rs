@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::{config::Config, errors::AppError};
+use crate::{config::Config, errors::AppError, services::session};
 
 pub type DbPool = crate::db::DbPool;
 
@@ -24,38 +24,8 @@ const MAX_LINES: usize = 5000;
 const TAIL_CHUNK_SIZE: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
-// Admin auth — same pattern as routes/queue.rs (this codebase keeps a private copy per
-// admin-only module rather than a shared helper; following that convention here).
+// Admin auth
 // ---------------------------------------------------------------------------
-
-fn bearer_token(req: &HttpRequest) -> Option<String> {
-    let header = req
-        .headers()
-        .get(actix_web::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?;
-    let lower = header.to_lowercase();
-    let token = header[lower.find("bearer ")? + 7..].trim();
-    if token.is_empty() {
-        return None;
-    }
-    Some(token.to_string())
-}
-
-fn jwt_user_id(token: &str) -> Option<String> {
-    use base64::Engine as _;
-    let payload = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
-        .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    json.get("id")
-        .or_else(|| json.get("sub"))?
-        .as_str()
-        .map(|s| s.to_string())
-}
 
 /// A per-user admin JWT only means something inside the environment that issued it -- a
 /// person who's admin in prod's `public.users`/`user_roles` has a *different* id (and no
@@ -70,6 +40,22 @@ fn jwt_user_id(token: &str) -> Option<String> {
 /// identity this environment's DB was never going to recognize. The per-user JWT path
 /// below is untouched and still works exactly as before for anyone hitting this endpoint
 /// directly with their own token.
+/// L18-04: plain `==` on secrets short-circuits at the first mismatched byte, which leaks
+/// how many leading bytes were right through response timing. Compares every byte
+/// regardless of where the first difference is; the length check up front is standard
+/// practice for this pattern (key length isn't the secret, the value is) and every real
+/// key here has a fixed, non-secret length anyway.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn admin_logs_key_matches(req: &HttpRequest, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return false;
@@ -77,7 +63,7 @@ fn admin_logs_key_matches(req: &HttpRequest, expected: Option<&str>) -> bool {
     req.headers()
         .get("x-admin-logs-key")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|got| got == expected)
+        .is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes()))
 }
 
 async fn require_admin(req: &HttpRequest, pool: &DbPool, cfg: &Config) -> Result<(), AppError> {
@@ -85,8 +71,7 @@ async fn require_admin(req: &HttpRequest, pool: &DbPool, cfg: &Config) -> Result
         return Ok(());
     }
 
-    let token = bearer_token(req).ok_or_else(|| AppError::unauthorized("Token requerido"))?;
-    let user_id = jwt_user_id(&token).ok_or_else(|| AppError::unauthorized("Token inválido"))?;
+    let user_id = session::require_session(req, cfg)?;
     let is_admin = crate::db::users::is_user_admin(pool, &user_id)
         .await
         .unwrap_or(false);
@@ -193,7 +178,7 @@ fn default_lines() -> usize {
         (status = 403, description = "Solo administradores"),
     )
 )]
-#[tracing::instrument(skip(pool, cfg, query))]
+#[tracing::instrument(skip(req, pool, cfg, query))]
 pub async fn get_logs(
     req: HttpRequest,
     pool: web::Data<DbPool>,
@@ -280,7 +265,7 @@ mod tail_lines_tests {
 
 #[cfg(test)]
 mod admin_logs_key_tests {
-    use super::admin_logs_key_matches;
+    use super::{admin_logs_key_matches, constant_time_eq};
     use actix_web::test::TestRequest;
 
     #[test]
@@ -289,6 +274,15 @@ mod admin_logs_key_tests {
             .insert_header(("x-admin-logs-key", "anything"))
             .to_http_request();
         assert!(!admin_logs_key_matches(&req, None));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_regular_equality() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"wrong!"));
+        assert!(!constant_time_eq(b"secret", b"secre"));
+        assert!(!constant_time_eq(b"", b"secret"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]

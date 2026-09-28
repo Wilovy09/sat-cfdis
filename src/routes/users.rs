@@ -2,9 +2,11 @@ use actix_web::{HttpRequest, HttpResponse, web};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::config::Config;
 use crate::db::DbPool;
-use crate::errors::AppError;
+use crate::errors::{AppError, GENERIC_INTERNAL_ERROR};
 use crate::services::crypto;
+use crate::services::session;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CompleteProfileDto {
@@ -20,34 +22,13 @@ struct ErrorBody {
     error: String,
 }
 
-fn bearer_token(req: &HttpRequest) -> Option<String> {
-    let header = req
-        .headers()
-        .get(actix_web::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?;
-    let lower = header.to_lowercase();
-    let token = header[lower.find("bearer ")? + 7..].trim();
-    if token.is_empty() {
-        return None;
-    }
-    Some(token.to_string())
-}
-
-fn jwt_user_id(token: &str) -> Option<String> {
-    use base64::Engine as _;
-    let payload = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
-        .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    // Adquiere uses "id"; fall back to "sub" for spec compliance
-    json.get("id")
-        .or_else(|| json.get("sub"))?
-        .as_str()
-        .map(|s| s.to_string())
+/// L18-02: this file's handlers return `HttpResponse` directly (not `Result<_, AppError>`),
+/// so they can't use `session::require_session`'s `?`-based AppError the way most other
+/// modules now do -- this converts it to the same match-and-early-return shape every
+/// handler here already used, without changing 21 handlers' return type to migrate them.
+fn require_user_id(req: &HttpRequest, cfg: &Config) -> Result<String, HttpResponse> {
+    use actix_web::ResponseError as _;
+    session::require_session(req, cfg).map_err(|e| e.error_response())
 }
 
 /// Compute period_from / period_to for the initial 3-year + current-year sync.
@@ -267,22 +248,14 @@ fn days_in_month(y: u32, m: u32) -> u32 {
     )
 )]
 #[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
-pub async fn get_profile(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".to_string(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".to_string(),
-            });
-        }
+pub async fn get_profile(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
+) -> HttpResponse {
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -310,90 +283,95 @@ pub async fn get_profile(req: HttpRequest, pool: web::Data<DbPool>) -> HttpRespo
     }
 }
 
-#[utoipa::path(
-    post,
-    path = "/api/v1/users/complete-profile",
-    tag = "Users",
-    request_body = CompleteProfileDto,
-    responses(
-        (status = 200, description = "Perfil completado exitosamente"),
-        (status = 401, description = "No autenticado"),
-        (status = 422, description = "RFC o CIEC inválidos"),
-    )
-)]
-#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
-pub async fn complete_profile(
-    req: HttpRequest,
-    pool: web::Data<DbPool>,
-    body: web::Json<CompleteProfileDto>,
-) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            tracing::warn!("complete_profile: missing token");
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".to_string(),
-            });
+/// L18-06 point 7: shared by `complete_profile` (pantalla de bienvenida) and `add_rfc`
+/// (Perfil -> Agregar RFC) so the two entry points can't drift apart the way they had --
+/// welcome had no per-user RFC limit at all, and both queued a sync job before checking
+/// ownership. Returns the queued sync job id on success, or the exact `HttpResponse` the
+/// caller should return on failure (so both handlers keep their existing error-response
+/// shape without duplicating it).
+async fn register_rfc(
+    pool: &DbPool,
+    user_id: &str,
+    rfc: &str,
+    clave: &str,
+    priority_analysis: Option<&str>,
+    is_admin: bool,
+) -> Result<Option<String>, HttpResponse> {
+    // L18-06 point 3: same limit in both entry points now (admin exempt).
+    if !is_admin {
+        let rfc_count = match crate::db::users::count_user_rfcs(pool, user_id).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(user_id = %user_id, "Error counting RFCs: {e}");
+                return Err(HttpResponse::InternalServerError().json(ErrorBody {
+                    error: "Error al verificar RFCs existentes".to_string(),
+                }));
+            }
+        };
+        if rfc_count >= 1 {
+            return Err(HttpResponse::Conflict().json(ErrorBody {
+                error: "Tu cuenta solo puede tener un RFC. Contacta a soporte si necesitas acceso a más.".to_string(),
+            }));
         }
-    };
+    }
 
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            tracing::warn!("complete_profile: invalid token");
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".to_string(),
-            });
+    // L18-06 point 2: ownership is checked *before* anything is queued -- a rejected
+    // attempt used to still leave a real sync job in the queue against someone else's RFC.
+    match crate::db::users::check_rfc_ownership(pool, user_id, rfc).await {
+        Err(crate::db::users::CreateUserError::AlreadyOwnedBySelf) => {
+            return Err(HttpResponse::Conflict().json(ErrorBody {
+                error: "Este RFC ya está registrado para este usuario".to_string(),
+            }));
         }
-    };
-    tracing::Span::current().record("user_id", user_id.as_str());
-
-    let rfc = body.rfc.trim().to_uppercase();
-    tracing::Span::current().record("rfc", rfc.as_str());
-    if rfc.is_empty() {
-        return HttpResponse::UnprocessableEntity().json(ErrorBody {
-            error: "RFC es requerido".to_string(),
-        });
+        Err(crate::db::users::CreateUserError::AlreadyOwnedByOther) => {
+            // L18-06 point 4: generic on purpose -- doesn't confirm the RFC is someone
+            // else's specifically, which is exactly the fact an attacker probing RFCs
+            // would want confirmed.
+            return Err(HttpResponse::Conflict().json(ErrorBody {
+                error:
+                    "No pudimos registrar este RFC. Si crees que es un error, contacta a soporte."
+                        .to_string(),
+            }));
+        }
+        Err(crate::db::users::CreateUserError::Db(e)) => {
+            tracing::error!(user_id = %user_id, "Error checking RFC ownership: {e}");
+            return Err(HttpResponse::InternalServerError().json(ErrorBody {
+                error: "Error al verificar el RFC".to_string(),
+            }));
+        }
+        Ok(()) => {}
     }
 
     let key = crypto::load_key();
-
-    // Encrypt the CIEC password for storage in pulso.users.
-    // clave may be empty when the user will authenticate via FIEL instead.
-    let clave_enc = match crypto::encrypt(&key, &body.clave) {
+    let clave_enc = match crypto::encrypt(&key, clave) {
         Ok(enc) => enc,
         Err(e) => {
-            return HttpResponse::InternalServerError().json(ErrorBody {
-                error: format!("Error al cifrar credenciales: {e}"),
-            });
+            tracing::error!("encrypt (credenciales) failed: {e}");
+            return Err(HttpResponse::InternalServerError().json(ErrorBody {
+                error: GENERIC_INTERNAL_ERROR.to_string(),
+            }));
         }
     };
-
-    // Build and encrypt auth payload for the background sync job
     let auth_json = serde_json::json!({
         "type": "ciec",
         "rfc": rfc,
-        "password": body.clave,
+        "password": clave,
     })
     .to_string();
-
     let auth_enc = match crypto::encrypt(&key, &auth_json) {
         Ok(enc) => enc,
         Err(e) => {
-            return HttpResponse::InternalServerError().json(ErrorBody {
-                error: format!("Error al cifrar auth: {e}"),
-            });
+            tracing::error!("encrypt (auth) failed: {e}");
+            return Err(HttpResponse::InternalServerError().json(ErrorBody {
+                error: GENERIC_INTERNAL_ERROR.to_string(),
+            }));
         }
     };
 
-    // Create the background sync job(s) covering 3 full years + complete
-    // months of current year. If the (optional) priority question was
-    // answered, this queues two ordered jobs instead of one "ambos" job.
     let (period_from, period_to) = initial_sync_period();
-    let priority_analysis = body.priority_analysis.as_deref();
     let sync_job_id = match queue_initial_sync(
-        &pool,
-        &rfc,
+        pool,
+        rfc,
         &auth_enc,
         &period_from,
         &period_to,
@@ -411,42 +389,78 @@ pub async fn complete_profile(
         }
     };
 
-    // Save RFC + encrypted CIEC to pulso.users
-    match crate::db::users::create_pulso_user(
-        &pool,
-        &user_id,
-        &rfc,
+    if let Err(e) = crate::db::users::create_pulso_user(
+        pool,
+        user_id,
+        rfc,
         &clave_enc,
         sync_job_id.as_deref(),
         priority_analysis,
     )
     .await
     {
-        Err(crate::db::users::CreateUserError::AlreadyOwnedBySelf) => {
-            return HttpResponse::Conflict().json(ErrorBody {
-                error: "Este RFC ya está registrado para este usuario".to_string(),
-            });
-        }
-        Err(crate::db::users::CreateUserError::AlreadyOwnedByOther) => {
-            return HttpResponse::Conflict().json(ErrorBody {
-                error: "Este RFC ya está registrado por otro usuario en Pulso".to_string(),
-            });
-        }
-        Err(crate::db::users::CreateUserError::Db(e)) => {
-            tracing::error!(user_id = %user_id, "Error creating pulso user: {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody {
-                error: "Error al guardar el perfil".to_string(),
-            });
-        }
-        Ok(_) => {}
+        tracing::error!(user_id = %user_id, "Error creating pulso user: {e}");
+        return Err(HttpResponse::InternalServerError().json(ErrorBody {
+            error: "Error al guardar el RFC".to_string(),
+        }));
     }
 
-    if let Err(e) = crate::db::users::set_profile_complete(&pool, &user_id).await {
+    if let Err(e) = crate::db::users::set_profile_complete(pool, user_id).await {
         tracing::error!(user_id = %user_id, "Error setting profile complete: {e}");
-        return HttpResponse::InternalServerError().json(ErrorBody {
-            error: "Error al actualizar el perfil".to_string(),
+    }
+
+    Ok(sync_job_id)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/users/complete-profile",
+    tag = "Users",
+    request_body = CompleteProfileDto,
+    responses(
+        (status = 200, description = "Perfil completado exitosamente"),
+        (status = 401, description = "No autenticado"),
+        (status = 422, description = "RFC o CIEC inválidos"),
+    )
+)]
+#[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty, rfc = tracing::field::Empty))]
+pub async fn complete_profile(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
+    body: web::Json<CompleteProfileDto>,
+) -> HttpResponse {
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    tracing::Span::current().record("user_id", user_id.as_str());
+
+    let rfc = body.rfc.trim().to_uppercase();
+    tracing::Span::current().record("rfc", rfc.as_str());
+    if rfc.is_empty() {
+        return HttpResponse::UnprocessableEntity().json(ErrorBody {
+            error: "RFC es requerido".to_string(),
         });
     }
+
+    let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+        .await
+        .unwrap_or(false);
+
+    let sync_job_id = match register_rfc(
+        &pool,
+        &user_id,
+        &rfc,
+        &body.clave,
+        body.priority_analysis.as_deref(),
+        is_admin,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
 
     tracing::info!("Profile completed successfully");
     HttpResponse::Ok().json(serde_json::json!({
@@ -475,25 +489,12 @@ pub struct TriggerSyncDto {
 pub async fn trigger_sync(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     body: Option<web::Json<TriggerSyncDto>>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            tracing::warn!("trigger_sync: missing token");
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".to_string(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            tracing::warn!("trigger_sync: invalid token");
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".to_string(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -573,8 +574,9 @@ pub async fn trigger_sync(
     let auth_enc = match crate::services::crypto::encrypt(&key, &auth_json) {
         Ok(e) => e,
         Err(e) => {
+            tracing::error!("encrypt (auth) failed: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
-                error: format!("Error al cifrar auth: {e}"),
+                error: GENERIC_INTERNAL_ERROR.to_string(),
             });
         }
     };
@@ -631,24 +633,12 @@ pub struct SyncStatusQuery {
 pub async fn sync_status(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     query: web::Query<SyncStatusQuery>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".to_string(),
-            });
-        }
-    };
-
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".to_string(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -657,6 +647,32 @@ pub async fn sync_status(
         .as_deref()
         .map(|s| s.trim().to_uppercase())
         .filter(|s| !s.is_empty());
+
+    // L18-07: access used to be checked only on the "no active job" fallback path below
+    // (get_credentials_for_rfc is scoped to user_id) -- the active-job branch returned full
+    // progress (status, error detail, month-by-month coverage) for ANY rfc, to any
+    // authenticated user, with no ownership/share/admin check at all. Deliberately NOT
+    // check_rfc_access (routes::analytics) -- that also requires an active subscription,
+    // and Perfil polls this route to surface a bad CIEC even for an unsubscribed owner.
+    if let Some(ref rfc) = specific_rfc {
+        let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
+            .await
+            .unwrap_or(false);
+        match crate::db::users::user_has_rfc_or_admin(&pool, &user_id, rfc, is_admin).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return HttpResponse::Forbidden().json(ErrorBody {
+                    error: "Acceso denegado".to_string(),
+                });
+            }
+            Err(e) => {
+                tracing::error!(user_id = %user_id, rfc = %rfc, "sync_status: access check failed: {e}");
+                return HttpResponse::InternalServerError().json(ErrorBody {
+                    error: "Error de base de datos".to_string(),
+                });
+            }
+        }
+    }
 
     let job_id_opt = if let Some(ref rfc) = specific_rfc {
         // Prefer any active (running/queued/paused_limit) job over the stored initial_sync_job_id,
@@ -813,9 +829,12 @@ pub async fn sync_status(
 // ---------------------------------------------------------------------------
 
 #[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
-pub async fn get_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> Result<HttpResponse, AppError> {
-    let token = bearer_token(&req).ok_or_else(|| AppError::unauthorized("Token requerido"))?;
-    let user_id = jwt_user_id(&token).ok_or_else(|| AppError::unauthorized("Token inválido"))?;
+pub async fn get_rfcs(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
+) -> Result<HttpResponse, AppError> {
+    let user_id = session::require_session(&req, &cfg)?;
     tracing::Span::current().record("user_id", user_id.as_str());
 
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
@@ -852,23 +871,12 @@ pub async fn get_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> Result<HttpR
 pub async fn add_rfc(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     body: web::Json<CompleteProfileDto>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".to_string(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".to_string(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -883,104 +891,20 @@ pub async fn add_rfc(
     let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
         .await
         .unwrap_or(false);
-    if !is_admin {
-        let rfc_count = match crate::db::users::count_user_rfcs(&pool, &user_id).await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!(user_id = %user_id, "Error counting RFCs: {e}");
-                return HttpResponse::InternalServerError().json(ErrorBody {
-                    error: "Error al verificar RFCs existentes".to_string(),
-                });
-            }
-        };
-        if rfc_count >= 1 {
-            return HttpResponse::Conflict().json(ErrorBody {
-                error: "Tu cuenta solo puede tener un RFC. Contacta a soporte si necesitas acceso a más.".to_string(),
-            });
-        }
-    }
 
-    let key = crypto::load_key();
-
-    let clave_enc = match crypto::encrypt(&key, &body.clave) {
-        Ok(enc) => enc,
-        Err(e) => {
-            return HttpResponse::InternalServerError().json(ErrorBody {
-                error: format!("Error al cifrar credenciales: {e}"),
-            });
-        }
-    };
-
-    let auth_json = serde_json::json!({
-        "type": "ciec",
-        "rfc": rfc,
-        "password": body.clave,
-    })
-    .to_string();
-
-    let auth_enc = match crypto::encrypt(&key, &auth_json) {
-        Ok(enc) => enc,
-        Err(e) => {
-            return HttpResponse::InternalServerError().json(ErrorBody {
-                error: format!("Error al cifrar auth: {e}"),
-            });
-        }
-    };
-
-    let (period_from, period_to) = initial_sync_period();
-    let priority_analysis = body.priority_analysis.as_deref();
-    let sync_job_id = match queue_initial_sync(
-        &pool,
-        &rfc,
-        &auth_enc,
-        &period_from,
-        &period_to,
-        priority_analysis,
-    )
-    .await
-    {
-        Ok(id) => {
-            tracing::info!(user_id = %user_id, job_id = %id, "Initial sync job(s) queued for new RFC");
-            Some(id)
-        }
-        Err(e) => {
-            tracing::error!(user_id = %user_id, "Failed to queue initial sync: {e}");
-            None
-        }
-    };
-
-    match crate::db::users::create_pulso_user(
+    let sync_job_id = match register_rfc(
         &pool,
         &user_id,
         &rfc,
-        &clave_enc,
-        sync_job_id.as_deref(),
-        priority_analysis,
+        &body.clave,
+        body.priority_analysis.as_deref(),
+        is_admin,
     )
     .await
     {
-        Err(crate::db::users::CreateUserError::AlreadyOwnedBySelf) => {
-            return HttpResponse::Conflict().json(ErrorBody {
-                error: "Este RFC ya está registrado para este usuario".to_string(),
-            });
-        }
-        Err(crate::db::users::CreateUserError::AlreadyOwnedByOther) => {
-            return HttpResponse::Conflict().json(ErrorBody {
-                error: "Este RFC ya está registrado por otro usuario en Pulso".to_string(),
-            });
-        }
-        Err(crate::db::users::CreateUserError::Db(e)) => {
-            tracing::error!(user_id = %user_id, "Error creating pulso user (add_rfc): {e}");
-            return HttpResponse::InternalServerError().json(ErrorBody {
-                error: "Error al guardar el RFC".to_string(),
-            });
-        }
-        Ok(_) => {}
-    }
-
-    if let Err(e) = crate::db::users::set_profile_complete(&pool, &user_id).await {
-        tracing::error!(user_id = %user_id, "Error setting profile complete: {e}");
-    }
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
 
     tracing::info!("RFC added successfully");
     HttpResponse::Ok().json(serde_json::json!({
@@ -1002,24 +926,13 @@ pub struct UpdateClaveDto {
 pub async fn update_rfc_clave_handler(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     path: web::Path<String>,
     body: web::Json<UpdateClaveDto>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".to_string(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".to_string(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -1036,8 +949,9 @@ pub async fn update_rfc_clave_handler(
     let clave_enc = match crypto::encrypt(&key, &body.clave) {
         Ok(enc) => enc,
         Err(e) => {
+            tracing::error!("encrypt (credenciales) failed: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
-                error: format!("Error al cifrar credenciales: {e}"),
+                error: GENERIC_INTERNAL_ERROR.to_string(),
             });
         }
     };
@@ -1091,23 +1005,12 @@ pub async fn update_rfc_clave_handler(
 pub async fn validate_clave_handler(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     path: web::Path<String>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".to_string(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".to_string(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -1148,8 +1051,9 @@ pub async fn validate_clave_handler(
     let auth_enc = match crypto::encrypt(&key, &auth_json) {
         Ok(e) => e,
         Err(e) => {
+            tracing::error!("encrypt (auth) failed: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
-                error: format!("Error al cifrar auth: {e}"),
+                error: GENERIC_INTERNAL_ERROR.to_string(),
             });
         }
     };
@@ -1208,24 +1112,13 @@ pub struct UpdatePriorityAnalysisDto {
 pub async fn update_priority_analysis_handler(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     path: web::Path<String>,
     body: web::Json<UpdatePriorityAnalysisDto>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".to_string(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".to_string(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -1278,23 +1171,13 @@ pub async fn update_priority_analysis_handler(
 pub async fn delete_rfc_handler(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
+    s3: web::Data<aws_sdk_s3::Client>,
     path: web::Path<String>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".to_string(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".to_string(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -1339,7 +1222,20 @@ pub async fn delete_rfc_handler(
     }
 
     match crate::db::users::delete_user_rfc(&pool, &user_id, &rfc).await {
-        Ok(true) => HttpResponse::Ok().json(serde_json::json!({ "ok": true })),
+        Ok(true) => {
+            // L18-06 points 5/6: the one place an RFC's ownership row gets marked
+            // removed -- if that just made it ownerless, its FIEL (if any) is orphaned
+            // and gets deleted here, same S3-then-DB sequence as the direct
+            // routes::fiel::delete endpoint. CFDIs stay; only the FIEL is removed.
+            match crate::db::users::has_active_owner(&pool, &rfc).await {
+                Ok(false) => delete_orphaned_fiel(&pool, &s3, &cfg, &rfc).await,
+                Ok(true) => {}
+                Err(e) => {
+                    tracing::error!(rfc = %rfc, "delete_rfc: orphan-owner check failed: {e}");
+                }
+            }
+            HttpResponse::Ok().json(serde_json::json!({ "ok": true }))
+        }
         Ok(false) => HttpResponse::NotFound().json(ErrorBody {
             error: "RFC no encontrado".to_string(),
         }),
@@ -1349,6 +1245,28 @@ pub async fn delete_rfc_handler(
                 error: "Error de base de datos".to_string(),
             })
         }
+    }
+}
+
+/// L18-06 points 5/6: deletes a now-ownerless RFC's FIEL (S3 files + encrypted password),
+/// best-effort on S3 (logs and continues on failure, same as routes::fiel::delete) so a
+/// transient S3 error never blocks the RFC deletion itself.
+async fn delete_orphaned_fiel(pool: &DbPool, s3: &aws_sdk_s3::Client, cfg: &Config, rfc: &str) {
+    let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+    if !bucket.is_empty() {
+        for s3_key in [
+            format!("fiel/{rfc}/cert.cer"),
+            format!("fiel/{rfc}/key.key"),
+        ] {
+            if let Err(e) = crate::services::s3::delete_fiel(s3, &bucket, &s3_key).await {
+                tracing::warn!(rfc = %rfc, "delete_orphaned_fiel: S3 delete failed (continuing): {e}");
+            }
+        }
+    }
+    match crate::db::fiel::delete(pool, rfc).await {
+        Ok(true) => tracing::info!(rfc = %rfc, "Orphaned FIEL removed (RFC has no active owner)"),
+        Ok(false) => {}
+        Err(e) => tracing::error!(rfc = %rfc, "delete_orphaned_fiel: DB error: {e}"),
     }
 }
 
@@ -1367,23 +1285,12 @@ pub struct ShareRfcDto {
 pub async fn list_rfc_shares_handler(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     path: web::Path<String>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -1425,21 +1332,9 @@ pub async fn share_rfc_handler(
     path: web::Path<String>,
     body: web::Json<ShareRfcDto>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -1538,23 +1433,12 @@ pub async fn share_rfc_handler(
 pub async fn revoke_rfc_share_handler(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     path: web::Path<(String, String)>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -1609,23 +1493,12 @@ pub struct AdminDownloadDto {
 pub async fn admin_download(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     body: web::Json<AdminDownloadDto>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -1672,8 +1545,9 @@ pub async fn admin_download(
     let auth_enc = match crypto::encrypt(&key, &auth_json) {
         Ok(e) => e,
         Err(e) => {
+            tracing::error!("encrypt (auth) failed: {e}");
             return HttpResponse::InternalServerError().json(ErrorBody {
-                error: format!("Error al cifrar auth: {e}"),
+                error: GENERIC_INTERNAL_ERROR.to_string(),
             });
         }
     };
@@ -1737,23 +1611,12 @@ fn parse_ym(s: &str) -> Option<(i32, i32)> {
 pub async fn admin_reprocess(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     body: web::Json<AdminReprocessDto>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -1861,22 +1724,14 @@ pub async fn admin_reprocess(
 // ---------------------------------------------------------------------------
 
 #[tracing::instrument(skip_all, fields(user_id = tracing::field::Empty))]
-pub async fn admin_list_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+pub async fn admin_list_rfcs(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
+) -> HttpResponse {
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -1895,7 +1750,7 @@ pub async fn admin_list_rfcs(req: HttpRequest, pool: web::Data<DbPool>) -> HttpR
         FROM pulso.users u
         LEFT JOIN LATERAL (
             SELECT c.nombre_emisor AS nombre
-            FROM pulso.cfdis c
+            FROM pulso.cfdis_raw c
             WHERE c.rfc_emisor = u.rfc AND c.nombre_emisor IS NOT NULL
             ORDER BY c.created_at DESC LIMIT 1
         ) lat ON true
@@ -1963,7 +1818,7 @@ const ADMIN_RFCS_BASE_CTE: &str = r#"
         JOIN public.users owner ON owner.id = pu.user_id
         LEFT JOIN LATERAL (
             SELECT c.nombre_emisor AS nombre
-            FROM pulso.cfdis c
+            FROM pulso.cfdis_raw c
             WHERE c.rfc_emisor = pu.rfc AND c.nombre_emisor IS NOT NULL
             ORDER BY c.created_at DESC LIMIT 1
         ) lat ON true
@@ -1982,23 +1837,12 @@ const ADMIN_RFCS_SEARCH_FILTER: &str = r#"
 pub async fn admin_list_rfcs_full(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     query: web::Query<AdminPageQuery>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -2156,23 +2000,12 @@ const ADMIN_USERS_SEARCH_FILTER: &str = r#"
 pub async fn admin_list_users(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     query: web::Query<AdminPageQuery>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -2263,23 +2096,12 @@ pub async fn admin_list_users(
 pub async fn admin_user_rfcs(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     path: web::Path<String>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -2310,7 +2132,7 @@ pub async fn admin_user_rfcs(
         FROM pulso.users pu
         LEFT JOIN LATERAL (
             SELECT c.nombre_emisor AS nombre
-            FROM pulso.cfdis c
+            FROM pulso.cfdis_raw c
             WHERE c.rfc_emisor = pu.rfc AND c.nombre_emisor IS NOT NULL
             ORDER BY c.created_at DESC LIMIT 1
         ) lat ON true
@@ -2337,7 +2159,7 @@ pub async fn admin_user_rfcs(
         FROM pulso.rfc_shares rs
         LEFT JOIN LATERAL (
             SELECT c.nombre_emisor AS nombre
-            FROM pulso.cfdis c
+            FROM pulso.cfdis_raw c
             WHERE c.rfc_emisor = rs.rfc AND c.nombre_emisor IS NOT NULL
             ORDER BY c.created_at DESC LIMIT 1
         ) lat ON true
@@ -2379,23 +2201,12 @@ pub async fn admin_user_rfcs(
 pub async fn admin_rfc_xml_years(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     path: web::Path<String>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -2412,7 +2223,7 @@ pub async fn admin_rfc_xml_years(
     tracing::Span::current().record("rfc", rfc.as_str());
 
     let rows: Vec<(i64,)> = match sqlx::query_as(
-        r#"SELECT DISTINCT year FROM pulso.cfdis WHERE rfc_emisor = $1 OR rfc_receptor = $1 ORDER BY year"#,
+        r#"SELECT DISTINCT year FROM pulso.cfdis_raw WHERE rfc_emisor = $1 OR rfc_receptor = $1 ORDER BY year"#,
     )
     .bind(&rfc)
     .fetch_all(pool.as_ref())
@@ -2444,24 +2255,13 @@ pub struct XmlDaysQuery {
 pub async fn admin_rfc_xml_days(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     path: web::Path<String>,
     query: web::Query<XmlDaysQuery>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 
@@ -2480,7 +2280,7 @@ pub async fn admin_rfc_xml_days(
     let rows: Vec<(String, i64)> = match sqlx::query_as(
         r#"
         SELECT substring(fecha_emision from 1 for 10) AS day, COUNT(*) AS n
-        FROM pulso.cfdis
+        FROM pulso.cfdis_raw
         WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND year = $2
         GROUP BY day
         "#,
@@ -2541,7 +2341,7 @@ const ADMIN_XML_DAY_BASE_CTE: &str = r#"
     WITH base AS (
         SELECT uuid, rfc_emisor, nombre_emisor, rfc_receptor, nombre_receptor, tipo_comprobante,
                fecha_emision, total, moneda, estado_sat, is_cancelled, xml_available
-        FROM pulso.cfdis
+        FROM pulso.cfdis_raw
         WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND fecha_emision LIKE $2 || '%'
     )
 "#;
@@ -2560,24 +2360,13 @@ const ADMIN_XML_DAY_SEARCH_FILTER: &str = r#"
 pub async fn admin_rfc_xml_day(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
     path: web::Path<String>,
     query: web::Query<XmlDayQuery>,
 ) -> HttpResponse {
-    let token = match bearer_token(&req) {
-        Some(t) => t,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token requerido".into(),
-            });
-        }
-    };
-    let user_id = match jwt_user_id(&token) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(ErrorBody {
-                error: "Token inválido".into(),
-            });
-        }
+    let user_id = match require_user_id(&req, &cfg) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
     tracing::Span::current().record("user_id", user_id.as_str());
 

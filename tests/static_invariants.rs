@@ -469,6 +469,61 @@ fn collapse_whitespace(content: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Item 5 (L18-02): ninguna decodificacion manual de JWT fuera del verificador.
+// ---------------------------------------------------------------------------
+//
+// Before L18-02, seven places split a bearer token on '.', base64-decoded the middle
+// segment and read `id`/`sub` straight out of the JSON -- no signature check. The fix
+// consolidated all seven into services::session::require_session. This guards against
+// the pattern coming back: a new handler that reaches for `token.split('.')` instead of
+// calling the shared verifier would reintroduce the exact same hole.
+//
+// Heuristic: `.split('.')` is this codebase's only way of slicing a JWT into segments
+// (the jsonwebtoken crate used everywhere else never needs it -- it takes the whole
+// token string). Any occurrence outside the two declared, non-authenticating exceptions
+// ("Lo que NO se toca" #4 in PULSO_Lote18_Seguridad.md: reading the Adquiere API's own
+// response right after login in `jwt_sub`, and Google's id_token from its direct
+// server-to-server exchange in `exchange_google_code`, both in routes/auth.rs) is
+// exactly the regression this test exists to catch.
+//
+// What this does NOT catch: a rewrite that decodes a JWT without ever writing the
+// literal substring `.split('.')` (e.g. `.splitn(3, '.')`, or manual byte scanning) --
+// same class of gap the file's other heuristics already accept per their own comments.
+#[test]
+fn no_manual_jwt_decode_outside_declared_exceptions() {
+    let allowed_file = Path::new("routes").join("auth.rs");
+    let mut findings: Vec<String> = Vec::new();
+
+    for path in src_files() {
+        let is_allowed = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with(&allowed_file.to_string_lossy().replace('\\', "/"));
+        if is_allowed {
+            continue;
+        }
+        let content = fs::read_to_string(&path).unwrap();
+        for (line_no, line) in content.lines().enumerate() {
+            if line.contains("split('.')") {
+                findings.push(format!(
+                    "{}:{}: manual JWT split outside services::session -- {}",
+                    path.display(),
+                    line_no + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        findings.is_empty(),
+        "manual JWT decoding found outside the declared exceptions in routes/auth.rs \
+         (should go through services::session::require_session instead):\n{}",
+        findings.join("\n")
+    );
+}
+
 /// Whether whitespace-collapsed `normalized` contains `::float8` followed -- after skipping
 /// any mix of closing parens and single spaces (e.g. `AVG(...)::float8) AS col`) -- by
 /// `AS <column>` at a word boundary.

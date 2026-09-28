@@ -1,54 +1,21 @@
 use actix_web::{HttpRequest, HttpResponse, web};
 use uuid::Uuid;
 
+use crate::config::Config;
 use crate::db::DbPool;
 use crate::errors::AppError;
-
-// ── Auth helpers (same pattern as users.rs / analytics.rs) ───────────────────
-
-fn bearer_token(req: &HttpRequest) -> Option<String> {
-    let header = req
-        .headers()
-        .get(actix_web::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?;
-    let lower = header.to_lowercase();
-    let token = header[lower.find("bearer ")? + 7..].trim();
-    if token.is_empty() {
-        return None;
-    }
-    Some(token.to_string())
-}
-
-fn jwt_user_id(token: &str) -> Option<String> {
-    use base64::Engine as _;
-    let payload = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
-        .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    json.get("id")
-        .or_else(|| json.get("sub"))?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
-fn parse_user(req: &HttpRequest) -> Option<(String, Uuid)> {
-    let token = bearer_token(req)?;
-    let id_str = jwt_user_id(&token)?;
-    let uid = Uuid::parse_str(&id_str).ok()?;
-    Some((id_str, uid))
-}
+use crate::services::session;
 
 // ── GET /api/v1/billing/status ────────────────────────────────────────────────
 
 pub async fn get_status(
     req: HttpRequest,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
 ) -> Result<HttpResponse, AppError> {
-    let (_, uid) = parse_user(&req).ok_or_else(|| AppError::unauthorized("Token requerido"))?;
+    let user_id = session::require_session(&req, &cfg)?;
+    let uid = Uuid::parse_str(&user_id)
+        .map_err(|_| AppError::unauthorized("Token inválido o expirado"))?;
 
     let status = crate::db::subscriptions::get_pulso_status(pool.get_ref(), uid)
         .await

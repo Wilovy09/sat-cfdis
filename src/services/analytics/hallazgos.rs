@@ -189,7 +189,7 @@ fn h1_interpretacion(nivel: &str) -> &'static str {
             "Concentración elevada con riesgo de pérdida material ante churn de las cuentas principales."
         }
         "medio" => {
-            "Concentración moderada. Revisar recurrencia y antigüedad de las cuentas principales en el módulo de Emitidas."
+            "Concentración moderada. Revisar recurrencia y antigüedad de las cuentas principales en Ingresos, pestañas Clientes y Recurrencia."
         }
         _ => "Base de clientes diversificada. Sin concentración crítica observable en LTM.",
     }
@@ -305,8 +305,9 @@ fn h4_interpretacion(nivel: &str) -> &'static str {
 ///      timbrado atrasado, no rotación (medido: RFC servicios A a un mes de dispararla).
 ///   2. Menos de 6 de los 12 meses de la ventana tienen nómina -- no hay historia para
 ///      promediar.
-///   3. Plantilla promedio (ya con los meses hueco contados como cero, no omitidos) menor
-///      a 5 personas -- una tasa sobre 1-4 personas no es una tasa.
+///   3. Plantilla promedio (L18-21: promediada sólo sobre los meses con al menos una
+///      persona, no sobre los 12 del calendario) menor a 5 personas -- una tasa sobre 1-4
+///      personas no es una tasa.
 fn h5a_nivel_e_interpretacion(
     tasa_pct: f64,
     avg_hc: f64,
@@ -369,7 +370,7 @@ fn cartera_pct_nivel(ratio_pct: f64) -> &'static str {
 fn h6_interpretacion(nivel: &str) -> &'static str {
     match nivel {
         "critico" | "alto" => {
-            "Cartera material en riesgo. Revisar antigüedad y concentración de saldos en el módulo de Cobranza."
+            "Cartera material en riesgo. Revisar antigüedad y concentración de saldos en Ingresos → Clientes → Cobranza por cliente."
         }
         "medio" => {
             "Saldo pendiente relevante. Verificar composición por cliente y buckets de antigüedad."
@@ -417,7 +418,7 @@ fn h9_nivel(delta_pct: f64) -> &'static str {
 fn h9_interpretacion(nivel: &str) -> &'static str {
     match nivel {
         "muy_negativo" => {
-            "Caída material en la ventana más reciente. El CAGR histórico puede enmascarar un deterioro acelerado. Contrastar con CAGR histórico y revisar módulo de Emitidas."
+            "Caída material en la ventana más reciente. El CAGR histórico puede enmascarar un deterioro acelerado. Contrastar con CAGR histórico y revisar Ingresos → Resumen."
         }
         "negativo" => {
             "Desaceleración visible en los últimos 12 meses vs el período anterior. Contrastar con el CAGR histórico para distinguir corrección temporal de deterioro estructural."
@@ -558,6 +559,36 @@ async fn compute_h1(
         .map(|c| c.mxn)
         .sum();
     let peg_pct = peg_mxn / total_ltm * 100.0;
+
+    // L18-17: when the two contrapartes genéricas this hallazgo already excludes from its
+    // own denominator (Público en General, Extranjero Genérico) carry more than half the
+    // period's ingreso, "Top N clientes representa X% del ingreso identificable" is
+    // computed over a tiny, unrepresentative slice -- servicios A's 45.5% read as
+    // "moderada" while it was 45.5% of 0.7% of ingreso. No verdict on concentration is
+    // meaningful here, so this short-circuits before the identificable/top3 computation
+    // below rather than feeding a nivel ladder that has no good answer for this shape.
+    let extranjero_mxn: f64 = clients
+        .iter()
+        .filter(|c| c.rfc == super::summary::RFC_EXTRANJERO_GENERICO)
+        .map(|c| c.mxn)
+        .sum();
+    let genericas_pct = (peg_mxn + extranjero_mxn) / total_ltm * 100.0;
+    if genericas_pct > 50.0 {
+        return Ok(Some(Hallazgo {
+            id: "H1".to_string(),
+            titulo: "Concentración de clientes".to_string(),
+            familia: "riesgo".to_string(),
+            nivel: "informativo".to_string(),
+            metrica_principal: Some(peg_pct),
+            cuerpo: format!(
+                "El {peg_pct:.1}% del ingreso es venta a Público en General: la concentración entre clientes identificados no describe la base de clientes."
+            ),
+            interpretacion: "Base de clientes dominada por público en general: la concentración entre clientes identificados no es una medida de riesgo útil aquí.".to_string(),
+            disclaimer: None,
+            nota_fija: None,
+            datos_tabla: None,
+        }));
+    }
 
     // Top 3 excluding PeG (take first 3 non-XAXX clients). L8-03: with credit notes now
     // netted in, a counterparty can land with a negative total_neto_mxn_ajustado --
@@ -753,24 +784,24 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     // blending contratos de obra/tiempo determinado (which end by design) with real
     // attrition of permanent staff -- Compro's 131.7% "crítico" was almost entirely people
     // whose obra contract simply ran out. `emp_tipo` classifies each employee ONCE, from
-    // their own last receipt by fecha_pago -- never MAX/MIN/mode: '03' sorts before '01'
-    // alphabetically, so MAX would (and once did, in this item's own diagnosis) misclassify
-    // permanent staff as temporary. Only tipo_contrato 01/02 (indeterminado/determinado)
-    // count as "plantilla permanente"; 03/04/99 are tracked separately below for the
-    // context sentence, never silently dropped.
-    // L17-01: fecha_pago alone doesn't break every tie -- two receipts on the same
-    // fecha_pago with different tipo_contrato used to leave the winner up to the query
-    // plan (measured live: 97 vs 93 bajas permanentes for the same RFC on two runs).
-    // fecha_emision DESC, then uuid, make it the same answer every time. This exact CTE is
-    // duplicated (not shared) across five sites in H5A/H5B on purpose, per the doc this
-    // fixes -- all five need the same tiebreak, not just this one.
-    let month_rows = sqlx::query(
+    // their own recibo vigente -- never MAX/MIN/mode: '03' sorts before '01' alphabetically,
+    // so MAX would (and once did, in this item's own diagnosis) misclassify permanent staff
+    // as temporary. Only tipo_contrato 01/02 (indeterminado/determinado) count as "plantilla
+    // permanente"; 03/04/99 are tracked separately below for the context sentence, never
+    // silently dropped.
+    // L18-22: "recibo vigente" (payroll::recibo_vigente_order) replaces this CTE's own
+    // fecha_pago-only tiebreak -- ordinario primero, luego fin de período pagado, fecha de
+    // pago, fecha de emisión, uuid. This exact CTE is duplicated (not shared) across five
+    // sites in H5A/H5B on purpose, per the doc this fixes -- all five call the same
+    // function, not five copies of the same literal order-by.
+    let emp_tipo_order = super::payroll::recibo_vigente_order("");
+    let month_rows = sqlx::query(&format!(
         r#"
         WITH emp_tipo AS (
             SELECT DISTINCT ON (rfc_receptor) rfc_receptor, tipo_contrato
             FROM pulso.nomina_normalizada
             WHERE rfc_emisor = $1 AND NOT is_excluded
-            ORDER BY rfc_receptor, fecha_pago DESC, fecha_emision DESC, uuid
+            ORDER BY rfc_receptor, {emp_tipo_order}
         )
         SELECT n.year_devengo AS year, n.month_devengo AS month, COUNT(DISTINCT n.rfc_receptor)::bigint AS hc
         FROM pulso.nomina_normalizada n
@@ -781,8 +812,8 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
           AND NOT n.is_excluded
           AND et.tipo_contrato IN ('01', '02')
         GROUP BY n.year_devengo, n.month_devengo
-        "#,
-    )
+        "#
+    ))
     .bind(rfc)
     .bind(ltm_start_y)
     .bind(ltm_start_m)
@@ -798,13 +829,17 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     // L10-09: one decimal on the average headcount -- rounding it to a whole number (as
     // before) is what let a reader's own bajas/headcount division disagree with the
     // displayed percentage (L10-06 / AUD-094).
-    // L17-04: divides by the window's 12 calendar months, not `hc_per_month.len()` -- that
-    // used to only count months that had a qualifying (01/02) row, so a hueco month
-    // dropped out of the divisor instead of counting as zero, inflating the average and
-    // understating the rate (measured live: one RFC moved from 91.7% to 100.0% once its
-    // one hueco month counted as zero headcount instead of being omitted).
-    const ROTACION_WINDOW_MONTHS: f64 = 12.0;
-    let avg_hc = hc_per_month.iter().sum::<i64>() as f64 / ROTACION_WINDOW_MONTHS;
+    // L18-21: divides by `hc_per_month.len()` (months where the plantilla series has at
+    // least one person), not a fixed 12 -- L17-04's "divide by all 12 calendar months,
+    // hueco counts as zero" turned out to contradict DEC-101's own guarda 1 (a month
+    // without a nómina CFDI is timbrado pendiente, not zero personas) and the run-rate's own
+    // convention of averaging only over months with data. Guarda 2 (below, meses_con_nomina
+    // < 6) is what protects short histories, not this divisor.
+    let avg_hc = if hc_per_month.is_empty() {
+        0.0
+    } else {
+        hc_per_month.iter().sum::<i64>() as f64 / hc_per_month.len() as f64
+    };
 
     // P-01 / AUD-075: latest-period headcount and bajas used to be two separate queries,
     // the second a correlated NOT EXISTS that rebuilt the whole nomina_normalizada view
@@ -814,13 +849,17 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     // period); this fused version inherits the window from the CTE it's built on, which is
     // harmless here because the latest month is always inside the LTM window by
     // construction -- not a definition change, just noted so it doesn't read as one later.
-    let emp_rows = sqlx::query(
+    // L18-20: active_latest = devengo igual-o-posterior al ancla, sin techo -- misma
+    // definición que el snapshot's own headcount (payroll.rs, "activo = devengo igual o
+    // posterior al ancla, sin techo"). La igualdad exacta contra el ancla contaba como baja
+    // a quien ya timbró el mes abierto.
+    let emp_rows = sqlx::query(&format!(
         r#"
         WITH emp_tipo AS (
             SELECT DISTINCT ON (rfc_receptor) rfc_receptor, tipo_contrato
             FROM pulso.nomina_normalizada
             WHERE rfc_emisor = $1 AND NOT is_excluded
-            ORDER BY rfc_receptor, fecha_pago DESC, fecha_emision DESC, uuid
+            ORDER BY rfc_receptor, {emp_tipo_order}
         )
         SELECT
             COUNT(*) FILTER (WHERE active_latest AND tipo_contrato IN ('01', '02'))       AS latest_hc,
@@ -828,17 +867,16 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
             COUNT(*) FILTER (WHERE NOT active_latest AND tipo_contrato NOT IN ('01', '02')) AS bajas_temporales
         FROM (
             SELECT n.rfc_receptor, et.tipo_contrato,
-                   BOOL_OR(n.year_devengo = $4 AND n.month_devengo = $5) AS active_latest
+                   BOOL_OR(n.year_devengo > $4 OR (n.year_devengo = $4 AND n.month_devengo >= $5)) AS active_latest
             FROM pulso.nomina_normalizada n
             JOIN emp_tipo et ON et.rfc_receptor = n.rfc_receptor
             WHERE n.rfc_emisor = $1
               AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
-              AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
               AND NOT n.is_excluded
             GROUP BY n.rfc_receptor, et.tipo_contrato
         ) emp
-        "#,
-    )
+        "#
+    ))
     .bind(rfc)
     .bind(ltm_start_y)
     .bind(ltm_start_m)
@@ -920,27 +958,32 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     // month), never the terminated pool -- ranking "most key of the people who left" always
     // finds someone; ranking against the company's own current plantilla is what "clave"
     // actually means. Median salary here also becomes the floor below (trap 1).
-    let active_rows = sqlx::query(
+    let last_ordinario_order = super::payroll::recibo_vigente_order("b.");
+    let active_rows = sqlx::query(&format!(
         r#"
         WITH base AS MATERIALIZED (
             SELECT n.rfc_receptor, n.year_devengo, n.month_devengo, n.tipo_nomina,
-                   n.total_sueldos, n.num_dias_pagados, n.fecha_pago, n.fecha_inicio_rel_laboral,
-                   n.fecha_emision, n.uuid
+                   n.total_sueldos, n.num_dias_pagados, n.fecha_pago, n.fecha_final_pago,
+                   n.fecha_inicio_rel_laboral, n.fecha_emision, n.uuid
             FROM pulso.nomina_normalizada n
             WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
         ),
+        -- L18-20: devengo igual-o-posterior al ancla, sin techo -- misma definición que
+        -- el snapshot y H5A (payroll::recibo_vigente_order's sibling fix).
         active_emps AS (
             SELECT DISTINCT rfc_receptor FROM base
-            WHERE year_devengo = $2 AND month_devengo = $3
+            WHERE year_devengo > $2 OR (year_devengo = $2 AND month_devengo >= $3)
         ),
-        -- L17-01: same deterministic tiebreak as the emp_tipo CTEs above (H5A) -- see that
-        -- comment for why fecha_pago alone isn't enough.
+        -- L18-22: payroll::recibo_vigente_order -- ordinario primero (cae a extraordinario
+        -- sólo si la persona no tiene ninguno), luego fin de período pagado, fecha de pago,
+        -- fecha de emisión, uuid. Ya no pre-filtra tipo_nomina='O': ese filtro es justo lo
+        -- que el fallback a extraordinario necesita no tener.
         last_ordinario AS (
             SELECT DISTINCT ON (b.rfc_receptor) b.rfc_receptor,
                 (COALESCE(b.total_sueldos, 0)::float8 / NULLIF(b.num_dias_pagados, 0)::float8 * 30.0) AS sueldo
             FROM base b
-            WHERE b.rfc_receptor IN (SELECT rfc_receptor FROM active_emps) AND b.tipo_nomina = 'O'
-            ORDER BY b.rfc_receptor, b.fecha_pago DESC, b.fecha_emision DESC, b.uuid
+            WHERE b.rfc_receptor IN (SELECT rfc_receptor FROM active_emps)
+            ORDER BY b.rfc_receptor, {last_ordinario_order}
         ),
         start_dates AS (
             SELECT b.rfc_receptor,
@@ -961,8 +1004,8 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
         FROM last_ordinario lo
         JOIN start_dates sd ON sd.rfc_receptor = lo.rfc_receptor
         WHERE lo.sueldo > 0
-        "#,
-    )
+        "#
+    ))
     .bind(rfc)
     .bind(ltm_end_y)
     .bind(ltm_end_m)
@@ -1002,7 +1045,8 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
     // receipt is almost always a finiquito, tipo_nomina='E'); tipo_contrato taken from each
     // employee's own last receipt by date, never MAX/MIN/mode (L10-09's own warning applies
     // here too -- '03' sorts before '01' alphabetically and MAX would misclassify).
-    let term_rows = sqlx::query(
+    let last_row_order = super::payroll::recibo_vigente_order("b.");
+    let term_rows = sqlx::query(&format!(
         r#"
         WITH base AS MATERIALIZED (
             SELECT n.rfc_receptor, n.nombre_receptor, n.year_devengo, n.month_devengo,
@@ -1012,6 +1056,11 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
             FROM pulso.nomina_normalizada n
             WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
         ),
+        -- L18-20: a person with a receipt at/after the ancla (activo per the corrected,
+        -- unbounded definition above) must not also show as a baja just because THIS CTE's
+        -- own window bounds the MAX(period) scan at the ancla -- the NOT EXISTS excludes
+        -- anyone who has any devengo at/after $4,$5, checked unbounded against the same
+        -- `base` this CTE already has in full (base itself carries no upper bound).
         term AS (
             SELECT rfc_receptor,
                 MAX(year_devengo * 100 + month_devengo)::bigint AS last_period
@@ -1020,25 +1069,28 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
               AND (year_devengo < $4 OR (year_devengo = $4 AND month_devengo <= $5))
             GROUP BY rfc_receptor
             HAVING MAX(year_devengo * 100 + month_devengo) < $4 * 100 + $5
+               AND NOT EXISTS (
+                   SELECT 1 FROM base b2
+                   WHERE b2.rfc_receptor = rfc_receptor
+                     AND (b2.year_devengo > $4 OR (b2.year_devengo = $4 AND b2.month_devengo >= $5))
+               )
         ),
-        -- L17-01: same deterministic tiebreak as the emp_tipo CTEs above (H5A) -- this is
-        -- the one that decides tipo_contrato for the "personal clave" table's name/fecha
-        -- rows, the most visible of the five sites (measured: 21 people flip sides of the
-        -- filter without this tiebreak).
+        -- L18-22: payroll::recibo_vigente_order -- this is the one that decides tipo_contrato
+        -- for the "personal clave" table's name/fecha rows, the most visible of the ten sites
+        -- (measured: 21 people flip sides of the filter without this tiebreak).
         last_row AS (
             SELECT DISTINCT ON (b.rfc_receptor)
                 b.rfc_receptor, b.nombre_receptor, b.tipo_contrato, b.fecha_final_pago
             FROM base b
             JOIN term t ON t.rfc_receptor = b.rfc_receptor
-            ORDER BY b.rfc_receptor, b.fecha_pago DESC, b.fecha_emision DESC, b.uuid
+            ORDER BY b.rfc_receptor, {last_row_order}
         ),
         last_ordinario AS (
             SELECT DISTINCT ON (b.rfc_receptor) b.rfc_receptor,
                 (COALESCE(b.total_sueldos, 0)::float8 / NULLIF(b.num_dias_pagados, 0)::float8 * 30.0) AS sueldo
             FROM base b
             JOIN term t ON t.rfc_receptor = b.rfc_receptor
-            WHERE b.tipo_nomina = 'O'
-            ORDER BY b.rfc_receptor, b.fecha_pago DESC, b.fecha_emision DESC, b.uuid
+            ORDER BY b.rfc_receptor, {last_row_order}
         ),
         start_dates AS (
             SELECT b.rfc_receptor,
@@ -1066,8 +1118,8 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
         JOIN last_ordinario lo ON lo.rfc_receptor = t.rfc_receptor
         JOIN start_dates sd ON sd.rfc_receptor = t.rfc_receptor
         WHERE lo.sueldo > 0
-        "#,
-    )
+        "#
+    ))
     .bind(rfc)
     .bind(win_start_y)
     .bind(win_start_m)
@@ -1573,12 +1625,15 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     // comprobante -- 5 of 6 RFC anchored on the in-progress current month (a handful of
     // days of data) before this. This one line reaches H1/H2/H8/H9 and H6/H7 (L7-03) below,
     // via the ltm_end_y/ltm_end_m this fn returns to its caller.
-    // L17-02 correction: H3/H5A/H5B do NOT inherit THIS variable -- H3 uses this window's
-    // min-of-cutoff-and-last-invoice-month logic too (correct for facturación), but H5A/H5B
-    // independently call `nomina_hallazgo_anchor`, which anchors on `current_month_yyyymm()`
-    // directly (DEC-100), not this fn's min. That distinction matters: an RFC current on
-    // nómina but behind on facturación would get its nómina hallazgos wrongly anchored to
-    // the facturación lag if they used this window instead of their own.
+    // L17-02/L18-20 correction: H3/H5A/H5B do NOT inherit THIS variable. H3 does NOT use a
+    // rolling 12-month window -- it iterates full calendar years (`complete_years`, only
+    // years with 12 full months of facturación) and needs at least two of them; it just
+    // happens to share this fn's min-of-cutoff-and-last-invoice-month anchor logic for
+    // deciding which years count as complete. H5A/H5B independently call
+    // `nomina_hallazgo_anchor`, which anchors on `current_month_yyyymm()` directly
+    // (DEC-100), not this fn's min. That distinction matters: an RFC current on nómina but
+    // behind on facturación would get its nómina hallazgos wrongly anchored to the
+    // facturación lag if they used this window instead of their own.
     let (ltm_end_y, ltm_end_m) = match max_ym {
         Some(ym) if ym > 0 => {
             let ym = ym.min(current_month_yyyymm());

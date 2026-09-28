@@ -34,6 +34,10 @@ impl std::fmt::Display for CreateUserError {
 pub struct RfcShare {
     pub id: String,
     pub rfc: String,
+    /// L18-08: the invited user's *email*, not their internal account id -- that id is
+    /// exactly what's needed to forge a session claiming to be them (services::session).
+    /// Field name kept as `shared_with` so the frontend doesn't need to change; empty
+    /// string if the linked account has no email on file.
     pub shared_with: String,
     pub invited_email: Option<String>,
     pub granted_at: String,
@@ -49,18 +53,17 @@ pub async fn get_profile_complete(pool: &PgPool, user_id: &str) -> Result<bool, 
     Ok(row.and_then(|(v,)| v).unwrap_or(false))
 }
 
-/// Register an RFC for a user.
-/// Returns `Ok(true)` if newly added (or restored from soft-delete).
-/// Returns `Err(CreateUserError::AlreadyOwnedBySelf)` if this user already owns it.
-/// Returns `Err(CreateUserError::AlreadyOwnedByOther)` if another user owns it globally.
-pub async fn create_pulso_user(
+/// L18-06 point 2: the ownership check on its own, callable *before* a sync job is queued.
+/// Previously this lived inside `create_pulso_user` (called after `queue_initial_sync`),
+/// so a registration attempt rejected as `AlreadyOwnedByOther` had already left a real job
+/// in the queue -- against someone else's RFC, authenticating with whatever credentials
+/// the rejected caller supplied. Callers must run this first and only queue a job if it
+/// returns `Ok(())`.
+pub async fn check_rfc_ownership(
     pool: &PgPool,
     user_id: &str,
     rfc: &str,
-    clave_enc: &str,
-    initial_sync_job_id: Option<&str>,
-    priority_analysis: Option<&str>,
-) -> Result<bool, CreateUserError> {
+) -> Result<(), CreateUserError> {
     let uid = parse_uuid(user_id)?;
     let rfc_upper = rfc.to_uppercase();
 
@@ -82,6 +85,23 @@ pub async fn create_pulso_user(
     if owned_by_other > 0 {
         return Err(CreateUserError::AlreadyOwnedByOther);
     }
+    Ok(())
+}
+
+/// Register an RFC for a user. Callers must have already run `check_rfc_ownership` (and,
+/// per L18-06, only queued a sync job) -- this does **not** re-check ownership, so it must
+/// not be called on its own from a route handler.
+/// Returns `Ok(true)` if newly added (or restored from soft-delete).
+pub async fn create_pulso_user(
+    pool: &PgPool,
+    user_id: &str,
+    rfc: &str,
+    clave_enc: &str,
+    initial_sync_job_id: Option<&str>,
+    priority_analysis: Option<&str>,
+) -> Result<bool, CreateUserError> {
+    let uid = parse_uuid(user_id)?;
+    let rfc_upper = rfc.to_uppercase();
 
     // Restore a previously soft-deleted row if one exists.
     let restored = sqlx::query(
@@ -428,13 +448,17 @@ pub async fn create_rfc_share(
     Ok(share_id.0.to_string())
 }
 
+type RfcShareRow = (Uuid, String, Option<String>, Option<String>, String);
+
 pub async fn list_rfc_shares(pool: &PgPool, rfc: &str) -> Result<Vec<RfcShare>, sqlx::Error> {
     let rfc_upper = rfc.to_uppercase();
-    // Fetch granted_at as ISO-8601 string directly from Postgres
-    let rows: Vec<(Uuid, String, Uuid, Option<String>, String)> = sqlx::query_as(
-        r#"SELECT s.id, s.rfc, s.shared_with, s.invited_email,
+    // L18-08: joins to public.users for the invited account's real email -- shared_with
+    // itself is that account's internal id, which never leaves this query.
+    let rows: Vec<RfcShareRow> = sqlx::query_as(
+        r#"SELECT s.id, s.rfc, u2.email, s.invited_email,
                   to_char(s.granted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS granted_at
            FROM pulso.rfc_shares s
+           LEFT JOIN public.users u2 ON u2.id = s.shared_with
            WHERE s.rfc = $1 AND s.revoked_at IS NULL
            ORDER BY s.granted_at"#,
     )
@@ -444,10 +468,10 @@ pub async fn list_rfc_shares(pool: &PgPool, rfc: &str) -> Result<Vec<RfcShare>, 
     Ok(rows
         .into_iter()
         .map(
-            |(id, rfc, shared_with, invited_email, granted_at)| RfcShare {
+            |(id, rfc, shared_with_email, invited_email, granted_at)| RfcShare {
                 id: id.to_string(),
                 rfc,
-                shared_with: shared_with.to_string(),
+                shared_with: shared_with_email.unwrap_or_default(),
                 invited_email,
                 granted_at,
             },
@@ -742,4 +766,16 @@ pub async fn delete_user_rfc(pool: &PgPool, user_id: &str, rfc: &str) -> Result<
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// L18-06 points 5/6: whether any active (non-soft-deleted) owner remains for `rfc`.
+/// Called right after a delete to decide whether that RFC's FIEL, if it has one, is now
+/// orphaned and should be removed.
+pub async fn has_active_owner(pool: &PgPool, rfc: &str) -> Result<bool, sqlx::Error> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT rfc FROM pulso.users WHERE rfc = $1 AND deleted_at IS NULL LIMIT 1")
+            .bind(rfc.to_uppercase())
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
 }

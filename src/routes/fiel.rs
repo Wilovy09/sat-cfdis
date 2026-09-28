@@ -7,40 +7,12 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::db::DbPool;
 use crate::services::crypto;
+use crate::services::session;
 
 #[derive(Serialize)]
 struct FielStatus {
     configured: bool,
     uploaded_at: Option<String>,
-}
-
-fn bearer_token(req: &HttpRequest) -> Option<String> {
-    let header = req
-        .headers()
-        .get(actix_web::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?;
-    let lower = header.to_lowercase();
-    let token = header[lower.find("bearer ")? + 7..].trim();
-    if token.is_empty() {
-        return None;
-    }
-    Some(token.to_string())
-}
-
-fn jwt_user_id(token: &str) -> Option<String> {
-    use base64::Engine as _;
-    let payload = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
-        .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    json.get("id")
-        .or_else(|| json.get("sub"))?
-        .as_str()
-        .map(|s| s.to_string())
 }
 
 /// POST /api/v1/users/rfcs/{rfc}/fiel
@@ -55,11 +27,9 @@ pub async fn upload(
 ) -> HttpResponse {
     let rfc = path.into_inner().to_uppercase();
 
-    let user_id = match bearer_token(&req).and_then(|t| jwt_user_id(&t)) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(serde_json::json!({"error": "Unauthorized"}));
-        }
+    let user_id = match session::require_session(&req, &cfg) {
+        Ok(id) => id,
+        Err(e) => return actix_web::ResponseError::error_response(&e),
     };
 
     match crate::db::users::get_credentials_for_rfc(&pool, &user_id, &rfc).await {
@@ -165,14 +135,13 @@ pub async fn get_status(
     req: HttpRequest,
     path: web::Path<String>,
     pool: web::Data<DbPool>,
+    cfg: web::Data<Config>,
 ) -> HttpResponse {
     let rfc = path.into_inner().to_uppercase();
 
-    let user_id = match bearer_token(&req).and_then(|t| jwt_user_id(&t)) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(serde_json::json!({"error": "Unauthorized"}));
-        }
+    let user_id = match session::require_session(&req, &cfg) {
+        Ok(id) => id,
+        Err(e) => return actix_web::ResponseError::error_response(&e),
     };
 
     match crate::db::users::get_credentials_for_rfc(&pool, &user_id, &rfc).await {
@@ -214,11 +183,9 @@ pub async fn delete(
 ) -> HttpResponse {
     let rfc = path.into_inner().to_uppercase();
 
-    let user_id = match bearer_token(&req).and_then(|t| jwt_user_id(&t)) {
-        Some(id) => id,
-        None => {
-            return HttpResponse::Unauthorized().json(serde_json::json!({"error": "Unauthorized"}));
-        }
+    let user_id = match session::require_session(&req, &cfg) {
+        Ok(id) => id,
+        Err(e) => return actix_web::ResponseError::error_response(&e),
     };
 
     match crate::db::users::get_credentials_for_rfc(&pool, &user_id, &rfc).await {
@@ -241,7 +208,7 @@ pub async fn delete(
             format!("fiel/{rfc}/key.key"),
         ] {
             if let Err(e) = crate::services::s3::delete_fiel(&s3, &bucket, &s3_key).await {
-                tracing::warn!(rfc = %rfc, key = %s3_key, "FIEL delete: S3 delete failed (continuing): {e}");
+                tracing::warn!(rfc = %rfc, "FIEL delete: S3 delete failed (continuing): {e}");
             }
         }
     }
