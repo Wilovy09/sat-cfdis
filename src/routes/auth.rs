@@ -85,6 +85,30 @@ pub async fn register(
     body: web::Json<RegisterDto>,
 ) -> HttpResponse {
     tracing::info!("Register attempt");
+
+    // The Adquiere API's SessionCreationException (email already taken, among other
+    // causes) always comes back as a plain 400 from its global exception filter -- the
+    // frontend expects 409 specifically to show "Ya existe una cuenta con este correo."
+    // instead of the generic "Datos inválidos" it shows for any other 400. Checked here,
+    // against the same public.users table the Adquiere API itself would reject against,
+    // so a real duplicate is caught with the right status before ever calling upstream --
+    // a genuine validation error (bad email format, etc.) still reaches the Adquiere API
+    // and its 400 passes through unchanged below.
+    match crate::db::users::find_by_email(&pool, &body.email).await {
+        Ok(Some(_)) => {
+            tracing::warn!("Register rejected: email already exists");
+            return HttpResponse::Conflict().json(ErrorBody {
+                error: "Ya existe una cuenta con este correo.".to_string(),
+            });
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!("register: find_by_email failed: {e}");
+            // Don't block registration on this pre-check's own failure -- the Adquiere
+            // API still enforces the real uniqueness constraint either way.
+        }
+    }
+
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
         Err(e) => {
@@ -187,8 +211,20 @@ pub async fn login(
         }
     };
 
-    let status = actix_web::http::StatusCode::from_u16(resp.status().as_u16())
+    let mut status = actix_web::http::StatusCode::from_u16(resp.status().as_u16())
         .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Same root cause as register()'s pre-check: the Adquiere API's SessionCreationException
+    // (user not found, wrong password, no password set) always comes back as a plain 400.
+    // The frontend's LoginForm only distinguishes 401 ("Correo o contraseña incorrectos.")
+    // from everything else (a generic "Error al iniciar sesión."), so remapping login's own
+    // 400 to 401 here is enough -- unlike register, it doesn't need to tell the specific
+    // reasons apart, since the frontend collapses them into one message either way. A
+    // genuine upstream failure (502, 500) is untouched -- only 400 means "rejected the
+    // credentials", never "server broke".
+    if status == actix_web::http::StatusCode::BAD_REQUEST {
+        status = actix_web::http::StatusCode::UNAUTHORIZED;
+    }
 
     match resp.json::<serde_json::Value>().await {
         Ok(json) => {
