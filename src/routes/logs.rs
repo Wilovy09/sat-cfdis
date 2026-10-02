@@ -66,7 +66,12 @@ fn admin_logs_key_matches(req: &HttpRequest, expected: Option<&str>) -> bool {
         .is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes()))
 }
 
-async fn require_admin(req: &HttpRequest, pool: &DbPool, cfg: &Config) -> Result<(), AppError> {
+/// Shared by every admin-only ops endpoint (logs, system).
+pub(crate) async fn require_admin(
+    req: &HttpRequest,
+    pool: &DbPool,
+    cfg: &Config,
+) -> Result<(), AppError> {
     if admin_logs_key_matches(req, cfg.admin_logs_key.as_deref()) {
         return Ok(());
     }
