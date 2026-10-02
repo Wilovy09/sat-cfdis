@@ -43,6 +43,7 @@ pub const SCALAR_HTML: &str = r#"<!doctype html>
         crate::routes::queue::cancel_job,
         // Admin
         crate::routes::logs::get_logs,
+        crate::routes::system::get_system,
         // Analytics
         crate::routes::analytics::get_summary,
         crate::routes::analytics::get_month_contributor,

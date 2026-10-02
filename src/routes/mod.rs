@@ -5,4 +5,5 @@ pub mod fiel;
 pub mod invoices;
 pub mod logs;
 pub mod queue;
+pub mod system;
 pub mod users;

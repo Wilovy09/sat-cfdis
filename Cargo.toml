@@ -48,3 +48,4 @@ utoipa = { version = "5" }
 utoipa-scalar = { version = "0.3", features = ["actix-web"] }
 jsonwebtoken = "9"
 thiserror = "1"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }

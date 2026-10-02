@@ -21,7 +21,7 @@ use db::DbPool;
 use routes::{
     analytics as analytics_routes, auth as auth_routes, billing as billing_routes,
     fiel as fiel_routes, invoices, logs as logs_routes, queue as queue_routes,
-    users as users_routes,
+    system as system_routes, users as users_routes,
 };
 use services::etl;
 use state::CaptchaMap;
@@ -1156,6 +1156,8 @@ async fn main() -> std::io::Result<()> {
         ));
     }
     let nomina_refresh_state_data = web::Data::new(nomina_refresh_state);
+    // One long-lived sampler: CPU usage is measured between consecutive requests.
+    let system_sampler_data = web::Data::new(system_routes::SystemSampler::new());
 
     // ── HTTP server ─────────────────────────────────────────────────────────
     let allowed_origins = cfg.allowed_origins.clone();
@@ -1186,6 +1188,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(s3_data.clone())
             .app_data(pool_data.clone())
             .app_data(nomina_refresh_state_data.clone())
+            .app_data(system_sampler_data.clone())
             .app_data(web::JsonConfig::default().limit(10 * 1024 * 1024))
             .wrap(cors)
             .wrap(TracingLogger::default());
@@ -1344,6 +1347,10 @@ async fn main() -> std::io::Result<()> {
             )
             // Admin
             .route("/api/v1/admin/logs", web::get().to(logs_routes::get_logs))
+            .route(
+                "/api/v1/admin/system",
+                web::get().to(system_routes::get_system),
+            )
             // Analytics API
             .service(
                 web::scope("/api/v1/analytics/{rfc}")
