@@ -169,8 +169,9 @@ pub async fn insert_concepts(
     let mut valor_unitarios: Vec<Option<f64>> = Vec::with_capacity(concepts.len());
     let mut importes: Vec<Option<f64>> = Vec::with_capacity(concepts.len());
     let mut descuentos: Vec<Option<f64>> = Vec::with_capacity(concepts.len());
+    let mut positions: Vec<i32> = Vec::with_capacity(concepts.len());
 
-    for c in concepts {
+    for (position, c) in (0_i32..).zip(concepts) {
         uuids.push(uuid);
         clave_prod_servs.push(c.clave_prod_serv.clone());
         clave_unidades.push(c.clave_unidad.clone());
@@ -179,12 +180,16 @@ pub async fn insert_concepts(
         valor_unitarios.push(c.valor_unitario);
         importes.push(c.importe);
         descuentos.push(c.descuento);
+        positions.push(position);
     }
 
+    // L19-06 point 1: `position` is the line's 0-based order in the XML's <Conceptos>, same
+    // as reconstruct_concepts. With the (uuid, position) unique index (migration 090), a
+    // second insert of the same list conflicts and DO NOTHING drops it.
     sqlx::query(r#"
         INSERT INTO pulso.cfdi_concepts
-            (uuid, clave_prod_serv, clave_unidad, descripcion, cantidad, valor_unitario, importe, descuento)
-        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::float8[], $7::float8[], $8::float8[])
+            (uuid, clave_prod_serv, clave_unidad, descripcion, cantidad, valor_unitario, importe, descuento, position)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::float8[], $7::float8[], $8::float8[], $9::int4[])
         ON CONFLICT DO NOTHING
         "#)
     .bind(&uuids)
@@ -195,6 +200,7 @@ pub async fn insert_concepts(
     .bind(&valor_unitarios)
     .bind(&importes)
     .bind(&descuentos)
+    .bind(&positions)
     .execute(pool)
     .await?;
     Ok(())
@@ -807,7 +813,7 @@ pub async fn mark_xml_unavailable_for_job(
 /// several jobs (one big historical `list` plus many one-day `gap_resync`s)
 /// active or paused per RFC, `get_active_for_rfc` could surface a narrow
 /// gap_resync job as "the" job and make already-downloaded months (fetched
-/// by a *different*, already-completed job) look undone — e.g. CES100706U65
+/// by a *different*, already-completed job) look undone — e.g. one client RFC
 /// showing only Nov–Dec 2023 covered while its financial summary (queried
 /// straight from these same rows) already reflected the full year.
 pub async fn months_with_data(
@@ -832,8 +838,8 @@ pub async fn months_with_data(
     // (0, 0) via unwrap_or, so this set was always effectively empty and
     // every RFC read as "0 months covered" regardless of real data. That's
     // the exact bug behind the coverage block firing at 100% for RFCs with
-    // plenty of CFDIs (Nubarium, Axented) and not just the ones with a real
-    // gap (CES100706U65).
+    // plenty of CFDIs (two client RFCs) and not just the ones with a real
+    // gap (a third).
     Ok(rows
         .into_iter()
         .map(|r| {

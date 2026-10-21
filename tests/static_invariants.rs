@@ -321,6 +321,121 @@ fn bare_comparison_identifiers(block: &str, is_keyword: &impl Fn(&str) -> bool) 
 }
 
 // ---------------------------------------------------------------------------
+// L19-08: ninguna comparacion de una columna consigo misma dentro de una subconsulta.
+// ---------------------------------------------------------------------------
+//
+// The shape the check above can't see: `b2.rfc_receptor = rfc_receptor` inside a subquery
+// whose only qualified references are to its own alias (`b2`), so it never counts as
+// correlated. The bare `rfc_receptor` resolves to the innermost table that has that
+// column -- `b2` itself, which provably has it -- so the comparison is always true
+// (H5b's NOT EXISTS excluded every person this way). Flags `own_alias.col = col` and
+// `col = own_alias.col` in any `(SELECT ...)` block.
+#[test]
+fn no_self_comparison_in_subquery() {
+    let mut findings: Vec<String> = Vec::new();
+    for path in src_files() {
+        let content = fs::read_to_string(&path).unwrap();
+        for (bare, block_head) in self_comparisons(&content) {
+            findings.push(format!(
+                "{}: subquery compares `{bare}` with itself -- {block_head}",
+                path.display()
+            ));
+        }
+    }
+    assert!(
+        findings.is_empty(),
+        "column compared with itself inside a subquery (L19-08-class bug):\n{}",
+        findings.join("\n")
+    );
+}
+
+#[test]
+fn self_comparison_detector_catches_the_l19_08_shape() {
+    let old_h5b = "HAVING MAX(x) < $4 AND NOT EXISTS (\n\
+                   SELECT 1 FROM base b2\n\
+                   WHERE b2.rfc_receptor = rfc_receptor AND b2.year_devengo > $4)";
+    assert_eq!(self_comparisons(old_h5b).len(), 1);
+    let fixed = "NOT EXISTS (SELECT 1 FROM base b2 WHERE b2.rfc_receptor = t0.rfc_receptor)";
+    assert!(self_comparisons(fixed).is_empty());
+    let reversed = "(SELECT 1 FROM pulso.cfdis c WHERE uuid = c.uuid)";
+    assert_eq!(self_comparisons(reversed).len(), 1);
+}
+
+/// Index of the next `(` at or after `from` that opens a subquery -- `SELECT` after any
+/// whitespace, so `EXISTS (\n    SELECT` counts too (the plain `"(SELECT"` search above
+/// misses that layout, which is exactly how H5b's NOT EXISTS was written).
+fn next_subquery_open(content: &str, from: usize) -> Option<usize> {
+    let mut idx = from;
+    while let Some(rel) = content[idx..].find('(') {
+        let open = idx + rel;
+        let rest = content[open + 1..].trim_start();
+        if rest
+            .get(..6)
+            .is_some_and(|w| w.eq_ignore_ascii_case("SELECT"))
+        {
+            return Some(open);
+        }
+        idx = open + 1;
+    }
+    None
+}
+
+/// `(bare column, first line of its block)` for every self-comparison in `content`'s
+/// `(SELECT ...)` blocks.
+fn self_comparisons(content: &str) -> Vec<(String, String)> {
+    let ops = ["=", "<", ">", "<>", "!="];
+    let bytes = content.as_bytes();
+    let mut found = Vec::new();
+    let mut idx = 0usize;
+    while let Some(open) = next_subquery_open(content, idx) {
+        let Some(close) = find_matching_close(bytes, open) else {
+            break;
+        };
+        let block = &content[open..=close];
+        let own_aliases = subquery_own_aliases(block);
+        let tokens = tokenize(block);
+        let is_bare = |i: usize| {
+            tokens.get(i).is_some_and(|t| {
+                t.chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic() || c == '_')
+            }) && (i == 0 || tokens[i - 1] != ".")
+                && tokens.get(i + 1).is_none_or(|t| t != ".")
+        };
+        for i in 0..tokens.len() {
+            // own_alias . col OP col
+            if i + 4 < tokens.len()
+                && own_aliases.contains(&tokens[i])
+                && tokens[i + 1] == "."
+                && ops.contains(&tokens[i + 3].as_str())
+                && tokens[i + 4] == tokens[i + 2]
+                && is_bare(i + 4)
+            {
+                found.push((
+                    tokens[i + 2].clone(),
+                    block.lines().next().unwrap_or("").trim().to_string(),
+                ));
+            }
+            // col OP own_alias . col
+            if i + 4 < tokens.len()
+                && is_bare(i)
+                && ops.contains(&tokens[i + 1].as_str())
+                && own_aliases.contains(&tokens[i + 2])
+                && tokens[i + 3] == "."
+                && tokens[i + 4] == tokens[i]
+            {
+                found.push((
+                    tokens[i].clone(),
+                    block.lines().next().unwrap_or("").trim().to_string(),
+                ));
+            }
+        }
+        idx = open + 1;
+    }
+    found
+}
+
+// ---------------------------------------------------------------------------
 // Item 4: ninguna lectura de columna NUMERIC/REAL decodificada como f64 sin conversion.
 // ---------------------------------------------------------------------------
 //

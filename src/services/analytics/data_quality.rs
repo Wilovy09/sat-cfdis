@@ -2,10 +2,10 @@
 //! rows that exist but were built without their XML (`xml_available = -1` —
 //! no subtotal, no currency, no payroll detail), and calendar months inside
 //! the RFC's own synced range that have *no rows at all*. See PULSO-021/
-//! Anexo B of the Axented audit for the first; the second is the same blind
+//! Anexo B of the PULSO-001 client audit for the first; the second is the same blind
 //! spot Anexo B.4 flags separately ("que la interfaz no pueda pintar un
 //! periodo... cuando existe una ventana sin cobertura de jobs") — confirmed
-//! live on 2026-08-18 when Axented's own missing-XML ratio read a clean 0.3%
+//! live on 2026-08-18 when the audited client RFC's own missing-XML ratio read a clean 0.3%
 //! (after the historical rebuild) while ~15 months of it still had zero
 //! CFDIs, because the rebuild hadn't reached them yet. A ratio-of-bad-rows
 //! check can't see a month with no rows to be bad — it needs the coverage
@@ -59,7 +59,7 @@ const COVERAGE_MATERIAL_THRESHOLD: f64 = 0.10;
 /// aren't just "a little off" — subtotal is a guessed /1.16 of total (wrong
 /// for anything not at the standard 16% rate), currency/tipo_cambio defaults
 /// to MXN 1:1 regardless of what it really was, and payroll detail is simply
-/// absent. Every clean RFC seen so far sits under 1%; Axented sits at
+/// absent. Every clean RFC seen so far sits under 1%; the audited client RFC sits at
 /// 48-74% per year. 5% leaves a wide, deliberately conservative margin.
 const MATERIAL_THRESHOLD: f64 = 0.05;
 

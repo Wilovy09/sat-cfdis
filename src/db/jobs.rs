@@ -164,7 +164,7 @@ pub async fn pause_limit(
 /// and reach the end of its period cleanly on the resumed attempt — but
 /// nothing ever cleared the stale `error_code`, so it landed here and got
 /// stamped `completed` anyway. That's PULSO-001: confirmed as the root cause
-/// of Axented's (ADC101206334) historical sync silently building thousands
+/// of the audited client RFC's historical sync silently building thousands
 /// of rows without their XML while reporting success the whole time — a
 /// `sat_connection_error` sat on the job from the point the session degraded
 /// onward, through a `completed` status, invisible to anything downstream.
@@ -219,7 +219,7 @@ pub async fn complete(
 /// onboarding job and the CIEC-update validation flow did — so a credential
 /// that started failing and later recovered on its own (SAT hiccup, retry,
 /// etc.) could show "inválida" indefinitely despite days of clean syncs.
-/// Reported live (Slack, CCO210630GE6 and CES100706U65, 2026-08-24-25).
+/// Reported live (Slack, two client RFCs, 2026-08-24-25).
 async fn heal_stale_credential_flag(
     pool: &PgPool,
     rfc: &str,
@@ -528,7 +528,7 @@ pub async fn has_any_daily_job(pool: &PgPool, rfc: &str) -> Result<bool, sqlx::E
 /// `gap_resync`) — SYNC-2: the point daily mode should resume from the first
 /// time it runs. Without this, `daily_sync_worker` only ever asks for
 /// "yesterday", so whatever gap sits between "the historical load ended" and
-/// "the day someone actually enabled daily mode" (Axented: 2026-07-31 →
+/// "the day someone actually enabled daily mode" (one client RFC: 2026-07-31 →
 /// 2026-08-16, 15 days) never gets requested by anyone.
 pub async fn latest_historical_period_to(
     pool: &PgPool,
@@ -777,7 +777,7 @@ pub async fn get_invoices(
 /// `login_not_registered` is included despite `retry_transient_or_fail`
 /// treating it as permanent — that call site can only see one job's outcome,
 /// not the fleet-wide pattern this query can see. On 2026-08-15, ~50
-/// same-minute single-day gap_resync jobs for NUB170623KI3 (fresh process,
+/// same-minute single-day gap_resync jobs for one client RFC (fresh process,
 /// fresh cookie jar, fresh login each) hit this code and only ~5 failed —
 /// with the SAT credentials independently confirmed valid by a human login
 /// the same day. A real bad-credential state fails every attempt, not one in
@@ -929,7 +929,7 @@ pub async fn earliest_completed_period_from(
 /// dates as "YYYY-MM-DD".
 /// A weekday inside a `completed` job's range where at least one side
 /// (emitidas or recibidas) has zero CFDIs. `emit_gap`/`recv_gap` say which
-/// side(s) — a day can be a gap on only one side, e.g. Nubarium
+/// side(s) — a day can be a gap on only one side, e.g. one client RFC on
 /// 2024-08-15/22 had 9 and 23 emitidas that day but zero recibidas.
 /// Checking combined activity (either side present = "not a gap") missed
 /// these entirely; each side needs its own zero-check.

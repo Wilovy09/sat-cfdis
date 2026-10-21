@@ -713,7 +713,7 @@ fn parse_docto_relacionado(e: &quick_xml::events::BytesStart<'_>) -> ParsedPayme
             "MonedaDR" => d.moneda_dr = Some(val()),
             // Pago 2.0 (el único que se ve en la práctica) llama a este
             // atributo "EquivalenciaDR", no "TipoCambioDR" — confirmado
-            // contra un XML real de CES100706U65 (payment_uuid 003D5198…).
+            // contra el XML real de un complemento de pago de un RFC cliente.
             // El nombre viejo se deja por si algún complemento Pago 1.0
             // todavía lo usa; nunca compiten por el mismo nodo.
             "TipoCambioDR" | "EquivalenciaDR" => d.tipo_cambio_dr = val().parse().ok(),

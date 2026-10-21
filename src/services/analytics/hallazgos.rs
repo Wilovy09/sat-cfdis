@@ -560,20 +560,16 @@ async fn compute_h1(
         .sum();
     let peg_pct = peg_mxn / total_ltm * 100.0;
 
-    // L18-17: when the two contrapartes genéricas this hallazgo already excludes from its
-    // own denominator (Público en General, Extranjero Genérico) carry more than half the
-    // period's ingreso, "Top N clientes representa X% del ingreso identificable" is
-    // computed over a tiny, unrepresentative slice -- servicios A's 45.5% read as
-    // "moderada" while it was 45.5% of 0.7% of ingreso. No verdict on concentration is
-    // meaningful here, so this short-circuits before the identificable/top3 computation
-    // below rather than feeding a nivel ladder that has no good answer for this shape.
-    let extranjero_mxn: f64 = clients
-        .iter()
-        .filter(|c| c.rfc == super::summary::RFC_EXTRANJERO_GENERICO)
-        .map(|c| c.mxn)
-        .sum();
-    let genericas_pct = (peg_mxn + extranjero_mxn) / total_ltm * 100.0;
-    if genericas_pct > 50.0 {
+    // L18-17: when Público en General -- excluded from this hallazgo's own denominator --
+    // carries more than half the period's ingreso, "Top N clientes representa X% del
+    // ingreso identificable" is computed over a tiny, unrepresentative slice. No verdict
+    // on concentration is meaningful here, so this short-circuits before the
+    // identificable/top3 computation below.
+    // L19-10 point 1: Público en General only. Extranjero Genérico used to count toward
+    // this 50% too, which sent an RFC selling abroad down this branch with "El 0.0% del
+    // ingreso es venta a Público en General" -- foreign clients are real, identifiable
+    // clients (point 2 below), not an atomized base.
+    if peg_pct > 50.0 {
         return Ok(Some(Hallazgo {
             id: "H1".to_string(),
             titulo: "Concentración de clientes".to_string(),
@@ -595,16 +591,13 @@ async fn compute_h1(
     // excluded here, not just from the top-3 pick (rows sort DESC so a negative total
     // wouldn't be picked anyway) but from the concentration denominator too, or a negative
     // contributor drags total_excl_peg below top3_mxn and the percentage passes 100.
-    // L10-10 / AUD-099, trap 3: also excludes the "residente extranjero" generic RFC, so
-    // H1's own "Top 3 clientes" doesn't become a third, differently-filtered concentration
-    // figure on the same screen as the KPI and the counterparties table.
+    // L19-10 point 2: foreign clients count, each by its own name -- cp_key already splits
+    // the Extranjero Genérico RFC per counterparty name, the same way the Conc. clientes
+    // card and the Top clientes table do (DEC-069). Excluding them (L10-10) hid an RFC's
+    // largest single client whenever that client was abroad.
     let identifiable: Vec<&ClientRow> = clients
         .iter()
-        .filter(|c| {
-            c.rfc != super::summary::RFC_PUBLICO_GENERAL
-                && c.rfc != super::summary::RFC_EXTRANJERO_GENERICO
-                && c.mxn > 0.0
-        })
+        .filter(|c| c.rfc != super::summary::RFC_PUBLICO_GENERAL && c.mxn > 0.0)
         .collect();
 
     if identifiable.is_empty() {
@@ -642,8 +635,9 @@ async fn compute_h1(
     );
 
     // L8-04: no longer conditioned on >30% -- if there's any ingreso a Público en
-    // General, it's always named, with its own percentage.
-    if peg_mxn > 0.0 {
+    // General, it's always named, with its own percentage. L19-10: only once it rounds to
+    // at least 0.1%, so the sentence never reads "el 0.0%".
+    if peg_pct >= 0.05 {
         cuerpo.push_str(&format!(
             " Adicionalmente, el {:.1}% del ingreso corresponde a ventas a Público en General.",
             peg_pct
@@ -782,7 +776,7 @@ async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
 
     // L10-09 / AUD-098, DEC-053: rotación used to count every termination the same way,
     // blending contratos de obra/tiempo determinado (which end by design) with real
-    // attrition of permanent staff -- Compro's 131.7% "crítico" was almost entirely people
+    // attrition of permanent staff -- one client RFC's 131.7% "crítico" was almost entirely people
     // whose obra contract simply ran out. `emp_tipo` classifies each employee ONCE, from
     // their own recibo vigente -- never MAX/MIN/mode: '03' sorts before '01' alphabetically,
     // so MAX would (and once did, in this item's own diagnosis) misclassify permanent staff
@@ -1061,17 +1055,20 @@ async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo
         -- own window bounds the MAX(period) scan at the ancla -- the NOT EXISTS excludes
         -- anyone who has any devengo at/after $4,$5, checked unbounded against the same
         -- `base` this CTE already has in full (base itself carries no upper bound).
+        -- L19-08: the outer row is aliased (t0) so the NOT EXISTS correlates to it. Unqualified,
+        -- `rfc_receptor` resolved to b2's own column, the check compared b2 with itself and
+        -- excluded every person -- H5b found no bajas anywhere.
         term AS (
-            SELECT rfc_receptor,
-                MAX(year_devengo * 100 + month_devengo)::bigint AS last_period
-            FROM base
-            WHERE (year_devengo > $2 OR (year_devengo = $2 AND month_devengo >= $3))
-              AND (year_devengo < $4 OR (year_devengo = $4 AND month_devengo <= $5))
-            GROUP BY rfc_receptor
-            HAVING MAX(year_devengo * 100 + month_devengo) < $4 * 100 + $5
+            SELECT t0.rfc_receptor,
+                MAX(t0.year_devengo * 100 + t0.month_devengo)::bigint AS last_period
+            FROM base t0
+            WHERE (t0.year_devengo > $2 OR (t0.year_devengo = $2 AND t0.month_devengo >= $3))
+              AND (t0.year_devengo < $4 OR (t0.year_devengo = $4 AND t0.month_devengo <= $5))
+            GROUP BY t0.rfc_receptor
+            HAVING MAX(t0.year_devengo * 100 + t0.month_devengo) < $4 * 100 + $5
                AND NOT EXISTS (
                    SELECT 1 FROM base b2
-                   WHERE b2.rfc_receptor = rfc_receptor
+                   WHERE b2.rfc_receptor = t0.rfc_receptor
                      AND (b2.year_devengo > $4 OR (b2.year_devengo = $4 AND b2.month_devengo >= $5))
                )
         ),
@@ -1541,14 +1538,14 @@ async fn compute_h8(
     // L8-07: exact RFC, not prefix -- IMS.../INF... matched a legitimate manufacturing
     // supplier of the RFC de control ($4,072) whose RFC happened to start the same way.
     // Confirmed by the team, not guessed: IMSS = IMS421231I45, Infonavit = INF7205011ZA.
-    // L10-10 / AUD-099, trap 3: also excludes the "residente extranjero" generic RFC now,
-    // for the same reason H1's identifiable pool below excludes both generic RFCs -- one
-    // definition of "not a real counterparty", shared by clientes and proveedores.
+    // L19-10 point 3: Público en General stays out, but a foreign supplier is a real one,
+    // identifiable by name (cp_key splits the Extranjero Genérico RFC per name) -- same
+    // definition of "real counterparty" as H1's identifiable pool, shared by clientes and
+    // proveedores.
     let is_regulatory = |rfc: &str| {
         rfc == super::summary::RFC_IMSS
             || rfc == super::summary::RFC_INFONAVIT
             || rfc == super::summary::RFC_PUBLICO_GENERAL
-            || rfc == super::summary::RFC_EXTRANJERO_GENERICO
     };
 
     // L8-03: same negative-total edge case as H1 -- see its comment for why.

@@ -1,7 +1,6 @@
 use sqlx::PgPool;
 
 pub struct FielRow {
-    #[allow(dead_code)]
     pub rfc: String,
     pub cert_s3_key: String,
     pub key_s3_key: String,
@@ -60,4 +59,30 @@ pub async fn delete(pool: &PgPool, rfc: &str) -> Result<bool, sqlx::Error> {
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// L19-03: every stored FIEL whose RFC has no active owner -- no live `pulso.users` row
+/// whose Adquiere account (`public.users`) is itself still live.
+pub async fn list_orphaned(pool: &PgPool) -> Result<Vec<FielRow>, sqlx::Error> {
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT f.rfc, f.cert_s3_key, f.key_s3_key, f.password_enc, f.uploaded_at::text \
+         FROM pulso.rfc_fiel f \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM pulso.users pu JOIN public.users u ON u.id = pu.user_id \
+             WHERE pu.rfc = f.rfc AND pu.deleted_at IS NULL AND u.deleted_at IS NULL)",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(rfc, cert_s3_key, key_s3_key, password_enc, uploaded_at)| FielRow {
+                rfc,
+                cert_s3_key,
+                key_s3_key,
+                password_enc,
+                uploaded_at,
+            },
+        )
+        .collect())
 }

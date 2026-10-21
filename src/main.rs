@@ -42,6 +42,18 @@ pub(crate) async fn try_fiel_auth(
     bucket: &str,
     rfc: &str,
 ) -> Option<(serde_json::Value, tempfile::TempDir)> {
+    // L19-03: a stored FIEL only authenticates for a verified owner. Until the current owner
+    // proves their own CIEC, a FIEL left behind (or uploaded by them before verification)
+    // must not open the SAT on their behalf -- the job's CIEC has to stand on its own.
+    match db::users::is_owner_verified(pool, rfc).await {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(e) => {
+            tracing::error!(rfc = %rfc, "FIEL check: owner verification lookup failed: {e}");
+            return None;
+        }
+    }
+
     let row = db::fiel::get(pool, rfc)
         .await
         .map_err(|e| tracing::error!(rfc = %rfc, "FIEL check: DB error: {e}"))
@@ -88,6 +100,69 @@ pub(crate) async fn try_fiel_auth(
     });
 
     Some((auth, tmp))
+}
+
+/// The CIEC a job authenticates with, when its auth payload is a CIEC for the job's own
+/// RFC. `None` for anything else (a FIEL payload, or a CIEC for a different RFC).
+fn job_ciec_password(auth_payload: &serde_json::Value, job_rfc: &str) -> Option<String> {
+    let is_ciec = auth_payload["type"].as_str() == Some("ciec");
+    let same_rfc = auth_payload["rfc"]
+        .as_str()
+        .is_some_and(|r| r.eq_ignore_ascii_case(job_rfc));
+    if !(is_ciec && same_rfc) {
+        return None;
+    }
+    auth_payload["password"].as_str().map(str::to_string)
+}
+
+/// L19-01 point 1 / L19-03 point 1: called once the SAT accepted a job's CIEC login. Marks
+/// the RFC's active owner verified only if that CIEC is the owner's current one -- a job
+/// queued with a previous owner's CIEC proves nothing about whoever owns the RFC now.
+async fn verify_owner_after_sat_login(pool: &DbPool, rfc: &str, job_ciec: &str) {
+    let (owner_row_id, clave_enc) = match db::users::get_unverified_owner(pool, rfc).await {
+        Ok(Some(owner)) => owner,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(rfc = %rfc, "Owner verification: DB error: {e}");
+            return;
+        }
+    };
+    let key = services::crypto::load_key();
+    let owner_ciec = match services::crypto::decrypt(&key, &clave_enc) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(rfc = %rfc, "Owner verification: decrypt failed: {e}");
+            return;
+        }
+    };
+    if owner_ciec != job_ciec {
+        tracing::warn!(rfc = %rfc, "SAT login passed with a CIEC that isn't the current owner's -- owner stays unverified");
+        return;
+    }
+    match db::users::set_owner_verified(pool, &owner_row_id).await {
+        Ok(true) => {
+            tracing::info!(rfc = %rfc, "RFC owner verified: SAT login passed with their CIEC")
+        }
+        Ok(false) => {}
+        Err(e) => tracing::error!(rfc = %rfc, "Owner verification: update failed: {e}"),
+    }
+}
+
+/// L19-04 point 2: the scraper's stderr is logged as-is. Reviewed: it never prints the CIEC,
+/// the FIEL passphrase or key contents (only library error templates, codes, dates and temp
+/// paths) -- this is the backstop in case a future library message echoes the CIEC back.
+fn redact_secret(line: &str, secret: Option<&str>) -> String {
+    match secret {
+        Some(s) if !s.is_empty() => line.replace(s, "[REDACTED]"),
+        _ => line.to_string(),
+    }
+}
+
+/// Whether a scraper output line is the one-time `{"__auth_ok__":true}` login signal.
+fn is_sat_login_ok(line: &serde_json::Value) -> bool {
+    line.get("__auth_ok__")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -185,16 +260,21 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                 }
             };
 
-            // If RFC has FIEL configured, override CIEC auth with FIEL.
-            // _fiel_tmp must stay alive until run_worker_chunk returns.
+            // If RFC has FIEL configured (verified owners only, see try_fiel_auth), override
+            // CIEC auth with FIEL. _fiel_tmp must stay alive until run_worker_chunk returns.
+            // `own_ciec` is set only when the job logs in with its own CIEC -- the one
+            // credential a successful login can verify the owner with.
             let bucket = cfg.s3_bucket.clone().unwrap_or_default();
-            let (auth_payload, _fiel_tmp) =
+            let (auth_payload, _fiel_tmp, own_ciec) =
                 match try_fiel_auth(&pool, &s3_client, &bucket, &job.rfc).await {
                     Some((fiel_auth, tmp)) => {
                         tracing::info!(rfc = %job.rfc, "Worker: using FIEL auth");
-                        (fiel_auth, Some(tmp))
+                        (fiel_auth, Some(tmp), None)
                     }
-                    None => (auth_payload, None::<tempfile::TempDir>),
+                    None => {
+                        let own_ciec = job_ciec_password(&auth_payload, &job.rfc);
+                        (auth_payload, None::<tempfile::TempDir>, own_ciec)
+                    }
                 };
 
             // Queued jobs start from period_from; paused jobs resume from day after cursor
@@ -233,7 +313,7 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                 job.job_type.clone(),
                 job.rfc.clone(),
                 auth_payload,
-                job.auth_type.clone(),
+                own_ciec,
                 job.period_from.clone(),
                 resume_from,
                 job.period_to.clone(),
@@ -512,11 +592,14 @@ const PHP_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
 /// Run the list-count PHP pass and return the total invoice count.
 /// Only counts complete calendar months within the period.
 /// Returns None on any failure (count is best-effort; stream will run regardless).
+#[allow(clippy::too_many_arguments)]
 async fn run_count_pass(
     pool: &DbPool,
     cfg: &Config,
     job_id: &str,
+    job_rfc: &str,
     auth_payload: &serde_json::Value,
+    own_ciec: Option<&str>,
     period_from: &str,
     period_to: &str,
     dl_type: &str,
@@ -556,6 +639,7 @@ async fn run_count_pass(
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
     let mut total: Option<i64> = None;
+    let mut pending_ciec = own_ciec;
     loop {
         let next = tokio::time::timeout(
             std::time::Duration::from_secs(PHP_IDLE_TIMEOUT_SECS),
@@ -576,6 +660,12 @@ async fn run_count_pass(
             continue;
         }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+            if is_sat_login_ok(&val) {
+                if let Some(ciec) = pending_ciec.take() {
+                    verify_owner_after_sat_login(pool, job_rfc, ciec).await;
+                }
+                continue;
+            }
             if val
                 .get("__keepalive__")
                 .and_then(|v| v.as_bool())
@@ -617,7 +707,8 @@ async fn notify_sync_failed(
     let Some(ref api_key) = cfg.sendgrid_api_key else {
         return;
     };
-    let Ok(Some(email)) = crate::db::users::get_email_by_rfc(pool, rfc).await else {
+    let Ok(Some((user_id, email))) = crate::db::users::get_owner_contact_by_rfc(pool, rfc).await
+    else {
         return;
     };
     match crate::services::email::send_sync_failed(
@@ -629,7 +720,7 @@ async fn notify_sync_failed(
     )
     .await
     {
-        Ok(_) => tracing::info!(job_id = %job_id, "Sent sync-failed email to {email}"),
+        Ok(_) => tracing::info!(job_id = %job_id, user_id = %user_id, "Sent sync-failed email"),
         Err(e) => tracing::warn!(job_id = %job_id, "Failed to send sync-failed email: {e}"),
     }
 }
@@ -646,7 +737,7 @@ async fn run_worker_chunk(
     job_type: String,
     job_rfc: String,
     auth_payload: serde_json::Value,
-    _auth_type: String,
+    own_ciec: Option<String>, // the job's CIEC, when it logs in with it (not a FIEL)
     full_period_from: String, // original job start (for count pass)
     period_from: String,      // resume point (may differ from full_period_from)
     period_to: String,
@@ -665,7 +756,9 @@ async fn run_worker_chunk(
             &pool,
             &cfg,
             &job_id,
+            &job_rfc,
             &auth_payload,
+            own_ciec.as_deref(),
             &full_period_from,
             &period_to,
             &dl_type,
@@ -729,11 +822,16 @@ async fn run_worker_chunk(
     // connection error (message contains "login data") as a bad password.
     if let Some(stderr) = child.stderr.take() {
         let job_id_err = job_id.clone();
+        let ciec = auth_payload["password"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
         tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt as _;
             let mut lines = tokio::io::BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if !line.is_empty() {
+                    let line = redact_secret(&line, ciec.as_deref());
                     tracing::error!(job_id = %job_id_err, php_stderr = %line, "PHP worker stderr");
                 }
             }
@@ -759,6 +857,7 @@ async fn run_worker_chunk(
     let mut auth_error: Option<(String, String)> = None; // (code, message)
     let mut done_received = false;
     let mut idle_timeout = false;
+    let mut pending_ciec = own_ciec;
 
     loop {
         let next = tokio::time::timeout(
@@ -783,6 +882,13 @@ async fn run_worker_chunk(
         let Ok(data) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+
+        if is_sat_login_ok(&data) {
+            if let Some(ciec) = pending_ciec.take() {
+                verify_owner_after_sat_login(&pool, &job_rfc, &ciec).await;
+            }
+            continue;
+        }
 
         if data
             .get("__keepalive__")
@@ -986,7 +1092,8 @@ async fn run_worker_chunk(
         // Email 1: initial sync complete (job_type == "list" and this is the user's initial_sync_job_id)
         // Email 2: monthly complete (job_type == "auto_daily" and period_to falls on the last day of its month)
         if let Some(ref api_key) = cfg.sendgrid_api_key
-            && let Ok(Some(email)) = crate::db::users::get_email_by_rfc(&pool, &job_rfc).await
+            && let Ok(Some((user_id, email))) =
+                crate::db::users::get_owner_contact_by_rfc(&pool, &job_rfc).await
         {
             let send_result = if job_type == "list" {
                 match crate::db::users::is_initial_sync_job(&pool, &job_rfc, &job_id).await {
@@ -1025,7 +1132,7 @@ async fn run_worker_chunk(
                     tracing::warn!(job_id = %job_id, "Failed to send completion email: {e}")
                 }
                 Some(Ok(_)) => {
-                    tracing::info!(job_id = %job_id, "Sent completion email to {email}")
+                    tracing::info!(job_id = %job_id, user_id = %user_id, "Sent completion email")
                 }
                 None => {}
             }
@@ -1052,11 +1159,10 @@ async fn main() -> std::io::Result<()> {
     // they do, that default becomes the key to forge any session, admin included. The
     // check lives here (server startup), not inside Config::from_env, because the four
     // test suites call from_env() directly and would break if it required the variable.
-    if cfg.jwt_secret.len() < 32 {
-        tracing::error!(
-            "JWT_SECRET is missing or shorter than 32 characters -- refusing to start. \
-             Set a real secret (>= 32 chars) in this environment's .env."
-        );
+    // Also rejects the .env.example placeholders, which are long enough to pass a
+    // length-only check.
+    if let Err(e) = cfg.validate_secrets() {
+        tracing::error!("{e} -- refusing to start. Set real secrets in this environment's .env.");
         std::process::exit(1);
     }
 
@@ -1148,6 +1254,13 @@ async fn main() -> std::io::Result<()> {
     }
     {
         tokio::spawn(services::response_cache::cleanup_worker(bg_pool.clone()));
+    }
+    {
+        tokio::spawn(services::fiel::orphan_sweep_worker(
+            bg_pool.clone(),
+            Arc::new(cfg.clone()),
+            s3_client.clone(),
+        ));
     }
     {
         tokio::spawn(services::nomina_refresh::worker(
@@ -1494,4 +1607,44 @@ async fn main() -> std::io::Result<()> {
     .bind(&bind_addr)?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod owner_verification_tests {
+    use super::*;
+
+    const RFC: &str = "AAA010101AAA";
+
+    #[test]
+    fn job_ciec_password_takes_a_ciec_for_the_jobs_own_rfc() {
+        let auth = serde_json::json!({"type": "ciec", "rfc": "aaa010101aaa", "password": "pw"});
+        assert_eq!(job_ciec_password(&auth, RFC), Some("pw".to_string()));
+    }
+
+    #[test]
+    fn job_ciec_password_ignores_fiel_and_other_rfcs() {
+        let fiel = serde_json::json!({"type": "fiel", "cert_pem_path": "/tmp/c", "password": ""});
+        assert_eq!(job_ciec_password(&fiel, RFC), None);
+        let other = serde_json::json!({"type": "ciec", "rfc": "BBB010101BBB", "password": "pw"});
+        assert_eq!(job_ciec_password(&other, RFC), None);
+    }
+
+    #[test]
+    fn is_sat_login_ok_only_matches_the_marker() {
+        assert!(is_sat_login_ok(&serde_json::json!({"__auth_ok__": true})));
+        assert!(!is_sat_login_ok(
+            &serde_json::json!({"__keepalive__": true})
+        ));
+        assert!(!is_sat_login_ok(&serde_json::json!({"uuid": "x"})));
+    }
+
+    #[test]
+    fn redact_secret_strips_the_ciec_from_stderr() {
+        assert_eq!(
+            redact_secret("login failed for s3cr3t!", Some("s3cr3t!")),
+            "login failed for [REDACTED]"
+        );
+        assert_eq!(redact_secret("Day error", None), "Day error");
+        assert_eq!(redact_secret("Day error", Some("")), "Day error");
+    }
 }

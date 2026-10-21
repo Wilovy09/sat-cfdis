@@ -13,20 +13,22 @@
 //!    borrado + inserción en la misma transacción, con `position` en el orden real del
 //!    documento. Esto es lo que de verdad arregla los duplicados: el XML real nunca tuvo
 //!    la línea repetida, solo la tabla.
-//! 2. XML no disponible (xml_available != 1): no hay de dónde reconstruir. En vez de dejar
-//!    la factura intacta (con sus posibles copias), se de-duplican las filas que ya
-//!    existen -- mismas columnas exactas, se queda la de `id` más chico -- y se numera lo
-//!    que sobrevive en ese mismo orden. El uuid se reporta en ambos casos de fallo para que
-//!    alguien decida si vale la pena perseguir el XML por separado.
+//! 2. XML no disponible (xml_available != 1): no hay de dónde reconstruir. L19-06: sólo se
+//!    quitan copias cuando la factura está inflada de verdad -- sus conceptos suman más que
+//!    su subtotal (más de 1 peso y más de 0.1 %) Y cada línea distinta aparece un múltiplo
+//!    del mismo número de veces (el patrón de "todo al doble"). Entonces se conserva la
+//!    fracción que corresponde de cada línea (no una sola: dos líneas idénticas legítimas
+//!    en el XML siguen siendo dos). Si no, nada se borra y sólo se numera. El uuid se
+//!    reporta en cada fallo para que alguien decida si vale la pena perseguir el XML.
 //!
-//! Punto 5 del ítem (el índice único en uuid+position) va en una migración aparte, DESPUÉS
-//! de correr esto -- hoy las duplicadas lo violarían de inmediato.
+//! Al terminar (sin --dry-run) refresca la vista de nómina e invalida el caché de
+//! respuestas (L19-06 punto 5). El índice único (uuid, position) es parcial y ya existe
+//! (migración 090): las filas viejas, con position NULL, no lo violan.
 
 use futures_util::stream::{self, StreamExt};
 use pulso_backend::config::Config;
-use pulso_backend::services::{storage, xml_parser};
+use pulso_backend::services::{nomina_refresh, storage, xml_parser};
 use sqlx::Row;
-use std::collections::HashSet;
 
 /// How many invoices are in flight at once. Bounded well under the pool's default 15
 /// connections (`POSTGRES_POOL_SIZE`) because each task only holds a connection for its
@@ -41,15 +43,17 @@ struct Target {
     uuid: String,
     rfc_emisor: String,
     rfc_receptor: String,
-    year: i64,
-    month: i64,
     fecha_emision: String,
     xml_available: i64,
+    subtotal: Option<f64>,
 }
 
 enum Outcome {
     Xml,
     Dedup,
+    NumberedOnly,
+    /// No XML, and still summing above its subtotal -- nothing safe to remove.
+    StillInflated(String),
     Failed(String),
 }
 
@@ -66,11 +70,10 @@ async fn main() {
     let s3 = aws_sdk_s3::Client::new(&aws_cfg);
     let bucket = cfg.s3_bucket.clone().unwrap_or_default();
 
-    // cfdis_raw, not the L18-06 access-filtered `cfdis` view: data integrity has to cover
-    // every invoice regardless of whether its RFC has cleared verified-owner access yet.
+    // cfdis_raw, the table itself: data integrity has to cover every invoice.
     let targets: Vec<Target> = sqlx::query_as(
-        r#"SELECT DISTINCT c.uuid, c.rfc_emisor, c.rfc_receptor, c.year, c.month,
-                  c.fecha_emision, c.xml_available
+        r#"SELECT DISTINCT c.uuid, c.rfc_emisor, c.rfc_receptor, c.fecha_emision,
+                  c.xml_available, c.subtotal::float8 AS subtotal
            FROM pulso.cfdis_raw c
            JOIN pulso.cfdi_concepts cc ON cc.uuid = c.uuid
            ORDER BY c.uuid"#,
@@ -91,7 +94,9 @@ async fn main() {
 
     let mut ok_from_xml = 0usize;
     let mut ok_dedup_only = 0usize;
+    let mut ok_numbered_only = 0usize;
     let mut failed: Vec<String> = Vec::new();
+    let mut still_inflated: Vec<String> = Vec::new();
     let mut completed = 0usize;
 
     let mut results = stream::iter(targets)
@@ -107,10 +112,12 @@ async fn main() {
         match outcome {
             Outcome::Xml => ok_from_xml += 1,
             Outcome::Dedup => ok_dedup_only += 1,
+            Outcome::NumberedOnly => ok_numbered_only += 1,
+            Outcome::StillInflated(uuid) => still_inflated.push(uuid),
             Outcome::Failed(uuid) => failed.push(uuid),
         }
         completed += 1;
-        if completed % 500 == 0 {
+        if completed.is_multiple_of(500) {
             println!(
                 "... {completed}/{total} (xml: {ok_from_xml}, dedup: {ok_dedup_only}, fallidas: {})",
                 failed.len()
@@ -120,13 +127,30 @@ async fn main() {
 
     println!();
     println!("Reconstruidas desde XML real: {ok_from_xml}");
-    println!("Solo de-duplicadas (XML no disponible): {ok_dedup_only}");
+    println!("Sin XML, copias quitadas: {ok_dedup_only}");
+    println!("Sin XML, sin copias (sólo numeradas): {ok_numbered_only}");
     println!(
         "Fallaron (no se pudo leer o parsear el XML): {}",
         failed.len()
     );
     for u in &failed {
         println!("  {u}");
+    }
+
+    println!(
+        "Sin XML y aún por encima de su subtotal (sin copias regulares que quitar): {}",
+        still_inflated.len()
+    );
+    for u in &still_inflated {
+        println!("  {u}");
+    }
+
+    if !dry_run {
+        let state = nomina_refresh::NominaRefreshState::new();
+        match nomina_refresh::refresh_guarded(&pool, &state).await {
+            Ok(_) => println!("Vista de nómina refrescada y caché invalidado."),
+            Err(e) => eprintln!("No se pudo refrescar la vista de nómina: {e}"),
+        }
     }
 }
 
@@ -137,33 +161,29 @@ async fn process_one(
     bucket: &str,
     dry_run: bool,
 ) -> Outcome {
-    let day: u32 = t
-        .fecha_emision
-        .get(8..10)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
-
-    let xml = if t.xml_available == 1 {
-        storage::get(
-            s3,
-            bucket,
-            &t.rfc_emisor,
-            &t.rfc_receptor,
-            t.year as u32,
-            t.month as u32,
-            day,
-            &t.uuid.to_lowercase(),
-        )
-        .await
-    } else {
-        None
+    // The XML is stored under its emission date (routes::invoices::extract_cfdi_path_info),
+    // not under cfdis.year/month -- for nómina those hold the devengo month.
+    let xml = match (t.xml_available, emission_ymd(&t.fecha_emision)) {
+        (1, Some((year, month, day))) => {
+            storage::get(
+                s3,
+                bucket,
+                &t.rfc_emisor,
+                &t.rfc_receptor,
+                year,
+                month,
+                day,
+                &t.uuid.to_lowercase(),
+            )
+            .await
+        }
+        _ => None,
     };
 
     match xml {
         Some(bytes) => match xml_parser::parse(&bytes, "reconstruct_concepts", "ambos", "") {
             Some(parsed) => {
-                if !dry_run
-                    && let Err(e) = replace_from_xml(pool, &t.uuid, &parsed.concepts).await
+                if !dry_run && let Err(e) = replace_from_xml(pool, &t.uuid, &parsed.concepts).await
                 {
                     eprintln!("{}: fallo al reemplazar desde XML: {e}", t.uuid);
                     return Outcome::Failed(t.uuid);
@@ -175,16 +195,24 @@ async fn process_one(
                 Outcome::Failed(t.uuid)
             }
         },
-        None => {
-            if !dry_run
-                && let Err(e) = dedup_in_place(pool, &t.uuid).await
-            {
+        None => match dedup_in_place(pool, &t.uuid, t.subtotal, dry_run).await {
+            Ok(DedupResult::CopiesRemoved) => Outcome::Dedup,
+            Ok(DedupResult::NumberedOnly) => Outcome::NumberedOnly,
+            Ok(DedupResult::StillInflated) => Outcome::StillInflated(t.uuid),
+            Err(e) => {
                 eprintln!("{}: fallo al de-duplicar: {e}", t.uuid);
-                return Outcome::Failed(t.uuid);
+                Outcome::Failed(t.uuid)
             }
-            Outcome::Dedup
-        }
+        },
     }
+}
+
+/// (year, month, day) of a `fecha_emision` like `2024-08-31T12:00:00`.
+fn emission_ymd(fecha_emision: &str) -> Option<(u32, u32, u32)> {
+    let year = fecha_emision.get(0..4)?.parse().ok()?;
+    let month = fecha_emision.get(5..7)?.parse().ok()?;
+    let day = fecha_emision.get(8..10)?.parse().ok()?;
+    Some((year, month, day))
 }
 
 async fn replace_from_xml(
@@ -219,9 +247,71 @@ async fn replace_from_xml(
     tx.commit().await
 }
 
-/// No hay XML de donde reconstruir -- de-duplica lo que ya existe (mismas columnas,
-/// conserva el `id` más chico de cada grupo) y numera lo que sobrevive en ese orden.
-async fn dedup_in_place(pool: &sqlx::PgPool, uuid: &str) -> Result<(), sqlx::Error> {
+/// One stored concept row: its id, the columns that make two lines "the same", and its
+/// importe.
+struct StoredConcept {
+    id: i64,
+    key: String,
+    importe: f64,
+}
+
+/// L19-06: sum of the concepts exceeds the invoice's subtotal by more than 1 peso and more
+/// than 0.1 % -- the verification threshold of the item.
+fn exceeds_subtotal(concepts_sum: f64, subtotal: Option<f64>) -> bool {
+    let Some(subtotal) = subtotal else {
+        return false;
+    };
+    let excess = concepts_sum - subtotal;
+    excess > 1.0 && excess > subtotal.abs() * 0.001
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// Which rows to keep (in id order) and which to drop. Copies go only when the invoice is
+/// inflated (`exceeds_subtotal`) and every distinct line repeats a multiple of the same
+/// factor; then each line keeps `count / factor` rows, its lowest ids. Otherwise nothing is
+/// dropped -- identical lines can be legitimate.
+fn plan_dedup(rows: &[StoredConcept], subtotal: Option<f64>) -> (Vec<i64>, Vec<i64>) {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for r in rows {
+        *counts.entry(r.key.as_str()).or_default() += 1;
+    }
+    let factor = counts.values().copied().fold(0, gcd);
+    let concepts_sum: f64 = rows.iter().map(|r| r.importe).sum();
+    if factor < 2 || !exceeds_subtotal(concepts_sum, subtotal) {
+        return (rows.iter().map(|r| r.id).collect(), Vec::new());
+    }
+
+    let mut kept_per_key: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let (mut keep, mut drop) = (Vec::new(), Vec::new());
+    for r in rows {
+        let kept = kept_per_key.entry(r.key.as_str()).or_default();
+        if *kept < counts[r.key.as_str()] / factor {
+            *kept += 1;
+            keep.push(r.id);
+        } else {
+            drop.push(r.id);
+        }
+    }
+    (keep, drop)
+}
+
+enum DedupResult {
+    CopiesRemoved,
+    NumberedOnly,
+    StillInflated,
+}
+
+/// No hay XML de donde reconstruir -- quita copias sólo si `plan_dedup` lo justifica y
+/// numera lo que queda en orden de `id`.
+async fn dedup_in_place(
+    pool: &sqlx::PgPool,
+    uuid: &str,
+    subtotal: Option<f64>,
+    dry_run: bool,
+) -> Result<DedupResult, sqlx::Error> {
     let rows = sqlx::query(
         r#"SELECT id, clave_prod_serv, clave_unidad, descripcion, cantidad, valor_unitario,
                   importe, descuento
@@ -231,27 +321,34 @@ async fn dedup_in_place(pool: &sqlx::PgPool, uuid: &str) -> Result<(), sqlx::Err
     .fetch_all(pool)
     .await?;
 
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut keep_ids_in_order: Vec<i64> = Vec::new();
-    let mut drop_ids: Vec<i64> = Vec::new();
-
+    let mut stored = Vec::with_capacity(rows.len());
     for row in &rows {
-        let id: i64 = row.try_get("id")?;
-        let key = format!(
-            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
-            row.try_get::<Option<String>, _>("clave_prod_serv")?,
-            row.try_get::<Option<String>, _>("clave_unidad")?,
-            row.try_get::<Option<String>, _>("descripcion")?,
-            row.try_get::<Option<f32>, _>("cantidad")?,
-            row.try_get::<Option<f32>, _>("valor_unitario")?,
-            row.try_get::<Option<f32>, _>("importe")?,
-            row.try_get::<Option<f32>, _>("descuento")?,
-        );
-        if seen.insert(key) {
-            keep_ids_in_order.push(id);
-        } else {
-            drop_ids.push(id);
-        }
+        let importe = row.try_get::<Option<f32>, _>("importe")?;
+        stored.push(StoredConcept {
+            id: row.try_get("id")?,
+            key: format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                row.try_get::<Option<String>, _>("clave_prod_serv")?,
+                row.try_get::<Option<String>, _>("clave_unidad")?,
+                row.try_get::<Option<String>, _>("descripcion")?,
+                row.try_get::<Option<f32>, _>("cantidad")?,
+                row.try_get::<Option<f32>, _>("valor_unitario")?,
+                importe,
+                row.try_get::<Option<f32>, _>("descuento")?,
+            ),
+            importe: f64::from(importe.unwrap_or(0.0)),
+        });
+    }
+    let (keep_ids_in_order, drop_ids) = plan_dedup(&stored, subtotal);
+    let result = if !drop_ids.is_empty() {
+        DedupResult::CopiesRemoved
+    } else if exceeds_subtotal(stored.iter().map(|r| r.importe).sum(), subtotal) {
+        DedupResult::StillInflated
+    } else {
+        DedupResult::NumberedOnly
+    };
+    if dry_run {
+        return Ok(result);
     }
 
     let mut tx = pool.begin().await?;
@@ -261,12 +358,86 @@ async fn dedup_in_place(pool: &sqlx::PgPool, uuid: &str) -> Result<(), sqlx::Err
             .execute(&mut *tx)
             .await?;
     }
-    for (pos, id) in keep_ids_in_order.iter().enumerate() {
+    // Cleared first so a re-run can't collide with the (uuid, position) unique index while
+    // renumbering.
+    sqlx::query("UPDATE pulso.cfdi_concepts SET position = NULL WHERE uuid = $1")
+        .bind(uuid)
+        .execute(&mut *tx)
+        .await?;
+    for (pos, id) in (0_i32..).zip(&keep_ids_in_order) {
         sqlx::query("UPDATE pulso.cfdi_concepts SET position = $1 WHERE id = $2")
-            .bind(pos as i32)
+            .bind(pos)
             .bind(id)
             .execute(&mut *tx)
             .await?;
     }
-    tx.commit().await
+    tx.commit().await?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: i64, key: &str, importe: f64) -> StoredConcept {
+        StoredConcept {
+            id,
+            key: key.to_string(),
+            importe,
+        }
+    }
+
+    #[test]
+    fn halves_an_invoice_stored_twice() {
+        let rows = [
+            row(1, "a", 100.0),
+            row(2, "b", 50.0),
+            row(3, "a", 100.0),
+            row(4, "b", 50.0),
+        ];
+        assert_eq!(plan_dedup(&rows, Some(150.0)), (vec![1, 2], vec![3, 4]));
+    }
+
+    #[test]
+    fn keeps_legitimate_identical_lines_when_the_sum_matches() {
+        let rows = [row(1, "a", 100.0), row(2, "a", 100.0)];
+        assert_eq!(plan_dedup(&rows, Some(200.0)), (vec![1, 2], vec![]));
+    }
+
+    #[test]
+    fn keeps_a_fraction_per_line_not_a_single_row() {
+        // Real invoice: line "a" twice, line "b" once -- stored twice over.
+        let rows = [
+            row(1, "a", 10.0),
+            row(2, "a", 10.0),
+            row(3, "b", 5.0),
+            row(4, "a", 10.0),
+            row(5, "a", 10.0),
+            row(6, "b", 5.0),
+        ];
+        assert_eq!(
+            plan_dedup(&rows, Some(25.0)),
+            (vec![1, 2, 3], vec![4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn leaves_rows_alone_when_counts_share_no_factor() {
+        let rows = [row(1, "a", 100.0), row(2, "a", 100.0), row(3, "b", 100.0)];
+        assert_eq!(plan_dedup(&rows, Some(100.0)), (vec![1, 2, 3], vec![]));
+    }
+
+    #[test]
+    fn subtotal_threshold_needs_both_one_peso_and_a_tenth_of_a_percent() {
+        assert!(!exceeds_subtotal(1_000_000.5, Some(1_000_000.0)));
+        assert!(!exceeds_subtotal(1_000_900.0, Some(1_000_000.0)));
+        assert!(exceeds_subtotal(1_001_001.0, Some(1_000_000.0)));
+        assert!(!exceeds_subtotal(100.0, None));
+    }
+
+    #[test]
+    fn emission_ymd_reads_the_emission_date() {
+        assert_eq!(emission_ymd("2024-08-31T12:00:00"), Some((2024, 8, 31)));
+        assert_eq!(emission_ymd("bad"), None);
+    }
 }

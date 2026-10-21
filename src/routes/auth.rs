@@ -379,8 +379,11 @@ pub async fn google_login(
     let google_user = match exchange_google_code(&cfg, &body.code).await {
         Ok(u) => u,
         Err(e) => {
+            // L19-04: the exchange error is Google's raw response -- logged, never returned.
             tracing::warn!("Google code exchange failed: {e}");
-            return HttpResponse::BadGateway().json(ErrorBody { error: e });
+            return HttpResponse::BadGateway().json(ErrorBody {
+                error: GENERIC_INTERNAL_ERROR.to_string(),
+            });
         }
     };
 
@@ -449,8 +452,11 @@ pub async fn google_link(
     let google_user = match exchange_google_code(&cfg, &body.code).await {
         Ok(u) => u,
         Err(e) => {
+            // L19-04: the exchange error is Google's raw response -- logged, never returned.
             tracing::warn!("Google code exchange failed: {e}");
-            return HttpResponse::BadGateway().json(ErrorBody { error: e });
+            return HttpResponse::BadGateway().json(ErrorBody {
+                error: GENERIC_INTERNAL_ERROR.to_string(),
+            });
         }
     };
 

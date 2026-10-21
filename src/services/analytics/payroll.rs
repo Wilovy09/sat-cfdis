@@ -493,12 +493,14 @@ pub async fn get(
             WHERE c.rfc_emisor = $1
               AND c.tipo_comprobante = 'N'
               AND NOT c.is_cancelled
-              -- L18-23 point 2: same anchor cutoff as the rest of this table (n.year_devengo/
-              -- n.month_devengo below, via $4/$5) -- this CTE reads the raw comprobante
-              -- instead of nomina_normalizada's own devengo columns, so it caps on
-              -- fecha_emision (ISO text, sorts correctly as a string) against the same
-              -- to_y/to_m the caller already bound.
-              AND c.fecha_emision < (make_date($4::int, $5::int, 1) + interval '1 month')::date::text
+              -- L18-23 point 2 / L19-09: same anchor cutoff as the rest of this table
+              -- (n.year_devengo/n.month_devengo below, via $4/$5), by devengo through the
+              -- same pulso.devengo_date nomina_normalizada uses -- not fecha_emision: a
+              -- receipt for the anchor month stamped early the next month (an August hire
+              -- paid in early September) left that person with no row here, and the inner
+              -- join to latest_attrs dropped them from Plantilla actual and Altas.
+              AND pulso.devengo_date(n.fecha_final_pago, c.fecha_emision)
+                  < (make_date($4::int, $5::int, 1) + interval '1 month')::date
         ),
         latest_attrs AS (
             SELECT DISTINCT ON (rfc_receptor)
@@ -1641,10 +1643,10 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     //    employed before Pulso's own data window starts. `fecha_inicio_rel_laboral` is the
     //    CFDI's own declared contract-start date -- MAX() (not MIN()) of the values >= 1980
     //    the employee's receipts carry (data-entry garbage predating any plausible hire
-    //    date -- Compro has one row at 1941-11-16 -- gets discarded by the floor; when a
+    //    date -- one client RFC has a row at 1941-11-16 -- gets discarded by the floor; when a
     //    receipt corrects an earlier value, the later correction is the one to trust).
     //    Falls back to MIN(fecha_pago) only when no receipt has a valid declared date at
-    //    all. Verified against this migration's own worked example: Compro's pasivo goes
+    //    all. Verified against this migration's own worked example: that client RFC's pasivo goes
     //    to $540,922.80 and average tenure to ~4.57 years with this exact MAX()+floor
     //    combination -- MIN() over-collects the 1941 outlier's era and undershoots by
     //    ~$18k; no floor at all overshoots further.
@@ -1724,7 +1726,7 @@ pub async fn get_snapshot(pool: &DbPool, rfc: &str) -> anyhow::Result<PayrollSna
     // sides weighted by num_dias_pagados so a receipt covering more days counts for more.
     // Threshold is 1.15x: the normal registered/real gap observed platform-wide sits at
     // 1.04-1.08x (salary updates lag real pay by design, reviewed every two months); 1.15 is
-    // above that band and well below the anomalous 1.29-1.43x band this item found in Compro.
+    // above that band and well below the anomalous 1.29-1.43x band this item found in one client RFC.
     let salario_row = sqlx::query(
         r#"
         SELECT

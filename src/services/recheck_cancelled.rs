@@ -12,7 +12,7 @@
 //!    well past the 72h reversal window) — nothing ever looks at it again
 //!    once it's not flagged cancelled, so the cancellation is invisible and
 //!    it keeps inflating revenue for as long as it's counted. Confirmed
-//!    against 5 Nubarium invoices SAT already showed cancelled days before
+//!    against 5 invoices of one client RFC SAT already showed cancelled days before
 //!    this worker's own cancelled-only scan ran — they were never in its
 //!    candidate set to begin with, not a check that failed.
 //!

@@ -1,5 +1,5 @@
 //! Background worker: re-downloads the real XML for CFDIs permanently marked
-//! `xml_available = -1` — the corruption behind the Axented audit (ADC101206334):
+//! `xml_available = -1` — the corruption behind the PULSO-001 client audit:
 //! subtotal guessed as total/1.16 (wrong for anything not at the standard 16%
 //! rate), currency/tipo_cambio defaulted to MXN 1:1 regardless of the truth,
 //! and payroll detail (`cfdi_nomina`) simply absent, because none of that is
@@ -31,7 +31,7 @@ use std::sync::Arc;
 /// How often the worker wakes up.
 const REDOWNLOAD_POLL_SECS: u64 = 6 * 3600;
 /// Candidates pulled per cycle, across all RFCs — a large historical backlog
-/// (Axented: ~4,176) drains over several cycles rather than all at once.
+/// (the audited client RFC: ~4,176) drains over several cycles rather than all at once.
 const BATCH_LIMIT: i64 = 2000;
 /// UUIDs per single PHP `download` call. Bigger chunks amortize the SAT
 /// login better; kept well under SAT's daily download ceiling per attempt.

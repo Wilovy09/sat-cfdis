@@ -36,7 +36,9 @@ async fn check_rfc_access(
         .await
         .unwrap_or(false);
 
-    let rfc_access = crate::db::users::user_has_rfc_or_admin(pool, &user_id, rfc, is_admin)
+    // L19-01 point 2: membership is not enough -- the RFC's owner must have passed the SAT
+    // login with their own CIEC. Until then the RFC only shows its sync progress.
+    let rfc_access = crate::db::users::user_can_read_rfc_data(pool, &user_id, rfc, is_admin)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
     if !rfc_access {

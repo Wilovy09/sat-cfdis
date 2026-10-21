@@ -157,6 +157,22 @@ function makeScraper(
 }
 
 /**
+ * Emits {"__auth_ok__":true} the first time the SAT accepts this process's login (any
+ * successful listByDateTime() call, which logs in on first use). Rust uses it to mark the
+ * RFC's owner as verified when the login used that owner's own CIEC (L19-01).
+ */
+function reportSatLoginOk(): void
+{
+    static $reported = false;
+    if ($reported) {
+        return;
+    }
+    $reported = true;
+    echo json_encode(['__auth_ok__' => true]) . "\n";
+    flush();
+}
+
+/**
  * Writes a JSON error to stderr and exits with a non-zero code.
  */
 function outputError(string $message, int $code = 1): never
@@ -328,6 +344,7 @@ switch ($command) {
     // ----------------------------------------------------------------------
     // list-stream: emit one JSON line per invoice as it is found, day by day.
     // Last line: {"__done__":true,"total":N}
+    // {"__auth_ok__":true} once, after the first SAT call that passed the login.
     // Rust reads this as SSE and forwards to the browser in real time.
     // ----------------------------------------------------------------------
     case 'list-stream':
@@ -389,6 +406,7 @@ switch ($command) {
 
             try {
                 $dayList = $scraper->listByDateTime($dayQuery);
+                reportSatLoginOk();
                 foreach ($dayList as $metadata) {
                     $data = $metadata->getData();
                     $uuid = strtolower($data['uuid'] ?? '');
@@ -552,6 +570,7 @@ switch ($command) {
                     $lcQuery->setDownloadType($lcDlType);
                     try {
                         $lcList = $scraper->listByDateTime($lcQuery);
+                        reportSatLoginOk();
                         foreach ($lcList as $lcMeta) {
                             $lcData = $lcMeta->getData();
                             $lcTipo = $lcData['efectoComprobante'] ?? 'Desconocido';

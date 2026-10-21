@@ -70,3 +70,53 @@ pub async fn der_to_pem(
 
     Ok((cert_pem_path, key_pem_path))
 }
+
+/// How often the orphaned-FIEL sweep runs after its first pass at startup.
+const ORPHAN_SWEEP_INTERVAL_SECS: u64 = 3600;
+
+/// L18-06 / L19-03: deletes one RFC's stored FIEL -- its S3 files, then the row holding the
+/// encrypted password. Best-effort on S3 (logged, never blocks): the row goes regardless,
+/// and without it the files can't be used, since the password lives only there.
+pub async fn delete_stored(
+    pool: &crate::db::DbPool,
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    row: &crate::db::fiel::FielRow,
+) {
+    if !bucket.is_empty() {
+        for s3_key in [&row.cert_s3_key, &row.key_s3_key] {
+            if let Err(e) = crate::services::s3::delete_fiel(s3, bucket, s3_key).await {
+                tracing::warn!(rfc = %row.rfc, "FIEL delete: S3 delete failed (continuing): {e}");
+            }
+        }
+    }
+    match crate::db::fiel::delete(pool, &row.rfc).await {
+        Ok(true) => {
+            tracing::info!(rfc = %row.rfc, "Orphaned FIEL removed (RFC has no active owner)")
+        }
+        Ok(false) => {}
+        Err(e) => tracing::error!(rfc = %row.rfc, "FIEL delete: DB error: {e}"),
+    }
+}
+
+/// L19-03 point 2: removes every FIEL whose RFC is left without an active owner, however
+/// that happened -- the owner removing the RFC, an admin, a migration, or the owner's
+/// Adquiere account being deleted outside Pulso. Runs at startup, then hourly.
+pub async fn orphan_sweep_worker(
+    pool: crate::db::DbPool,
+    cfg: std::sync::Arc<crate::config::Config>,
+    s3: std::sync::Arc<aws_sdk_s3::Client>,
+) {
+    let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+    loop {
+        match crate::db::fiel::list_orphaned(&pool).await {
+            Ok(rows) => {
+                for row in &rows {
+                    delete_stored(&pool, &s3, &bucket, row).await;
+                }
+            }
+            Err(e) => tracing::error!("FIEL orphan sweep: DB error: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(ORPHAN_SWEEP_INTERVAL_SECS)).await;
+    }
+}

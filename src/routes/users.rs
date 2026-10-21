@@ -186,6 +186,27 @@ fn month_progress(
     months
 }
 
+/// L19-01 point 3: the months the sync grid may mark as holding data. Empty while the
+/// RFC's owner is unverified, so the grid reads like a brand-new RFC's instead of revealing
+/// which months Pulso already holds for it as someone else's counterparty. Fails closed.
+async fn grid_months_with_data(
+    pool: &DbPool,
+    rfc: &str,
+    direction: Option<&str>,
+) -> std::collections::HashSet<(i64, i64)> {
+    if !crate::db::users::is_owner_verified(pool, rfc)
+        .await
+        .unwrap_or(false)
+    {
+        return std::collections::HashSet::new();
+    }
+    let months = match direction {
+        Some(d) => crate::db::cfdis::months_with_data_direction(pool, rfc, d).await,
+        None => crate::db::cfdis::months_with_data(pool, rfc).await,
+    };
+    months.unwrap_or_default()
+}
+
 /// L6-13-adjacent fix: `months` (above) is direction-blind -- a month reads "done" the
 /// instant either emitidas or recibidas has one row, so an RFC downloaded on only one side
 /// still shows a fully "done" grid. Builds the same grid scoped to one direction: its own
@@ -198,9 +219,7 @@ async fn direction_months(
     range_from: &str,
     range_to: &str,
 ) -> Vec<serde_json::Value> {
-    let months_with_data = crate::db::cfdis::months_with_data_direction(pool, rfc, direction)
-        .await
-        .unwrap_or_default();
+    let months_with_data = grid_months_with_data(pool, rfc, Some(direction)).await;
     let job = crate::db::jobs::get_latest_for_rfc_direction(pool, rfc, direction)
         .await
         .ok()
@@ -297,6 +316,19 @@ async fn register_rfc(
     priority_analysis: Option<&str>,
     is_admin: bool,
 ) -> Result<Option<String>, HttpResponse> {
+    // L19-01 point 5: the SAT's generic RFCs aren't companies -- registering one would make
+    // its holder the "owner" of every counterparty invoice billed to the public or abroad.
+    if [
+        crate::services::analytics::summary::RFC_PUBLICO_GENERAL,
+        crate::services::analytics::summary::RFC_EXTRANJERO_GENERICO,
+    ]
+    .contains(&rfc.to_uppercase().as_str())
+    {
+        return Err(HttpResponse::BadRequest().json(ErrorBody {
+            error: "Ese RFC es genérico del SAT y no puede registrarse.".to_string(),
+        }));
+    }
+
     // L18-06 point 3: same limit in both entry points now (admin exempt).
     if !is_admin {
         let rfc_count = match crate::db::users::count_user_rfcs(pool, user_id).await {
@@ -654,6 +686,11 @@ pub async fn sync_status(
     // authenticated user, with no ownership/share/admin check at all. Deliberately NOT
     // check_rfc_access (routes::analytics) -- that also requires an active subscription,
     // and Perfil polls this route to surface a bad CIEC even for an unsubscribed owner.
+    // L19-01: membership only, also on purpose -- an unverified RFC still shows its sync
+    // progress; what it can't show (months with data) is gated in grid_months_with_data.
+    // L19-04: `error_msg` is always null -- it holds the SAT scraper's raw exception text.
+    // `error_code` carries what the UI acts on, and the frontend has its own wording per
+    // state for when the message is missing.
     if let Some(ref rfc) = specific_rfc {
         let is_admin = crate::db::users::is_user_admin(&pool, &user_id)
             .await
@@ -679,9 +716,7 @@ pub async fn sync_status(
         // so admin-queued jobs and paused syncs are always surfaced correctly.
         match crate::db::jobs::get_active_for_rfc(&pool, rfc).await {
             Ok(Some(active_job)) => {
-                let months_with_data = crate::db::cfdis::months_with_data(&pool, rfc)
-                    .await
-                    .unwrap_or_default();
+                let months_with_data = grid_months_with_data(&pool, rfc, None).await;
                 let (range_from, range_to) = crate::db::jobs::rfc_job_range(&pool, rfc)
                     .await
                     .ok()
@@ -715,7 +750,7 @@ pub async fn sync_status(
                     "period_from":        range_from,
                     "period_to":          range_to,
                     "error_code":         active_job.error_code,
-                    "error_msg":          active_job.error_msg,
+                    "error_msg":          serde_json::Value::Null,
                     "months":             months,
                     "months_emitidos":    months_emitidos,
                     "months_recibidos":   months_recibidos,
@@ -770,9 +805,7 @@ pub async fn sync_status(
 
     match crate::db::jobs::get_by_id(&pool, &job_id).await {
         Ok(Some(job)) => {
-            let months_with_data = crate::db::cfdis::months_with_data(&pool, &job.rfc)
-                .await
-                .unwrap_or_default();
+            let months_with_data = grid_months_with_data(&pool, &job.rfc, None).await;
             let (range_from, range_to) = crate::db::jobs::rfc_job_range(&pool, &job.rfc)
                 .await
                 .ok()
@@ -804,7 +837,7 @@ pub async fn sync_status(
                 "period_from":        range_from,
                 "period_to":          range_to,
                 "error_code":         job.error_code,
-                "error_msg":          job.error_msg,
+                "error_msg":          serde_json::Value::Null,
                 "months":             months,
                 "months_emitidos":    months_emitidos,
                 "months_recibidos":   months_recibidos,
@@ -1248,24 +1281,14 @@ pub async fn delete_rfc_handler(
     }
 }
 
-/// L18-06 points 5/6: deletes a now-ownerless RFC's FIEL (S3 files + encrypted password),
-/// best-effort on S3 (logs and continues on failure, same as routes::fiel::delete) so a
-/// transient S3 error never blocks the RFC deletion itself.
+/// L18-06 points 5/6: deletes a now-ownerless RFC's FIEL, if it has one.
 async fn delete_orphaned_fiel(pool: &DbPool, s3: &aws_sdk_s3::Client, cfg: &Config, rfc: &str) {
-    let bucket = cfg.s3_bucket.clone().unwrap_or_default();
-    if !bucket.is_empty() {
-        for s3_key in [
-            format!("fiel/{rfc}/cert.cer"),
-            format!("fiel/{rfc}/key.key"),
-        ] {
-            if let Err(e) = crate::services::s3::delete_fiel(s3, &bucket, &s3_key).await {
-                tracing::warn!(rfc = %rfc, "delete_orphaned_fiel: S3 delete failed (continuing): {e}");
-            }
+    match crate::db::fiel::get(pool, rfc).await {
+        Ok(Some(row)) => {
+            let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+            crate::services::fiel::delete_stored(pool, s3, &bucket, &row).await;
         }
-    }
-    match crate::db::fiel::delete(pool, rfc).await {
-        Ok(true) => tracing::info!(rfc = %rfc, "Orphaned FIEL removed (RFC has no active owner)"),
-        Ok(false) => {}
+        Ok(None) => {}
         Err(e) => tracing::error!(rfc = %rfc, "delete_orphaned_fiel: DB error: {e}"),
     }
 }

@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::db::DbPool;
+use crate::errors::GENERIC_INTERNAL_ERROR;
 use crate::services::crypto;
 use crate::services::session;
 
@@ -53,8 +54,9 @@ pub async fn upload(
         let mut field = match item {
             Ok(f) => f,
             Err(e) => {
+                tracing::warn!(user_id = %user_id, "FIEL upload: multipart read failed: {e}");
                 return HttpResponse::BadRequest()
-                    .json(serde_json::json!({"error": e.to_string()}));
+                    .json(serde_json::json!({"error": GENERIC_INTERNAL_ERROR}));
             }
         };
 
@@ -64,8 +66,9 @@ pub async fn upload(
             match chunk {
                 Ok(bytes) => data.extend_from_slice(&bytes),
                 Err(e) => {
+                    tracing::warn!(user_id = %user_id, "FIEL upload: multipart chunk failed: {e}");
                     return HttpResponse::BadRequest()
-                        .json(serde_json::json!({"error": e.to_string()}));
+                        .json(serde_json::json!({"error": GENERIC_INTERNAL_ERROR}));
                 }
             }
         }

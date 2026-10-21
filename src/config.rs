@@ -1,5 +1,22 @@
 use std::env;
 
+/// L18-03/L19-02: minimum length for both session-signing keys.
+const MIN_JWT_SECRET_LEN: usize = 32;
+
+/// Every placeholder secret in `.env.example` starts with this. An environment built by
+/// copying that file would otherwise start with a publicly known signing key, since the
+/// `JWT_SECRET` placeholder is long enough to pass the length check on its own.
+const PLACEHOLDER_SECRET_PREFIX: &str = "CHANGE_ME";
+
+/// Why the server refuses to start with the secrets it was given.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SecretConfigError {
+    #[error("{0} is missing or shorter than {MIN_JWT_SECRET_LEN} characters")]
+    TooShort(&'static str),
+    #[error("{0} still holds the .env.example placeholder value")]
+    Placeholder(&'static str),
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub host: String,
@@ -50,8 +67,10 @@ pub struct Config {
     /// test suites that call `Config::from_env()` directly don't need the variable set.
     pub jwt_secret: String,
     /// L18-02: verifies a session token the Adquiere API issued (email register/login) --
-    /// see services::session for why this can't reuse `jwt_secret`. `None` (unset)
-    /// means that issuer's tokens are rejected, not trusted by default.
+    /// see services::session for why this can't reuse `jwt_secret`. `None` (unset or
+    /// empty) means that issuer's tokens are rejected, not trusted by default. An empty
+    /// value must never reach the verifier as `Some("")`: HS256 accepts an empty key, so
+    /// anyone could sign a token that verifies against it.
     pub adquiere_jwt_secret: Option<String>,
     #[allow(dead_code)]
     pub app_base_url: String,
@@ -131,11 +150,102 @@ impl Config {
                 .trim()
                 .to_string(),
             jwt_secret: env::var("JWT_SECRET").unwrap_or_default(),
-            adquiere_jwt_secret: env::var("ADQUIERE_JWT_SECRET").ok(),
+            adquiere_jwt_secret: env::var("ADQUIERE_JWT_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
             app_base_url: env::var("APP_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),
             pm2_app_name: env::var("PM2_APP_NAME").unwrap_or_else(|_| "pulso-backend".to_string()),
             admin_logs_key: env::var("ADMIN_LOGS_KEY").ok().filter(|s| !s.is_empty()),
         }
+    }
+
+    /// Checks the signing secrets before the server accepts any traffic. Called from
+    /// `main()` rather than `from_env()` so the test suites that build a `Config` without
+    /// these variables keep working.
+    ///
+    /// L19-02: both keys get the same treatment -- missing, empty, shorter than
+    /// `MIN_JWT_SECRET_LEN`, or still the `.env.example` placeholder all refuse startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first secret that is missing, too short, or still the placeholder from
+    /// `.env.example`.
+    pub fn validate_secrets(&self) -> Result<(), SecretConfigError> {
+        let secrets = [
+            ("JWT_SECRET", Some(self.jwt_secret.as_str())),
+            ("ADQUIERE_JWT_SECRET", self.adquiere_jwt_secret.as_deref()),
+        ];
+        for (name, value) in secrets {
+            let value = value.unwrap_or_default();
+            if value.len() < MIN_JWT_SECRET_LEN {
+                return Err(SecretConfigError::TooShort(name));
+            }
+            if value.starts_with(PLACEHOLDER_SECRET_PREFIX) {
+                return Err(SecretConfigError::Placeholder(name));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod validate_secrets_tests {
+    use super::*;
+
+    const REAL_SECRET: &str = "a-real-random-secret-that-is-long-enough-123";
+    const OTHER_REAL_SECRET: &str = "another-real-random-secret-long-enough-456";
+    const JWT_PLACEHOLDER: &str = "CHANGE_ME_to_a_real_random_secret_at_least_32_chars_long";
+
+    fn cfg_with(jwt_secret: &str, adquiere_jwt_secret: Option<&str>) -> Config {
+        let mut cfg = Config::from_env();
+        cfg.jwt_secret = jwt_secret.to_string();
+        cfg.adquiere_jwt_secret = adquiere_jwt_secret.map(str::to_string);
+        cfg
+    }
+
+    #[test]
+    fn accepts_real_secrets() {
+        assert_eq!(
+            cfg_with(REAL_SECRET, Some(OTHER_REAL_SECRET)).validate_secrets(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_a_short_jwt_secret() {
+        assert_eq!(
+            cfg_with("too-short", Some(OTHER_REAL_SECRET)).validate_secrets(),
+            Err(SecretConfigError::TooShort("JWT_SECRET"))
+        );
+    }
+
+    #[test]
+    fn rejects_an_unset_adquiere_secret() {
+        assert_eq!(
+            cfg_with(REAL_SECRET, None).validate_secrets(),
+            Err(SecretConfigError::TooShort("ADQUIERE_JWT_SECRET"))
+        );
+    }
+
+    #[test]
+    fn rejects_a_short_adquiere_secret() {
+        assert_eq!(
+            cfg_with(REAL_SECRET, Some("short")).validate_secrets(),
+            Err(SecretConfigError::TooShort("ADQUIERE_JWT_SECRET"))
+        );
+    }
+
+    #[test]
+    fn rejects_the_env_example_placeholder_despite_its_length() {
+        assert!(JWT_PLACEHOLDER.len() >= MIN_JWT_SECRET_LEN);
+        assert_eq!(
+            cfg_with(JWT_PLACEHOLDER, Some(OTHER_REAL_SECRET)).validate_secrets(),
+            Err(SecretConfigError::Placeholder("JWT_SECRET"))
+        );
+        assert_eq!(
+            cfg_with(REAL_SECRET, Some(JWT_PLACEHOLDER)).validate_secrets(),
+            Err(SecretConfigError::Placeholder("ADQUIERE_JWT_SECRET"))
+        );
     }
 }

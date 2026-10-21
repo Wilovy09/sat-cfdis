@@ -15,7 +15,7 @@
 //!    overall run. This one can't be detected from `sync_jobs` metadata at
 //!    all; the only signal is the data itself being suspiciously empty.
 //!
-//! Both were confirmed against a day-by-day reference report for Nubarium
+//! Both were confirmed against a day-by-day reference report for one client RFC
 //! (2023-06-28, 2023-12-29, 2024-10-25, 2024-12-02): the 2024-10-25 gap traced
 //! to three consecutive `captcha_failed` job failures over Sep-Nov 2024; the
 //! others sat inside ranges Pulso already considered fully synced.
@@ -122,7 +122,7 @@ async fn requeue_failed_jobs(
         // Trusting cursor_date there computed next_day(period_from) >
         // period_to for every single-day job that failed immediately,
         // which read as "fully covered" and gave up without ever retrying —
-        // confirmed against 163 jobs platform-wide (129 on ALA2409253U7
+        // confirmed against 163 jobs platform-wide (129 on a single client RFC
         // alone) that failed with found=0 and were marked superseded despite
         // covering zero real days. When found = 0, ignore cursor_date
         // entirely and restart from period_from.
@@ -235,7 +235,7 @@ async fn scan_activity_gaps(
 
         for gap in &gap_days {
             let day = &gap.day;
-            // A day can be a gap on only one side (Nubarium 2024-08-15/22:
+            // A day can be a gap on only one side (one client RFC, 2024-08-15/22:
             // 9 and 23 emitidas that day, zero recibidas) — resync just the
             // missing side instead of "ambos" so a healthy side's real
             // invoices aren't redundantly re-fetched every time.

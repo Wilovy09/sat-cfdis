@@ -61,7 +61,7 @@ pub async fn get(
     // Infonavit, nor the generic RFCs, on either clientes or proveedores. Reverts L10-10's
     // resolution (which excluded them by exact RFC match). Two things changed the decision:
     // a prefix-based version of that filter (`isRegulatory` on the frontend, before L10-10)
-    // was already misclassifying a real company (`IMS2003263P4`, a manufacturing supplier)
+    // was already misclassifying a real company (a manufacturing supplier whose RFC starts with `IMS`)
     // as a regulatory authority just for its RFC prefix, and the symmetric risk was worse --
     // el RFC de prueba's single largest supplier (18.85% of spend) has an RFC starting with
     // `SAT`, so any future "for consistency" prefix rule would silently disappear it. Product

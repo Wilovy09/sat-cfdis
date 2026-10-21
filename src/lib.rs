@@ -49,4 +49,8 @@ pub mod services {
     // belongs where data actually lands, not at job-complete before the ETL runs). Only
     // depends on `crate::db::DbPool`, no binary-only dependency.
     pub mod response_cache;
+    // L19-06 point 5: reconstruct_concepts refreshes the nómina view (and, through it, the
+    // response cache) when it finishes. Depends only on `crate::db::DbPool` and
+    // `response_cache` above.
+    pub mod nomina_refresh;
 }
