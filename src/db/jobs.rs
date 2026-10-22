@@ -108,6 +108,16 @@ fn fmt_unix(secs: u64) -> String {
     )
 }
 
+/// ISO-8601 UTC timestamp `ago_secs` seconds before now, same format as `now_utc`.
+pub fn utc_ago(ago_secs: u64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    fmt_unix(secs.saturating_sub(ago_secs))
+}
+
 /// Return ISO-8601 UTC timestamp `offset_secs` seconds from now.
 pub fn utc_offset(offset_secs: u64) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -783,26 +793,105 @@ pub async fn get_invoices(
 /// the same day. A real bad-credential state fails every attempt, not one in
 /// ten; this is `accessPortalMainPage()`'s exact-string check
 /// (`RFC Autenticado: <rfc>`) occasionally missing on an otherwise-successful
-/// login, not the account being unregistered. Still excludes
-/// `invalid_credentials` / `fiel_login_failed`, which the SAT login POST
-/// itself rejects immediately — those really do need a human to fix.
+/// login, not the account being unregistered. `fiel_login_failed` is still
+/// excluded -- a rejected certificate doesn't recover on its own.
+///
+/// `invalid_credentials` is retried too, but only for an RFC whose owner is verified (its
+/// CIEC has passed the SAT login before) and only once the failure is
+/// `CREDENTIAL_RETRY_SPACING_SECS` old, so the `max_retries` attempts land at different
+/// moments. The SAT rejects a valid CIEC sporadically mid-run (two client RFCs' historical
+/// recibidos died this way while the same CIEC worked the day before and after); an owner
+/// who has never passed the login gets no retries -- nothing suggests the CIEC ever worked.
 pub async fn find_failed_retryable(
     pool: &PgPool,
     max_retries: i32,
     limit: i64,
 ) -> Result<Vec<SyncJob>, sqlx::Error> {
+    let spaced_before = utc_ago(CREDENTIAL_RETRY_SPACING_SECS);
     sqlx::query_as::<_, SyncJob>(
-        r#"SELECT * FROM pulso.sync_jobs
-           WHERE status = 'failed'
-             AND superseded_by IS NULL
-             AND gap_retry_count < $1
-             AND (error_code IS NULL OR error_code IN ('captcha_failed', 'sat_connection_error', 'rate_limited', 'unknown_error', 'login_not_registered'))
-           ORDER BY created_at ASC
+        r#"SELECT * FROM pulso.sync_jobs j
+           WHERE j.status = 'failed'
+             AND j.superseded_by IS NULL
+             AND j.gap_retry_count < $1
+             AND (j.error_code IS NULL
+                  OR j.error_code IN ('captcha_failed', 'sat_connection_error', 'rate_limited', 'unknown_error', 'login_not_registered')
+                  OR (j.error_code = 'invalid_credentials'
+                      AND j.updated_at < $3
+                      AND EXISTS (SELECT 1 FROM pulso.users u
+                                  WHERE u.rfc = j.rfc AND u.deleted_at IS NULL
+                                    AND u.verified_at IS NOT NULL)))
+           ORDER BY j.created_at ASC
            LIMIT $2"#,
     )
     .bind(max_retries)
     .bind(limit)
+    .bind(spaced_before)
     .fetch_all(pool)
+    .await
+}
+
+/// Fresh continuations a failed job gets from the gap detector (`gap_retry_count` cap) --
+/// a persistently broken RFC (revoked credentials, deleted FIEL) isn't restarted forever.
+/// Shared with the credential-rejection rules below so "retries exhausted" means the same
+/// thing everywhere.
+pub const MAX_FAILED_JOB_RETRIES: i32 = 3;
+
+/// Minimum age of an `invalid_credentials` failure before it is retried -- spreads the
+/// attempts over the day instead of three logins in a row (UX-4: confirm with several
+/// attempts that it isn't a sporadic rejection).
+const CREDENTIAL_RETRY_SPACING_SECS: u64 = 2 * 3600;
+
+/// Error codes that mean the SAT rejected the stored credential.
+pub const CREDENTIAL_ERROR_CODES: [&str; 3] = [
+    "invalid_credentials",
+    "login_not_registered",
+    "fiel_login_failed",
+];
+
+/// Whether a credential rejection on this job is final -- the owner must update it -- or
+/// will still be retried automatically: final once the owner has never passed the SAT
+/// login (nothing to retry against) or the job already used up its continuations.
+pub async fn credential_rejection_is_final(
+    pool: &PgPool,
+    job_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT j.error_code = 'fiel_login_failed'
+                  OR j.gap_retry_count >= $2
+                  OR NOT EXISTS (SELECT 1 FROM pulso.users u
+                                 WHERE u.rfc = j.rfc AND u.deleted_at IS NULL
+                                   AND u.verified_at IS NOT NULL)
+           FROM pulso.sync_jobs j WHERE j.id = $1"#,
+    )
+    .bind(job_id)
+    .bind(MAX_FAILED_JOB_RETRIES)
+    .fetch_one(pool)
+    .await
+}
+
+/// The last job of a chain of gap-detector continuations (`superseded_by`), starting at
+/// `job_id` -- the job that actually tells how that range ended. `n/a-fully-covered` is a
+/// marker, not a job id, so the chain stops before it.
+pub async fn resolve_continuation_chain(
+    pool: &PgPool,
+    job_id: &str,
+) -> Result<Option<SyncJob>, sqlx::Error> {
+    sqlx::query_as::<_, SyncJob>(
+        r#"WITH RECURSIVE chain AS (
+               SELECT j.*, 0 AS depth FROM pulso.sync_jobs j WHERE j.id = $1
+               UNION ALL
+               SELECT n.*, c.depth + 1 FROM pulso.sync_jobs n
+               JOIN chain c ON n.id = c.superseded_by
+               WHERE c.depth < 20
+           )
+           SELECT id, job_type, rfc, auth_type, auth_enc, dl_type, period_from, period_to,
+                  cursor_date, found, total_expected, count_progress, count_cursor_date,
+                  status, error_code, error_msg, resume_at, retry_count, gap_retry_count,
+                  superseded_by, created_at, updated_at
+           FROM chain ORDER BY depth DESC LIMIT 1"#,
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
     .await
 }
 
@@ -906,6 +995,24 @@ pub async fn set_gap_scan_progress(
     Ok(())
 }
 
+/// Pulso_Propuestas_Integridad_Descarga_RFC.md 3.2.3: where the gap scan must go back to
+/// because a job completed after the last scan covering days the cursor had already
+/// passed (a historical job finishing after the cursor moved on to recent dates left its
+/// whole range unscanned). `None` when nothing new sits behind the cursor.
+pub async fn gap_scan_rewind_from(pool: &PgPool, rfc: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT MIN(LEFT(j.period_from, 10))
+           FROM pulso.sync_jobs j
+           JOIN pulso.gap_scan_progress g ON g.rfc = j.rfc
+           WHERE j.rfc = $1 AND j.status = 'completed'
+             AND j.updated_at > g.updated_at
+             AND LEFT(j.period_from, 10) <= g.last_scanned_date"#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await
+}
+
 /// Earliest day this RFC has a completed sync for — where a never-before-scanned
 /// RFC's gap scan should start from.
 pub async fn earliest_completed_period_from(
@@ -920,19 +1027,13 @@ pub async fn earliest_completed_period_from(
     .await
 }
 
-/// Weekdays in `[start_day, end_day]` that fall inside one of this RFC's
-/// `completed` job ranges yet have zero CFDIs (either side, any type) on
-/// that calendar day. Restricted to weekdays because every confirmed real
-/// gap so far (2023-06-28, 2023-12-29, 2024-10-25, 2024-12-02) landed on one —
-/// B2B invoicing is overwhelmingly a business-day activity for this kind of
-/// RFC, so weekends would otherwise dominate as false positives. Returns
-/// dates as "YYYY-MM-DD".
-/// A weekday inside a `completed` job's range where at least one side
-/// (emitidas or recibidas) has zero CFDIs. `emit_gap`/`recv_gap` say which
-/// side(s) — a day can be a gap on only one side, e.g. one client RFC on
-/// 2024-08-15/22 had 9 and 23 emitidas that day but zero recibidas.
-/// Checking combined activity (either side present = "not a gap") missed
-/// these entirely; each side needs its own zero-check.
+/// Saturdays (or Sundays) with CFDIs on a side in the last year -- 75 % of them -- before
+/// the gap scan treats that side's empty Saturdays (Sundays) as possible gaps. Measured on
+/// the test base: the one RFC that really invoices on Saturdays did so on 42 of 52; every
+/// other RFC x side x day stayed at 37 or fewer, and a looser bar (12 weekend days) would
+/// have queued a resync for almost every empty Saturday of that RFC's history.
+const WEEKEND_ACTIVE_MIN_DAYS: i64 = 39;
+
 #[derive(Debug)]
 pub struct ActivityGapDay {
     pub day: String,
@@ -940,6 +1041,19 @@ pub struct ActivityGapDay {
     pub recv_gap: bool,
 }
 
+/// Days in `[start_day, end_day]` where one side (emitidas or recibidas) has zero CFDIs
+/// although a `completed` job covered that side that day. `emit_gap`/`recv_gap` say which
+/// side(s) -- a day can be a gap on only one side, e.g. one client RFC on 2024-08-15/22 had
+/// 9 and 23 emitidas that day but zero recibidas. Returns dates as "YYYY-MM-DD".
+///
+/// Pulso_Propuestas_Integridad_Descarga_RFC.md 3.2.3:
+/// - Coverage is per direction: a completed emitidos job doesn't vouch for recibidos (a
+///   failed historical recibidos job sat under completed emitidos ones, unseen).
+/// - A Saturday (Sunday) counts for a side when the RFC routinely works that day on that
+///   side -- `WEEKEND_ACTIVE_MIN_DAYS` of them with CFDIs in the year before `end_day`.
+///   Weekdays-only (every confirmed gap until then fell on one) missed a Saturday emitido
+///   of an RFC that invoices on Saturdays; checking every weekend for every RFC would flood
+///   the queue with resyncs of days that are legitimately empty.
 pub async fn find_activity_gap_days(
     pool: &PgPool,
     rfc: &str,
@@ -949,17 +1063,33 @@ pub async fn find_activity_gap_days(
     use sqlx::Row;
     let rows = sqlx::query(
         r#"
-        WITH weekdays AS (
-            SELECT d::date AS day
+        WITH days AS (
+            SELECT d::date AS day, EXTRACT(ISODOW FROM d)::int AS dow
             FROM generate_series($2::date, $3::date, interval '1 day') d
-            WHERE EXTRACT(ISODOW FROM d) BETWEEN 1 AND 5
+        ),
+        -- Which weekend days (6 = Saturday, 7 = Sunday) each side routinely works.
+        weekend_active AS (
+            SELECT w.dow,
+                   COUNT(DISTINCT c.fecha_emision::date) FILTER (WHERE c.rfc_emisor = $1)
+                       >= $4 AS emit,
+                   COUNT(DISTINCT c.fecha_emision::date) FILTER (WHERE c.rfc_receptor = $1)
+                       >= $4 AS recv
+            FROM (VALUES (6), (7)) w(dow)
+            LEFT JOIN pulso.cfdis_raw c
+              ON (c.rfc_emisor = $1 OR c.rfc_receptor = $1)
+             AND EXTRACT(ISODOW FROM c.fecha_emision::date) = w.dow
+             AND c.fecha_emision::date BETWEEN $3::date - 365 AND $3::date
+            GROUP BY w.dow
         ),
         covered AS (
-            SELECT DISTINCT w.day
-            FROM weekdays w
+            SELECT d.day, d.dow,
+                   bool_or(j.dl_type IN ('emitidos', 'ambos'))  AS emit_covered,
+                   bool_or(j.dl_type IN ('recibidos', 'ambos')) AS recv_covered
+            FROM days d
             JOIN pulso.sync_jobs j
               ON j.rfc = $1 AND j.status = 'completed'
-             AND w.day BETWEEN j.period_from::date AND j.period_to::date
+             AND d.day BETWEEN j.period_from::date AND j.period_to::date
+            GROUP BY d.day, d.dow
         ),
         emit_activity AS (
             SELECT fecha_emision::date AS day, COUNT(*) AS cnt
@@ -974,21 +1104,28 @@ pub async fn find_activity_gap_days(
             WHERE rfc_receptor = $1
               AND fecha_emision::date BETWEEN $2::date AND $3::date
             GROUP BY fecha_emision::date
+        ),
+        flagged AS (
+            SELECT c.day,
+                   c.emit_covered AND (c.dow < 6 OR COALESCE(w.emit, false))
+                       AND COALESCE(e.cnt, 0) = 0 AS emit_gap,
+                   c.recv_covered AND (c.dow < 6 OR COALESCE(w.recv, false))
+                       AND COALESCE(r.cnt, 0) = 0 AS recv_gap
+            FROM covered c
+            LEFT JOIN weekend_active w ON w.dow = c.dow
+            LEFT JOIN emit_activity e ON e.day = c.day
+            LEFT JOIN recv_activity r ON r.day = c.day
         )
-        SELECT
-            to_char(c.day, 'YYYY-MM-DD') AS day,
-            COALESCE(e.cnt, 0) = 0 AS emit_gap,
-            COALESCE(r.cnt, 0) = 0 AS recv_gap
-        FROM covered c
-        LEFT JOIN emit_activity e ON e.day = c.day
-        LEFT JOIN recv_activity r ON r.day = c.day
-        WHERE COALESCE(e.cnt, 0) = 0 OR COALESCE(r.cnt, 0) = 0
-        ORDER BY c.day
+        SELECT to_char(day, 'YYYY-MM-DD') AS day, emit_gap, recv_gap
+        FROM flagged
+        WHERE emit_gap OR recv_gap
+        ORDER BY day
         "#,
     )
     .bind(rfc)
     .bind(start_day)
     .bind(end_day)
+    .bind(WEEKEND_ACTIVE_MIN_DAYS)
     .fetch_all(pool)
     .await?;
     Ok(rows

@@ -429,3 +429,49 @@ pub async fn send_sync_complete(
 
     Ok(())
 }
+
+/// Internal alert to the Pulso team (Pulso_Propuestas_Integridad_Descarga_RFC.md, 3.2.5):
+/// an RFC whose download can't finish on its own -- credential confirmed rejected, or a
+/// month that still doesn't reconcile against the SAT after every automatic attempt.
+/// Plain text, no client data beyond the RFC itself.
+pub async fn send_internal_alert(
+    api_key: &str,
+    from_email: &str,
+    to_email: &str,
+    subject: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    let body = json!({
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": from_email, "name": "Pulso alertas"},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": text}]
+    });
+
+    let response = reqwest::Client::new()
+        .post("https://api.sendgrid.com/v3/mail/send")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        anyhow::bail!("SendGrid returned {status}: {text}");
+    }
+    Ok(())
+}
+
+/// Logs an internal alert and, when `INTERNAL_ALERT_EMAIL` and SendGrid are configured,
+/// emails it to the team. Best-effort: a failed send is logged, never propagated.
+pub async fn alert_team(cfg: &crate::config::Config, subject: &str, text: &str) {
+    tracing::error!(alert = %subject, "{text}");
+    let (Some(api_key), Some(to)) = (&cfg.sendgrid_api_key, &cfg.internal_alert_email) else {
+        return;
+    };
+    if let Err(e) = send_internal_alert(api_key, &cfg.sendgrid_from, to, subject, text).await {
+        tracing::warn!("Internal alert email failed: {e}");
+    }
+}

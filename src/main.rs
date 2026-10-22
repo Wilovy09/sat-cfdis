@@ -172,7 +172,12 @@ fn is_sat_login_ok(line: &serde_json::Value) -> bool {
 /// How often the worker wakes up to check for resumable jobs (seconds).
 const WORKER_POLL_SECS: u64 = 30;
 
-async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>) {
+async fn resume_worker(
+    pool: DbPool,
+    cfg: Arc<Config>,
+    s3_client: Arc<S3Client>,
+    counting: services::reconciliation::CountingRfcs,
+) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(WORKER_POLL_SECS)).await;
 
@@ -225,6 +230,17 @@ async fn resume_worker(pool: DbPool, cfg: Arc<Config>, s3_client: Arc<S3Client>)
                         continue;
                     }
                 }
+            }
+
+            // The reconciliation worker has a SAT counting session open for this RFC; a
+            // second concurrent login would make the SAT reset one of them. Picked up on
+            // the next poll.
+            if counting
+                .lock()
+                .map(|set| set.contains(&job.rfc))
+                .unwrap_or(false)
+            {
+                continue;
             }
 
             let label = if job.status == "queued" {
@@ -378,6 +394,11 @@ fn next_day(date_str: &str) -> String {
 
 /// How often the daily worker wakes to check whether yesterday has been synced (1 h).
 const DAILY_POLL_SECS: u64 = 3600;
+/// Mexico's central time (UTC-6, no daylight saving since 2022).
+const MEXICO_UTC_OFFSET_SECS: u64 = 6 * 3600;
+/// Extra days each auto_daily job looks back, to pick up CFDIs stamped after their day was
+/// already requested.
+const DAILY_LOOKBACK_DAYS: u64 = 2;
 
 /// Every day, queue a one-day sync job for yesterday for every registered user
 /// whose credentials are stored and whose yesterday period hasn't been synced yet.
@@ -386,47 +407,26 @@ async fn daily_sync_worker(pool: DbPool) {
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
     loop {
-        // Yesterday in UTC (seconds-since-epoch - 86400, then format as date).
-        let yesterday_secs = {
+        // Pulso_Propuestas_Integridad_Descarga_RFC.md 3.5: "yesterday" in Mexico time, not
+        // UTC -- in UTC the day rolled over at 18:00 local, so a day was requested while it
+        // was still running. And the window reaches DAILY_LOOKBACK_DAYS further back: a CFDI
+        // stamped late (the SAT allows up to 72 h) after its day was requested was never
+        // looked for again -- 4 emitidos of one client RFC in a single month went missing so.
+        let now_secs = {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs()
-                .saturating_sub(86400)
         };
-        let (yy, ym, yd) = {
-            // Gregorian calendar from epoch seconds (no external crate needed).
-            let days = yesterday_secs / 86400;
-            let mut y = 1970u32;
-            let mut d = days as u32;
-            loop {
-                let dy = if (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
-                {
-                    366
-                } else {
-                    365
-                };
-                if d < dy {
-                    break;
-                }
-                d -= dy;
-                y += 1;
-            }
-            let mut m = 1u32;
-            loop {
-                let dm = days_in_month(y, m);
-                if d < dm {
-                    break;
-                }
-                d -= dm;
-                m += 1;
-            }
-            (y, m, d + 1)
-        };
+        let mexico_yesterday_secs = now_secs.saturating_sub(MEXICO_UTC_OFFSET_SECS + 86400);
+        let yesterday = services::gap_detector::ymd_from_epoch_secs(mexico_yesterday_secs);
+        let window_start = services::gap_detector::ymd_from_epoch_secs(
+            mexico_yesterday_secs.saturating_sub(DAILY_LOOKBACK_DAYS * 86400),
+        );
 
-        let period_from = format!("{yy:04}-{ym:02}-{yd:02} 00:00:00");
-        let period_to = format!("{yy:04}-{ym:02}-{yd:02} 23:59:59");
+        let period_from = format!("{window_start} 00:00:00");
+        let period_to = format!("{yesterday} 23:59:59");
 
         let users = match db::users::get_all_with_credentials(&pool).await {
             Ok(u) => u,
@@ -518,7 +518,7 @@ async fn daily_sync_worker(pool: DbPool) {
                     tracing::info!(
                         rfc = %rfc,
                         job_id = %job_id,
-                        date = %format!("{yy:04}-{ym:02}-{yd:02}"),
+                        date = %yesterday,
                         "Daily auto-sync queued"
                     );
                 }
@@ -592,6 +592,8 @@ const PHP_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
 /// Run the list-count PHP pass and return the total invoice count.
 /// Only counts complete calendar months within the period.
 /// Returns None on any failure (count is best-effort; stream will run regardless).
+/// The per-month counts it gathers are kept for the RFC's reconciliation against the SAT
+/// (services::reconciliation) -- one SAT pass serves both.
 #[allow(clippy::too_many_arguments)]
 async fn run_count_pass(
     pool: &DbPool,
@@ -604,93 +606,39 @@ async fn run_count_pass(
     period_to: &str,
     dl_type: &str,
 ) -> Option<i64> {
-    use std::process::Stdio;
-    use tokio::io::AsyncBufReadExt as _;
-    use tokio::io::AsyncWriteExt as _;
-
-    let payload = serde_json::json!({
-        "command": "list-count",
-        "auth":    auth_payload,
-        "params": {
-            "period_from":   period_from,
-            "period_to":     period_to,
-            "download_type": dl_type,
-        }
+    let (login_tx, login_rx) = tokio::sync::oneshot::channel::<()>();
+    let login_ok = own_ciec.map(|ciec| {
+        let pool = pool.clone();
+        let rfc = job_rfc.to_string();
+        let ciec = ciec.to_string();
+        tokio::spawn(async move {
+            if login_rx.await.is_ok() {
+                verify_owner_after_sat_login(&pool, &rfc, &ciec).await;
+            }
+        });
+        login_tx
     });
 
-    let mut input_bytes = serde_json::to_vec(&payload).ok()?;
-    input_bytes.push(b'\n');
-
-    let mut cmd = tokio::process::Command::new(&cfg.php_bin);
-    cmd.arg(&cfg.php_cli_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    if let Some(ref proxy) = cfg.https_proxy {
-        cmd.env("HTTPS_PROXY", proxy).env("https_proxy", proxy);
+    let count = services::reconciliation::run_list_count(
+        cfg,
+        auth_payload,
+        period_from,
+        period_to,
+        dl_type,
+        Some(services::reconciliation::CountProgress { pool, job_id }),
+        login_ok,
+    )
+    .await?;
+    if let Some(code) = &count.auth_error {
+        tracing::warn!(job_id = %job_id, code = %code, "list-count stopped: SAT login rejected");
+        return None;
     }
-
-    let mut child = cmd.spawn().ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&input_bytes).await;
+    if !count.error_days.is_empty() {
+        // Still fine as the progress bar's denominator; reconciliation won't trust it.
+        tracing::warn!(job_id = %job_id, months = count.error_days.len(), "list-count: some days went unanswered, total may be short");
     }
-
-    let stdout = child.stdout.take()?;
-    let mut lines = tokio::io::BufReader::new(stdout).lines();
-
-    let mut total: Option<i64> = None;
-    let mut pending_ciec = own_ciec;
-    loop {
-        let next = tokio::time::timeout(
-            std::time::Duration::from_secs(PHP_IDLE_TIMEOUT_SECS),
-            lines.next_line(),
-        )
-        .await;
-        let line = match next {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => break,
-            Ok(Err(_)) => break,
-            Err(_) => {
-                tracing::error!("list-count: PHP worker idle timeout, killing");
-                let _ = child.start_kill();
-                break;
-            }
-        };
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-            if is_sat_login_ok(&val) {
-                if let Some(ciec) = pending_ciec.take() {
-                    verify_owner_after_sat_login(pool, job_rfc, ciec).await;
-                }
-                continue;
-            }
-            if val
-                .get("__keepalive__")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                let total_so_far = val["total_so_far"].as_i64().unwrap_or(0);
-                let date = val["date"].as_str().unwrap_or("?");
-                tracing::info!(
-                    job_id = %job_id,
-                    date,
-                    total_so_far,
-                    "list-count progress"
-                );
-                let _ = db::jobs::update_count_progress(pool, job_id, total_so_far, date).await;
-                continue;
-            }
-            if val.get("__count__").is_some() {
-                total = val["total"].as_i64();
-                break;
-            }
-        }
-    }
-
-    let _ = child.wait().await;
-    total
+    count.record(pool, job_rfc).await;
+    Some(count.total)
 }
 
 /// Emails the client when their sync job becomes permanently inaccessible —
@@ -1041,7 +989,33 @@ async fn run_worker_chunk(
         } else {
             let _ = db::jobs::fail(&pool, &job_id, Some(&code), &message).await;
             tracing::warn!(job_id = %job_id, code = %code, "Job failed: auth error");
-            notify_sync_failed(&pool, &cfg, &job_id, &job_rfc, Some(&code)).await;
+            // UX-4: a rejection the gap detector will still retry (verified owner, attempts
+            // left) is very likely sporadic -- the client hears about it only once it's
+            // confirmed, and the team gets an alert at the same moment.
+            match db::jobs::credential_rejection_is_final(&pool, &job_id).await {
+                Ok(true) => {
+                    notify_sync_failed(&pool, &cfg, &job_id, &job_rfc, Some(&code)).await;
+                    if db::users::is_owner_verified(&pool, &job_rfc)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        services::email::alert_team(
+                            &cfg,
+                            &format!("Pulso: credencial rechazada en {job_rfc}"),
+                            &format!(
+                                "El SAT rechazó la credencial guardada del RFC {job_rfc} ({code}) en todos los reintentos automáticos (job {job_id}). La descarga queda detenida hasta que el dueño la actualice."
+                            ),
+                        )
+                        .await;
+                    }
+                }
+                Ok(false) => {
+                    tracing::info!(job_id = %job_id, code = %code, "Credential rejection will be retried by the gap detector");
+                }
+                Err(e) => {
+                    tracing::error!(job_id = %job_id, "credential_rejection_is_final error: {e}")
+                }
+            }
         }
         return;
     }
@@ -1211,11 +1185,25 @@ async fn main() -> std::io::Result<()> {
 
     // ── Background workers ──────────────────────────────────────────────────
     // P-05: all six now take bg_pool, not pool -- see its own comment above for why.
+    let counting_rfcs = services::reconciliation::CountingRfcs::default();
     {
         let worker_pool = bg_pool.clone();
         let worker_cfg = Arc::new(cfg.clone());
         let worker_s3 = s3_client.clone();
-        tokio::spawn(resume_worker(worker_pool, worker_cfg, worker_s3));
+        tokio::spawn(resume_worker(
+            worker_pool,
+            worker_cfg,
+            worker_s3,
+            counting_rfcs.clone(),
+        ));
+    }
+    {
+        tokio::spawn(services::reconciliation::worker(
+            bg_pool.clone(),
+            Arc::new(cfg.clone()),
+            s3_client.clone(),
+            counting_rfcs.clone(),
+        ));
     }
     let nomina_refresh_state = services::nomina_refresh::NominaRefreshState::new();
     {

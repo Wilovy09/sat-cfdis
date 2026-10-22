@@ -88,6 +88,9 @@ pub struct Config {
     /// open to an equally-empty header -- filtering it out here means "configured" and
     /// "non-empty" are the same thing everywhere downstream, not two checks to remember.
     pub admin_logs_key: Option<String>,
+    /// Where internal alerts go (services::email::alert_team) -- an RFC whose download
+    /// can't finish without a person. `None` (unset/empty): alerts are only logged.
+    pub internal_alert_email: Option<String>,
 }
 
 impl Config {
@@ -157,6 +160,9 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),
             pm2_app_name: env::var("PM2_APP_NAME").unwrap_or_else(|_| "pulso-backend".to_string()),
             admin_logs_key: env::var("ADMIN_LOGS_KEY").ok().filter(|s| !s.is_empty()),
+            internal_alert_email: env::var("INTERNAL_ALERT_EMAIL")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 

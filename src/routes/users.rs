@@ -207,6 +207,51 @@ async fn grid_months_with_data(
     months.unwrap_or_default()
 }
 
+/// UX-4: how a job's outcome is shown. A credential rejection the gap detector will still
+/// retry (verified owner, attempts left) reads as a pause -- it is most likely one of the
+/// SAT's sporadic rejections -- and only a confirmed one reads as "CIEC inválida".
+/// Returns (status, error_code, credential_rejected).
+async fn public_job_outcome(
+    pool: &DbPool,
+    job: &crate::db::jobs::SyncJob,
+) -> (String, Option<String>, bool) {
+    let credential_failure = job.status == "failed"
+        && job
+            .error_code
+            .as_deref()
+            .is_some_and(|c| crate::db::jobs::CREDENTIAL_ERROR_CODES.contains(&c));
+    if !credential_failure {
+        return (job.status.clone(), job.error_code.clone(), false);
+    }
+    match crate::db::jobs::credential_rejection_is_final(pool, &job.id).await {
+        Ok(false) => (
+            "paused_limit".to_string(),
+            Some("credential_retry".to_string()),
+            false,
+        ),
+        _ => (job.status.clone(), job.error_code.clone(), true),
+    }
+}
+
+/// Pulso_Propuestas_Integridad_Descarga_RFC.md 3.3 / UX-1..UX-3: the RFC's completeness
+/// against the SAT. An RFC whose owner isn't verified shows no progress (L19-01: nothing
+/// about its data until then).
+async fn completeness_json(
+    pool: &DbPool,
+    rfc: &str,
+    credential_rejected: bool,
+) -> serde_json::Value {
+    let verified = crate::db::users::is_owner_verified(pool, rfc)
+        .await
+        .unwrap_or(false);
+    let completeness = if verified {
+        crate::services::reconciliation::completeness(pool, rfc, credential_rejected).await
+    } else {
+        crate::services::reconciliation::Completeness::unverified(credential_rejected)
+    };
+    serde_json::to_value(completeness).unwrap_or(serde_json::Value::Null)
+}
+
 /// L6-13-adjacent fix: `months` (above) is direction-blind -- a month reads "done" the
 /// instant either emitidas or recibidas has one row, so an RFC downloaded on only one side
 /// still shows a fully "done" grid. Builds the same grid scoped to one direction: its own
@@ -318,12 +363,9 @@ async fn register_rfc(
 ) -> Result<Option<String>, HttpResponse> {
     // L19-01 point 5: the SAT's generic RFCs aren't companies -- registering one would make
     // its holder the "owner" of every counterparty invoice billed to the public or abroad.
-    if [
-        crate::services::analytics::summary::RFC_PUBLICO_GENERAL,
-        crate::services::analytics::summary::RFC_EXTRANJERO_GENERICO,
-    ]
-    .contains(&rfc.to_uppercase().as_str())
-    {
+    // The whole XAXX/XEXX prefix is reserved for them, not just the two canonical values.
+    let rfc_upper = rfc.to_uppercase();
+    if rfc_upper.starts_with("XAXX") || rfc_upper.starts_with("XEXX") {
         return Err(HttpResponse::BadRequest().json(ErrorBody {
             error: "Ese RFC es genérico del SAT y no puede registrarse.".to_string(),
         }));
@@ -739,7 +781,9 @@ pub async fn sync_status(
                     current_year_month(active_job.count_cursor_date.as_deref());
                 let (downloading_year, downloading_month) =
                     current_year_month(active_job.cursor_date.as_deref());
+                let completeness = completeness_json(&pool, rfc, false).await;
                 return HttpResponse::Ok().json(serde_json::json!({
+                    "completeness":       completeness,
                     "status":             active_job.status,
                     "found":              active_job.found,
                     "total_expected":     active_job.total_expected,
@@ -803,8 +847,12 @@ pub async fn sync_status(
         return HttpResponse::Ok().json(serde_json::json!({ "status": "none" }));
     };
 
-    match crate::db::jobs::get_by_id(&pool, &job_id).await {
+    // The stored job may have been continued by the gap detector: the end of that chain is
+    // what tells how this range really ended.
+    match crate::db::jobs::resolve_continuation_chain(&pool, &job_id).await {
         Ok(Some(job)) => {
+            let (status, error_code, credential_rejected) = public_job_outcome(&pool, &job).await;
+            let completeness = completeness_json(&pool, &job.rfc, credential_rejected).await;
             let months_with_data = grid_months_with_data(&pool, &job.rfc, None).await;
             let (range_from, range_to) = crate::db::jobs::rfc_job_range(&pool, &job.rfc)
                 .await
@@ -827,7 +875,8 @@ pub async fn sync_status(
             let (downloading_year, downloading_month) =
                 current_year_month(job.cursor_date.as_deref());
             HttpResponse::Ok().json(serde_json::json!({
-                "status":             job.status,
+                "completeness":       completeness,
+                "status":             status,
                 "found":              job.found,
                 "total_expected":     job.total_expected,
                 "count_progress":     job.count_progress,
@@ -836,7 +885,7 @@ pub async fn sync_status(
                 "job_id":             job.id,
                 "period_from":        range_from,
                 "period_to":          range_to,
-                "error_code":         job.error_code,
+                "error_code":         error_code,
                 "error_msg":          serde_json::Value::Null,
                 "months":             months,
                 "months_emitidos":    months_emitidos,

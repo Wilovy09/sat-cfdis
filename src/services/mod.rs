@@ -7,6 +7,7 @@ pub mod gap_detector;
 pub mod nomina_refresh;
 pub mod php_cli;
 pub mod recheck_cancelled;
+pub mod reconciliation;
 pub mod response_cache;
 pub mod s3;
 pub mod session;

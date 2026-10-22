@@ -497,8 +497,14 @@ switch ($command) {
     // ----------------------------------------------------------------------
     // list-count: iterate complete months in period_from..period_to, count
     // metadata only (no XML downloads). Emits keepalives during processing.
-    // Final line: {"__count__":true,"total":N,"type_counts":{...}}
+    // Final line: {"__count__":true,"total":N,"type_counts":{...},
+    //   "by_month":{"YYYY-MM|emitidos":N,...},"error_days":{"YYYY-MM|emitidos":K,...},
+    //   "auth_error":null|"<code>"}
     // Only counts COMPLETE calendar months (skips partial months at edges).
+    // A day the SAT failed to answer used to count as 0 in silence -- the reason a count
+    // could come out short. It is now reported in error_days, so the caller knows that
+    // month's number can't be trusted. A rejected login stops the pass right away instead
+    // of retrying the login once per remaining day.
     // ----------------------------------------------------------------------
     case 'list-count':
         if (empty($params['period_from']) || empty($params['period_to'])) {
@@ -551,6 +557,15 @@ switch ($command) {
 
         $lcTotal      = 0;
         $lcTypeCounts = [];
+        $lcByMonth    = [];
+        $lcErrorDays  = [];
+        $lcAuthError  = null;
+        $lcDirLabel   = static fn ($t) => ($t === DownloadType::recibidos()) ? 'recibidos' : 'emitidos';
+        foreach ($lcMonths as [$lcMonthStart, $lcMonthEnd]) {
+            foreach ($lcDownloadTypes as $lcDlType) {
+                $lcByMonth[$lcMonthStart->format('Y-m') . '|' . $lcDirLabel($lcDlType)] = 0;
+            }
+        }
 
         foreach ($lcMonths as [$lcMonthStart, $lcMonthEnd]) {
             $lcDay = $lcMonthStart;
@@ -566,6 +581,7 @@ switch ($command) {
                 $lcDayEnd   = $lcDay->setTime(23, 59, 59);
 
                 foreach ($lcDownloadTypes as $lcDlType) {
+                    $lcKey   = $lcDay->format('Y-m') . '|' . $lcDirLabel($lcDlType);
                     $lcQuery = new QueryByFilters($lcDayStart, $lcDayEnd);
                     $lcQuery->setDownloadType($lcDlType);
                     try {
@@ -575,10 +591,17 @@ switch ($command) {
                             $lcData = $lcMeta->getData();
                             $lcTipo = $lcData['efectoComprobante'] ?? 'Desconocido';
                             $lcTypeCounts[$lcTipo] = ($lcTypeCounts[$lcTipo] ?? 0) + 1;
+                            $lcByMonth[$lcKey] = ($lcByMonth[$lcKey] ?? 0) + 1;
                             $lcTotal++;
                         }
                     } catch (Throwable $e) {
-                        fwrite(STDERR, 'list-count error on ' . $lcDay->format('Y-m-d') . ': ' . $e->getMessage() . "\n");
+                        $lcCode = ErrorClassifier::classify($e)['code'];
+                        fwrite(STDERR, 'list-count error on ' . $lcDay->format('Y-m-d') . " [$lcCode]: " . $e->getMessage() . "\n");
+                        if (ErrorClassifier::isAuthErrorCode($lcCode) && $lcCode !== 'unknown_error') {
+                            $lcAuthError = $lcCode;
+                            break 3;
+                        }
+                        $lcErrorDays[$lcKey] = ($lcErrorDays[$lcKey] ?? 0) + 1;
                     }
                 }
 
@@ -586,7 +609,14 @@ switch ($command) {
             }
         }
 
-        echo json_encode(['__count__' => true, 'total' => $lcTotal, 'type_counts' => $lcTypeCounts]) . "\n";
+        echo json_encode([
+            '__count__'   => true,
+            'total'       => $lcTotal,
+            'type_counts' => $lcTypeCounts,
+            'by_month'    => (object) $lcByMonth,
+            'error_days'  => (object) $lcErrorDays,
+            'auth_error'  => $lcAuthError,
+        ]) . "\n";
         flush();
         exit(0);
 

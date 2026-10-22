@@ -31,10 +31,6 @@ use std::sync::Arc;
 
 /// How often the worker wakes up.
 const GAP_POLL_SECS: u64 = 6 * 3600;
-/// Fresh restarts a permanently-failed job's leftover range gets before the
-/// gap detector stops trying — a persistently broken RFC (revoked
-/// credentials, deleted FIEL) shouldn't be restarted forever.
-const MAX_GAP_JOB_RETRIES: i32 = 3;
 /// Failed jobs re-queued per cycle.
 const GAP_JOB_BATCH: i64 = 50;
 /// How many days of the zero-activity scan to advance per RFC per cycle —
@@ -97,7 +93,9 @@ async fn requeue_failed_jobs(
     cfg: &Arc<Config>,
     s3: &Arc<S3Client>,
 ) -> anyhow::Result<()> {
-    let failed = db::jobs::find_failed_retryable(pool, MAX_GAP_JOB_RETRIES, GAP_JOB_BATCH).await?;
+    let failed =
+        db::jobs::find_failed_retryable(pool, db::jobs::MAX_FAILED_JOB_RETRIES, GAP_JOB_BATCH)
+            .await?;
     if failed.is_empty() {
         return Ok(());
     }
@@ -191,7 +189,7 @@ async fn requeue_failed_jobs(
 }
 
 // ---------------------------------------------------------------------------
-// Part 2 — zero-activity weekdays inside otherwise-"completed" ranges
+// Part 2 — zero-activity days inside otherwise-"completed" ranges
 // ---------------------------------------------------------------------------
 
 async fn scan_activity_gaps(
@@ -212,8 +210,24 @@ async fn scan_activity_gaps(
     let yesterday = yesterday_ymd();
 
     for rfc in rfcs {
+        // A queued/running/paused job may be filling these very days right now (e.g. the
+        // continuation requeue_failed_jobs just created) -- scanning now would queue a
+        // single-day resync, and a SAT login, for every day it hasn't reached yet. The
+        // cursor doesn't move, so the scan resumes here once that job is done.
+        if db::jobs::get_active_for_rfc(pool, &rfc).await?.is_some() {
+            continue;
+        }
         let start = match db::jobs::get_gap_scan_progress(pool, &rfc).await? {
-            Some(last) => crate::next_day(&last)[..10].to_string(),
+            Some(last) => {
+                let next = crate::next_day(&last)[..10].to_string();
+                match db::jobs::gap_scan_rewind_from(pool, &rfc).await? {
+                    Some(rewind) if rewind < next => {
+                        tracing::info!(rfc = %rfc, from = %rewind, "Gap-detector: rewinding scan to a newly completed older range");
+                        rewind
+                    }
+                    _ => next,
+                }
+            }
             None => match db::jobs::earliest_completed_period_from(pool, &rfc).await? {
                 Some(from) => from[..10.min(from.len())].to_string(),
                 None => continue,
@@ -229,7 +243,7 @@ async fn scan_activity_gaps(
         if !gap_days.is_empty() {
             tracing::warn!(
                 rfc = %rfc, count = gap_days.len(), days = ?gap_days,
-                "Gap-detector: zero-activity weekdays found inside a completed sync range"
+                "Gap-detector: zero-activity days found inside a completed sync range"
             );
         }
 
@@ -385,11 +399,9 @@ pub(crate) fn yesterday_ymd() -> String {
     ymd_from_epoch_secs(secs)
 }
 
-/// Same Gregorian decomposition `daily_sync_worker` uses inline in main.rs —
-/// duplicated here as a real function since that one isn't callable from
-/// this module. Deliberately not shared: it's ~15 lines of pure calendar
-/// math, not worth a cross-cutting refactor of a working, unrelated worker.
-fn ymd_from_epoch_secs(secs: u64) -> String {
+/// "YYYY-MM-DD" of a UTC epoch-seconds instant (Gregorian calendar, no crate needed).
+/// Also used by main.rs's `daily_sync_worker`.
+pub(crate) fn ymd_from_epoch_secs(secs: u64) -> String {
     const DAYS_IN_MONTH: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let days = secs / 86400;
     let mut y = 1970u32;
