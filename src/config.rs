@@ -1,5 +1,22 @@
 use std::env;
 
+/// L18-03/L19-02: minimum length for both session-signing keys.
+const MIN_JWT_SECRET_LEN: usize = 32;
+
+/// Every placeholder secret in `.env.example` starts with this. An environment built by
+/// copying that file would otherwise start with a publicly known signing key, since the
+/// `JWT_SECRET` placeholder is long enough to pass the length check on its own.
+const PLACEHOLDER_SECRET_PREFIX: &str = "CHANGE_ME";
+
+/// Why the server refuses to start with the secrets it was given.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SecretConfigError {
+    #[error("{0} is missing or shorter than {MIN_JWT_SECRET_LEN} characters")]
+    TooShort(&'static str),
+    #[error("{0} still holds the .env.example placeholder value")]
+    Placeholder(&'static str),
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub host: String,
@@ -17,6 +34,20 @@ pub struct Config {
     pub pg_password: String,
     pub pg_database: String,
     pub pg_cert_path: String,
+    // P-05 / AUD-079: pool size and acquire timeout used to be hardcoded (max_connections(5),
+    // no timeout at all) -- configurable now, and split from the background-worker pool
+    // below so a long sync doesn't compete with user traffic for the same five slots.
+    /// User-facing (HTTP server) pool size. Default sized for the Dashboard's own load: 9
+    /// simultaneous requests, plus headroom for more than one browser tab/user at once.
+    pub pg_pool_size: u32,
+    /// Background-worker pool size (resume, ETL, daily sync, recheck-cancelled,
+    /// gap-detector, xml-redownload) -- same size the single shared pool used to be, since
+    /// the point of splitting it off is to stop it from taking slots away from users, not
+    /// to give the workers more capacity than they had.
+    pub pg_worker_pool_size: u32,
+    /// How long a request waits for a free connection before giving up, instead of
+    /// queuing forever.
+    pub pg_acquire_timeout_secs: u64,
     /// Optional residential proxy for PHP CLI SAT requests (e.g. http://user:pass@host:port)
     pub https_proxy: Option<String>,
     /// SendGrid API key for transactional email notifications
@@ -30,8 +61,36 @@ pub struct Config {
     pub google_client_id: String,
     pub google_client_secret: String,
     pub google_redirect_uri: String,
+    /// L18-03: no fallback value -- an empty/short secret used to let the server start
+    /// with a 9-character default anyone could read off GitHub. Read raw here; the
+    /// length check (>= 32 chars, refuse to start otherwise) lives in main() so the four
+    /// test suites that call `Config::from_env()` directly don't need the variable set.
     pub jwt_secret: String,
+    /// L18-02: verifies a session token the Adquiere API issued (email register/login) --
+    /// see services::session for why this can't reuse `jwt_secret`. `None` (unset or
+    /// empty) means that issuer's tokens are rejected, not trusted by default. An empty
+    /// value must never reach the verifier as `Some("")`: HS256 accepts an empty key, so
+    /// anyone could sign a token that verifies against it.
+    pub adquiere_jwt_secret: Option<String>,
+    #[allow(dead_code)]
     pub app_base_url: String,
+    /// pm2 process name for this app, e.g. what `pm2 start ... --name <this>` used --
+    /// locates its log files on disk (/root/.pm2/logs/<name>-out.log and -error.log) for
+    /// the admin-only GET /api/v1/admin/logs endpoint. Defaults to the name this app is
+    /// actually registered under on the current server.
+    pub pm2_app_name: String,
+    /// Shared secret that lets a trusted log-aggregator (adquiere-logs) call GET
+    /// /api/v1/admin/logs without a per-environment admin JWT -- see
+    /// `routes::logs::admin_logs_key_matches` for why a personal JWT can't do this job
+    /// across environments. `None` (unset) disables the bypass entirely; only the
+    /// existing per-user JWT + DB admin check applies.
+    /// L18-04: an env var set but empty (e.g. `ADMIN_LOGS_KEY=`) used to leave the bypass
+    /// open to an equally-empty header -- filtering it out here means "configured" and
+    /// "non-empty" are the same thing everywhere downstream, not two checks to remember.
+    pub admin_logs_key: Option<String>,
+    /// Where internal alerts go (services::email::alert_team) -- an RFC whose download
+    /// can't finish without a person. `None` (unset/empty): alerts are only logged.
+    pub internal_alert_email: Option<String>,
 }
 
 impl Config {
@@ -59,6 +118,18 @@ impl Config {
             pg_database: env::var("POSTGRES_DATABASE").unwrap_or_else(|_| "adquiere".to_string()),
             pg_cert_path: env::var("POSTGRES_CERT_PATH")
                 .unwrap_or_else(|_| "/arena/certs/rds-ca-bundle.pem".to_string()),
+            pg_pool_size: env::var("POSTGRES_POOL_SIZE")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(15),
+            pg_worker_pool_size: env::var("POSTGRES_WORKER_POOL_SIZE")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5),
+            pg_acquire_timeout_secs: env::var("POSTGRES_ACQUIRE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(10),
             https_proxy: env::var("HTTPS_PROXY").ok(),
             sendgrid_api_key: env::var("SENDGRID_API_KEY").ok(),
             sendgrid_from: env::var("SENDGRID_FROM")
@@ -81,9 +152,106 @@ impl Config {
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
-            jwt_secret: env::var("JWT_SECRET").unwrap_or_else(|_| "jwtsecret".to_string()),
+            jwt_secret: env::var("JWT_SECRET").unwrap_or_default(),
+            adquiere_jwt_secret: env::var("ADQUIERE_JWT_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
             app_base_url: env::var("APP_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),
+            pm2_app_name: env::var("PM2_APP_NAME").unwrap_or_else(|_| "pulso-backend".to_string()),
+            admin_logs_key: env::var("ADMIN_LOGS_KEY").ok().filter(|s| !s.is_empty()),
+            internal_alert_email: env::var("INTERNAL_ALERT_EMAIL")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
+    }
+
+    /// Checks the signing secrets before the server accepts any traffic. Called from
+    /// `main()` rather than `from_env()` so the test suites that build a `Config` without
+    /// these variables keep working.
+    ///
+    /// L19-02: both keys get the same treatment -- missing, empty, shorter than
+    /// `MIN_JWT_SECRET_LEN`, or still the `.env.example` placeholder all refuse startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first secret that is missing, too short, or still the placeholder from
+    /// `.env.example`.
+    pub fn validate_secrets(&self) -> Result<(), SecretConfigError> {
+        let secrets = [
+            ("JWT_SECRET", Some(self.jwt_secret.as_str())),
+            ("ADQUIERE_JWT_SECRET", self.adquiere_jwt_secret.as_deref()),
+        ];
+        for (name, value) in secrets {
+            let value = value.unwrap_or_default();
+            if value.len() < MIN_JWT_SECRET_LEN {
+                return Err(SecretConfigError::TooShort(name));
+            }
+            if value.starts_with(PLACEHOLDER_SECRET_PREFIX) {
+                return Err(SecretConfigError::Placeholder(name));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod validate_secrets_tests {
+    use super::*;
+
+    const REAL_SECRET: &str = "a-real-random-secret-that-is-long-enough-123";
+    const OTHER_REAL_SECRET: &str = "another-real-random-secret-long-enough-456";
+    const JWT_PLACEHOLDER: &str = "CHANGE_ME_to_a_real_random_secret_at_least_32_chars_long";
+
+    fn cfg_with(jwt_secret: &str, adquiere_jwt_secret: Option<&str>) -> Config {
+        let mut cfg = Config::from_env();
+        cfg.jwt_secret = jwt_secret.to_string();
+        cfg.adquiere_jwt_secret = adquiere_jwt_secret.map(str::to_string);
+        cfg
+    }
+
+    #[test]
+    fn accepts_real_secrets() {
+        assert_eq!(
+            cfg_with(REAL_SECRET, Some(OTHER_REAL_SECRET)).validate_secrets(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_a_short_jwt_secret() {
+        assert_eq!(
+            cfg_with("too-short", Some(OTHER_REAL_SECRET)).validate_secrets(),
+            Err(SecretConfigError::TooShort("JWT_SECRET"))
+        );
+    }
+
+    #[test]
+    fn rejects_an_unset_adquiere_secret() {
+        assert_eq!(
+            cfg_with(REAL_SECRET, None).validate_secrets(),
+            Err(SecretConfigError::TooShort("ADQUIERE_JWT_SECRET"))
+        );
+    }
+
+    #[test]
+    fn rejects_a_short_adquiere_secret() {
+        assert_eq!(
+            cfg_with(REAL_SECRET, Some("short")).validate_secrets(),
+            Err(SecretConfigError::TooShort("ADQUIERE_JWT_SECRET"))
+        );
+    }
+
+    #[test]
+    fn rejects_the_env_example_placeholder_despite_its_length() {
+        assert!(JWT_PLACEHOLDER.len() >= MIN_JWT_SECRET_LEN);
+        assert_eq!(
+            cfg_with(JWT_PLACEHOLDER, Some(OTHER_REAL_SECRET)).validate_secrets(),
+            Err(SecretConfigError::Placeholder("JWT_SECRET"))
+        );
+        assert_eq!(
+            cfg_with(REAL_SECRET, Some(JWT_PLACEHOLDER)).validate_secrets(),
+            Err(SecretConfigError::Placeholder("ADQUIERE_JWT_SECRET"))
+        );
     }
 }

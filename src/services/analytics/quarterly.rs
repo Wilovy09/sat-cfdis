@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, parse_ym, rfc_column};
+use super::summary::{dl_type_filter, get_f64, parse_ym, rfc_column};
 /// Quarterly aggregation — groups months into fiscal quarters with YoY comparison.
 use crate::db::DbPool;
 use serde::Serialize;
@@ -13,17 +13,17 @@ pub struct QuarterlyResponse {
 #[derive(Debug, Serialize)]
 pub struct QuarterRow {
     pub year: i64,
-    pub quarter: i64,       // 1–4
-    pub period: String,     // e.g. "2024-Q1"
+    pub quarter: i64,   // 1–4
+    pub period: String, // e.g. "2024-Q1"
     pub total_mxn: f64,
     pub invoice_count: i64,
-    pub is_complete: bool,  // all 3 months present in data
+    pub is_complete: bool, // all 3 months present in data
 }
 
 #[derive(Debug, Serialize)]
 pub struct QuarterYoyRow {
     pub quarter: i64,
-    pub period: String,     // e.g. "Q1"
+    pub period: String, // e.g. "Q1"
     pub current_year: i64,
     pub prior_year: i64,
     pub current_mxn: f64,
@@ -54,26 +54,19 @@ pub async fn get(
                 WHEN month BETWEEN 7 AND 9 THEN 3
                 ELSE 4
             END AS quarter,
-            SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total,
+            SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total,
             COUNT(*) AS cnt,
             COUNT(DISTINCT month) AS months_present
-        FROM pulso.cfdis
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N')
+          AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
           AND NOT EXISTS (
-              SELECT 1 FROM pulso.normalization_rules nr
-              WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
-                AND (
-                  (nr.cfdi_uuid IS NOT NULL AND UPPER(nr.cfdi_uuid) = UPPER(uuid))
-                  OR (nr.cfdi_uuid IS NULL AND (
-                      (nr.dl_type IN ('emitidos','ambos') AND nr.source_rfc = rfc_receptor)
-                      OR (nr.dl_type IN ('recibidos','ambos') AND nr.source_rfc = rfc_emisor)
-                  ))
-                )
+              SELECT 1 FROM pulso.cfdi_exclusion ex
+              WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
           )
         GROUP BY year, quarter
         ORDER BY year, quarter
@@ -97,7 +90,7 @@ pub async fn get(
                 year,
                 quarter,
                 period: format!("{year}-Q{quarter}"),
-                total_mxn: r.try_get("total").unwrap_or(0.0),
+                total_mxn: get_f64(r, "total"),
                 invoice_count: r.try_get("cnt").unwrap_or(0),
                 is_complete: months_present == 3,
             }

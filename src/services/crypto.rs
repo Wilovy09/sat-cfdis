@@ -20,12 +20,12 @@ const KEY_FILE: &str = ".pulso_queue_key";
 pub fn load_key() -> [u8; 32] {
     // 1. Env var
     if let Ok(hex_key) = std::env::var("QUEUE_SECRET_KEY") {
-        if let Ok(bytes) = hex::decode(hex_key.trim()) {
-            if bytes.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&bytes);
-                return key;
-            }
+        if let Ok(bytes) = hex::decode(hex_key.trim())
+            && bytes.len() == 32
+        {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return key;
         }
         tracing::warn!(
             "QUEUE_SECRET_KEY is set but not 64 valid hex chars — falling back to file key"
@@ -33,14 +33,13 @@ pub fn load_key() -> [u8; 32] {
     }
 
     // 2. Key file
-    if let Ok(content) = std::fs::read_to_string(KEY_FILE) {
-        if let Ok(bytes) = hex::decode(content.trim()) {
-            if bytes.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&bytes);
-                return key;
-            }
-        }
+    if let Ok(content) = std::fs::read_to_string(KEY_FILE)
+        && let Ok(bytes) = hex::decode(content.trim())
+        && bytes.len() == 32
+    {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        return key;
     }
 
     // 3. Generate + persist

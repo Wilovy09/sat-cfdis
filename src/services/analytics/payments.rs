@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, parse_ym, rfc_column};
+use super::summary::{dl_type_filter, get_f64, parse_ym, rfc_column};
 /// Payments: payment complement analysis — collection (emitidos) and payables (recibidos).
 use crate::db::DbPool;
 use serde::Serialize;
@@ -16,6 +16,18 @@ pub struct PaymentsResponse {
     pub by_metodo_pago: Vec<MetodoRow>,
     pub outstanding_invoices: Vec<OutstandingInvoice>,
     pub payment_timeline: Vec<PaymentMonth>,
+    // C-01: aging por cubetas, 0-30/31-60/61-90/91-180/>180, same universe as
+    // total_outstanding_mxn (PPD, capped at the last closed month, no saldo floor) so the
+    // five buckets sum to that figure exactly.
+    pub aging_buckets: Vec<AgingBucket>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgingBucket {
+    pub label: String,
+    pub total_mxn: f64,
+    pub invoice_count: i64,
+    pub pct_of_total: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,90 +88,43 @@ pub async fn get(
         "nombre_receptor"
     };
 
-    // Collection totals — universe capped at the latest "complete" month (as_of_cutoff).
-    // Sparse months (< 15% of median monthly invoice count, min 3) are excluded so that
-    // a partially-loaded current month doesn't artificially deflate pct_cobrado_total.
-    // paid_raw = valid payment complements (excluding cancelled ones) + credit notes (tipo E, tipo_relacion=01).
+    // Collection totals — universe capped at the last complete calendar month (L7-03 /
+    // DEC-039), not the old "densest month" cutoff from pulso.rfc_as_of_cutoff. That view's
+    // COALESCE(…, 999912) left 855 of 996 RFC emisores with no cap at all (the current
+    // month counted as cartera), and froze another 111 at a stale month -- both wrong in
+    // opposite directions. The current month never counts as "cartera" just because it
+    // hasn't finished yet (AUD-009). L2-01: pagado/saldo per invoice comes from the shared
+    // base, which also folds in returns ('03', AUD-008) that this query used to miss.
+    let cutoff_yyyymm = crate::routes::analytics::current_month_yyyymm();
     let totals_row = sqlx::query(&format!(
         r#"
-        WITH monthly_invoice_counts AS (
-            SELECT year AS yr, month AS mo, COUNT(*) AS cnt
-            FROM pulso.cfdis
-            WHERE {owner_col} = $1
-              AND {dl_filter}
-              AND tipo_comprobante = 'I'
-              AND NOT is_cancelled
-            GROUP BY year, month
-        ),
-        baseline_median AS (
-            SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cnt)::float8 AS median
-            FROM monthly_invoice_counts
-        ),
-        as_of_cutoff AS (
-            SELECT MAX(mc.yr * 100 + mc.mo) AS as_of_ym
-            FROM monthly_invoice_counts mc, baseline_median bm
-            WHERE mc.cnt::float8 >= GREATEST(bm.median * 0.15, 3.0)
-        ),
-        pue_totals AS (
-            SELECT SUM(COALESCE(total_mxn,0)::float8)::float8 AS pue_total
-            FROM pulso.cfdis, as_of_cutoff
-            WHERE {owner_col} = $1
-              AND {dl_filter}
-              AND tipo_comprobante = 'I'
-              AND COALESCE(metodo_pago,'PUE') != 'PPD'
-              AND NOT is_cancelled
-              AND (year * 100 + month) <= as_of_cutoff.as_of_ym
-        ),
-        ppd_per_invoice AS (
-            SELECT
-                inv.uuid,
-                COALESCE(inv.total_mxn, 0)::float8 AS inv_total,
-                COALESCE((
-                    SELECT SUM(pd.imp_pagado)
-                    FROM pulso.cfdi_payment_docs pd
-                    JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
-                    WHERE pd.invoice_uuid = inv.uuid
-                      AND NOT comp.is_cancelled
-                )::float8, 0) +
-                COALESCE((
-                    SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
-                    FROM pulso.cfdi_relacionados cr
-                    JOIN pulso.cfdis nc ON nc.uuid = cr.source_uuid
-                    WHERE cr.related_uuid = inv.uuid
-                      AND cr.tipo_relacion = '01'
-                      AND nc.tipo_comprobante = 'E'
-                      AND NOT nc.is_cancelled
-                ), 0) AS paid_raw
-            FROM pulso.cfdis inv, as_of_cutoff
-            WHERE inv.{owner_col} = $1
-              AND inv.{dl_filter}
-              AND inv.tipo_comprobante = 'I'
-              AND inv.metodo_pago = 'PPD'
-              AND NOT inv.is_cancelled
-              AND (inv.year * 100 + inv.month) <= as_of_cutoff.as_of_ym
-        ),
-        ppd_agg AS (
-            SELECT
-                SUM(inv_total)::float8                                       AS ppd_total,
-                SUM(LEAST(paid_raw, inv_total))::float8                      AS ppd_cobrado,
-                SUM(GREATEST(inv_total - paid_raw, 0))::float8               AS ppd_outstanding
-            FROM ppd_per_invoice
-        )
         SELECT
-            (pt.pue_total + pa.ppd_total)::float8                           AS total_invoiced,
-            (pt.pue_total + pa.ppd_cobrado)::float8                         AS total_paid,
-            pa.ppd_outstanding::float8                                       AS ppd_outstanding
-        FROM pue_totals pt, ppd_agg pa
+            COALESCE(SUM(c.total_mxn), 0)::float8               AS total_invoiced,
+            COALESCE(SUM(c.total_mxn - c.saldo_mxn), 0)::float8 AS total_paid,
+            COALESCE(SUM(LEAST(c.pagado_mxn, c.total_mxn)), 0)::float8 AS total_cobrado_real,
+            COALESCE(SUM(CASE WHEN c.metodo_pago = 'PPD' THEN c.saldo_mxn ELSE 0 END), 0)::float8 AS ppd_outstanding
+        FROM pulso.cfdi_cobro_estado c
+        WHERE c.{owner_col} = $1
+          AND c.{dl_filter}
+          AND (c.year * 100 + c.month) <= $2
         "#
     ))
     .bind(rfc)
+    .bind(cutoff_yyyymm)
     .fetch_one(pool)
     .await?;
-    let total_invoiced_mxn: f64 = totals_row.try_get("total_invoiced").unwrap_or(0.0);
-    let total_paid_mxn: f64     = totals_row.try_get("total_paid").unwrap_or(0.0);
-    let total_outstanding: f64  = totals_row.try_get("ppd_outstanding").unwrap_or(0.0);
+    let total_invoiced_mxn: f64 = get_f64(&totals_row, "total_invoiced");
+    // total_paid_mxn keeps the old total_mxn - saldo_mxn arithmetic on purpose (L7-04: it's
+    // not painted on any screen today, so it's declared out of scope rather than moved).
+    let total_paid_mxn: f64 = get_f64(&totals_row, "total_paid");
+    let total_outstanding: f64 = get_f64(&totals_row, "ppd_outstanding");
+    // L7-04 / DEC-040: "% Cobrado/Pagado del universo" measures real collection, not
+    // saldo's derived "paid" (which nets out credit notes applied to the invoice -- a
+    // credit note isn't money that came in). LEAST guards the same overpayment edge case
+    // saldo's own clamp-to-zero already protects against on the other side.
+    let total_cobrado_real: f64 = get_f64(&totals_row, "total_cobrado_real");
     let collection_rate = if total_invoiced_mxn > 0.0 {
-        total_paid_mxn / total_invoiced_mxn * 100.0
+        total_cobrado_real / total_invoiced_mxn * 100.0
     } else {
         0.0
     };
@@ -194,7 +159,7 @@ pub async fn get(
         .iter()
         .map(|r| {
             let forma: String = r.try_get("forma").unwrap_or_default();
-            let total: f64 = r.try_get("total").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "total");
             FormaRow {
                 label: forma_label(&forma).to_string(),
                 pct_of_total: if total_invoiced_mxn > 0.0 {
@@ -242,48 +207,31 @@ pub async fn get(
                 label: metodo_label(&metodo).to_string(),
                 metodo_pago: metodo,
                 invoice_count: r.try_get("cnt").unwrap_or(0),
-                total_mxn: r.try_get("total").unwrap_or(0.0),
+                total_mxn: get_f64(r, "total"),
             }
         })
         .collect();
 
-    // Outstanding invoices — full universe (no date filter)
+    // Outstanding invoices — full universe (no date filter, L2-01: cartera is a balance).
+    // days_out now comes from the base's dias_antiguedad (DEC-024 / L2-05: measured from
+    // the last complete calendar month, not CURRENT_DATE, so the same query run on two
+    // different days gives the same answer).
     let outstanding_rows = sqlx::query(&format!(
         r#"
-        SELECT uuid, cp_rfc, cp_nombre, fecha_emision, total_mxn, days_out, paid
-        FROM (
-            SELECT
-                inv.uuid,
-                inv.{cp_rfc_col}                                 AS cp_rfc,
-                inv.{cp_name_col}                                AS cp_nombre,
-                inv.fecha_emision,
-                inv.total_mxn,
-                (CURRENT_DATE - inv.fecha_emision::date)::bigint AS days_out,
-                COALESCE((
-                    SELECT SUM(pd.imp_pagado)
-                    FROM pulso.cfdi_payment_docs pd
-                    JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
-                    WHERE pd.invoice_uuid = inv.uuid
-                      AND NOT comp.is_cancelled
-                )::float8, 0) +
-                COALESCE((
-                    SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
-                    FROM pulso.cfdi_relacionados cr
-                    JOIN pulso.cfdis nc ON nc.uuid = cr.source_uuid
-                    WHERE cr.related_uuid = inv.uuid
-                      AND cr.tipo_relacion = '01'
-                      AND nc.tipo_comprobante = 'E'
-                      AND NOT nc.is_cancelled
-                ), 0) AS paid
-            FROM pulso.cfdis inv
-            WHERE inv.{owner_col} = $1
-              AND inv.{dl_filter}
-              AND inv.tipo_comprobante = 'I'
-              AND inv.metodo_pago = 'PPD'
-              AND NOT inv.is_cancelled
-        ) sub
-        WHERE (sub.total_mxn - sub.paid) > 1.0
-        ORDER BY (sub.total_mxn - sub.paid) DESC
+        SELECT c.uuid,
+               inv.{cp_rfc_col}  AS cp_rfc,
+               inv.{cp_name_col} AS cp_nombre,
+               c.fecha_emision,
+               c.total_mxn,
+               c.dias_antiguedad AS days_out,
+               (c.total_mxn - c.saldo_mxn) AS paid
+        FROM pulso.cfdi_cobro_estado c
+        JOIN pulso.cfdis inv ON inv.uuid = c.uuid
+        WHERE c.{owner_col} = $1
+          AND c.{dl_filter}
+          AND c.metodo_pago = 'PPD'
+          AND c.saldo_mxn > 1.0
+        ORDER BY c.saldo_mxn DESC
         LIMIT 50
         "#
     ))
@@ -294,8 +242,8 @@ pub async fn get(
     let outstanding_invoices: Vec<OutstandingInvoice> = outstanding_rows
         .iter()
         .map(|r| {
-            let total: f64 = r.try_get("total_mxn").unwrap_or(0.0);
-            let paid: f64 = r.try_get("paid").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "total_mxn");
+            let paid: f64 = get_f64(r, "paid");
             OutstandingInvoice {
                 uuid: r.try_get("uuid").unwrap_or_default(),
                 rfc_cp: r.try_get("cp_rfc").unwrap_or_default(),
@@ -304,76 +252,105 @@ pub async fn get(
                 total_mxn: total,
                 paid_mxn: paid,
                 outstanding_mxn: (total - paid).max(0.0),
-                days_outstanding: r.try_get("days_out").unwrap_or(0),
+                // L7-05: dias_antiguedad is a 4-byte Postgres integer -- decoding it
+                // straight as i64 silently failed and always fell back to 0.
+                days_outstanding: r.try_get::<i32, _>("days_out").unwrap_or(0) as i64,
             }
         })
         .collect();
 
-    // Exposure >180d — full universe (no date filter)
+    // Exposure >180d, aged from the base's dias_antiguedad. C-01: now capped at the same
+    // last complete calendar month as total_outstanding_mxn above -- without that shared
+    // cutoff the two queries don't share a universe, and the first RFC with a PPD invoice
+    // issued after the cutoff would make exposure exceed the saldo pendiente card (which
+    // *is* capped), an impossible result since exposure is supposed to be a subset of it.
     let exposure_row = sqlx::query(&format!(
         r#"
-        SELECT COALESCE(SUM(GREATEST(
-            inv.total_mxn -
-            COALESCE((
-                SELECT SUM(pd.imp_pagado)
-                FROM pulso.cfdi_payment_docs pd
-                JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
-                WHERE pd.invoice_uuid = inv.uuid
-                  AND NOT comp.is_cancelled
-            )::float8, 0) -
-            COALESCE((
-                SELECT SUM(COALESCE(nc.total_mxn, 0)::float8)
-                FROM pulso.cfdi_relacionados cr
-                JOIN pulso.cfdis nc ON nc.uuid = cr.source_uuid
-                WHERE cr.related_uuid = inv.uuid
-                  AND cr.tipo_relacion = '01'
-                  AND nc.tipo_comprobante = 'E'
-                  AND NOT nc.is_cancelled
-            ), 0),
-            0
-        )::float8), 0) AS exposure
-        FROM pulso.cfdis inv
-        WHERE inv.{owner_col} = $1
-          AND inv.{dl_filter}
-          AND inv.tipo_comprobante = 'I'
-          AND inv.metodo_pago = 'PPD'
-          AND NOT inv.is_cancelled
-          AND (CURRENT_DATE - inv.fecha_emision::date) > 180
+        SELECT COALESCE(SUM(c.saldo_mxn), 0)::float8 AS exposure
+        FROM pulso.cfdi_cobro_estado c
+        WHERE c.{owner_col} = $1
+          AND c.{dl_filter}
+          AND c.metodo_pago = 'PPD'
+          AND c.dias_antiguedad > 180
+          AND (c.year * 100 + c.month) <= $2
         "#
     ))
     .bind(rfc)
+    .bind(cutoff_yyyymm)
     .fetch_one(pool)
     .await?;
-    let exposure_180d_mxn: f64 = exposure_row.try_get("exposure").unwrap_or(0.0);
+    let exposure_180d_mxn: f64 = get_f64(&exposure_row, "exposure");
 
-    // Average days to pay — PPD invoices only, using the LAST payment date per invoice.
-    // Grouping by invoice and taking MAX(fecha_pago) matches Python's dias_ultimo_pago
-    // logic: partial payments don't count as "collected", only when fully/finally paid.
-    let avg_days_row = sqlx::query(&format!(
+    // C-01: aging por cubetas -- exact same universe as total_outstanding_mxn (PPD, capped
+    // at the same cutoff, NO saldo floor -- filtering saldo > 1 here would drop the
+    // buckets' sum a few pesos short of the "Saldo pendiente" card, the kind of gap that
+    // makes a verification never close). Antiguedad comes straight from the base's
+    // dias_antiguedad (anchored to the last closed month's last day), not recomputed
+    // against today -- two runs on different days must give the same buckets. Bucketed by
+    // upper edge (<=30, <=60, ...); a negative antiguedad (invoice issued after the cutoff)
+    // falls into the first bucket.
+    let aging_row = sqlx::query(&format!(
         r#"
-        SELECT AVG(last_pay_days) AS avg_days
-        FROM (
-            SELECT inv.uuid,
-                   MAX((cp.fecha_pago::date - inv.fecha_emision::date)::float8) AS last_pay_days
-            FROM pulso.cfdis inv
-            JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
-            JOIN pulso.cfdi_payments cp ON cp.payment_uuid = pd.payment_uuid
-                AND cp.pago_num = pd.pago_num
-            WHERE inv.{owner_col} = $1
-              AND inv.{dl_filter}
-              AND inv.tipo_comprobante = 'I'
-              AND inv.metodo_pago = 'PPD'
-              AND NOT inv.is_cancelled
-              AND cp.fecha_pago IS NOT NULL
-            GROUP BY inv.uuid
-            HAVING MAX((cp.fecha_pago::date - inv.fecha_emision::date)::float8) >= 0
-        ) per_invoice
+        -- C8-02 / AUD-066: the five COUNTs get their own `AND saldo_mxn > 0` -- otherwise
+        -- they count every invoice in the universe, including ones already fully paid.
+        -- The five SUMs stay unfiltered on purpose (same as C-01 already established: a
+        -- saldo floor there loses $61.10 and breaks the tie-out with "Saldo pendiente").
+        -- `> 0`, not `> 1`: the count must count exactly what the amount sums, and a
+        -- fifty-cent saldo still sums into the amount.
+        SELECT
+            COALESCE(SUM(c.saldo_mxn) FILTER (WHERE c.dias_antiguedad <= 30), 0)::float8                                    AS b1_mxn,
+            COUNT(*) FILTER (WHERE c.dias_antiguedad <= 30 AND c.saldo_mxn > 0)                                              AS b1_cnt,
+            COALESCE(SUM(c.saldo_mxn) FILTER (WHERE c.dias_antiguedad > 30 AND c.dias_antiguedad <= 60), 0)::float8          AS b2_mxn,
+            COUNT(*) FILTER (WHERE c.dias_antiguedad > 30 AND c.dias_antiguedad <= 60 AND c.saldo_mxn > 0)                   AS b2_cnt,
+            COALESCE(SUM(c.saldo_mxn) FILTER (WHERE c.dias_antiguedad > 60 AND c.dias_antiguedad <= 90), 0)::float8          AS b3_mxn,
+            COUNT(*) FILTER (WHERE c.dias_antiguedad > 60 AND c.dias_antiguedad <= 90 AND c.saldo_mxn > 0)                   AS b3_cnt,
+            COALESCE(SUM(c.saldo_mxn) FILTER (WHERE c.dias_antiguedad > 90 AND c.dias_antiguedad <= 180), 0)::float8         AS b4_mxn,
+            COUNT(*) FILTER (WHERE c.dias_antiguedad > 90 AND c.dias_antiguedad <= 180 AND c.saldo_mxn > 0)                  AS b4_cnt,
+            COALESCE(SUM(c.saldo_mxn) FILTER (WHERE c.dias_antiguedad > 180), 0)::float8                                     AS b5_mxn,
+            COUNT(*) FILTER (WHERE c.dias_antiguedad > 180 AND c.saldo_mxn > 0)                                              AS b5_cnt
+        FROM pulso.cfdi_cobro_estado c
+        WHERE c.{owner_col} = $1
+          AND c.{dl_filter}
+          AND c.metodo_pago = 'PPD'
+          AND (c.year * 100 + c.month) <= $2
         "#
     ))
     .bind(rfc)
+    .bind(cutoff_yyyymm)
     .fetch_one(pool)
     .await?;
-    let avg_days_to_pay: f64 = avg_days_row.try_get("avg_days").unwrap_or(0.0);
+    let bucket_defs: [(&str, &str, &str); 5] = [
+        ("0-30 días", "b1_mxn", "b1_cnt"),
+        ("31-60 días", "b2_mxn", "b2_cnt"),
+        ("61-90 días", "b3_mxn", "b3_cnt"),
+        ("91-180 días", "b4_mxn", "b4_cnt"),
+        ("> 180 días", "b5_mxn", "b5_cnt"),
+    ];
+    let aging_total: f64 = bucket_defs
+        .iter()
+        .map(|(_, mxn_col, _)| get_f64(&aging_row, mxn_col))
+        .sum();
+    let aging_buckets: Vec<AgingBucket> = bucket_defs
+        .iter()
+        .map(|(label, mxn_col, cnt_col)| {
+            let total_mxn = get_f64(&aging_row, mxn_col);
+            AgingBucket {
+                label: label.to_string(),
+                total_mxn,
+                invoice_count: aging_row.try_get(*cnt_col).unwrap_or(0),
+                pct_of_total: if aging_total > 0.0 {
+                    total_mxn / aging_total * 100.0
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect();
+
+    // Average days to pay — PPD invoices only, using the base's ultimo_pago_fecha (already
+    // guarded against fecha_pago < fecha_emision data errors). L9-06: shared with
+    // cashflow.rs's identical query now, see avg_dias_a_cobro's own comment for why.
+    let avg_days_to_pay: f64 = super::summary::avg_dias_a_cobro(pool, rfc, dl_type).await?;
 
     // Monthly timeline: invoiced = PUE+PPD emitted; paid = PUE (immediate) + PPD DR payments
     // grouped by invoice emission month. Avoids multiplying PUE totals via payment doc JOIN.
@@ -395,18 +372,15 @@ pub async fn get(
             GROUP BY year, month
         ),
         ppd_paid_by_month AS (
-            SELECT inv.year, inv.month,
-                   COALESCE(SUM(pd.imp_pagado)::float8, 0) AS ppd_paid
-            FROM pulso.cfdis inv
-            JOIN pulso.cfdi_payment_docs pd ON pd.invoice_uuid = inv.uuid
-            WHERE inv.{owner_col} = $1
-              AND inv.{dl_filter}
-              AND inv.tipo_comprobante = 'I'
-              AND inv.metodo_pago = 'PPD'
-              AND NOT inv.is_cancelled
-              AND (inv.year > $2 OR (inv.year = $2 AND inv.month >= $3))
-              AND (inv.year < $4 OR (inv.year = $4 AND inv.month <= $5))
-            GROUP BY inv.year, inv.month
+            SELECT c.year, c.month,
+                   SUM(c.total_mxn - c.saldo_mxn)::float8 AS ppd_paid
+            FROM pulso.cfdi_cobro_estado c
+            WHERE c.{owner_col} = $1
+              AND c.{dl_filter}
+              AND c.metodo_pago = 'PPD'
+              AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+              AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+            GROUP BY c.year, c.month
         )
         SELECT bm.year, bm.month,
                (bm.pue_invoiced + bm.ppd_invoiced)::float8 AS invoiced,
@@ -431,8 +405,8 @@ pub async fn get(
             let month: i64 = r.try_get("month").unwrap_or(0);
             PaymentMonth {
                 period: format!("{year}-{month:02}"),
-                invoiced_mxn: r.try_get("invoiced").unwrap_or(0.0),
-                paid_mxn: r.try_get("paid").unwrap_or(0.0),
+                invoiced_mxn: get_f64(r, "invoiced"),
+                paid_mxn: get_f64(r, "paid"),
             }
         })
         .collect();
@@ -448,9 +422,13 @@ pub async fn get(
         by_metodo_pago,
         outstanding_invoices,
         payment_timeline,
+        aging_buckets,
     })
 }
 
+// P-04 / DEC-042: only caller was cashflow.rs's payment_method_breakdown, paused (not
+// deleted) since nothing on screen reads it -- kept, not removed, for when that's restored.
+#[allow(dead_code)]
 pub fn forma_label_str(f: &str) -> String {
     forma_label(f).to_string()
 }

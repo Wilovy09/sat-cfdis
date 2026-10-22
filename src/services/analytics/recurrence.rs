@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, rfc_column};
+use super::summary::{cp_key_expr, dl_type_filter, get_f64, rfc_column};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -10,7 +10,6 @@ pub struct RecurrenceResponse {
     pub from_period: String,
     pub to_period: String,
     pub by_active_months: Vec<ActiveMonthsBucket>,
-    pub scores_by_year: Vec<YearScore>,
     pub top_recurrent: Vec<RecurrentCp>,
 }
 
@@ -20,12 +19,6 @@ pub struct ActiveMonthsBucket {
     pub cp_count: i64,
     pub total_mxn: f64,
     pub pct_of_total: f64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct YearScore {
-    pub year: i32,
-    pub score: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,18 +53,10 @@ pub async fn get(
         "nombre_receptor"
     };
 
-    // For "emitidos" (ingresos), split XEXX010101000 foreign clients by name — matches Python behaviour
-    // where each distinct foreign entity gets its own contraparte_key ("XEXX010101000||NOMBRE")
-    let cp_key_expr = if dl_type != "recibidos" {
-        format!(
-            "CASE WHEN {cp_col} = 'XEXX010101000' \
-                  AND TRIM(COALESCE({cp_name_col}, '')) <> '' \
-             THEN 'XEXX010101000||' || UPPER(REGEXP_REPLACE(TRIM(COALESCE({cp_name_col},'')), '[^A-Z0-9 &\\-]', '', 'g')) \
-             ELSE {cp_col} END"
-        )
-    } else {
-        cp_col.to_string()
-    };
+    // Split generic SAT RFCs (XAXX/XEXX) by name — matches Python behaviour where each
+    // distinct real entity gets its own contraparte_key ("GENERIC_RFC||NOMBRE"). Degrades
+    // to the bare RFC on the "recibidos" side, where rfc_emisor never carries a generic RFC.
+    let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
 
     // If explicit from/to given (user-selected period), clamp window to that range.
     // Otherwise roll back window_months from the latest date in DB.
@@ -85,10 +70,14 @@ pub async fn get(
     let max_q = format!(
         "SELECT MAX(year * 100 + month)::bigint AS max_period \
          FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND NOT is_cancelled"
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N', 'T') AND NOT is_cancelled"
     );
     let max_row = sqlx::query(&max_q).bind(rfc).fetch_one(pool).await?;
-    let max_period_db: i64 = max_row.try_get("max_period").unwrap_or(0);
+    let max_period_raw: i64 = max_row.try_get("max_period").unwrap_or(0);
+    // Nunca dejar que el mes en curso entre a la ventana: el último periodo
+    // visible es siempre el último mes calendario cerrado.
+    let cutoff = crate::routes::analytics::current_month_yyyymm();
+    let max_period_db: i64 = max_period_raw.min(cutoff);
     if max_period_db == 0 {
         return Ok(RecurrenceResponse {
             window_months: 0,
@@ -96,24 +85,24 @@ pub async fn get(
             from_period: String::new(),
             to_period: String::new(),
             by_active_months: vec![],
-            scores_by_year: vec![],
             top_recurrent: vec![],
         });
     }
 
-    let (from_yyyymm, max_period) = if let (Some(f), Some(t)) = (from, to) {
-        // Respect user-selected range, clamped to DB bounds
-        let f_ym = parse_yyyymm(f).max(1);
-        let t_ym = parse_yyyymm(t).min(max_period_db);
-        (f_ym, t_ym)
+    // `to` se respeta aunque `from` no venga (el FE manda solo `to`).
+    let max_period = to
+        .map(|t| parse_yyyymm(t).min(max_period_db))
+        .unwrap_or(max_period_db);
+    let from_yyyymm = if let Some(f) = from {
+        parse_yyyymm(f).max(1)
     } else {
-        let max_year = (max_period_db / 100) as i32;
-        let max_month = (max_period_db % 100) as i32;
+        let max_year = (max_period / 100) as i32;
+        let max_month = (max_period % 100) as i32;
         let max_month_abs = max_year * 12 + max_month - 1;
         let from_month_abs = max_month_abs - (window_months - 1);
         let from_year = from_month_abs / 12;
         let from_month = from_month_abs % 12 + 1;
-        ((from_year * 100 + from_month) as i64, max_period_db)
+        (from_year * 100 + from_month) as i64
     };
 
     let to_year = (max_period / 100) as i32;
@@ -125,7 +114,7 @@ pub async fn get(
         "SELECT COUNT(DISTINCT year * 100 + month)::bigint AS cnt, \
                 MIN(year * 100 + month)::bigint AS min_period \
          FROM pulso.cfdis \
-         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N') AND NOT is_cancelled \
+         WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P', 'N', 'T') AND NOT is_cancelled \
            AND year * 100 + month >= $2 AND year * 100 + month <= $3"
     );
     let actual_row = sqlx::query(&actual_q)
@@ -148,10 +137,13 @@ pub async fn get(
         WITH cp_months AS (
             SELECT ({cp_key_expr})                               AS cp_key,
                    COUNT(DISTINCT year * 100 + month)::bigint   AS months_active,
-                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8   AS total_mxn
-            FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
+                   SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8   AS total_mxn
+            FROM pulso.cfdis_ajustado c
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+              )
             GROUP BY ({cp_key_expr})
         ),
         wt AS (SELECT GREATEST(SUM(total_mxn), 1) AS total FROM cp_months)
@@ -173,84 +165,38 @@ pub async fn get(
         .map(|r| ActiveMonthsBucket {
             months_active: r.try_get("months_active").unwrap_or(0),
             cp_count: r.try_get("cp_count").unwrap_or(0),
-            total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
-            pct_of_total: r.try_get::<f64, _>("pct_of_total").unwrap_or(0.0),
-        })
-        .collect();
-
-    // Q2: recurrence score per year (revenue-weighted per-year continuity).
-    // ratio_rec = months_active_in_year / months_available_in_year (matches Python).
-    // score_year = weighted_average(ratio_rec, weight=year_total/year_total_all) * 100
-    let q2 = format!(
-        r#"
-        WITH months_avail_year AS (
-            SELECT year,
-                   COUNT(DISTINCT month)::float8 AS months_avail
-            FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
-              AND year * 100 + month >= $2 AND year * 100 + month <= $3
-            GROUP BY year
-        ),
-        cp_year AS (
-            SELECT year, ({cp_key_expr}) AS cp_key,
-                   COUNT(DISTINCT month)::float8                                   AS cp_months_in_year,
-                   GREATEST(SUM(COALESCE(total_neto_mxn,0)::float8), 0)::float8   AS year_total
-            FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
-              AND year * 100 + month >= $2 AND year * 100 + month <= $3
-            GROUP BY year, ({cp_key_expr})
-        ),
-        year_totals AS (
-            SELECT year, GREATEST(SUM(year_total), 1) AS yt FROM cp_year GROUP BY year
-        )
-        SELECT cy.year,
-               LEAST(100.0,
-                 SUM(
-                   (cy.cp_months_in_year / ma.months_avail)
-                   * (cy.year_total / yt.yt)
-                 ) * 100
-               )::float8 AS score
-        FROM cp_year cy
-        JOIN months_avail_year ma ON ma.year = cy.year
-        JOIN year_totals yt ON yt.year = cy.year
-        GROUP BY cy.year ORDER BY cy.year
-    "#
-    );
-    let rows2 = sqlx::query(&q2)
-        .bind(rfc)
-        .bind(from_yyyymm)
-        .bind(max_period)
-        .fetch_all(pool)
-        .await?;
-    let scores_by_year: Vec<YearScore> = rows2
-        .iter()
-        .map(|r| YearScore {
-            year: r.try_get::<i64, _>("year").unwrap_or(0) as i32,
-            score: r.try_get("score").unwrap_or(0.0),
+            total_mxn: get_f64(r, "total_mxn"),
+            pct_of_total: get_f64(r, "pct_of_total"),
         })
         .collect();
 
     // Q3: top recurrent counterparties (>= 75% of window, min 1, capped at 18)
-    let min_months: i64 = ((actual_window * 3 / 4).max(1)).min(18);
+    let min_months: i64 = (actual_window * 3 / 4).clamp(1, 18);
     let q3 = format!(
         r#"
         WITH cp_data AS (
             SELECT ({cp_key_expr})                                     AS rfc,
                    MAX({cp_name_col})                                  AS nombre,
                    COUNT(DISTINCT year * 100 + month)::bigint          AS months_active,
-                   SUM(COALESCE(total_neto_mxn,0)::float8)::float8    AS total_mxn,
+                   SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8    AS total_mxn,
                    COUNT(*)::bigint                                    AS invoice_count
-            FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
+            FROM pulso.cfdis_ajustado c
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+              )
             GROUP BY ({cp_key_expr})
             HAVING COUNT(DISTINCT year * 100 + month) >= $4
         ),
         wt AS (
-            SELECT GREATEST(SUM(COALESCE(total_neto_mxn,0)::float8), 1) AS total
-            FROM pulso.cfdis
-            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
+            SELECT GREATEST(SUM(COALESCE(total_neto_mxn_ajustado,0)::float8), 1) AS total
+            FROM pulso.cfdis_ajustado c
+            WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T') AND NOT is_cancelled
               AND year * 100 + month >= $2 AND year * 100 + month <= $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+              )
         )
         SELECT rfc, nombre, months_active, total_mxn,
                total_mxn / (SELECT total FROM wt) * 100     AS pct_of_total,
@@ -274,9 +220,9 @@ pub async fn get(
             rfc: r.try_get("rfc").unwrap_or_default(),
             nombre: r.try_get("nombre").unwrap_or_default(),
             months_active: r.try_get("months_active").unwrap_or(0),
-            total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
-            pct_of_total: r.try_get::<f64, _>("pct_of_total").unwrap_or(0.0),
-            avg_monthly_mxn: r.try_get("avg_monthly_mxn").unwrap_or(0.0),
+            total_mxn: get_f64(r, "total_mxn"),
+            pct_of_total: get_f64(r, "pct_of_total"),
+            avg_monthly_mxn: get_f64(r, "avg_monthly_mxn"),
             invoice_count: r.try_get("invoice_count").unwrap_or(0),
         })
         .collect();
@@ -287,7 +233,6 @@ pub async fn get(
         from_period,
         to_period,
         by_active_months,
-        scores_by_year,
         top_recurrent,
     })
 }

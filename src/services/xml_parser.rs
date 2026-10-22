@@ -195,12 +195,14 @@ pub fn parse(
     let mut reader = Reader::from_reader(xml_bytes);
     reader.config_mut().trim_text(true);
 
-    let mut cfdi = ParsedCfdi::default();
-    cfdi.job_id = job_id.to_string();
-    cfdi.dl_type = dl_type.to_string();
-    cfdi.estado_sat = estado_sat.to_string();
-    cfdi.xml_available = 1;
-    cfdi.created_at = utc_now();
+    let mut cfdi = ParsedCfdi {
+        job_id: job_id.to_string(),
+        dl_type: dl_type.to_string(),
+        estado_sat: estado_sat.to_string(),
+        xml_available: 1,
+        created_at: utc_now(),
+        ..Default::default()
+    };
 
     let mut ctx_stack: Vec<Ctx> = vec![Ctx::Root];
     let mut current_concept = ParsedConcept::default();
@@ -412,9 +414,47 @@ pub fn parse(
         cfdi.nomina = Some(current_nomina);
     }
 
+    // For nómina CFDIs the relevant period is the payment period, NOT fecha_emision.
+    // Override year/month from fecha_final_pago (fallback: fecha_inicial_pago).
+    //
+    // Moved here (single point, inside the only parser that ever populates `cfdi.nomina`)
+    // per a later review: this used to live in etl.rs's `process_invoice`, called only on
+    // the "XML already in storage on first pass" path. `apply_xml_bytes` (the enrichment/
+    // redownload path, which parses real XML too and always has a nómina block available)
+    // called `xml_parser::parse` directly and skipped the override entirely -- measured,
+    // 1,968 of 3,457 receipts where devengo actually differs from emisión lost the correct
+    // period this way. `from_metadata` never populates `cfdi.nomina` (it has no XML to read
+    // a Nomina complement from), so it can never reach this block -- exactly the "don't
+    // touch year/month when parsing didn't bring nómina" property a shared fix needs.
+    if cfdi.tipo_comprobante == "N"
+        && let Some(ref nom) = cfdi.nomina
+    {
+        let fecha_periodo = nom
+            .fecha_final_pago
+            .as_deref()
+            .or(nom.fecha_inicial_pago.as_deref())
+            .unwrap_or("");
+        if !fecha_periodo.is_empty() {
+            let parts: Vec<&str> = fecha_periodo.splitn(3, '-').collect();
+            if parts.len() >= 2
+                && let (Ok(y), Ok(m)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>())
+                && y > 2000
+                && (1..=12).contains(&m)
+            {
+                cfdi.year = y;
+                cfdi.month = m;
+            }
+        }
+    }
+
     // Require at minimum an RFC emisor
     if cfdi.rfc_emisor.is_empty() {
-        let prefix: String = xml_bytes.iter().take(8).map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+        let prefix: String = xml_bytes
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         tracing::warn!(first_bytes = %prefix, "xml_parser: rfc_emisor empty after parse");
         return None;
     }
@@ -492,13 +532,17 @@ pub fn from_metadata(meta_json: &str, job_id: &str, dl_type: &str) -> Option<Par
         .unwrap_or("I")
         .to_uppercase();
 
-    // Map efectoComprobante (Emitido/Recibido) to tipo
+    // Map efectoComprobante (Emitido/Recibido) to tipo. SAT sends this as
+    // "Nómina" (with the accent) — `.to_uppercase()` above turns that into
+    // "NÓMINA", not "NOMINA", so the unaccented literal never matched and
+    // every metadata-only-parsed payroll CFDI silently fell through to the
+    // `_ => "I"` default, counting salaries as sales revenue.
     let tipo_comprobante = match tipo_comprobante.as_str() {
         "INGRESO" | "I" => "I",
         "EGRESO" | "E" => "E",
         "TRASLADO" | "T" => "T",
         "PAGO" | "P" => "P",
-        "NOMINA" | "N" => "N",
+        "NOMINA" | "NÓMINA" | "N" => "N",
         _ => "I",
     }
     .to_string();
@@ -545,7 +589,7 @@ pub fn from_metadata(meta_json: &str, job_id: &str, dl_type: &str) -> Option<Par
 fn parse_comprobante_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedCfdi) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "Fecha" => {
                 let v = val();
@@ -582,10 +626,10 @@ fn parse_comprobante_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut Parsed
 fn parse_emisor_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedCfdi) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = String::from_utf8_lossy(&attr.value).to_uppercase();
+        let val = decode_attr(&attr.value).to_uppercase();
         match key.as_str() {
             "Rfc" => c.rfc_emisor = val.to_string(),
-            "Nombre" => c.nombre_emisor = Some(String::from_utf8_lossy(&attr.value).to_string()),
+            "Nombre" => c.nombre_emisor = Some(decode_attr(&attr.value)),
             "RegimenFiscal" => c.regimen_fiscal_emisor = Some(val.to_string()),
             _ => {}
         }
@@ -595,7 +639,7 @@ fn parse_emisor_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedCfdi)
 fn parse_receptor_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedCfdi) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "Rfc" => c.rfc_receptor = val().to_uppercase(),
             "Nombre" => c.nombre_receptor = Some(val()),
@@ -610,7 +654,7 @@ fn parse_receptor_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedCfd
 fn parse_concept_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedConcept) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "ClaveProdServ" => c.clave_prod_serv = Some(val()),
             "ClaveUnidad" => c.clave_unidad = Some(val()),
@@ -627,7 +671,7 @@ fn parse_concept_attrs(e: &quick_xml::events::BytesStart<'_>, c: &mut ParsedConc
 fn parse_tax_attrs(e: &quick_xml::events::BytesStart<'_>, t: &mut ParsedTax, is_ret: bool) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "Impuesto" => t.impuesto = Some(val()),
             "TipoFactor" => t.tipo_factor = Some(val()),
@@ -643,7 +687,7 @@ fn parse_tax_attrs(e: &quick_xml::events::BytesStart<'_>, t: &mut ParsedTax, is_
 fn parse_pago_attrs(e: &quick_xml::events::BytesStart<'_>, p: &mut ParsedPayment) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "FechaPago" => p.fecha_pago = Some(val()),
             "FormaDePagoP" => p.forma_pago = Some(val()),
@@ -659,7 +703,7 @@ fn parse_docto_relacionado(e: &quick_xml::events::BytesStart<'_>) -> ParsedPayme
     let mut d = ParsedPaymentDoc::default();
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "IdDocumento" => d.invoice_uuid = val().to_uppercase(),
             "NumParcialidad" => d.num_parcialidad = val().parse().ok(),
@@ -667,7 +711,12 @@ fn parse_docto_relacionado(e: &quick_xml::events::BytesStart<'_>) -> ParsedPayme
             "ImpPagado" => d.imp_pagado = val().parse().ok(),
             "ImpSaldoInsoluto" => d.imp_saldo_insoluto = val().parse().ok(),
             "MonedaDR" => d.moneda_dr = Some(val()),
-            "TipoCambioDR" => d.tipo_cambio_dr = val().parse().ok(),
+            // Pago 2.0 (el único que se ve en la práctica) llama a este
+            // atributo "EquivalenciaDR", no "TipoCambioDR" — confirmado
+            // contra el XML real de un complemento de pago de un RFC cliente.
+            // El nombre viejo se deja por si algún complemento Pago 1.0
+            // todavía lo usa; nunca compiten por el mismo nodo.
+            "TipoCambioDR" | "EquivalenciaDR" => d.tipo_cambio_dr = val().parse().ok(),
             _ => {}
         }
     }
@@ -677,7 +726,7 @@ fn parse_docto_relacionado(e: &quick_xml::events::BytesStart<'_>) -> ParsedPayme
 fn parse_nomina_attrs(e: &quick_xml::events::BytesStart<'_>, n: &mut ParsedNomina) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "TipoNomina" => n.tipo_nomina = Some(val()),
             "FechaPago" => n.fecha_pago = Some(val()),
@@ -695,7 +744,7 @@ fn parse_nomina_attrs(e: &quick_xml::events::BytesStart<'_>, n: &mut ParsedNomin
 fn parse_nomina_receptor_attrs(e: &quick_xml::events::BytesStart<'_>, n: &mut ParsedNomina) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "Curp" => n.curp = Some(val()),
             "TipoContrato" => n.tipo_contrato = Some(val()),
@@ -717,7 +766,7 @@ fn parse_nomina_receptor_attrs(e: &quick_xml::events::BytesStart<'_>, n: &mut Pa
 fn parse_nomina_percepciones_totals(e: &quick_xml::events::BytesStart<'_>, n: &mut ParsedNomina) {
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "TotalSueldos" => n.total_sueldos = val().parse().ok(),
             "TotalGravado" => n.total_gravado = val().parse().ok(),
@@ -731,7 +780,7 @@ fn parse_nomina_percepcion(e: &quick_xml::events::BytesStart<'_>) -> ParsedNomin
     let mut p = ParsedNominaPercepcion::default();
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "TipoPercepcion" => p.tipo_percepcion = Some(val()),
             "Clave" => p.clave = Some(val()),
@@ -748,7 +797,7 @@ fn parse_nomina_deduccion(e: &quick_xml::events::BytesStart<'_>) -> ParsedNomina
     let mut d = ParsedNominaDeduccion::default();
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "TipoDeduccion" => d.tipo_deduccion = Some(val()),
             "Clave" => d.clave = Some(val()),
@@ -764,7 +813,7 @@ fn parse_nomina_otro_pago(e: &quick_xml::events::BytesStart<'_>) -> ParsedNomina
     let mut op = ParsedNominaOtroPago::default();
     for attr in e.attributes().flatten() {
         let key = local_name(attr.key.as_ref());
-        let val = || String::from_utf8_lossy(&attr.value).to_string();
+        let val = || decode_attr(&attr.value);
         match key.as_str() {
             "TipoOtroPago" => op.tipo_otro_pago = Some(val()),
             "Clave" => op.clave = Some(val()),
@@ -790,11 +839,29 @@ fn local_name(name: &[u8]) -> String {
     }
 }
 
+/// L18-13: an attribute's raw bytes are still XML-escaped -- quick-xml doesn't decode
+/// entities on its own. A name with a quote in it arrives here as the literal text
+/// `&quot;`, not a `"` character. This is the one shared decode point every attribute read
+/// in this file (15 of them, across 9 functions -- both the `attr()` lookup below and each
+/// `parse_*_attrs` function's own `String::from_utf8_lossy(&attr.value)` pattern) now goes
+/// through. `quick_xml::escape::unescape` resolves both the five predefined entities
+/// (&amp; &lt; &gt; &quot; &apos;) and numeric character references (&#10; etc, e.g.
+/// embedded newlines) per the doc's own "incluye las codificaciones numéricas"
+/// requirement. Malformed escape sequences fall back to the raw text rather than dropping
+/// the field -- a still-readable name beats losing the value entirely over one bad entity.
+fn decode_attr(bytes: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(bytes).to_string();
+    match quick_xml::escape::unescape(&raw) {
+        Ok(decoded) => decoded.into_owned(),
+        Err(_) => raw,
+    }
+}
+
 fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     for a in e.attributes().flatten() {
         let k = local_name(a.key.as_ref());
         if k.as_bytes() == key {
-            return Some(String::from_utf8_lossy(&a.value).to_string());
+            return Some(decode_attr(&a.value));
         }
     }
     None
@@ -846,7 +913,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let mut y = 1970u64;
     let mut rem = days;
     loop {
-        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
         let dy = if leap { 366 } else { 365 };
         if rem < dy {
             break;
@@ -854,7 +921,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
         rem -= dy;
         y += 1;
     }
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let months = [
         31u64,
         if leap { 29 } else { 28 },
@@ -878,4 +945,120 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
         mo += 1;
     }
     (y, mo, rem + 1)
+}
+
+#[cfg(test)]
+mod aud010_retencion_tests {
+    use super::*;
+
+    /// Modeled on a real 2026 comprobante's AUD-010 arithmetic fingerprint:
+    /// subtotal(3000) - descuento(0) + trasladados(480) = 3480, which exceeds
+    /// total(3442.50) by exactly 37.50 -- the ISR retention SAT computed but
+    /// Pulso never stored. RFCs, names, and UUID below are synthetic --
+    /// deliberately not the real comprobante's, which involves a real
+    /// person's tax ID and is not something to carry into source code.
+    ///
+    /// The comprobante-level `<cfdi:Retencion>` here carries only Impuesto
+    /// and Importe -- per the CFDI 4.0 XSD, comprobante-level retentions
+    /// never carry TipoFactor/TasaOCuota/Base (unlike comprobante-level
+    /// Traslado, and unlike concept-level Retencion, both of which require
+    /// the full rate breakdown). That schema asymmetry is why every
+    /// comprobante-level retention row has `tipo_factor: None`.
+    const SAMPLE_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<cfdi:Comprobante Version="4.0" Fecha="2026-08-14T07:43:53" SubTotal="3000.00" Moneda="MXN" Total="3442.50" TipoDeComprobante="I" MetodoPago="PPD" xmlns:cfdi="http://www.sat.gob.mx/cfd/4" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <cfdi:Emisor Rfc="AAAA010101AAA" Nombre="PROVEEDOR DE PRUEBA" RegimenFiscal="626" />
+  <cfdi:Receptor Rfc="BBB010101BB1" Nombre="CLIENTE DE PRUEBA" DomicilioFiscalReceptor="66368" RegimenFiscalReceptor="601" UsoCFDI="G03" />
+  <cfdi:Conceptos>
+    <cfdi:Concepto ClaveProdServ="31211600" Cantidad="2" ClaveUnidad="H87" Descripcion="CURADO DE TINTA UV" ValorUnitario="1500" Importe="3000.000000" ObjetoImp="02">
+      <cfdi:Impuestos>
+        <cfdi:Traslados>
+          <cfdi:Traslado Base="3000.000000" Impuesto="002" TipoFactor="Tasa" TasaOCuota="0.160000" Importe="480.000000" />
+        </cfdi:Traslados>
+        <cfdi:Retenciones>
+          <cfdi:Retencion Base="3000.000000" Impuesto="001" TipoFactor="Tasa" TasaOCuota="0.012500" Importe="37.500000" />
+        </cfdi:Retenciones>
+      </cfdi:Impuestos>
+    </cfdi:Concepto>
+  </cfdi:Conceptos>
+  <cfdi:Impuestos TotalImpuestosTrasladados="480.00" TotalImpuestosRetenidos="37.50">
+    <cfdi:Retenciones>
+      <cfdi:Retencion Impuesto="001" Importe="37.50" />
+    </cfdi:Retenciones>
+    <cfdi:Traslados>
+      <cfdi:Traslado Base="3000.00" Impuesto="002" TipoFactor="Tasa" TasaOCuota="0.160000" Importe="480.00" />
+    </cfdi:Traslados>
+  </cfdi:Impuestos>
+  <cfdi:Complemento>
+    <tfd:TimbreFiscalDigital xmlns:tfd="http://www.sat.gob.mx/TimbreFiscalDigital" Version="1.1" UUID="00000000-0000-0000-0000-000000000001" FechaTimbrado="2026-08-14T07:44:25" />
+  </cfdi:Complemento>
+</cfdi:Comprobante>"#;
+
+    #[test]
+    fn comprobante_level_retencion_without_tipo_factor_is_parsed() {
+        let cfdi =
+            parse(SAMPLE_XML.as_bytes(), "job", "emitidos", "vigente").expect("parse failed");
+
+        let retencion = cfdi
+            .taxes
+            .iter()
+            .find(|t| t.is_retenido == 1)
+            .expect("comprobante-level retencion should be parsed");
+        assert_eq!(retencion.impuesto, Some("001".to_string()));
+        assert_eq!(retencion.importe, Some(37.5));
+        // The CFDI 4.0 XSD doesn't give comprobante-level Retencion a
+        // TipoFactor/TasaOCuota/Base -- this is expected to be None, and
+        // `cfdi_taxes.tipo_factor` must accept it (migration 061).
+        assert_eq!(retencion.tipo_factor, None);
+        assert_eq!(retencion.tasa, None);
+
+        let traslado = cfdi
+            .taxes
+            .iter()
+            .find(|t| t.is_retenido == 0)
+            .expect("comprobante-level traslado should be parsed");
+        assert_eq!(traslado.importe, Some(480.0));
+
+        // The arithmetic fingerprint: subtotal - descuento + trasladados > total,
+        // resolved exactly by the retained amount.
+        let subtotal = cfdi.subtotal.unwrap();
+        let descuento = cfdi.descuento.unwrap_or(0.0);
+        let trasladados = 480.0;
+        let retenidos = 37.5;
+        assert!(
+            (subtotal - descuento + trasladados - retenidos - cfdi.total.unwrap()).abs() < 1e-6
+        );
+    }
+}
+
+#[cfg(test)]
+mod l18_13_decode_attr_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_the_five_predefined_entities() {
+        assert_eq!(decode_attr(b"AT&amp;T"), "AT&T");
+        assert_eq!(decode_attr(b"&quot;ACME&quot;"), "\"ACME\"");
+        assert_eq!(decode_attr(b"O&apos;Brien"), "O'Brien");
+        assert_eq!(decode_attr(b"a &lt; b &gt; c"), "a < b > c");
+    }
+
+    #[test]
+    fn decodes_numeric_character_references_including_newlines() {
+        // The doc's own example: a newline stored as a numeric char ref.
+        assert_eq!(decode_attr(b"line1&#10;line2"), "line1\nline2");
+        assert_eq!(decode_attr(b"caf&#xe9;"), "caf\u{e9}");
+    }
+
+    #[test]
+    fn leaves_plain_text_unchanged() {
+        assert_eq!(decode_attr(b"ACME SA DE CV"), "ACME SA DE CV");
+    }
+
+    #[test]
+    fn falls_back_to_the_raw_text_on_a_malformed_entity_instead_of_dropping_it() {
+        // An unterminated/unrecognized entity must not turn a name into an empty
+        // string or panic -- better a still-readable (if imperfect) name.
+        let raw = "AT&INVALID;T";
+        assert_eq!(decode_attr(raw.as_bytes()), raw);
+    }
 }

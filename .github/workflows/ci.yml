@@ -1,0 +1,26 @@
+name: CI
+
+# L6C-02: format, lint and the DB-free tests on every push/PR. No POSTGRES_* needed --
+# `just test` runs static_invariants only (see justfile: consistency_invariants moved to
+# test-db under L6C-10, once its two invariants became live relational comparisons).
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: extractions/setup-just@v2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: just fc
+      - run: just l
+      - run: just test

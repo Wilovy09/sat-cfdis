@@ -1,3 +1,4 @@
+use super::summary::{cp_key_expr, current_month_yyyymm, get_f64};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -25,9 +26,16 @@ pub struct Hallazgo {
 #[derive(Debug, Serialize, Clone)]
 pub struct TablaRow {
     pub nombre: String,
-    pub fecha_primer_pago: String,
-    pub fecha_baja: String,
+    // L10-02b: declared contract-start date (fecha_inicio_rel_laboral), not an inferred
+    // "primer pago" -- renamed to match what it actually is.
+    pub fecha_ingreso: String,
+    // L10-02c: an exact date (fecha_final_pago), not a truncated year-month.
+    pub ultimo_periodo_pagado: String,
+    // L10-02d: last ordinario receipt's gross monthly salary, full precision -- see
+    // fmt_mxn_full for why this isn't run through the abbreviating fmt_mxn.
     pub sueldo_mensual: f64,
+    // L10-03: lets the analyst see what contract figure backs each row.
+    pub tipo_contrato: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -39,13 +47,64 @@ fn subtract_months(y: i64, m: i64, n: i64) -> (i64, i64) {
     (total / 12, total % 12 + 1)
 }
 
+/// L16-design/AUD-173: `format!` never groups thousands -- Rust has no built-in digit
+/// grouping. Every money figure a hallazgo bakes into its narrative text (`cuerpo`) goes
+/// through this, never a bare `format!("${v}...")`: once a number is baked into a sentence
+/// STRING, the frontend's fmx* helpers can never reformat it the way they can a struct's own
+/// numeric field (confirmed live: `$175617.45 MXN` reached the Dashboard with no comma,
+/// H5B's single-employee narrative, because that money was already text by the time it left
+/// this function).
+fn group_thousands(integer_part: &str) -> String {
+    let bytes = integer_part.as_bytes();
+    let mut out = String::with_capacity(integer_part.len() + integer_part.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
 fn fmt_mxn(v: f64) -> String {
     if v >= 1_000_000.0 {
         format!("${:.1}M MXN", v / 1_000_000.0)
     } else if v >= 1_000.0 {
         format!("${:.0}K MXN", v / 1_000.0)
     } else {
-        format!("${:.0} MXN", v)
+        format!("${} MXN", group_thousands(&format!("{:.0}", v.abs())))
+    }
+}
+
+// L10-02d / AUD-086: abbreviating to miles hid a 0.32x-1.47x error in H5B's salary column --
+// full precision doesn't fix that on its own, but it's the format that lets an analyst
+// actually reconcile the number against a payslip, which "$140K" doesn't.
+fn fmt_mxn_full(v: f64) -> String {
+    let sign = if v < 0.0 { "-" } else { "" };
+    let formatted = format!("{:.2}", v.abs());
+    let (int_part, dec_part) = formatted
+        .split_once('.')
+        .unwrap_or((formatted.as_str(), "00"));
+    format!("{sign}${}.{dec_part} MXN", group_thousands(int_part))
+}
+
+/// Linear-interpolated percentile of a value already sorted ascending (0.5 = median).
+/// Empty input returns 0.0 -- callers only reach this after checking the population.
+fn percentile_of_sorted(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let rank = p * (sorted.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        let frac = rank - lo as f64;
+        sorted[lo] + (sorted[hi] - sorted[lo]) * frac
     }
 }
 
@@ -58,7 +117,11 @@ fn severity_score(nivel: &str) -> u8 {
         "alto" | "negativo" => 1,
         "medio" | "neutral" => 2,
         "bajo" | "positivo" => 3,
-        "muy_bajo" | "muy_positivo" => 4,
+        // L17-04/DEC-101: `informativo` (nivel nuevo, rotación) ranks exactly like
+        // `muy_bajo` on purpose -- rotación ya ocupaba este escalón en 6 de 7 empresas de
+        // control antes de este ítem; un escalón distinto movería qué hallazgos se ven en
+        // el Dashboard, y este ítem cambia lo que el badge dice, no qué hallazgos se ven.
+        "muy_bajo" | "muy_positivo" | "informativo" => 4,
         _ => 5,
     }
 }
@@ -82,35 +145,67 @@ fn h_priority(id: &str) -> u8 {
 // Nivel thresholds + interpretation text
 // ---------------------------------------------------------------------------
 
-fn h1_nivel(top3_pct: f64) -> &'static str {
-    if top3_pct < 40.0 {
-        "muy_bajo"
-    } else if top3_pct < 60.0 {
+/// L8-05: shared concentration scale for H1 and H8 -- both compute the same arithmetic
+/// (top 3 / base identificable), so they share one scale; the difference between "clientes"
+/// and "proveedores" lives in the interpretation text below, not the color. Decided as
+/// Opción C: <25% is omitted (the piso común -- H8 used to omit under 15%, H1 never
+/// omitted at all), 25-45 bajo, 45-65 medio, 65-80 alto, >=80 crítico. Top 1 is a second
+/// disparador on top of the Top 3 band: >=35% forces at least "alto", >=50% forces
+/// "crítico" -- covers the shape Top 3 dilutes (many small counterparties plus one that
+/// dominates), not "fixing" the data, just reading a different concentration pattern.
+fn concentracion_nivel(top3_pct: f64, top1_pct: f64) -> Option<&'static str> {
+    if top3_pct < 25.0 {
+        return None;
+    }
+    let base = if top3_pct < 45.0 {
         "bajo"
-    } else if top3_pct < 75.0 {
+    } else if top3_pct < 65.0 {
         "medio"
-    } else if top3_pct < 85.0 {
+    } else if top3_pct < 80.0 {
         "alto"
     } else {
         "critico"
-    }
+    };
+    let disparador = if top1_pct >= 50.0 {
+        Some("critico")
+    } else if top1_pct >= 35.0 {
+        Some("alto")
+    } else {
+        None
+    };
+    // The more severe of the two readings wins (lower severity_score = more severe).
+    Some(match disparador {
+        Some(d) if severity_score(d) < severity_score(base) => d,
+        _ => base,
+    })
 }
 
 fn h1_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "critico" => "Dependencia extrema — la pérdida o renegociación de cualquiera de estas cuentas tiene impacto directo sobre la viabilidad del negocio.",
-        "alto" => "Concentración elevada con riesgo de pérdida material ante churn de las cuentas principales.",
-        "medio" => "Concentración moderada. Revisar recurrencia y antigüedad de las cuentas principales en el módulo de Emitidas.",
+        "critico" => {
+            "Dependencia extrema — la pérdida o renegociación de cualquiera de estas cuentas tiene impacto directo sobre la viabilidad del negocio."
+        }
+        "alto" => {
+            "Concentración elevada con riesgo de pérdida material ante churn de las cuentas principales."
+        }
+        "medio" => {
+            "Concentración moderada. Revisar recurrencia y antigüedad de las cuentas principales en Ingresos, pestañas Clientes y Recurrencia."
+        }
         _ => "Base de clientes diversificada. Sin concentración crítica observable en LTM.",
     }
 }
 
+// L8-06: adopts H9's neutral band (-5% to +5%) instead of its own (0% to +5%) -- the same
+// class of twin-hallazgo defect as concentracion_nivel above. A CAGR of two extremes that
+// actually rose 20% then fell 17% used to land at -0.22%, just inside H2's old "negativo"
+// band, and print "Caída sostenida ... requiere explicación de gestión" for a trajectory
+// that wasn't a sustained fall at all.
 fn h2_nivel(cagr: f64) -> &'static str {
     if cagr > 15.0 {
         "muy_positivo"
-    } else if cagr > 5.0 {
+    } else if cagr >= 5.0 {
         "positivo"
-    } else if cagr >= 0.0 {
+    } else if cagr > -5.0 {
         "neutral"
     } else if cagr >= -15.0 {
         "negativo"
@@ -121,8 +216,12 @@ fn h2_nivel(cagr: f64) -> &'static str {
 
 fn h2_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "muy_negativo" | "negativo" => "Caída sostenida de ingresos en el período analizado. Requiere explicación de gestión antes de cualquier ejercicio de valoración.",
-        "neutral" => "Crecimiento marginal. Insuficiente para absorber inflación de costos sin compresión de flujo visible.",
+        "muy_negativo" | "negativo" => {
+            "Caída sostenida de ingresos en el período analizado. Requiere explicación de gestión antes de cualquier ejercicio de valoración."
+        }
+        "neutral" => {
+            "Crecimiento marginal. Insuficiente para absorber inflación de costos sin compresión de flujo visible."
+        }
         "positivo" => "Crecimiento consistente en el período analizado.",
         _ => "Crecimiento sólido y sostenido en el período analizado.",
     }
@@ -144,10 +243,21 @@ fn h3_nivel(delta_pp: f64) -> &'static str {
 
 fn h3_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "muy_negativo" => "Deterioro de flujo visible: los egresos crecen más rápido que los ingresos. Revisar drivers de gasto y masa salarial en detalle.",
-        "negativo" => "Presión creciente sobre el flujo visible. Verificar evolución de egresos y nómina frente a tendencia de ingresos.",
-        "neutral" => "Relación ingresos/egresos estable en el período analizado.",
-        _ => "Mejora en la relación ingresos vs egresos visibles.",
+        "muy_negativo" => {
+            "Deterioro de flujo visible: los egresos y la nómina crecen más rápido que los ingresos. Revisar drivers de gasto y masa salarial en detalle."
+        }
+        "negativo" => {
+            "Presión creciente sobre el flujo visible. Verificar evolución de egresos y nómina frente a tendencia de ingresos."
+        }
+        "neutral" => "Relación ingresos/egresos/nómina estable en el período analizado.",
+        // L10-07 / AUD-096, trap 1: a large improvement isn't unconditionally good news --
+        // it doesn't get a congratulatory text, it gets the same "revisar si es recurrente"
+        // framing a deterioration of the same magnitude would. A margin swing this size in
+        // the year before a sale is exactly what a buyer questions first.
+        "muy_positivo" => {
+            "Mejora marcada en la relación ingresos/egresos/nómina. Revisar si responde a un cambio estructural o a movimientos no recurrentes antes de proyectarla hacia adelante."
+        }
+        _ => "Mejora en la relación ingresos/egresos/nómina visibles.",
     }
 }
 
@@ -167,35 +277,83 @@ fn h4_nivel(ratio_pct: f64) -> &'static str {
 
 fn h4_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "critico" | "alto" => "Pasivo laboral de peso significativo. Requiere análisis detallado de antigüedad, sueldos y estructura de plantilla.",
+        "critico" | "alto" => {
+            "Pasivo laboral de peso significativo. Requiere análisis detallado de antigüedad, sueldos y estructura de plantilla."
+        }
         "medio" => "Pasivo laboral relevante. Considerar en la estructura de la transacción.",
         _ => "Pasivo laboral manejable en relación al nivel de ingresos.",
     }
 }
 
-fn h5a_nivel(tasa_pct: f64) -> &'static str {
-    if tasa_pct < 10.0 {
-        "muy_bajo"
-    } else if tasa_pct < 20.0 {
-        "bajo"
-    } else if tasa_pct < 35.0 {
-        "medio"
-    } else if tasa_pct < 50.0 {
+/// L16-09/AUD-168/DEC-094: cortes movidos a la referencia nacional que Nómina ya usa --
+/// Pulso no conoce el sector, y los cortes anteriores (20% medio, 35% alto, 50% crítico)
+/// etiquetaban "Alto" a una tasa que el propio Lote 15 documenta como normal en manufactura
+/// (30%-50%). Dentro de la referencia (hasta el 50% de manufactura, la más ancha de las dos
+/// bandas nacionales) el hallazgo se queda en un solo nivel informativo -- Pulso no tiene
+/// con qué distinguir un 8% de un 45% sin saber el giro, así que no finge que sí puede.
+/// Sólo por encima de esa banda hay algo que de verdad se sale de lo esperable en cualquier
+/// sector.
+///
+/// L17-04/DEC-101: no hay nivel "bajo" ni "muy_bajo" -- por abajo no hay corte defendible
+/// (industria/banca/técnico operan estructuralmente bajo el promedio nacional; un 15.8%
+/// puede ser bajo en manufactura y alto en banca), y el único caso que un corte bajo
+/// premiaría -- cero bajas en doce meses -- casi siempre es timbrado incompleto, no
+/// estabilidad. Sólo dos salidas: `alto` (>50%, fuera de cualquier banda documentada en
+/// cualquier sector) o `informativo` para todo lo demás, incluidas tres guardas evaluadas
+/// EN ESTE ORDEN -- la primera que aplique gana, y ninguna deja pasar a la siguiente:
+///   1. El mes ancla no tiene ningún CFDI de nómina para este RFC -- la tasa sería
+///      timbrado atrasado, no rotación (medido: RFC servicios A a un mes de dispararla).
+///   2. Menos de 6 de los 12 meses de la ventana tienen nómina -- no hay historia para
+///      promediar.
+///   3. Plantilla promedio (L18-21: promediada sólo sobre los meses con al menos una
+///      persona, no sobre los 12 del calendario) menor a 5 personas -- una tasa sobre 1-4
+///      personas no es una tasa.
+fn h5a_nivel_e_interpretacion(
+    tasa_pct: f64,
+    avg_hc: f64,
+    meses_con_nomina_en_ventana: usize,
+    ancla_tiene_nomina: bool,
+) -> (&'static str, String) {
+    if !ancla_tiene_nomina {
+        return (
+            "informativo",
+            "Sin CFDI de nómina en el último mes cerrado: esta tasa refleja timbrado pendiente, no rotación."
+                .to_string(),
+        );
+    }
+    if meses_con_nomina_en_ventana < 6 {
+        return (
+            "informativo",
+            "Menos de seis meses con nómina en el período: no hay historia suficiente para una tasa anual."
+                .to_string(),
+        );
+    }
+    if avg_hc < 5.0 {
+        return (
+            "informativo",
+            "Plantilla promedio menor a cinco personas: la tasa no es representativa.".to_string(),
+        );
+    }
+    let nivel = if tasa_pct > 50.0 {
         "alto"
     } else {
-        "critico"
-    }
+        "informativo"
+    };
+    (nivel, h5a_interpretacion().to_string())
 }
 
-fn h5a_interpretacion(nivel: &str) -> &'static str {
-    match nivel {
-        "critico" | "alto" => "Rotación elevada — señal de inestabilidad operativa o condiciones laborales que requieren validación. Revisar distribución por departamento y nivel salarial en módulo de Nómina.",
-        "medio" => "Rotación moderada. Verificar si se concentra en áreas críticas o corresponde a patrones estacionales.",
-        _ => "Plantilla estable en el período analizado.",
-    }
+/// L16-09: el mismo texto de referencia que Nómina, copiado tal cual (DEC-094), para
+/// cualquier tasa sin guarda -- ver `h5a_nivel_e_interpretacion` para el texto que sí
+/// cambia por guarda.
+fn h5a_interpretacion() -> &'static str {
+    "Referencia nacional: 17% a 25%; manufactura, 30% a 50%."
 }
 
-fn h6_nivel(ratio_pct: f64) -> &'static str {
+/// C8-04 (opcional): H6 and H7 measure a saldo/ingreso ratio with the same shape now
+/// (both con IVA, sin exclusiones -- see compute_h6's comment for why) and had been writing
+/// identical thresholds twice. One definition; the interpretation text stays separate below
+/// since "cartera de clientes" and "saldo con proveedores" read differently.
+fn cartera_pct_nivel(ratio_pct: f64) -> &'static str {
     if ratio_pct < 2.0 {
         "muy_bajo"
     } else if ratio_pct < 5.0 {
@@ -211,52 +369,34 @@ fn h6_nivel(ratio_pct: f64) -> &'static str {
 
 fn h6_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "critico" | "alto" => "Cartera material en riesgo. Revisar antigüedad y concentración de saldos en el módulo de Cobranza.",
-        "medio" => "Saldo pendiente relevante. Verificar composición por cliente y buckets de antigüedad.",
+        "critico" | "alto" => {
+            "Cartera material en riesgo. Revisar antigüedad y concentración de saldos en Ingresos → Clientes → Cobranza por cliente."
+        }
+        "medio" => {
+            "Saldo pendiente relevante. Verificar composición por cliente y buckets de antigüedad."
+        }
         _ => "Cobranza eficiente. Cartera pendiente dentro de rangos normales.",
-    }
-}
-
-fn h7_nivel(ratio_pct: f64) -> &'static str {
-    if ratio_pct < 2.0 {
-        "muy_bajo"
-    } else if ratio_pct < 5.0 {
-        "bajo"
-    } else if ratio_pct < 10.0 {
-        "medio"
-    } else if ratio_pct < 20.0 {
-        "alto"
-    } else {
-        "critico"
     }
 }
 
 fn h7_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "critico" | "alto" => "Saldo relevante con proveedores. Revisar antigüedad, concentración y posible impacto en relaciones comerciales o liquidez.",
+        "critico" | "alto" => {
+            "Saldo relevante con proveedores. Revisar antigüedad, concentración y posible impacto en relaciones comerciales o liquidez."
+        }
         "medio" => "Saldo moderado. Verificar composición por proveedor y buckets de vencimiento.",
         _ => "Disciplina de pago sólida. Sin pasivo material observable con proveedores.",
     }
 }
 
-fn h8_nivel(top3_pct: f64) -> Option<&'static str> {
-    if top3_pct < 15.0 {
-        None // omit
-    } else if top3_pct < 25.0 {
-        Some("bajo")
-    } else if top3_pct < 40.0 {
-        Some("medio")
-    } else if top3_pct < 60.0 {
-        Some("alto")
-    } else {
-        Some("critico")
-    }
-}
-
 fn h8_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "critico" | "alto" => "Concentración elevada en pocos proveedores. Una interrupción en las relaciones principales tendría impacto material sobre la operación. Revisar condiciones contractuales.",
-        "medio" => "Concentración moderada. Validar diversificación, exclusividad y riesgo de sustitución en el proceso de due diligence.",
+        "critico" | "alto" => {
+            "Concentración elevada en pocos proveedores. Una interrupción en las relaciones principales tendría impacto material sobre la operación. Revisar condiciones contractuales."
+        }
+        "medio" => {
+            "Concentración moderada. Validar diversificación, exclusividad y riesgo de sustitución en el proceso de due diligence."
+        }
         _ => "Gasto distribuido entre proveedores. Sin dependencia crítica observable.",
     }
 }
@@ -277,11 +417,19 @@ fn h9_nivel(delta_pct: f64) -> &'static str {
 
 fn h9_interpretacion(nivel: &str) -> &'static str {
     match nivel {
-        "muy_negativo" => "Caída material en la ventana más reciente. El CAGR histórico puede enmascarar un deterioro acelerado. Contrastar con CAGR histórico y revisar módulo de Emitidas.",
-        "negativo" => "Desaceleración visible en los últimos 12 meses vs el período anterior. Contrastar con el CAGR histórico para distinguir corrección temporal de deterioro estructural.",
-        "neutral" => "Ingresos recientes en línea con el LTM anterior. Sin aceleración ni deterioro visible en la ventana más reciente.",
+        "muy_negativo" => {
+            "Caída material en la ventana más reciente. El CAGR histórico puede enmascarar un deterioro acelerado. Contrastar con CAGR histórico y revisar Ingresos → Resumen."
+        }
+        "negativo" => {
+            "Desaceleración visible en los últimos 12 meses vs el período anterior. Contrastar con el CAGR histórico para distinguir corrección temporal de deterioro estructural."
+        }
+        "neutral" => {
+            "Ingresos recientes en línea con el LTM anterior. Sin aceleración ni deterioro visible en la ventana más reciente."
+        }
         "positivo" => "Ingresos recientes por encima del LTM anterior. Momentum favorable.",
-        _ => "Aceleración de ingresos en la ventana más reciente. Señal positiva de momentum comercial.",
+        _ => {
+            "Aceleración de ingresos en la ventana más reciente. Señal positiva de momentum comercial."
+        }
     }
 }
 
@@ -297,16 +445,21 @@ async fn compute_ltm_ingreso(
     to_y: i64,
     to_m: i64,
 ) -> anyhow::Result<f64> {
+    // L8-03 / DEC-041: same four properties as H1's query above. Feeds H9, called once for
+    // the current LTM window and once for LTM-12.
     let row = sqlx::query(
         r#"
-        SELECT COALESCE(SUM(COALESCE(total_mxn,0))::float8, 0) AS total
-        FROM pulso.cfdis
+        SELECT COALESCE(SUM(COALESCE(total_neto_mxn_ajustado,0))::float8, 0) AS total
+        FROM pulso.cfdis_ajustado c
         WHERE rfc_emisor = $1
           AND dl_type IN ('emitidos','ambos')
-          AND tipo_comprobante = 'I'
+          AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         "#,
     )
     .bind(rfc)
@@ -316,7 +469,7 @@ async fn compute_ltm_ingreso(
     .bind(to_m)
     .fetch_one(pool)
     .await?;
-    Ok(row.try_get::<f64, _>("total").unwrap_or(0.0))
+    Ok(get_f64(&row, "total"))
 }
 
 // ---------------------------------------------------------------------------
@@ -331,20 +484,33 @@ async fn compute_h1(
     ltm_end_y: i64,
     ltm_end_m: i64,
 ) -> anyhow::Result<Option<Hallazgo>> {
-    let rows = sqlx::query(
+    // C13-04/DEC-080: every query that groups by counterparty uses cp_key_expr, so a
+    // generic RFC (XAXX/XEXX) hiding several distinct real clients doesn't collapse them
+    // into one row here while every other module keeps them separate.
+    let cp_key = cp_key_expr("c.rfc_receptor", "c.nombre_receptor");
+
+    // L8-03 / DEC-041: base del Resumen -- cfdis_ajustado, total_neto_mxn_ajustado,
+    // exclusiones, tipo_comprobante NOT IN ('P','N','T') instead of ='I' (con IVA, sin
+    // exclusiones, notas de crédito descartadas del todo). Same four properties on every
+    // one of H1/H2/H8/H9's six feeder queries.
+    let rows = sqlx::query(&format!(
         r#"
-        SELECT rfc_receptor, MAX(nombre_receptor) AS nombre, SUM(COALESCE(total_mxn,0))::float8 AS ltm_mxn
-        FROM pulso.cfdis
-        WHERE rfc_emisor = $1
-          AND dl_type IN ('emitidos','ambos')
-          AND tipo_comprobante = 'I'
-          AND NOT is_cancelled
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY rfc_receptor
+        SELECT ({cp_key}) AS rfc_receptor, MAX(c.nombre_receptor) AS nombre,
+               SUM(COALESCE(c.total_neto_mxn_ajustado,0))::float8 AS ltm_mxn
+        FROM pulso.cfdis_ajustado c
+        WHERE c.rfc_emisor = $1
+          AND c.dl_type IN ('emitidos','ambos')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
+          AND NOT c.is_cancelled
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
+        GROUP BY ({cp_key})
         ORDER BY ltm_mxn DESC
-        "#,
-    )
+        "#
+    ))
     .bind(rfc)
     .bind(ltm_start_y)
     .bind(ltm_start_m)
@@ -366,10 +532,18 @@ async fn compute_h1(
 
     let clients: Vec<ClientRow> = rows
         .iter()
-        .map(|r| ClientRow {
-            rfc: r.try_get("rfc_receptor").unwrap_or_default(),
-            nombre: r.try_get("nombre").unwrap_or_default(),
-            mxn: r.try_get("ltm_mxn").unwrap_or(0.0),
+        .map(|r| {
+            let cp_key: String = r.try_get("rfc_receptor").unwrap_or_default();
+            // C13-04/DEC-080: split the composite key back apart -- the PeG/extranjero
+            // comparisons below match the bare RFC, same as before this item.
+            let rfc = cp_key
+                .split_once("||")
+                .map_or_else(|| cp_key.clone(), |(base, _)| base.to_string());
+            ClientRow {
+                rfc,
+                nombre: r.try_get("nombre").unwrap_or_default(),
+                mxn: get_f64(r, "ltm_mxn"),
+            }
         })
         .collect();
 
@@ -381,15 +555,49 @@ async fn compute_h1(
     // PeG share
     let peg_mxn: f64 = clients
         .iter()
-        .filter(|c| c.rfc == "XAXX010101000")
+        .filter(|c| c.rfc == super::summary::RFC_PUBLICO_GENERAL)
         .map(|c| c.mxn)
         .sum();
     let peg_pct = peg_mxn / total_ltm * 100.0;
 
-    // Top 3 excluding PeG (take first 3 non-XAXX clients)
+    // L18-17: when Público en General -- excluded from this hallazgo's own denominator --
+    // carries more than half the period's ingreso, "Top N clientes representa X% del
+    // ingreso identificable" is computed over a tiny, unrepresentative slice. No verdict
+    // on concentration is meaningful here, so this short-circuits before the
+    // identificable/top3 computation below.
+    // L19-10 point 1: Público en General only. Extranjero Genérico used to count toward
+    // this 50% too, which sent an RFC selling abroad down this branch with "El 0.0% del
+    // ingreso es venta a Público en General" -- foreign clients are real, identifiable
+    // clients (point 2 below), not an atomized base.
+    if peg_pct > 50.0 {
+        return Ok(Some(Hallazgo {
+            id: "H1".to_string(),
+            titulo: "Concentración de clientes".to_string(),
+            familia: "riesgo".to_string(),
+            nivel: "informativo".to_string(),
+            metrica_principal: Some(peg_pct),
+            cuerpo: format!(
+                "El {peg_pct:.1}% del ingreso es venta a Público en General: la concentración entre clientes identificados no describe la base de clientes."
+            ),
+            interpretacion: "Base de clientes dominada por público en general: la concentración entre clientes identificados no es una medida de riesgo útil aquí.".to_string(),
+            disclaimer: None,
+            nota_fija: None,
+            datos_tabla: None,
+        }));
+    }
+
+    // Top 3 excluding PeG (take first 3 non-XAXX clients). L8-03: with credit notes now
+    // netted in, a counterparty can land with a negative total_neto_mxn_ajustado --
+    // excluded here, not just from the top-3 pick (rows sort DESC so a negative total
+    // wouldn't be picked anyway) but from the concentration denominator too, or a negative
+    // contributor drags total_excl_peg below top3_mxn and the percentage passes 100.
+    // L19-10 point 2: foreign clients count, each by its own name -- cp_key already splits
+    // the Extranjero Genérico RFC per counterparty name, the same way the Conc. clientes
+    // card and the Top clientes table do (DEC-069). Excluding them (L10-10) hid an RFC's
+    // largest single client whenever that client was abroad.
     let identifiable: Vec<&ClientRow> = clients
         .iter()
-        .filter(|c| c.rfc != "XAXX010101000")
+        .filter(|c| c.rfc != super::summary::RFC_PUBLICO_GENERAL && c.mxn > 0.0)
         .collect();
 
     if identifiable.is_empty() {
@@ -404,19 +612,32 @@ async fn compute_h1(
     let top3: Vec<&ClientRow> = identifiable.iter().take(3).copied().collect();
     let top3_mxn: f64 = top3.iter().map(|c| c.mxn).sum();
     let top3_pct = top3_mxn / total_excl_peg * 100.0;
+    let top1_pct = top3
+        .first()
+        .map(|c| c.mxn / total_excl_peg * 100.0)
+        .unwrap_or(0.0);
     let n = top3.len();
 
-    let nivel = h1_nivel(top3_pct);
+    let nivel = match concentracion_nivel(top3_pct, top1_pct) {
+        Some(n) => n,
+        None => return Ok(None), // < 25% Top 3 and < 35% Top 1 -- omit
+    };
     let interp = h1_interpretacion(nivel);
 
+    // L8-04: the denominator stays base identificable (concentration among identifiable
+    // clients is the right metric) -- what changes is the body saying so explicitly,
+    // instead of implying it's a share of the whole LTM ingreso.
     let mut cuerpo = format!(
-        "El Top {} cliente{} representa el {:.1}% del ingreso LTM.",
+        "El Top {} cliente{} representa el {:.1}% del ingreso identificable.",
         n,
         if n == 1 { "" } else { "s" },
         top3_pct
     );
 
-    if peg_pct > 30.0 {
+    // L8-04: no longer conditioned on >30% -- if there's any ingreso a Público en
+    // General, it's always named, with its own percentage. L19-10: only once it rounds to
+    // at least 0.1%, so the sentence never reads "el 0.0%".
+    if peg_pct >= 0.05 {
         cuerpo.push_str(&format!(
             " Adicionalmente, el {:.1}% del ingreso corresponde a ventas a Público en General.",
             peg_pct
@@ -441,28 +662,152 @@ async fn compute_h1(
 // H5A — Rotación de personal
 // ---------------------------------------------------------------------------
 
-async fn compute_h5a(
+/// L6C-03: H5A/H5B's own "last period" -- nómina's own MAX(year, month), not the facturas
+/// anchor `get()` resolves for H1/H2/H3/H6 (which excludes tipo_comprobante='N' precisely
+/// so nómina can't move it). Nómina is timbrada after facturas, so the facturas anchor is
+/// routinely a month ahead of the last real payroll -- for 5 of 7 RFCs measured 2026-09-04,
+/// the facturas anchor's month has ZERO nómina rows, so `latest_row`/`term_rows` compared
+/// every real employee against an empty ghost month: H5A read 100% rotación (every LTM
+/// employee counted as a baja against a month with nobody in it) and H5B marked the entire
+/// plantilla as terminada. Resolved by having H5A/H5B query nomina_normalizada's own anchor
+/// directly instead of receiving the facturas one from the caller.
+/// Nómina bruta por año (total_percepciones, L5-04's bruto redefinition), todo tipo_nomina,
+/// grouped by year_devengo -- matches the single definition every other consumer
+/// (payroll.rs's by_month/by_year, the bridge's three nomina sources, list_excluded_cfdis)
+/// uses since Lote 5. `pub`, not `pub(crate)`: this is the single source H3's `cuerpo` reads
+/// from AND the one `tests/consistency_invariants.rs` (an integration test, which only sees
+/// the public API) calls to verify H3 against `payroll::monthly_series` -- per Rob's review
+/// of L6C-10: the invariant used to re-type this exact query inside the test file, so
+/// reverting H3 to `n.year` would leave the test passing against its own untouched copy
+/// while the real code silently regressed. Extracted here, both call sites read the same
+/// compiled function; there's no second copy left to diverge.
+pub async fn nomina_por_year(
     pool: &DbPool,
     rfc: &str,
-    ltm_start_y: i64,
-    ltm_start_m: i64,
-    ltm_end_y: i64,
-    ltm_end_m: i64,
-) -> anyhow::Result<Option<Hallazgo>> {
-    // Per-month distinct employee count in LTM
-    let month_rows = sqlx::query(
+) -> anyhow::Result<std::collections::HashMap<i64, f64>> {
+    // L16-04/AUD-164/DEC-095/DEC-096: same floor payroll::get enforces -- this had none, so
+    // the Dashboard's nómina hallazgo/bridge kept a pre-piso year (2022, $590,664.16 on the
+    // RFC grande measured) alive after L15-07 had already taken it out of the rest of the
+    // module.
+    let anio_piso = super::summary::anio_piso_for_rfc(pool, rfc).await?;
+    let rows = sqlx::query(
         r#"
-        SELECT c.year, c.month, COUNT(DISTINCT c.rfc_receptor)::bigint AS hc
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-        GROUP BY c.year, c.month
+        SELECT n.year_devengo AS year,
+               SUM(n.total_percepciones) AS nomina
+        FROM pulso.nomina_normalizada n
+        WHERE n.rfc_emisor = $1
+          AND NOT n.is_excluded
+          AND n.year_devengo >= $2
+        GROUP BY n.year_devengo
         "#,
     )
+    .bind(rfc)
+    .bind(anio_piso)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<i64, _>("year").unwrap_or(0),
+                get_f64(r, "nomina"),
+            )
+        })
+        .collect())
+}
+
+/// L17-02/DEC-100: H5A/H5B anchor on `current_month_yyyymm()` PLAIN -- the shared "último
+/// mes cerrado" cutoff itself, not this RFC's own most-recent devengo month capped at that
+/// cutoff. Those are different anchors whenever this RFC's own nómina lags the shared
+/// cutoff (the common case: most RFC haven't timbrado the just-closed month yet at the
+/// moment this runs). `min(own_max, cutoff)` would pick the EARLIER of the two -- this
+/// RFC's own (older) last month -- silently reintroducing a per-RFC anchor by the back
+/// door. Measured live: the RFC unipersonal's own nómina reaches July 2026; the shared
+/// cutoff is August. Anchoring on the shared cutoff (plain) reads August as the reference
+/// month, where this RFC has zero rows -- 100% rotación, correctly, since its one employee
+/// has no recibo in the anchor month. `min()`-ing back down to July (where that employee
+/// does have a recibo) reads 0% -- wrong, and indistinguishable from "no rotación" instead
+/// of "nómina timbrado behind."
+///
+/// The existence check this fn already did is kept as-is and stays load-bearing: `None`
+/// still short-circuits both hallazgos before they run their full queries, for an RFC with
+/// literally zero nómina ever -- the cheap query below is now ONLY that existence check,
+/// never a source for the anchor value itself.
+async fn nomina_hallazgo_anchor(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<(i64, i64)>> {
+    let row = sqlx::query(
+        r#"
+        SELECT MAX(year_devengo * 100 + month_devengo)::bigint AS max_ym
+        FROM pulso.nomina_normalizada
+        WHERE rfc_emisor = $1 AND NOT is_excluded
+        "#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await?;
+    let max_ym: Option<i64> = row.try_get("max_ym").ok().flatten();
+    if max_ym.filter(|ym| *ym > 0).is_none() {
+        return Ok(None);
+    }
+    let ym = current_month_yyyymm();
+    Ok(Some((ym / 100, ym % 100)))
+}
+
+async fn compute_h5a(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo>> {
+    let Some((ltm_end_y, ltm_end_m)) = nomina_hallazgo_anchor(pool, rfc).await? else {
+        return Ok(None);
+    };
+    let (ltm_start_y, ltm_start_m) = subtract_months(ltm_end_y, ltm_end_m, 11);
+
+    // L17-04/DEC-101 guardas 1 y 2: same shared month-detector DEC-099 already uses for
+    // meses_sin_nomina (one definition of "meses con nómina", not a second one just for
+    // this hallazgo) -- fetched from ltm_start_y onward (no upper bound of its own) and
+    // clipped to this 12-month window here.
+    let months_with_data: std::collections::HashSet<(i64, i64)> =
+        super::payroll::nomina_months_with_data(pool, rfc, ltm_start_y)
+            .await?
+            .into_iter()
+            .filter(|&(y, m)| {
+                (y, m) >= (ltm_start_y, ltm_start_m) && (y, m) <= (ltm_end_y, ltm_end_m)
+            })
+            .collect();
+    let ancla_tiene_nomina = months_with_data.contains(&(ltm_end_y, ltm_end_m));
+    let meses_con_nomina_en_ventana = months_with_data.len();
+
+    // L10-09 / AUD-098, DEC-053: rotación used to count every termination the same way,
+    // blending contratos de obra/tiempo determinado (which end by design) with real
+    // attrition of permanent staff -- one client RFC's 131.7% "crítico" was almost entirely people
+    // whose obra contract simply ran out. `emp_tipo` classifies each employee ONCE, from
+    // their own recibo vigente -- never MAX/MIN/mode: '03' sorts before '01' alphabetically,
+    // so MAX would (and once did, in this item's own diagnosis) misclassify permanent staff
+    // as temporary. Only tipo_contrato 01/02 (indeterminado/determinado) count as "plantilla
+    // permanente"; 03/04/99 are tracked separately below for the context sentence, never
+    // silently dropped.
+    // L18-22: "recibo vigente" (payroll::recibo_vigente_order) replaces this CTE's own
+    // fecha_pago-only tiebreak -- ordinario primero, luego fin de período pagado, fecha de
+    // pago, fecha de emisión, uuid. This exact CTE is duplicated (not shared) across five
+    // sites in H5A/H5B on purpose, per the doc this fixes -- all five call the same
+    // function, not five copies of the same literal order-by.
+    let emp_tipo_order = super::payroll::recibo_vigente_order("");
+    let month_rows = sqlx::query(&format!(
+        r#"
+        WITH emp_tipo AS (
+            SELECT DISTINCT ON (rfc_receptor) rfc_receptor, tipo_contrato
+            FROM pulso.nomina_normalizada
+            WHERE rfc_emisor = $1 AND NOT is_excluded
+            ORDER BY rfc_receptor, {emp_tipo_order}
+        )
+        SELECT n.year_devengo AS year, n.month_devengo AS month, COUNT(DISTINCT n.rfc_receptor)::bigint AS hc
+        FROM pulso.nomina_normalizada n
+        JOIN emp_tipo et ON et.rfc_receptor = n.rfc_receptor
+        WHERE n.rfc_emisor = $1
+          AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+          AND (n.year_devengo < $4 OR (n.year_devengo = $4 AND n.month_devengo <= $5))
+          AND NOT n.is_excluded
+          AND et.tipo_contrato IN ('01', '02')
+        GROUP BY n.year_devengo, n.month_devengo
+        "#
+    ))
     .bind(rfc)
     .bind(ltm_start_y)
     .bind(ltm_start_m)
@@ -471,60 +816,61 @@ async fn compute_h5a(
     .fetch_all(pool)
     .await?;
 
-    if month_rows.is_empty() {
-        return Ok(None);
-    }
-
     let hc_per_month: Vec<i64> = month_rows
         .iter()
         .map(|r| r.try_get::<i64, _>("hc").unwrap_or(0))
         .collect();
-    let avg_hc = hc_per_month.iter().sum::<i64>() as f64 / hc_per_month.len() as f64;
+    // L10-09: one decimal on the average headcount -- rounding it to a whole number (as
+    // before) is what let a reader's own bajas/headcount division disagree with the
+    // displayed percentage (L10-06 / AUD-094).
+    // L18-21: divides by `hc_per_month.len()` (months where the plantilla series has at
+    // least one person), not a fixed 12 -- L17-04's "divide by all 12 calendar months,
+    // hueco counts as zero" turned out to contradict DEC-101's own guarda 1 (a month
+    // without a nómina CFDI is timbrado pendiente, not zero personas) and the run-rate's own
+    // convention of averaging only over months with data. Guarda 2 (below, meses_con_nomina
+    // < 6) is what protects short histories, not this divisor.
+    let avg_hc = if hc_per_month.is_empty() {
+        0.0
+    } else {
+        hc_per_month.iter().sum::<i64>() as f64 / hc_per_month.len() as f64
+    };
 
-    // Employees active in last period
-    let latest_row = sqlx::query(
+    // P-01 / AUD-075: latest-period headcount and bajas used to be two separate queries,
+    // the second a correlated NOT EXISTS that rebuilt the whole nomina_normalizada view
+    // once per LTM employee (102 times, measured 5.8s on the RFC grande). Grouping by
+    // employee once and counting with FILTER gets both numbers in a single pass. The old
+    // `latest_row` query didn't bind the LTM window (it just filtered the literal latest
+    // period); this fused version inherits the window from the CTE it's built on, which is
+    // harmless here because the latest month is always inside the LTM window by
+    // construction -- not a definition change, just noted so it doesn't read as one later.
+    // L18-20: active_latest = devengo igual-o-posterior al ancla, sin techo -- misma
+    // definición que el snapshot's own headcount (payroll.rs, "activo = devengo igual o
+    // posterior al ancla, sin techo"). La igualdad exacta contra el ancla contaba como baja
+    // a quien ya timbró el mes abierto.
+    let emp_rows = sqlx::query(&format!(
         r#"
-        SELECT COUNT(DISTINCT c.rfc_receptor)::bigint AS active
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND c.year = $2 AND c.month = $3
-        "#,
-    )
-    .bind(rfc)
-    .bind(ltm_end_y)
-    .bind(ltm_end_m)
-    .fetch_one(pool)
-    .await?;
-    let _latest_hc: i64 = latest_row.try_get("active").unwrap_or(0);
-
-    // Employees who appeared in LTM but not in the latest month
-    let bajas_row = sqlx::query(
-        r#"
-        SELECT COUNT(DISTINCT ltm.rfc_receptor)::bigint AS bajas
-        FROM (
-            SELECT DISTINCT c.rfc_receptor
-            FROM pulso.cfdi_nomina n
-            JOIN pulso.cfdis c ON c.uuid = n.uuid
-            WHERE c.rfc_emisor = $1
-              AND c.tipo_comprobante = 'N'
-              AND NOT c.is_cancelled
-              AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-              AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-        ) ltm
-        WHERE NOT EXISTS (
-            SELECT 1 FROM pulso.cfdi_nomina n2
-            JOIN pulso.cfdis c2 ON c2.uuid = n2.uuid
-            WHERE c2.rfc_emisor = $1
-              AND c2.tipo_comprobante = 'N'
-              AND NOT c2.is_cancelled
-              AND c2.rfc_receptor = ltm.rfc_receptor
-              AND c2.year = $4 AND c2.month = $5
+        WITH emp_tipo AS (
+            SELECT DISTINCT ON (rfc_receptor) rfc_receptor, tipo_contrato
+            FROM pulso.nomina_normalizada
+            WHERE rfc_emisor = $1 AND NOT is_excluded
+            ORDER BY rfc_receptor, {emp_tipo_order}
         )
-        "#,
-    )
+        SELECT
+            COUNT(*) FILTER (WHERE active_latest AND tipo_contrato IN ('01', '02'))       AS latest_hc,
+            COUNT(*) FILTER (WHERE NOT active_latest AND tipo_contrato IN ('01', '02'))   AS bajas_permanentes,
+            COUNT(*) FILTER (WHERE NOT active_latest AND tipo_contrato NOT IN ('01', '02')) AS bajas_temporales
+        FROM (
+            SELECT n.rfc_receptor, et.tipo_contrato,
+                   BOOL_OR(n.year_devengo > $4 OR (n.year_devengo = $4 AND n.month_devengo >= $5)) AS active_latest
+            FROM pulso.nomina_normalizada n
+            JOIN emp_tipo et ON et.rfc_receptor = n.rfc_receptor
+            WHERE n.rfc_emisor = $1
+              AND (n.year_devengo > $2 OR (n.year_devengo = $2 AND n.month_devengo >= $3))
+              AND NOT n.is_excluded
+            GROUP BY n.rfc_receptor, et.tipo_contrato
+        ) emp
+        "#
+    ))
     .bind(rfc)
     .bind(ltm_start_y)
     .bind(ltm_start_m)
@@ -532,23 +878,46 @@ async fn compute_h5a(
     .bind(ltm_end_m)
     .fetch_one(pool)
     .await?;
-    let bajas: i64 = bajas_row.try_get("bajas").unwrap_or(0);
+    let latest_hc: i64 = emp_rows.try_get("latest_hc").unwrap_or(0);
+    let bajas: i64 = emp_rows.try_get("bajas_permanentes").unwrap_or(0);
+    let bajas_temporales: i64 = emp_rows.try_get("bajas_temporales").unwrap_or(0);
 
-    if avg_hc <= 0.0 {
-        return Ok(None);
-    }
+    // L17-04: no early `None` return on avg_hc<=0 anymore -- an RFC with real nómina
+    // history but zero plantilla permanente in this window is exactly guarda 3's job
+    // (avg_hc < 5.0 covers avg_hc == 0.0 too), which shows `informativo` with an
+    // explanation instead of silently hiding the hallazgo.
+    let tasa_pct = if avg_hc > 0.0 {
+        bajas as f64 / avg_hc * 100.0
+    } else {
+        0.0
+    };
+    let (nivel, interp) = h5a_nivel_e_interpretacion(
+        tasa_pct,
+        avg_hc,
+        meses_con_nomina_en_ventana,
+        ancla_tiene_nomina,
+    );
 
-    let tasa_pct = bajas as f64 / avg_hc * 100.0;
-    let nivel = h5a_nivel(tasa_pct);
-    let interp = h5a_interpretacion(nivel);
-
-    let cuerpo = format!(
-        "La rotación estimada en los últimos 12 meses es de {:.1}% ({} baja{} / headcount promedio {:.0} empleados).",
+    // L10-09: one figure, one semáforo -- the by-tipo-de-contrato breakdown belongs in
+    // Nómina > Altas y bajas, not here. The second sentence only appears when there's
+    // something it would otherwise hide: without it, a low permanent-turnover number could
+    // read as "barely anyone left" even when dozens of obra contracts ended.
+    let mut cuerpo = format!(
+        "La rotación de plantilla permanente en los últimos 12 meses es de {:.1}% ({} baja{} / {:.1} \
+         empleados de planta en promedio, {} activo{} en el último periodo).",
         tasa_pct,
         bajas,
         if bajas == 1 { "" } else { "s" },
-        avg_hc
+        avg_hc,
+        latest_hc,
+        if latest_hc == 1 { "" } else { "s" }
     );
+    if bajas_temporales > 0 {
+        cuerpo.push_str(&format!(
+            " Además terminaron {bajas_temporales} contrato{} por obra o tiempo determinado, que no cuentan como rotación.",
+            if bajas_temporales == 1 { "" } else { "s" }
+        ));
+    }
 
     Ok(Some(Hallazgo {
         id: "H5A".to_string(),
@@ -557,8 +926,13 @@ async fn compute_h5a(
         nivel: nivel.to_string(),
         metrica_principal: Some(tasa_pct),
         cuerpo,
-        interpretacion: interp.to_string(),
-        disclaimer: None,
+        interpretacion: interp,
+        // L16-09/AUD-168 punto 3: esta tasa usa su propia ventana (12 meses móviles, no año
+        // calendario) y su propio universo (sólo contratos 01/02) -- distinto de la que
+        // reporta el módulo de Nómina (año calendario, toda la plantilla). Antes el texto
+        // mandaba al usuario "al módulo de Nómina" sin avisar que el número que iba a ver
+        // ahí no es el mismo número, ni es comparable.
+        disclaimer: Some("Esta tasa cubre los últimos 12 meses y sólo plantilla permanente. El módulo de Nómina reporta la rotación por año calendario, sobre toda la plantilla: los dos números no son comparables entre sí.".to_string()),
         nota_fija: Some("Estimado a partir de CFDIs de nómina. Puede no reflejar movimientos que no se timbraron, o puede contener errores en el timbrado de CFDIs de nómina.".to_string()),
         datos_tabla: None,
     }))
@@ -568,34 +942,181 @@ async fn compute_h5a(
 // H5B — Baja de personal clave (top 10% salarial, últimos 24 meses)
 // ---------------------------------------------------------------------------
 
-async fn compute_h5b(
-    pool: &DbPool,
-    rfc: &str,
-    ltm_end_y: i64,
-    ltm_end_m: i64,
-) -> anyhow::Result<Option<Hallazgo>> {
+async fn compute_h5b(pool: &DbPool, rfc: &str) -> anyhow::Result<Option<Hallazgo>> {
+    let Some((ltm_end_y, ltm_end_m)) = nomina_hallazgo_anchor(pool, rfc).await? else {
+        return Ok(None);
+    };
     let (win_start_y, win_start_m) = subtract_months(ltm_end_y, ltm_end_m, 23);
 
-    // Employees with last payroll in the 24-month window but not in latest month
-    let term_rows = sqlx::query(
+    // L10-03 / AUD-098, DEC-050: reference distribution is the ACTIVE workforce (last devengo
+    // month), never the terminated pool -- ranking "most key of the people who left" always
+    // finds someone; ranking against the company's own current plantilla is what "clave"
+    // actually means. Median salary here also becomes the floor below (trap 1).
+    let last_ordinario_order = super::payroll::recibo_vigente_order("b.");
+    let active_rows = sqlx::query(&format!(
         r#"
+        WITH base AS MATERIALIZED (
+            SELECT n.rfc_receptor, n.year_devengo, n.month_devengo, n.tipo_nomina,
+                   n.total_sueldos, n.num_dias_pagados, n.fecha_pago, n.fecha_final_pago,
+                   n.fecha_inicio_rel_laboral, n.fecha_emision, n.uuid
+            FROM pulso.nomina_normalizada n
+            WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
+        ),
+        -- L18-20: devengo igual-o-posterior al ancla, sin techo -- misma definición que
+        -- el snapshot y H5A (payroll::recibo_vigente_order's sibling fix).
+        active_emps AS (
+            SELECT DISTINCT rfc_receptor FROM base
+            WHERE year_devengo > $2 OR (year_devengo = $2 AND month_devengo >= $3)
+        ),
+        -- L18-22: payroll::recibo_vigente_order -- ordinario primero (cae a extraordinario
+        -- sólo si la persona no tiene ninguno), luego fin de período pagado, fecha de pago,
+        -- fecha de emisión, uuid. Ya no pre-filtra tipo_nomina='O': ese filtro es justo lo
+        -- que el fallback a extraordinario necesita no tener.
+        last_ordinario AS (
+            SELECT DISTINCT ON (b.rfc_receptor) b.rfc_receptor,
+                (COALESCE(b.total_sueldos, 0)::float8 / NULLIF(b.num_dias_pagados, 0)::float8 * 30.0) AS sueldo
+            FROM base b
+            WHERE b.rfc_receptor IN (SELECT rfc_receptor FROM active_emps)
+            ORDER BY b.rfc_receptor, {last_ordinario_order}
+        ),
+        start_dates AS (
+            SELECT b.rfc_receptor,
+                COALESCE(
+                    MAX(b.fecha_inicio_rel_laboral::date) FILTER (
+                        WHERE b.fecha_inicio_rel_laboral::date >= DATE '1980-01-01'
+                          AND b.fecha_inicio_rel_laboral::date <= CURRENT_DATE
+                    ),
+                    MIN(b.fecha_pago::date)
+                ) AS start_date
+            FROM base b
+            WHERE b.rfc_receptor IN (SELECT rfc_receptor FROM active_emps)
+            GROUP BY b.rfc_receptor
+        )
         SELECT
-            c.rfc_receptor                                                       AS rfc,
-            MAX(COALESCE(n.curp, c.rfc_receptor))                               AS nombre,
-            MIN(c.year * 100 + c.month)::bigint                                 AS first_period,
-            MAX(c.year * 100 + c.month)::bigint                                 AS last_period,
-            AVG(COALESCE(n.salario_diario_integrado, 0)::float8) * 30           AS sueldo_mensual
-        FROM pulso.cfdi_nomina n
-        JOIN pulso.cfdis c ON c.uuid = n.uuid
-        WHERE c.rfc_emisor = $1
-          AND c.tipo_comprobante = 'N'
-          AND NOT c.is_cancelled
-          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
-          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
-        GROUP BY c.rfc_receptor
-        HAVING MAX(c.year * 100 + c.month) < $4 * 100 + $5
-        "#,
-    )
+            lo.sueldo,
+            ((((date_trunc('month', CURRENT_DATE) - interval '1 day')::date) - sd.start_date) / 365.25)::float8 AS antiguedad_years
+        FROM last_ordinario lo
+        JOIN start_dates sd ON sd.rfc_receptor = lo.rfc_receptor
+        WHERE lo.sueldo > 0
+        "#
+    ))
+    .bind(rfc)
+    .bind(ltm_end_y)
+    .bind(ltm_end_m)
+    .fetch_all(pool)
+    .await?;
+
+    if active_rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut active_sueldos: Vec<f64> = active_rows.iter().map(|r| get_f64(r, "sueldo")).collect();
+    let mut active_tenures: Vec<f64> = active_rows
+        .iter()
+        .map(|r| get_f64(r, "antiguedad_years"))
+        .collect();
+    active_sueldos.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    active_tenures.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let masa_salarial_activa: f64 = active_sueldos.iter().sum();
+    let mediana_sueldo_activa = percentile_of_sorted(&active_sueldos, 0.5);
+
+    // percentile_rank(x, sorted) = share of the reference population at or below x -- used
+    // both for the sueldo floor above and for each candidate's índice below.
+    let percentile_rank = |sorted: &[f64], x: f64| -> f64 {
+        if sorted.is_empty() {
+            return 0.0;
+        }
+        let count_le = sorted.iter().filter(|&&v| v <= x).count();
+        count_le as f64 / sorted.len() as f64
+    };
+
+    // Employees with last payroll in the 24-month window but not in the latest month --
+    // still "terminados en la ventana", unchanged from before this item.
+    // L10-02a/b/c/d, L10-03 / AUD-083..087, AUD-098: nombre from nombre_receptor (not CURP);
+    // fecha de ingreso from fecha_inicio_rel_laboral (not inferred from MIN(fecha_pago));
+    // fecha de baja is fecha_final_pago, a real date (not a truncated month); sueldo is the
+    // last ordinario receipt regardless of when it falls (a departing employee's very last
+    // receipt is almost always a finiquito, tipo_nomina='E'); tipo_contrato taken from each
+    // employee's own last receipt by date, never MAX/MIN/mode (L10-09's own warning applies
+    // here too -- '03' sorts before '01' alphabetically and MAX would misclassify).
+    let last_row_order = super::payroll::recibo_vigente_order("b.");
+    let term_rows = sqlx::query(&format!(
+        r#"
+        WITH base AS MATERIALIZED (
+            SELECT n.rfc_receptor, n.nombre_receptor, n.year_devengo, n.month_devengo,
+                   n.tipo_nomina, n.tipo_contrato, n.total_sueldos, n.num_dias_pagados,
+                   n.fecha_pago, n.fecha_final_pago, n.fecha_inicio_rel_laboral,
+                   n.fecha_emision, n.uuid
+            FROM pulso.nomina_normalizada n
+            WHERE n.rfc_emisor = $1 AND NOT n.is_excluded
+        ),
+        -- L18-20: a person with a receipt at/after the ancla (activo per the corrected,
+        -- unbounded definition above) must not also show as a baja just because THIS CTE's
+        -- own window bounds the MAX(period) scan at the ancla -- the NOT EXISTS excludes
+        -- anyone who has any devengo at/after $4,$5, checked unbounded against the same
+        -- `base` this CTE already has in full (base itself carries no upper bound).
+        -- L19-08: the outer row is aliased (t0) so the NOT EXISTS correlates to it. Unqualified,
+        -- `rfc_receptor` resolved to b2's own column, the check compared b2 with itself and
+        -- excluded every person -- H5b found no bajas anywhere.
+        term AS (
+            SELECT t0.rfc_receptor,
+                MAX(t0.year_devengo * 100 + t0.month_devengo)::bigint AS last_period
+            FROM base t0
+            WHERE (t0.year_devengo > $2 OR (t0.year_devengo = $2 AND t0.month_devengo >= $3))
+              AND (t0.year_devengo < $4 OR (t0.year_devengo = $4 AND t0.month_devengo <= $5))
+            GROUP BY t0.rfc_receptor
+            HAVING MAX(t0.year_devengo * 100 + t0.month_devengo) < $4 * 100 + $5
+               AND NOT EXISTS (
+                   SELECT 1 FROM base b2
+                   WHERE b2.rfc_receptor = t0.rfc_receptor
+                     AND (b2.year_devengo > $4 OR (b2.year_devengo = $4 AND b2.month_devengo >= $5))
+               )
+        ),
+        -- L18-22: payroll::recibo_vigente_order -- this is the one that decides tipo_contrato
+        -- for the "personal clave" table's name/fecha rows, the most visible of the ten sites
+        -- (measured: 21 people flip sides of the filter without this tiebreak).
+        last_row AS (
+            SELECT DISTINCT ON (b.rfc_receptor)
+                b.rfc_receptor, b.nombre_receptor, b.tipo_contrato, b.fecha_final_pago
+            FROM base b
+            JOIN term t ON t.rfc_receptor = b.rfc_receptor
+            ORDER BY b.rfc_receptor, {last_row_order}
+        ),
+        last_ordinario AS (
+            SELECT DISTINCT ON (b.rfc_receptor) b.rfc_receptor,
+                (COALESCE(b.total_sueldos, 0)::float8 / NULLIF(b.num_dias_pagados, 0)::float8 * 30.0) AS sueldo
+            FROM base b
+            JOIN term t ON t.rfc_receptor = b.rfc_receptor
+            ORDER BY b.rfc_receptor, {last_row_order}
+        ),
+        start_dates AS (
+            SELECT b.rfc_receptor,
+                COALESCE(
+                    MAX(b.fecha_inicio_rel_laboral::date) FILTER (
+                        WHERE b.fecha_inicio_rel_laboral::date >= DATE '1980-01-01'
+                          AND b.fecha_inicio_rel_laboral::date <= CURRENT_DATE
+                    ),
+                    MIN(b.fecha_pago::date)
+                ) AS start_date
+            FROM base b
+            JOIN term t ON t.rfc_receptor = b.rfc_receptor
+            GROUP BY b.rfc_receptor
+        )
+        SELECT
+            t.rfc_receptor AS rfc,
+            lr.nombre_receptor AS nombre,
+            lr.tipo_contrato,
+            sd.start_date::text AS start_date,
+            lr.fecha_final_pago::text AS fecha_final_pago,
+            lo.sueldo,
+            ((make_date((t.last_period/100)::int, (t.last_period%100)::int, 1) - sd.start_date) / 365.25)::float8 AS antiguedad_al_baja
+        FROM term t
+        JOIN last_row lr ON lr.rfc_receptor = t.rfc_receptor
+        JOIN last_ordinario lo ON lo.rfc_receptor = t.rfc_receptor
+        JOIN start_dates sd ON sd.rfc_receptor = t.rfc_receptor
+        WHERE lo.sueldo > 0
+        "#
+    ))
     .bind(rfc)
     .bind(win_start_y)
     .bind(win_start_m)
@@ -612,9 +1133,11 @@ async fn compute_h5b(
         #[allow(dead_code)]
         rfc: String,
         nombre: String,
-        first_period: i64,
-        last_period: i64,
+        tipo_contrato: String,
+        fecha_ingreso: Option<String>,
+        fecha_baja: Option<String>,
         sueldo: f64,
+        antiguedad_years: f64,
     }
 
     let terminated: Vec<TermRow> = term_rows
@@ -622,59 +1145,94 @@ async fn compute_h5b(
         .map(|r| TermRow {
             rfc: r.try_get("rfc").unwrap_or_default(),
             nombre: r.try_get("nombre").unwrap_or_default(),
-            first_period: r.try_get::<i64, _>("first_period").unwrap_or(0),
-            last_period: r.try_get::<i64, _>("last_period").unwrap_or(0),
-            sueldo: r.try_get("sueldo_mensual").unwrap_or(0.0),
+            tipo_contrato: r.try_get("tipo_contrato").unwrap_or_default(),
+            fecha_ingreso: r.try_get("start_date").ok(),
+            fecha_baja: r.try_get("fecha_final_pago").ok(),
+            sueldo: get_f64(r, "sueldo"),
+            antiguedad_years: get_f64(r, "antiguedad_al_baja"),
         })
         .collect();
 
-    if terminated.is_empty() {
-        return Ok(None);
-    }
-
-    // 90th percentile salary among terminated employees
-    let mut sueldos: Vec<f64> = terminated.iter().map(|t| t.sueldo).collect();
-    sueldos.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p90_idx = ((sueldos.len() as f64 * 0.9).ceil() as usize).saturating_sub(1);
-    let p90 = sueldos[p90_idx];
-
-    // Filter terminated employees in top 10% salary
-    let key_exits: Vec<&TermRow> = terminated.iter().filter(|t| t.sueldo >= p90).collect();
+    // L10-03 / DEC-050, trap 1/2: contrato indeterminado only, tenure >= 3 years measured AT
+    // the moment of the baja (not against today), salary at or above the ACTIVE plantilla's
+    // median -- someone paid less than the median employee isn't "personal clave" by pay.
+    let key_exits: Vec<&TermRow> = terminated
+        .iter()
+        .filter(|t| {
+            t.tipo_contrato == "01"
+                && t.antiguedad_years >= 3.0
+                && t.sueldo >= mediana_sueldo_activa
+        })
+        .collect();
 
     if key_exits.is_empty() {
         return Ok(None);
     }
 
-    let nivel = if key_exits.len() >= 2 { "critico" } else { "alto" };
-
-    let fmt_period = |ym: i64| -> String {
-        format!("{}-{:02}", ym / 100, ym % 100)
+    // L10-12 / AUD-101: level decided by what share of the active plantilla's total masa
+    // salarial these exits represent, not by a raw headcount threshold -- two exits of
+    // $18k each isn't the same signal as one of $234k, and a count-based cutoff can't tell
+    // them apart once L10-03's filters shrink the population this much.
+    let masa_perdida: f64 = key_exits.iter().map(|e| e.sueldo).sum();
+    let pct_masa_perdida = if masa_salarial_activa > 0.0 {
+        masa_perdida / masa_salarial_activa
+    } else {
+        0.0
     };
+    let nivel = if pct_masa_perdida >= 0.15 {
+        "critico"
+    } else {
+        "alto"
+    };
+
+    // Índice 50/50 en percentiles de la plantilla activa -- ver compute_h5b's own doc comment
+    // on why percentiles and not simple ratios (a low-tenure, low-salary reference population
+    // makes ratio-based scoring dominated by whichever variable has more spread).
+    let mut ranked: Vec<&TermRow> = key_exits.clone();
+    ranked.sort_by(|a, b| {
+        let ia = 0.5 * percentile_rank(&active_sueldos, a.sueldo)
+            + 0.5 * percentile_rank(&active_tenures, a.antiguedad_years);
+        let ib = 0.5 * percentile_rank(&active_sueldos, b.sueldo)
+            + 0.5 * percentile_rank(&active_tenures, b.antiguedad_years);
+        ib.partial_cmp(&ia).unwrap()
+    });
+
+    let fmt_date =
+        |d: &Option<String>| -> String { d.clone().unwrap_or_else(|| "—".to_string()) };
+
+    let top: Vec<&TermRow> = ranked.iter().take(5).copied().collect();
+    let extra = ranked.len().saturating_sub(top.len());
 
     let (cuerpo, datos_tabla) = if key_exits.len() == 1 {
         let emp = key_exits[0];
         let body = format!(
             "En los últimos 24 meses se detectó la baja de 1 empleado con nivel salarial relevante.\n\
-             · Fecha de inicio de relación: {}\n\
-             · Fecha de baja estimada: {}\n\
-             · Sueldo mensual promedio: {}",
-            fmt_period(emp.first_period),
-            fmt_period(emp.last_period),
-            fmt_mxn(emp.sueldo)
+             · Fecha de ingreso: {}\n\
+             · Último periodo pagado: {}\n\
+             · Último sueldo bruto mensual: {}",
+            fmt_date(&emp.fecha_ingreso),
+            fmt_date(&emp.fecha_baja),
+            fmt_mxn_full(emp.sueldo)
         );
         (body, None)
     } else {
-        let body = format!(
+        let mut body = format!(
             "En los últimos 24 meses se detectaron {} bajas de empleados con nivel salarial relevante.",
             key_exits.len()
         );
-        let tabla: Vec<TablaRow> = key_exits
+        if extra > 0 {
+            body.push_str(&format!(
+                " Se muestran las 5 de mayor índice, y {extra} más."
+            ));
+        }
+        let tabla: Vec<TablaRow> = top
             .iter()
             .map(|emp| TablaRow {
                 nombre: emp.nombre.clone(),
-                fecha_primer_pago: fmt_period(emp.first_period),
-                fecha_baja: fmt_period(emp.last_period),
+                fecha_ingreso: fmt_date(&emp.fecha_ingreso),
+                ultimo_periodo_pagado: fmt_date(&emp.fecha_baja),
                 sueldo_mensual: emp.sueldo,
+                tipo_contrato: emp.tipo_contrato.clone(),
             })
             .collect();
         (body, Some(tabla))
@@ -695,7 +1253,7 @@ async fn compute_h5b(
         cuerpo,
         interpretacion: interpretacion.to_string(),
         disclaimer: None,
-        nota_fija: Some("Fechas inferidas desde CFDIs de nómina. Confirmar con expedientes de Recursos Humanos. Identificadores corresponden a RFC o CURP del empleado.".to_string()),
+        nota_fija: Some("Fechas e ingreso desde CFDIs de nómina (fecha_inicio_rel_laboral / fecha_final_pago). Confirmar con expedientes de Recursos Humanos. Identificadores corresponden a RFC o nombre declarado en el CFDI.".to_string()),
         datos_tabla,
     }))
 }
@@ -732,50 +1290,57 @@ async fn compute_h6(
         return Ok(None);
     }
 
-    // Outstanding = sum of PPD invoices - payments received - credit notes
+    // Outstanding = base saldo for PPD invoices (L2-04: shared with payments.rs/counterparties.rs),
+    // capped at the last complete calendar month like those two (L7-03 / DEC-039, AUD-011)
+    // -- without it this disagreed with the Cobranza tab's own saldo for the same RFC.
     let outstanding_row = sqlx::query(
         r#"
-        SELECT COALESCE(SUM(GREATEST(
-            COALESCE(inv.total_mxn, 0)::float8
-            - COALESCE((
-                SELECT SUM(pd.imp_pagado)
-                FROM pulso.cfdi_payment_docs pd
-                JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
-                WHERE pd.invoice_uuid = inv.uuid
-                  AND NOT comp.is_cancelled
-            ), 0)
-            - COALESCE((
-                SELECT SUM(cr_inv.total_mxn)
-                FROM pulso.cfdi_relacionados cr
-                JOIN pulso.cfdis cr_inv ON cr_inv.uuid = cr.source_uuid
-                WHERE cr.related_uuid = inv.uuid
-                  AND cr.tipo_relacion = '01'
-                  AND cr_inv.tipo_comprobante = 'E'
-                  AND NOT cr_inv.is_cancelled
-            ), 0),
-            0
-        )), 0)::float8 AS outstanding
-        FROM pulso.cfdis inv
-        WHERE inv.rfc_emisor = $1
-          AND inv.dl_type IN ('emitidos','ambos')
-          AND inv.tipo_comprobante = 'I'
-          AND inv.metodo_pago = 'PPD'
-          AND NOT inv.is_cancelled
+        SELECT COALESCE(SUM(c.saldo_mxn), 0)::float8 AS outstanding
+        FROM pulso.cfdi_cobro_estado c
+        WHERE c.rfc_emisor = $1
+          AND c.dl_type IN ('emitidos','ambos')
+          AND c.metodo_pago = 'PPD'
+          AND (c.year * 100 + c.month) <= $2
         "#,
     )
     .bind(rfc)
+    .bind(current_month_yyyymm())
     .fetch_one(pool)
     .await?;
-    let outstanding: f64 = outstanding_row.try_get("outstanding").unwrap_or(0.0);
+    let outstanding: f64 = get_f64(&outstanding_row, "outstanding");
 
-    let ltm_ingreso =
-        compute_ltm_ingreso(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?;
+    // C8-04 / AUD-068: H6's numerator (outstanding, above) is a balance -- con IVA, sin
+    // exclusiones. A ratio between a balance and a P&L figure means nothing (DEC-044
+    // backwards), so the denominator has to be the same shape, not `compute_ltm_ingreso`
+    // (moved to the Resumen base by L8-03 for H9/H4, which are P&L measures and correctly
+    // stay net-with-exclusions -- not touched here). Same form H7 already uses for its own
+    // ratio, applied to the emitidos side.
+    let ltm_ingreso_row = sqlx::query(
+        r#"
+        SELECT COALESCE(SUM(COALESCE(total_mxn,0))::float8, 0) AS total
+        FROM pulso.cfdis
+        WHERE rfc_emisor = $1
+          AND dl_type IN ('emitidos','ambos')
+          AND tipo_comprobante = 'I'
+          AND NOT is_cancelled
+          AND (year > $2 OR (year = $2 AND month >= $3))
+          AND (year < $4 OR (year = $4 AND month <= $5))
+        "#,
+    )
+    .bind(rfc)
+    .bind(ltm_start_y)
+    .bind(ltm_start_m)
+    .bind(ltm_end_y)
+    .bind(ltm_end_m)
+    .fetch_one(pool)
+    .await?;
+    let ltm_ingreso: f64 = get_f64(&ltm_ingreso_row, "total");
     if ltm_ingreso <= 0.0 {
         return Ok(None);
     }
 
     let ratio_pct = outstanding / ltm_ingreso * 100.0;
-    let nivel = h6_nivel(ratio_pct);
+    let nivel = cartera_pct_nivel(ratio_pct);
     let interp = h6_interpretacion(nivel);
 
     let cuerpo = format!(
@@ -830,40 +1395,23 @@ async fn compute_h7(
         return Ok(None);
     }
 
+    // L7-03 / DEC-039, AUD-011: capped at the last complete calendar month, same as H6 and
+    // the Cobranza tab.
     let outstanding_row = sqlx::query(
         r#"
-        SELECT COALESCE(SUM(GREATEST(
-            COALESCE(inv.total_mxn, 0)::float8
-            - COALESCE((
-                SELECT SUM(pd.imp_pagado)
-                FROM pulso.cfdi_payment_docs pd
-                JOIN pulso.cfdis comp ON comp.uuid = pd.payment_uuid
-                WHERE pd.invoice_uuid = inv.uuid
-                  AND NOT comp.is_cancelled
-            ), 0)
-            - COALESCE((
-                SELECT SUM(cr_inv.total_mxn)
-                FROM pulso.cfdi_relacionados cr
-                JOIN pulso.cfdis cr_inv ON cr_inv.uuid = cr.source_uuid
-                WHERE cr.related_uuid = inv.uuid
-                  AND cr.tipo_relacion = '01'
-                  AND cr_inv.tipo_comprobante = 'E'
-                  AND NOT cr_inv.is_cancelled
-            ), 0),
-            0
-        )), 0)::float8 AS outstanding
-        FROM pulso.cfdis inv
-        WHERE inv.rfc_receptor = $1
-          AND inv.dl_type IN ('recibidos','ambos')
-          AND inv.tipo_comprobante = 'I'
-          AND inv.metodo_pago = 'PPD'
-          AND NOT inv.is_cancelled
+        SELECT COALESCE(SUM(c.saldo_mxn), 0)::float8 AS outstanding
+        FROM pulso.cfdi_cobro_estado c
+        WHERE c.rfc_receptor = $1
+          AND c.dl_type IN ('recibidos','ambos')
+          AND c.metodo_pago = 'PPD'
+          AND (c.year * 100 + c.month) <= $2
         "#,
     )
     .bind(rfc)
+    .bind(current_month_yyyymm())
     .fetch_one(pool)
     .await?;
-    let outstanding: f64 = outstanding_row.try_get("outstanding").unwrap_or(0.0);
+    let outstanding: f64 = get_f64(&outstanding_row, "outstanding");
 
     // LTM gasto recibidos
     let ltm_gasto_row = sqlx::query(
@@ -885,14 +1433,14 @@ async fn compute_h7(
     .bind(ltm_end_m)
     .fetch_one(pool)
     .await?;
-    let ltm_gasto: f64 = ltm_gasto_row.try_get("total").unwrap_or(0.0);
+    let ltm_gasto: f64 = get_f64(&ltm_gasto_row, "total");
 
     if ltm_gasto <= 0.0 {
         return Ok(None);
     }
 
     let ratio_pct = outstanding / ltm_gasto * 100.0;
-    let nivel = h7_nivel(ratio_pct);
+    let nivel = cartera_pct_nivel(ratio_pct);
     let interp = h7_interpretacion(nivel);
 
     let cuerpo = format!(
@@ -909,7 +1457,10 @@ async fn compute_h7(
         metrica_principal: Some(ratio_pct),
         cuerpo,
         interpretacion: interp.to_string(),
-        disclaimer: Some("Interpretar como señal analítica, no como saldo de cuentas por pagar definitivo.".to_string()),
+        disclaimer: Some(
+            "Interpretar como señal analítica, no como saldo de cuentas por pagar definitivo."
+                .to_string(),
+        ),
         nota_fija: None,
         datos_tabla: None,
     }))
@@ -927,20 +1478,28 @@ async fn compute_h8(
     ltm_end_y: i64,
     ltm_end_m: i64,
 ) -> anyhow::Result<Option<Hallazgo>> {
-    let rows = sqlx::query(
+    // C13-04/DEC-080: same cp_key_expr grouping as H1 above.
+    let cp_key = cp_key_expr("c.rfc_emisor", "c.nombre_emisor");
+
+    // L8-03 / DEC-041: same four properties as H1's query above.
+    let rows = sqlx::query(&format!(
         r#"
-        SELECT rfc_emisor, MAX(nombre_emisor) AS nombre, SUM(COALESCE(total_mxn,0))::float8 AS ltm_mxn
-        FROM pulso.cfdis
-        WHERE rfc_receptor = $1
-          AND dl_type IN ('recibidos','ambos')
-          AND tipo_comprobante = 'I'
-          AND NOT is_cancelled
-          AND (year > $2 OR (year = $2 AND month >= $3))
-          AND (year < $4 OR (year = $4 AND month <= $5))
-        GROUP BY rfc_emisor
+        SELECT ({cp_key}) AS rfc_emisor, MAX(c.nombre_emisor) AS nombre,
+               SUM(COALESCE(c.total_neto_mxn_ajustado,0))::float8 AS ltm_mxn
+        FROM pulso.cfdis_ajustado c
+        WHERE c.rfc_receptor = $1
+          AND c.dl_type IN ('recibidos','ambos')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
+          AND NOT c.is_cancelled
+          AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
+          AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
+        GROUP BY ({cp_key})
         ORDER BY ltm_mxn DESC
-        "#,
-    )
+        "#
+    ))
     .bind(rfc)
     .bind(ltm_start_y)
     .bind(ltm_start_m)
@@ -961,19 +1520,39 @@ async fn compute_h8(
 
     let suppliers: Vec<SupRow> = rows
         .iter()
-        .map(|r| SupRow {
-            rfc: r.try_get("rfc_emisor").unwrap_or_default(),
-            nombre: r.try_get("nombre").unwrap_or_default(),
-            mxn: r.try_get("ltm_mxn").unwrap_or(0.0),
+        .map(|r| {
+            let cp_key: String = r.try_get("rfc_emisor").unwrap_or_default();
+            // C13-04/DEC-080: split the composite key back apart -- `is_regulatory` below
+            // matches the bare RFC, same as before this item.
+            let rfc = cp_key
+                .split_once("||")
+                .map_or_else(|| cp_key.clone(), |(base, _)| base.to_string());
+            SupRow {
+                rfc,
+                nombre: r.try_get("nombre").unwrap_or_default(),
+                mxn: get_f64(r, "ltm_mxn"),
+            }
         })
         .collect();
 
-    // Exclude regulatory RFCs from concentration calculation
+    // L8-07: exact RFC, not prefix -- IMS.../INF... matched a legitimate manufacturing
+    // supplier of the RFC de control ($4,072) whose RFC happened to start the same way.
+    // Confirmed by the team, not guessed: IMSS = IMS421231I45, Infonavit = INF7205011ZA.
+    // L19-10 point 3: Público en General stays out, but a foreign supplier is a real one,
+    // identifiable by name (cp_key splits the Extranjero Genérico RFC per name) -- same
+    // definition of "real counterparty" as H1's identifiable pool, shared by clientes and
+    // proveedores.
     let is_regulatory = |rfc: &str| {
-        rfc.starts_with("IMS") || rfc.starts_with("INF") || rfc == "XAXX010101000"
+        rfc == super::summary::RFC_IMSS
+            || rfc == super::summary::RFC_INFONAVIT
+            || rfc == super::summary::RFC_PUBLICO_GENERAL
     };
 
-    let identifiable: Vec<&SupRow> = suppliers.iter().filter(|s| !is_regulatory(&s.rfc)).collect();
+    // L8-03: same negative-total edge case as H1 -- see its comment for why.
+    let identifiable: Vec<&SupRow> = suppliers
+        .iter()
+        .filter(|s| !is_regulatory(&s.rfc) && s.mxn > 0.0)
+        .collect();
     if identifiable.is_empty() {
         return Ok(None);
     }
@@ -986,15 +1565,18 @@ async fn compute_h8(
     let top3: Vec<&SupRow> = identifiable.iter().take(3).copied().collect();
     let top3_mxn: f64 = top3.iter().map(|s| s.mxn).sum();
     let top3_pct = top3_mxn / total_excl * 100.0;
+    let top1_nombre = top3.first().map(|s| s.nombre.as_str()).unwrap_or("");
+    let top1_pct = top3
+        .first()
+        .map(|s| s.mxn / total_excl * 100.0)
+        .unwrap_or(0.0);
 
-    let nivel = match h8_nivel(top3_pct) {
+    let nivel = match concentracion_nivel(top3_pct, top1_pct) {
         Some(n) => n,
-        None => return Ok(None), // < 15% — omit
+        None => return Ok(None), // < 25% Top 3 and < 35% Top 1 -- omit
     };
 
     let interp = h8_interpretacion(nivel);
-    let top1_nombre = top3.first().map(|s| s.nombre.as_str()).unwrap_or("");
-    let top1_pct = top3.first().map(|s| s.mxn / total_excl * 100.0).unwrap_or(0.0);
 
     let cuerpo = format!(
         "El Top 3 proveedores representa el {:.1}% del gasto LTM. El mayor proveedor es {} con el {:.1}% del gasto.",
@@ -1036,9 +1618,30 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     .await?;
 
     let max_ym: Option<i64> = max_ym_row.try_get("max_ym").ok().flatten();
+    // L8-01: anchor at the last CLOSED calendar month, not the last month with any
+    // comprobante -- 5 of 6 RFC anchored on the in-progress current month (a handful of
+    // days of data) before this. This one line reaches H1/H2/H8/H9 and H6/H7 (L7-03) below,
+    // via the ltm_end_y/ltm_end_m this fn returns to its caller.
+    // L17-02/L18-20 correction: H3/H5A/H5B do NOT inherit THIS variable. H3 does NOT use a
+    // rolling 12-month window -- it iterates full calendar years (`complete_years`, only
+    // years with 12 full months of facturación) and needs at least two of them; it just
+    // happens to share this fn's min-of-cutoff-and-last-invoice-month anchor logic for
+    // deciding which years count as complete. H5A/H5B independently call
+    // `nomina_hallazgo_anchor`, which anchors on `current_month_yyyymm()` directly
+    // (DEC-100), not this fn's min. That distinction matters: an RFC current on nómina but
+    // behind on facturación would get its nómina hallazgos wrongly anchored to the
+    // facturación lag if they used this window instead of their own.
     let (ltm_end_y, ltm_end_m) = match max_ym {
-        Some(ym) if ym > 0 => (ym / 100, ym % 100),
-        _ => return Ok(HallazgosResponse { visible: vec![], all: vec![] }),
+        Some(ym) if ym > 0 => {
+            let ym = ym.min(current_month_yyyymm());
+            (ym / 100, ym % 100)
+        }
+        _ => {
+            return Ok(HallazgosResponse {
+                visible: vec![],
+                all: vec![],
+            });
+        }
     };
     let (ltm_start_y, ltm_start_m) = subtract_months(ltm_end_y, ltm_end_m, 11);
 
@@ -1049,23 +1652,29 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     let mut all: Vec<Hallazgo> = Vec::new();
 
     // H1 — Concentración de clientes
-    if let Some(h) =
-        compute_h1(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?
-    {
+    if let Some(h) = compute_h1(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await? {
         all.push(h);
     }
 
-    // Annual emitidos data — needed for H2, H3
+    // Annual emitidos data — needed for H2 (the `ingreso` figure), and H3 (only the
+    // `complete_years` year list -- H3's own ingreso comes from its ing_rows/rec_rows
+    // queries below, untouched by this one). L8-03 / DEC-041: H2's ingreso now sums
+    // total_neto_mxn_ajustado over cfdis_ajustado with exclusions applied, same four
+    // properties as H1's query above -- was con-IVA and counted only tipo_comprobante='I',
+    // discarding notas de crédito ('E') entirely instead of netting them.
     let annual_rows = sqlx::query(
         r#"
         SELECT year,
                COUNT(DISTINCT month)::bigint AS month_count,
-               SUM(CASE WHEN tipo_comprobante='I' THEN COALESCE(total_mxn,0) ELSE 0 END)::float8 AS ingreso
-        FROM pulso.cfdis
+               SUM(COALESCE(total_neto_mxn_ajustado,0))::float8 AS ingreso
+        FROM pulso.cfdis_ajustado c
         WHERE rfc_emisor = $1
           AND dl_type IN ('emitidos','ambos')
           AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         GROUP BY year
         ORDER BY year
         "#,
@@ -1085,7 +1694,7 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         .map(|r| AnnualEmitidos {
             year: r.try_get("year").unwrap_or(0),
             month_count: r.try_get("month_count").unwrap_or(0),
-            ingreso: r.try_get("ingreso").unwrap_or(0.0),
+            ingreso: get_f64(r, "ingreso"),
         })
         .collect();
 
@@ -1109,8 +1718,13 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
                 familia: "desempeno".to_string(),
                 nivel: nivel.to_string(),
                 metrica_principal: Some(cagr_pct),
+                // L8-06: H2 only ever uses complete calendar years -- correct for a CAGR,
+                // but silently discarding the in-progress current year read as a
+                // contradiction next to H9 (which does use it) with nothing on screen to
+                // reconcile the two. Says its own window now instead of assuming it's
+                // implied.
                 cuerpo: format!(
-                    "Los ingresos muestran un CAGR de {:.1}% en el período {}-{}.",
+                    "Los ingresos muestran un CAGR de {:.1}% en el período {}-{} (años calendario completos; no incluye el año en curso).",
                     cagr_pct, first.year, last.year
                 ),
                 interpretacion: interp.to_string(),
@@ -1123,16 +1737,58 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
 
     // H3 — Evolución del flujo visible
     if complete_years.len() >= 2 {
-        // Recibidos per year
+        // R-34 + AUD-012 + AUD-013: aligned to the "Neto facturado" dashboard measure —
+        // con IVA, facturas MENOS notas de crédito (the dashboard reads this as
+        // ingreso_con_iva_mxn - egreso_con_iva_mxn from summary.rs, which is exactly
+        // SUM(I) - SUM(E) within one direction), nómina neta de caja, and L3-01's shared
+        // exclusion base instead of a hand-rolled join (AUD-012's broken AND/OR precedence
+        // left the UUID branch of that join with no owner/action guard at all).
+        let ing_rows = sqlx::query(
+            r#"
+            SELECT c.year,
+                   SUM(CASE WHEN c.tipo_comprobante = 'I' THEN COALESCE(c.total_mxn,0)
+                            WHEN c.tipo_comprobante = 'E' THEN -COALESCE(c.total_mxn,0)
+                            ELSE 0 END)::float8 AS ingreso
+            FROM pulso.cfdis c
+            WHERE c.rfc_emisor = $1
+              AND c.dl_type IN ('emitidos','ambos')
+              AND c.tipo_comprobante IN ('I','E')
+              AND NOT c.is_cancelled
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+              )
+            GROUP BY c.year
+            "#,
+        )
+        .bind(rfc)
+        .fetch_all(pool)
+        .await?;
+        let ing_h3_map: std::collections::HashMap<i64, f64> = ing_rows
+            .iter()
+            .map(|r| {
+                (
+                    r.try_get::<i64, _>("year").unwrap_or(0),
+                    get_f64(r, "ingreso"),
+                )
+            })
+            .collect();
+
+        // Recibidos per year (con IVA, menos notas de crédito recibidas)
         let rec_rows = sqlx::query(
             r#"
-            SELECT year, SUM(COALESCE(total_mxn,0))::float8 AS egreso
-            FROM pulso.cfdis
-            WHERE rfc_receptor = $1
-              AND dl_type IN ('recibidos','ambos')
-              AND tipo_comprobante = 'I'
-              AND NOT is_cancelled
-            GROUP BY year
+            SELECT c.year,
+                   SUM(CASE WHEN c.tipo_comprobante = 'I' THEN COALESCE(c.total_mxn,0)
+                            WHEN c.tipo_comprobante = 'E' THEN -COALESCE(c.total_mxn,0)
+                            ELSE 0 END)::float8 AS egreso
+            FROM pulso.cfdis c
+            WHERE c.rfc_receptor = $1
+              AND c.dl_type IN ('recibidos','ambos')
+              AND c.tipo_comprobante IN ('I','E')
+              AND NOT c.is_cancelled
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+              )
+            GROUP BY c.year
             "#,
         )
         .bind(rfc)
@@ -1144,38 +1800,16 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
             .map(|r| {
                 (
                     r.try_get::<i64, _>("year").unwrap_or(0),
-                    r.try_get::<f64, _>("egreso").unwrap_or(0.0),
+                    get_f64(r, "egreso"),
                 )
             })
             .collect();
 
-        // Nomina ordinary per year (excluding extraordinary percepciones)
-        let nom_rows = sqlx::query(
-            r#"
-            SELECT c.year, SUM(COALESCE(p.importe_gravado,0) + COALESCE(p.importe_exento,0))::float8 AS nomina
-            FROM pulso.cfdi_nomina_percepciones p
-            JOIN pulso.cfdi_nomina n ON n.uuid = p.uuid
-            JOIN pulso.cfdis c ON c.uuid = n.uuid
-            WHERE c.rfc_emisor = $1
-              AND c.tipo_comprobante = 'N'
-              AND NOT c.is_cancelled
-              AND p.tipo_percepcion NOT IN ('002','003','022','038','039','044','045')
-            GROUP BY c.year
-            "#,
-        )
-        .bind(rfc)
-        .fetch_all(pool)
-        .await?;
-
-        let nom_map: std::collections::HashMap<i64, f64> = nom_rows
-            .iter()
-            .map(|r| {
-                (
-                    r.try_get::<i64, _>("year").unwrap_or(0),
-                    r.try_get::<f64, _>("nomina").unwrap_or(0.0),
-                )
-            })
-            .collect();
+        // Looked up below against `yd.year`, the facturas-side (emisión) annual bucket H1/H2
+        // already iterate -- an accepted mismatch of bases at the year grain: measured
+        // system-wide, only one year boundary (2025/2026) has any receipts that cross it, for
+        // 10,855 pesos total, so this doesn't manufacture a new visible divergence in practice.
+        let nom_map = nomina_por_year(pool, rfc).await?;
 
         struct YearMargin {
             year: i64,
@@ -1185,15 +1819,16 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         let year_margins: Vec<YearMargin> = complete_years
             .iter()
             .filter_map(|yd| {
-                if yd.ingreso <= 0.0 {
+                let ingreso = *ing_h3_map.get(&yd.year).unwrap_or(&0.0);
+                if ingreso <= 0.0 {
                     return None;
                 }
                 let egreso = *rec_map.get(&yd.year).unwrap_or(&0.0);
                 let nomina = *nom_map.get(&yd.year).unwrap_or(&0.0);
-                let flujo = yd.ingreso - egreso - nomina;
+                let flujo = ingreso - egreso - nomina;
                 Some(YearMargin {
                     year: yd.year,
-                    margin_pct: flujo / yd.ingreso * 100.0,
+                    margin_pct: flujo / ingreso * 100.0,
                 })
             })
             .collect();
@@ -1210,8 +1845,12 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
                 familia: "desempeno".to_string(),
                 nivel: nivel.to_string(),
                 metrica_principal: Some(delta),
+                // L10-07 / AUD-095: the text used to name two terms (ingresos, egresos)
+                // while the number behind it (margin_pct = flujo/ingreso, flujo = ingreso -
+                // egreso - nomina) already subtracts a third. Naming all three here is the
+                // whole fix -- the calculation itself doesn't change.
                 cuerpo: format!(
-                    "La relación ingresos vs egresos visibles pasó de {:.1}% en {} a {:.1}% en {} ({:+.1}pp).",
+                    "La relación ingresos vs egresos y nómina visibles pasó de {:.1}% en {} a {:.1}% en {} ({:+.1}pp).",
                     fm.margin_pct, fm.year, lm.margin_pct, lm.year, delta
                 ),
                 interpretacion: interp.to_string(),
@@ -1223,43 +1862,40 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     }
 
     // H4, H5A, H5B — payroll hallazgos (conditional on nomina data)
-    if let Ok(snap) = super::payroll::get_snapshot(pool, rfc).await {
-        if snap.has_data {
-            // H4 — Pasivo laboral relativo
-            let ltm_ingreso = compute_ltm_ingreso(
-                pool,
-                rfc,
-                ltm_start_y,
-                ltm_start_m,
-                ltm_end_y,
-                ltm_end_m,
-            )
-            .await
-            .unwrap_or(0.0);
-            if ltm_ingreso > 0.0 {
-                let ratio_pct = snap.pasivo_laboral_estimado_mxn / ltm_ingreso * 100.0;
-                let meses_equiv = if snap.run_rate_mensual_ltm_mxn > 0.0 {
-                    snap.pasivo_laboral_estimado_mxn / snap.run_rate_mensual_ltm_mxn
-                } else {
-                    0.0
-                };
-                let nivel = h4_nivel(ratio_pct);
-                let interp = h4_interpretacion(nivel);
-                let cuerpo_h4 = if snap.months_of_data >= 6 {
-                    format!(
-                        "El pasivo laboral estimado asciende a {}, equivalente al {:.1}% del ingreso LTM y a {:.1} meses de nómina ordinaria estimada.",
-                        fmt_mxn(snap.pasivo_laboral_estimado_mxn),
-                        ratio_pct,
-                        meses_equiv
-                    )
-                } else {
-                    format!(
-                        "El pasivo laboral estimado asciende a {}, equivalente al {:.1}% del ingreso LTM.",
-                        fmt_mxn(snap.pasivo_laboral_estimado_mxn),
-                        ratio_pct,
-                    )
-                };
-                all.push(Hallazgo {
+    if let Ok(snap) = super::payroll::get_snapshot(pool, rfc).await
+        && snap.has_data
+    {
+        // H4 — Pasivo laboral relativo
+        let ltm_ingreso =
+            compute_ltm_ingreso(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m)
+                .await
+                .unwrap_or(0.0);
+        if ltm_ingreso > 0.0 {
+            let ratio_pct = snap.pasivo_laboral_estimado_mxn / ltm_ingreso * 100.0;
+            // L17-05: run_rate_mensual_ltm_mxn is Option now (None = no mes con nómina
+            // ordinaria en la ventana, not a real $0) -- H4 is dead code today (DEC-043
+            // strips it before the response ships) but still needs to compile.
+            let meses_equiv = match snap.run_rate_mensual_ltm_mxn {
+                Some(rr) if rr > 0.0 => snap.pasivo_laboral_estimado_mxn / rr,
+                _ => 0.0,
+            };
+            let nivel = h4_nivel(ratio_pct);
+            let interp = h4_interpretacion(nivel);
+            let cuerpo_h4 = if snap.months_of_data >= 6 {
+                format!(
+                    "El pasivo laboral estimado asciende a {}, equivalente al {:.1}% del ingreso LTM y a {:.1} meses de nómina ordinaria estimada.",
+                    fmt_mxn(snap.pasivo_laboral_estimado_mxn),
+                    ratio_pct,
+                    meses_equiv
+                )
+            } else {
+                format!(
+                    "El pasivo laboral estimado asciende a {}, equivalente al {:.1}% del ingreso LTM.",
+                    fmt_mxn(snap.pasivo_laboral_estimado_mxn),
+                    ratio_pct,
+                )
+            };
+            all.push(Hallazgo {
                     id: "H4".to_string(),
                     titulo: "Pasivo laboral estimado".to_string(),
                     familia: "riesgo".to_string(),
@@ -1271,59 +1907,47 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
                     nota_fija: Some("Estimación con prestaciones de ley: aguinaldo 15 días, vacaciones y prima vacacional según Ley Federal del Trabajo. No constituye un cálculo definitivo.".to_string()),
                     datos_tabla: None,
                 });
-            }
+        }
 
-            // H5A — Rotación
-            if let Some(h) = compute_h5a(
-                pool,
-                rfc,
-                ltm_start_y,
-                ltm_start_m,
-                ltm_end_y,
-                ltm_end_m,
-            )
-            .await?
-            {
-                all.push(h);
-            }
+        // H5A — Rotación
+        if let Some(h) = compute_h5a(pool, rfc).await? {
+            all.push(h);
+        }
 
-            // H5B — Personal clave
-            if let Some(h) = compute_h5b(pool, rfc, ltm_end_y, ltm_end_m).await? {
-                all.push(h);
-            }
+        // H5B — Personal clave
+        if let Some(h) = compute_h5b(pool, rfc).await? {
+            all.push(h);
         }
     }
 
     // H6 — CxC pendiente
-    if let Some(h) =
-        compute_h6(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?
-    {
+    if let Some(h) = compute_h6(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await? {
         all.push(h);
     }
 
     // H7 — CxP pendiente
-    if let Some(h) =
-        compute_h7(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?
-    {
+    if let Some(h) = compute_h7(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await? {
         all.push(h);
     }
 
     // H8 — Concentración de proveedores
-    if let Some(h) =
-        compute_h8(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await?
-    {
+    if let Some(h) = compute_h8(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m).await? {
         all.push(h);
     }
 
-    // H9 — Momentum reciente (≥ 24 months condition)
+    // H9 — Momentum reciente (≥ 24 months condition). L8-03: same base as the other five --
+    // a month excluded entirely shouldn't count toward the 24-month gate either.
     let total_months_row = sqlx::query(
         r#"
         SELECT COUNT(DISTINCT year * 100 + month)::bigint AS cnt
-        FROM pulso.cfdis
+        FROM pulso.cfdis_ajustado c
         WHERE rfc_emisor = $1
           AND dl_type IN ('emitidos','ambos')
           AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         "#,
     )
     .bind(rfc)
@@ -1332,16 +1956,10 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     let total_months: i64 = total_months_row.try_get("cnt").unwrap_or(0);
 
     if total_months >= 24 {
-        let ltm_current = compute_ltm_ingreso(
-            pool,
-            rfc,
-            ltm_start_y,
-            ltm_start_m,
-            ltm_end_y,
-            ltm_end_m,
-        )
-        .await
-        .unwrap_or(0.0);
+        let ltm_current =
+            compute_ltm_ingreso(pool, rfc, ltm_start_y, ltm_start_m, ltm_end_y, ltm_end_m)
+                .await
+                .unwrap_or(0.0);
         let ltm_prev = compute_ltm_ingreso(
             pool,
             rfc,
@@ -1379,11 +1997,25 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
         }
     }
 
+    // L8-02 / DEC-043: H4 "Pasivo laboral estimado" doesn't ship in the launch -- dropped
+    // here, the one place, so it never reaches the response (not just hidden from the
+    // five visible slots).
+    all.retain(|h| h.id != "H4");
+
     // -------------------------------------------------------------------------
     // Ranking & visible selection (max 5)
     // -------------------------------------------------------------------------
     let h5b = all.iter().find(|h| h.id == "H5B").cloned();
-    let mut others: Vec<Hallazgo> = all.iter().filter(|h| h.id != "H5B").cloned().collect();
+    // L10-07 / AUD-096, trap 3: H3 is the only hallazgo that speaks to the business result
+    // itself (ingresos vs egresos y nómina) -- reserved a slot the same way H5B already is,
+    // so a severity-only ranking (which favors risk-family bad news) can't push out the one
+    // performance hallazgo that exists, whether its own news is good or bad.
+    let h3 = all.iter().find(|h| h.id == "H3").cloned();
+    let mut others: Vec<Hallazgo> = all
+        .iter()
+        .filter(|h| h.id != "H5B" && h.id != "H3")
+        .cloned()
+        .collect();
 
     others.sort_by(|a, b| {
         severity_score(&a.nivel)
@@ -1392,14 +2024,64 @@ pub async fn get(pool: &DbPool, rfc: &str) -> anyhow::Result<HallazgosResponse> 
     });
 
     let max_slots = 5usize;
-    let h5b_slot = if h5b.is_some() { 1 } else { 0 };
-    let remaining = max_slots.saturating_sub(h5b_slot);
+    let reserved_slots = h5b.is_some() as usize + h3.is_some() as usize;
+    let remaining = max_slots.saturating_sub(reserved_slots);
 
     let mut visible: Vec<Hallazgo> = Vec::new();
     if let Some(b) = h5b.clone() {
         visible.push(b);
     }
+    if let Some(t) = h3.clone() {
+        visible.push(t);
+    }
     visible.extend(others.into_iter().take(remaining));
 
     Ok(HallazgosResponse { visible, all })
+}
+
+#[cfg(test)]
+mod l16_design_tests {
+    use super::*;
+
+    #[test]
+    fn fmt_mxn_full_groups_thousands() {
+        // The bug measured live: H5B's single-employee narrative shipped
+        // "$175617.45 MXN" to the Dashboard, no comma, because `format!("${v:.2} MXN")`
+        // never groups digits -- Rust has none of that built in.
+        assert_eq!(fmt_mxn_full(175_617.45), "$175,617.45 MXN");
+    }
+
+    #[test]
+    fn fmt_mxn_full_handles_millions_and_small_values() {
+        assert_eq!(fmt_mxn_full(1_234_567.89), "$1,234,567.89 MXN");
+        assert_eq!(fmt_mxn_full(999.5), "$999.50 MXN");
+        assert_eq!(fmt_mxn_full(0.0), "$0.00 MXN");
+    }
+
+    #[test]
+    fn fmt_mxn_full_handles_negative() {
+        assert_eq!(fmt_mxn_full(-12_345.0), "-$12,345.00 MXN");
+    }
+
+    #[test]
+    fn fmt_mxn_below_thousand_still_groups_correctly() {
+        // Never actually reaches 4+ digits here (the `< 1_000.0` branch), but should stay
+        // correct if that boundary ever moves.
+        assert_eq!(fmt_mxn(623.0), "$623 MXN");
+    }
+
+    #[test]
+    fn fmt_mxn_abbreviates_thousands_and_millions() {
+        assert_eq!(fmt_mxn(5_200_000.0), "$5.2M MXN");
+        assert_eq!(fmt_mxn(140_000.0), "$140K MXN");
+    }
+
+    #[test]
+    fn group_thousands_handles_short_and_long_integers() {
+        assert_eq!(group_thousands("1"), "1");
+        assert_eq!(group_thousands("100"), "100");
+        assert_eq!(group_thousands("1000"), "1,000");
+        assert_eq!(group_thousands("175617"), "175,617");
+        assert_eq!(group_thousands("1234567"), "1,234,567");
+    }
 }

@@ -1,0 +1,16 @@
+-- PULSO_Lote18_Seguridad.md, L18-12 punto 3: cfdi_concepts is the only CFDI child table
+-- with no unique constraint -- ON CONFLICT DO NOTHING (db/cfdis.rs's insert_concepts) has
+-- never had anything to conflict against, which is the mechanical reason duplicates could
+-- accumulate at all once a guard gap let a second insert through (fixed separately: both
+-- write paths now check concepts_exist first).
+--
+-- `position` is the concept's line order within its own CFDI's <Conceptos> block. Nullable
+-- for now on purpose -- this migration only adds the column. The reconstruction pass
+-- (L18-12 point 4: re-parse each invoice's XML and assign position in document order,
+-- de-duplicating as a side effect) has to run and backfill every existing row BEFORE a
+-- unique index on (uuid, position) can be added -- today's ~15,812 duplicated invoices
+-- would violate it immediately if the index went on first. That reconstruction is real
+-- production-shaped work (refetch + reparse XML for every invoice that has concepts, one
+-- at a time, with its own error handling per invoice) -- deliberately not bundled into
+-- this migration, which only prepares the schema for it.
+ALTER TABLE pulso.cfdi_concepts ADD COLUMN position INTEGER;
