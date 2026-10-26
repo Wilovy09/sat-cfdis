@@ -399,7 +399,9 @@ switch ($command) {
             $dayEnd   = $streamCurrent->setTime(23, 59, 59);
 
         foreach ($streamDownloadTypes as $streamDownloadType) {
-            $dlTypeLabel = ($streamDownloadType === DownloadType::recibidos()) ? 'recibidos' : 'emitidos';
+            // isRecibidos(), not `=== DownloadType::recibidos()`: the enum hands out a new
+            // instance on every call, so an identity check is always false.
+            $dlTypeLabel = $streamDownloadType->isRecibidos() ? 'recibidos' : 'emitidos';
 
             $dayQuery = new QueryByFilters($dayStart, $dayEnd);
             $dayQuery->setDownloadType($streamDownloadType);
@@ -560,7 +562,9 @@ switch ($command) {
         $lcByMonth    = [];
         $lcErrorDays  = [];
         $lcAuthError  = null;
-        $lcDirLabel   = static fn ($t) => ($t === DownloadType::recibidos()) ? 'recibidos' : 'emitidos';
+        // isRecibidos(), not `===`: DownloadType::recibidos() is a new instance every call,
+        // and the identity check filed every recibido under emitidos.
+        $lcDirLabel   = static fn (DownloadType $t) => $t->isRecibidos() ? 'recibidos' : 'emitidos';
         foreach ($lcMonths as [$lcMonthStart, $lcMonthEnd]) {
             foreach ($lcDownloadTypes as $lcDlType) {
                 $lcByMonth[$lcMonthStart->format('Y-m') . '|' . $lcDirLabel($lcDlType)] = 0;

@@ -808,8 +808,13 @@ pub async fn sync_status(
                 // No active job — fall through to initial_sync_job_id
                 match crate::db::users::get_credentials_for_rfc(&pool, &user_id, rfc).await {
                     Ok(Some((_clave, job_id))) => job_id,
+                    // A viewer has no row of their own here -- the RFC's completeness still
+                    // applies to them (UX-1: the banner shows for everyone who sees the RFC).
                     Ok(None) => {
-                        return HttpResponse::Ok().json(serde_json::json!({ "status": "none" }));
+                        return HttpResponse::Ok().json(serde_json::json!({
+                            "status": "none",
+                            "completeness": completeness_json(&pool, rfc, false).await,
+                        }));
                     }
                     Err(e) => {
                         tracing::error!(user_id = %user_id, "Error fetching sync info for RFC: {e}");
@@ -844,7 +849,13 @@ pub async fn sync_status(
     };
 
     let Some(job_id) = job_id_opt else {
-        return HttpResponse::Ok().json(serde_json::json!({ "status": "none" }));
+        return match &specific_rfc {
+            Some(rfc) => HttpResponse::Ok().json(serde_json::json!({
+                "status": "none",
+                "completeness": completeness_json(&pool, rfc, false).await,
+            })),
+            None => HttpResponse::Ok().json(serde_json::json!({ "status": "none" })),
+        };
     };
 
     // The stored job may have been continued by the gap detector: the end of that chain is

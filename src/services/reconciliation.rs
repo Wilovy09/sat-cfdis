@@ -520,11 +520,21 @@ pub struct Completeness {
 impl Completeness {
     /// An RFC whose owner hasn't passed the SAT login yet: nothing verified, no progress.
     pub fn unverified(credential_rejected: bool) -> Self {
-        Self::from_rows(&[], "", credential_rejected)
+        Self::from_rows(&[], "", "", credential_rejected)
     }
 
-    fn from_rows(rows: &[MonthRow], to_ym: &str, credential_rejected: bool) -> Self {
-        let total = rows.len();
+    /// `[from_ym, to_ym]` is the range that must be verified: a closed month without a row
+    /// yet counts as pending, not as absent.
+    fn from_rows(rows: &[MonthRow], from_ym: &str, to_ym: &str, credential_rejected: bool) -> Self {
+        let expected = match (parse_ym(from_ym), parse_ym(to_ym)) {
+            (Some((fy, fm)), Some((ty, tm))) => {
+                let months =
+                    (i64::from(ty) * 12 + i64::from(tm)) - (i64::from(fy) * 12 + i64::from(fm)) + 1;
+                usize::try_from(months.max(0) * 2).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        let total = expected.max(rows.len());
         let verified = rows.iter().filter(|r| r.verified).count();
         let mut per_year: BTreeMap<i32, (usize, usize)> = BTreeMap::new();
         for r in rows {
@@ -565,24 +575,25 @@ impl Completeness {
 
 /// The completeness of `rfc` as of today. Fails closed to "incompleto" with no progress.
 pub async fn completeness(pool: &DbPool, rfc: &str, credential_rejected: bool) -> Completeness {
-    let empty = Completeness::from_rows(&[], "", credential_rejected);
+    let empty = Completeness::unverified(credential_rejected);
     let Some(to_ym) = last_closed_month(&today_utc()) else {
         return empty;
     };
     let Ok(Some(anio_piso)) = db::users::get_anio_piso_for_rfc(pool, rfc).await else {
         return empty;
     };
+    let from_ym = format_ym(anio_piso, 1);
     match db::reconciliation::rows(
         pool,
         rfc,
-        &format_ym(anio_piso, 1),
+        &from_ym,
         &to_ym,
         CLOSE_GRACE_DAYS,
         RECHECK_AFTER_DAYS,
     )
     .await
     {
-        Ok(rows) => Completeness::from_rows(&rows, &to_ym, credential_rejected),
+        Ok(rows) => Completeness::from_rows(&rows, &from_ym, &to_ym, credential_rejected),
         Err(e) => {
             tracing::error!(rfc = %rfc, "completeness: {e}");
             empty
@@ -678,16 +689,21 @@ mod tests {
         let mut open = row("2025-01", None, 0);
         open.verified = false;
         rows.push(open);
-        let c = Completeness::from_rows(&rows, "2025-01", false);
+        let c = Completeness::from_rows(&rows, "2024-01", "2025-01", false);
         assert_eq!(c.state, "incompleto");
         assert_eq!(c.verified_years, vec![2024]);
         assert!(c.progress_pct > 90.0 && c.progress_pct < 100.0);
         assert_eq!(
-            Completeness::from_rows(&rows[..24], "2024-12", false).state,
+            Completeness::from_rows(&rows[..24], "2024-01", "2024-12", false).state,
             "liberado"
         );
+        // A closed month with no row yet is pending, not absent.
         assert_eq!(
-            Completeness::from_rows(&rows[..24], "2024-12", true).state,
+            Completeness::from_rows(&rows[..24], "2024-01", "2025-01", false).state,
+            "incompleto"
+        );
+        assert_eq!(
+            Completeness::from_rows(&rows[..24], "2024-01", "2024-12", true).state,
             "requiere_accion"
         );
     }

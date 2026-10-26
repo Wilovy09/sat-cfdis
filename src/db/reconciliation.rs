@@ -44,7 +44,9 @@ pub async fn watched_rfcs(pool: &PgPool) -> Result<Vec<WatchedRfc>, sqlx::Error>
 }
 
 /// Creates the missing rows for every month in `[from_ym, to_ym]` ("YYYY-MM"), both
-/// directions, then recomputes what Pulso holds for each of this RFC's rows. A verified
+/// directions, then recomputes what Pulso holds for each of this RFC's rows. A cancelled
+/// CFDI without its XML doesn't count as missing XML: the SAT rarely serves those, and
+/// they would keep their month from ever verifying. A verified
 /// month whose numbers no longer agree (a CFDI arrived or vanished, an XML went missing)
 /// drops back to unverified.
 pub async fn sync_rows(
@@ -70,13 +72,15 @@ pub async fn sync_rows(
         r#"WITH held AS (
                SELECT left(c.fecha_emision, 7) AS ym, 'emitidos' AS direction,
                       COUNT(*)::int AS n,
-                      COUNT(*) FILTER (WHERE c.xml_available IS DISTINCT FROM 1)::int AS missing
+                      COUNT(*) FILTER (WHERE c.xml_available IS DISTINCT FROM 1
+                                         AND NOT c.is_cancelled)::int AS missing
                FROM pulso.cfdis_raw c WHERE c.rfc_emisor = $1
                GROUP BY 1
                UNION ALL
                SELECT left(c.fecha_emision, 7), 'recibidos',
                       COUNT(*)::int,
-                      COUNT(*) FILTER (WHERE c.xml_available IS DISTINCT FROM 1)::int
+                      COUNT(*) FILTER (WHERE c.xml_available IS DISTINCT FROM 1
+                                         AND NOT c.is_cancelled)::int
                FROM pulso.cfdis_raw c WHERE c.rfc_receptor = $1
                GROUP BY 1
            )
@@ -169,6 +173,9 @@ pub async fn record_count(
     Ok(())
 }
 
+/// The attempt counters are kept, not reset: a month whose SAT counts disagree with each
+/// other would otherwise bounce between verified and resync forever without ever reaching
+/// the review cap.
 pub async fn mark_verified(
     pool: &PgPool,
     rfc: &str,
@@ -177,8 +184,7 @@ pub async fn mark_verified(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"UPDATE pulso.rfc_month_reconciliation
-           SET verified_at = now(), resync_attempts = 0, recount_attempts = 0,
-               needs_review = false, updated_at = now()
+           SET verified_at = now(), needs_review = false, updated_at = now()
            WHERE rfc = $1 AND ym = $2 AND direction = $3"#,
     )
     .bind(rfc)
