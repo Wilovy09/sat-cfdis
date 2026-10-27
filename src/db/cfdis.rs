@@ -566,6 +566,44 @@ pub async fn find_pending_etl(
         .collect())
 }
 
+/// ETL fast path for a CFDI listed again by a later job (the 3-day daily window and the
+/// reconciliation's month jobs re-list mostly CFDIs Pulso already holds). When the CFDI is
+/// already stored with its XML, reprocessing it from that same XML would rewrite identical
+/// values; the only thing the new listing can change is the SAT status (a cancellation).
+/// So: update `estado_sat` if it differs, and mark this listing processed -- no S3 read,
+/// no parse. Returns `None` when the CFDI isn't stored with XML yet (full path needed),
+/// `Some(changed)` otherwise, `changed` telling whether its status moved.
+pub async fn settle_known_cfdi(
+    pool: &PgPool,
+    job_id: &str,
+    uuid: &str,
+    estado_sat: &str,
+) -> Result<Option<bool>, sqlx::Error> {
+    let (known, changed): (bool, bool) = sqlx::query_as(
+        r#"WITH known AS (
+               SELECT uuid FROM pulso.cfdis_raw WHERE uuid = upper($2) AND xml_available = 1
+           ),
+           upd AS (
+               UPDATE pulso.cfdis_raw c SET estado_sat = $3
+               FROM known k
+               WHERE c.uuid = k.uuid AND c.estado_sat IS DISTINCT FROM $3
+               RETURNING c.uuid
+           ),
+           done AS (
+               UPDATE pulso.job_invoices SET etl_processed = true
+               WHERE job_id = $1 AND uuid = $2 AND EXISTS (SELECT 1 FROM known)
+               RETURNING 1
+           )
+           SELECT EXISTS (SELECT 1 FROM known), EXISTS (SELECT 1 FROM upd)"#,
+    )
+    .bind(job_id)
+    .bind(uuid)
+    .bind(estado_sat)
+    .fetch_one(pool)
+    .await?;
+    Ok(known.then_some(changed))
+}
+
 /// Marks a job_invoices row as ETL'd, once its cfdis header row has been written --
 /// mirrors the point `process_invoice` (services/etl.rs) already treats as "this invoice
 /// is now visible to analytics." Keeps `jobs_needing_etl`/`find_pending_etl`'s

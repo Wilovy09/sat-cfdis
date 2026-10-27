@@ -337,6 +337,12 @@ async fn reconcile_rfc(
     {
         return Ok(());
     }
+    // A finished job's CFDIs only count once the ETL has loaded them. Comparing before that
+    // read every month still in the ETL queue as "Pulso is short", burned its 3 attempts
+    // (each a SAT login) and sent it to review while its CFDIs were already downloaded.
+    if db::reconciliation::has_pending_etl(pool, rfc).await? {
+        return Ok(());
+    }
 
     db::reconciliation::sync_rows(pool, rfc, &from_ym, &to_ym).await?;
     let rows = db::reconciliation::rows(

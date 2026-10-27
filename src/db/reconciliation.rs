@@ -263,3 +263,17 @@ pub async fn last_job_activity(pool: &PgPool, rfc: &str) -> Result<Option<String
         .fetch_one(pool)
         .await
 }
+
+/// Whether any of this RFC's jobs still has listed CFDIs the ETL hasn't loaded.
+pub async fn has_pending_etl(pool: &PgPool, rfc: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT EXISTS (
+               SELECT 1 FROM pulso.job_invoices ji
+               JOIN pulso.sync_jobs j ON j.id = ji.job_id
+               WHERE j.rfc = $1 AND NOT ji.etl_processed
+           )"#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await
+}

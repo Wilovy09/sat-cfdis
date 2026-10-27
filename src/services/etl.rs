@@ -275,7 +275,9 @@ async fn process_job(
 /// Returns `true` once the header row is written -- the point at which this invoice
 /// becomes visible to every analytics query that reads `pulso.cfdis`. The child-table
 /// inserts below (taxes, concepts, payments, relacionados, nomina) stay best-effort
-/// (warn and continue) same as before; they don't gate this signal.
+/// (warn and continue) same as before; they don't gate this signal. A CFDI already stored
+/// with its XML takes the fast path instead and returns `true` only if its SAT status
+/// changed -- the only case where the caller has a cache to invalidate.
 async fn process_invoice(
     pool: &DbPool,
     cfg: &Config,
@@ -285,6 +287,17 @@ async fn process_invoice(
     metadata: &str,
     dl_type: &str,
 ) -> bool {
+    // Re-listings of already-loaded CFDIs used to go through the full S3 read + parse +
+    // upsert below, ~200 rows/min, and buried the genuinely new CFDIs behind them (TEST,
+    // 27-oct: 139,034 of 141,980 pending rows were CFDIs Pulso already held).
+    match db::cfdis::settle_known_cfdi(pool, job_id, uuid, &extract_estado_from_meta(metadata))
+        .await
+    {
+        Ok(Some(status_changed)) => return status_changed,
+        Ok(None) => {}
+        Err(e) => tracing::warn!(uuid = %uuid, "ETL: fast path failed, using the full path: {e}"),
+    }
+
     // Try to find the XML in storage first
     let xml_bytes = try_load_xml(cfg, s3, uuid, metadata).await;
 
