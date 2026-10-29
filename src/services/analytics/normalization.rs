@@ -176,14 +176,14 @@ pub async fn list_rules(pool: &DbPool, owner_rfc: &str) -> anyhow::Result<Vec<No
         // L5-01: capex_useful_life_years/capex_annual_dep_mxn are NUMERIC -- sqlx's f64
         // only decodes FLOAT8, so an uncast read here silently failed and .ok() turned it
         // into a null the frontend could never tell apart from "not captured".
-        "SELECT id, owner_rfc, dl_type, source_rfc, source_name, source_name_key, group_name,
+        "SELECT id, split_part(owner_rfc, '#', 1) AS owner_rfc, dl_type, source_rfc, source_name, source_name_key, group_name,
                 action, label, rule_name, cfdi_uuid,
                 accounting_line, motivo, impacts_ebitda, capex_estimate_dep,
                 capex_asset_type, capex_useful_life_years::float8 AS capex_useful_life_years,
                 capex_annual_dep_mxn::float8 AS capex_annual_dep_mxn,
                 period_start, period_end,
                 created_at, updated_at
-         FROM pulso.normalization_rules WHERE owner_rfc = $1 ORDER BY created_at DESC",
+         FROM pulso.normalization_rules WHERE owner_rfc = pulso.analysis_key($1) ORDER BY created_at DESC",
     )
     .bind(owner_rfc)
     .fetch_all(pool)
@@ -257,7 +257,7 @@ pub async fn create_rule(
              action, label, rule_name, cfdi_uuid, accounting_line, motivo, impacts_ebitda,
              capex_estimate_dep, capex_asset_type, capex_useful_life_years,
              capex_annual_dep_mxn, period_start, period_end, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)"#,
+           VALUES ($1,pulso.analysis_key($2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)"#,
     )
     .bind(&id)
     .bind(owner_rfc)
@@ -312,7 +312,7 @@ pub async fn create_rule(
 
 pub async fn delete_rule(pool: &DbPool, id: &str, owner_rfc: &str) -> anyhow::Result<bool> {
     let result =
-        sqlx::query("DELETE FROM pulso.normalization_rules WHERE id = $1 AND owner_rfc = $2")
+        sqlx::query("DELETE FROM pulso.normalization_rules WHERE id = $1 AND owner_rfc = pulso.analysis_key($2)")
             .bind(id)
             .bind(owner_rfc)
             .execute(pool)
@@ -349,7 +349,7 @@ pub async fn update_rule(
                capex_estimate_dep = $14, capex_asset_type = $15,
                capex_useful_life_years = $16, capex_annual_dep_mxn = $17,
                period_start = $18, period_end = $19, updated_at = $20
-           WHERE id = $21 AND owner_rfc = $22
+           WHERE id = $21 AND owner_rfc = pulso.analysis_key($22)
            RETURNING created_at, source_name_key"#,
     )
     .bind(&req.dl_type)
@@ -420,11 +420,11 @@ pub async fn list_payroll_rules(
     let rows = sqlx::query(
         // L5-01: value_pct/value_mxn are NUMERIC -- see list_rules' comment above on the
         // same sqlx/f64 decode gap (this is one of the two columns the audit confirmed).
-        "SELECT id, owner_rfc, rule_family, employee_rfc, employee_name, action,
+        "SELECT id, split_part(owner_rfc, '#', 1) AS owner_rfc, rule_family, employee_rfc, employee_name, action,
                 value_pct::float8 AS value_pct, value_mxn::float8 AS value_mxn,
                 period_start, period_end, notes, label, rule_name,
                 excluded_cfdi_uuids, accounting_line, motivo, created_at, updated_at
-         FROM pulso.payroll_normalization_rules WHERE owner_rfc = $1 ORDER BY created_at DESC",
+         FROM pulso.payroll_normalization_rules WHERE owner_rfc = pulso.analysis_key($1) ORDER BY created_at DESC",
     )
     .bind(owner_rfc)
     .fetch_all(pool)
@@ -599,7 +599,7 @@ async fn check_payroll_rule_locks(
     let rows = sqlx::query(
         r#"SELECT id, rule_family, action, period_start, period_end
            FROM pulso.payroll_normalization_rules
-           WHERE owner_rfc = $1 AND employee_rfc = $2"#,
+           WHERE owner_rfc = pulso.analysis_key($1) AND employee_rfc = $2"#,
     )
     .bind(owner_rfc)
     .bind(employee_rfc)
@@ -924,7 +924,7 @@ pub async fn create_payroll_rule(
             (id, owner_rfc, rule_family, employee_rfc, employee_name, action,
              value_pct, value_mxn, period_start, period_end, notes, label, rule_name,
              excluded_cfdi_uuids, accounting_line, motivo, created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"#,
+           VALUES ($1,pulso.analysis_key($2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"#,
     )
     .bind(&id)
     .bind(owner_rfc)
@@ -974,7 +974,7 @@ pub async fn create_payroll_rule(
 
 pub async fn delete_payroll_rule(pool: &DbPool, id: &str, owner_rfc: &str) -> anyhow::Result<bool> {
     let result = sqlx::query(
-        "DELETE FROM pulso.payroll_normalization_rules WHERE id = $1 AND owner_rfc = $2",
+        "DELETE FROM pulso.payroll_normalization_rules WHERE id = $1 AND owner_rfc = pulso.analysis_key($2)",
     )
     .bind(id)
     .bind(owner_rfc)
@@ -1001,7 +1001,7 @@ pub async fn update_payroll_rule(
                value_pct = $5, value_mxn = $6, period_start = $7, period_end = $8,
                notes = $9, label = $10, rule_name = $11, excluded_cfdi_uuids = $12,
                accounting_line = $13, motivo = $14, updated_at = $15
-           WHERE id = $16 AND owner_rfc = $17
+           WHERE id = $16 AND owner_rfc = pulso.analysis_key($17)
            RETURNING created_at"#,
     )
     .bind(&req.rule_family)
@@ -1318,7 +1318,7 @@ pub async fn list_counterparties_for_normalization(
                        THEN UPPER(nr.source_rfc) || '||' || nr.source_name_key
                        ELSE UPPER(nr.source_rfc) END AS cp_key
            FROM pulso.normalization_rules nr
-           WHERE nr.owner_rfc = $1 AND nr.action = 'exclude'
+           WHERE nr.owner_rfc = pulso.analysis_key($1) AND nr.action = 'exclude'
              AND nr.cfdi_uuid IS NULL AND nr.source_rfc IS NOT NULL
              AND {dl_rule_filter}"#
     );
@@ -1481,7 +1481,7 @@ pub async fn list_individual_rule_ids_for_counterparty(
         r#"SELECT nr.id
            FROM pulso.normalization_rules nr
            JOIN pulso.cfdis c ON UPPER(nr.cfdi_uuid) = UPPER(c.uuid)
-           WHERE nr.owner_rfc = $1
+           WHERE nr.owner_rfc = pulso.analysis_key($1)
              AND nr.cfdi_uuid IS NOT NULL
              AND nr.action = 'exclude'
              AND (
@@ -1676,7 +1676,7 @@ pub async fn list_ebitda_bridge_adjustments(
             nr.capex_annual_dep_mxn::float8 AS capex_annual_dep_mxn,
             c.year,
             SUM(
-                CASE WHEN c.rfc_emisor = nr.owner_rfc THEN -COALESCE(c.total_neto_mxn_ajustado, 0)
+                CASE WHEN c.rfc_emisor = split_part(nr.owner_rfc, '#', 1) THEN -COALESCE(c.total_neto_mxn_ajustado, 0)
                      ELSE COALESCE(c.total_neto_mxn_ajustado, 0) END
             )::float8 AS year_total
         FROM pulso.cfdi_exclusion ex

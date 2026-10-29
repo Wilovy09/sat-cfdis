@@ -19,12 +19,16 @@ use crate::{
 // Auth helper
 // ---------------------------------------------------------------------------
 
+/// Who may read this RFC's analytics, and on which analysis (migration 096: one RFC, one
+/// analysis per owning account). Returns the pool to run the request on: the main pool for
+/// the RFC's own analysis, a co-owner's analysis pool otherwise -- so every query and
+/// cached result of the request belongs to that analysis.
 async fn check_rfc_access(
     pool: &crate::db::DbPool,
     req: &HttpRequest,
     cfg: &Config,
     rfc: &str,
-) -> Result<(), AppError> {
+) -> Result<crate::db::DbPool, AppError> {
     let user_id = session::require_session(req, cfg)?;
 
     // P-03 / AUD-077: role resolved once per request, not three times (once inside
@@ -40,12 +44,12 @@ async fn check_rfc_access(
 
     // L19-01 point 2: membership is not enough -- the RFC's owner must have passed the SAT
     // login with their own CIEC. Until then the RFC only shows its sync progress.
-    let rfc_access = crate::db::users::user_can_read_rfc_data(pool, &user_id, rfc, is_admin)
+    let Some(analysis_key) = crate::db::users::analysis_for(pool, &user_id, rfc, is_admin)
         .await
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    if !rfc_access {
+        .map_err(|e| AppError::internal(e.to_string()))?
+    else {
         return Err(AppError::forbidden("Acceso denegado"));
-    }
+    };
 
     // Non-admins must have an active pulso subscription.
     if !is_admin {
@@ -57,7 +61,7 @@ async fn check_rfc_access(
         }
     }
 
-    Ok(())
+    Ok(crate::db::analysis::pool_for(pool, &analysis_key))
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +128,7 @@ pub async fn get_summary(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let p = summary::SummaryParams {
         dl_type: query.dl_type(),
         from: query.from(),
@@ -178,7 +182,7 @@ pub async fn get_month_contributor(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let p = summary::SummaryParams {
         dl_type: query
             .dl_type
@@ -213,7 +217,7 @@ pub async fn get_data_quality(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let value = response_cache::get_or_compute(&pool, &rfc, "data-quality", "", || async {
         data_quality::get(&pool, &rfc).await
     })
@@ -249,7 +253,7 @@ pub async fn get_counterparties(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to, limit) = (query.dl_type(), query.from(), query.to(), query.limit());
     let key = cache_key(&[
         ("dl_type", &dl_type),
@@ -288,7 +292,7 @@ pub async fn get_recurrence(
     cfg: web::Data<Config>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let dl_type = query
         .get("dl_type")
         .map(|s| s.as_str())
@@ -342,7 +346,7 @@ pub async fn get_retention(
     cfg: web::Data<Config>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let dl_type = query
         .get("dl_type")
         .map(|s| s.as_str())
@@ -386,7 +390,7 @@ pub async fn get_geography(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
     let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
     let value = response_cache::get_or_compute(&pool, &rfc, "geography", &key, || async {
@@ -421,7 +425,7 @@ pub async fn get_hallazgos_egresos(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     // C14-03/AUD-146: same fix as recurrence/retention -- an omitted `to` must key on the
     // resolved cutoff, not an empty placeholder.
     let to_key = query
@@ -463,7 +467,7 @@ pub async fn get_concepts(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
     let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
     let value = response_cache::get_or_compute(&pool, &rfc, "concepts", &key, || async {
@@ -500,7 +504,7 @@ pub async fn get_fiscal(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
     let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
     let value = response_cache::get_or_compute(&pool, &rfc, "fiscal", &key, || async {
@@ -537,7 +541,7 @@ pub async fn get_payments(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
     let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
     let value = response_cache::get_or_compute(&pool, &rfc, "payments", &key, || async {
@@ -574,7 +578,7 @@ pub async fn get_cashflow(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
     let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
     let value = response_cache::get_or_compute(&pool, &rfc, "cashflow", &key, || async {
@@ -610,7 +614,7 @@ pub async fn get_payroll(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (from, to) = (query.from(), query.to());
     let key = cache_key(&[("from", &from), ("to", &to)]);
     let value = response_cache::get_or_compute(&pool, &rfc, "payroll", &key, || async {
@@ -641,7 +645,7 @@ pub async fn get_payroll_snapshot(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     // C14-03/AUD-145: get_snapshot reads CURRENT_DATE five times internally -- an empty
     // key never invalidated across a month boundary. Month granularity (not daily) is
     // enough: everything it computes is anchored to month-end by design (DEC's tenure/
@@ -676,7 +680,7 @@ pub async fn get_hallazgos(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     // C14-03/AUD-145: same fix as payroll-snapshot -- 3 uses of today's date and 3 of the
     // last closed month, an empty key never invalidated across a month boundary.
     let key = cache_key(&[("month", &today_yyyymm().to_string())]);
@@ -714,7 +718,7 @@ pub async fn list_normalization(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let rules = normalization::list_rules(&pool, &rfc)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -742,7 +746,7 @@ pub async fn create_normalization(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     validate_comprobante_rule_fields(&body)?;
     let rule = normalization::create_rule(&pool, &rfc, &body)
         .await
@@ -777,7 +781,7 @@ pub async fn update_normalization(
     let rfc = rfc.to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     tracing::Span::current().record("rule_id", id.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     validate_comprobante_rule_fields(&body)?;
     let rule = normalization::update_rule(&pool, &id, &rfc, &body)
         .await
@@ -862,7 +866,7 @@ pub async fn delete_normalization(
     let (rfc, id) = path.into_inner();
     tracing::Span::current().record("rfc", rfc.to_uppercase().as_str());
     tracing::Span::current().record("rule_id", id.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc.to_uppercase()).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc.to_uppercase()).await?;
     let deleted = normalization::delete_rule(&pool, &id, &rfc.to_uppercase())
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -889,7 +893,7 @@ pub async fn list_payroll_normalization(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let rules = normalization::list_payroll_rules(&pool, &rfc)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -917,7 +921,7 @@ pub async fn create_payroll_normalization(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
 
     match normalization::check_payroll_rule(&pool, &rfc, &body, None)
         .await
@@ -966,7 +970,7 @@ pub async fn update_payroll_normalization(
     let rfc = rfc.to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
     tracing::Span::current().record("rule_id", id.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
 
     // L5-10: same locks/validations as creation, run against this rule's own id so it
     // doesn't get rejected for overlapping itself (L5-08 C1/C2, L5-12, L4-04/L4-12).
@@ -1016,7 +1020,7 @@ pub async fn delete_payroll_normalization(
     let (rfc, id) = path.into_inner();
     tracing::Span::current().record("rfc", rfc.to_uppercase().as_str());
     tracing::Span::current().record("rule_id", id.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc.to_uppercase()).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc.to_uppercase()).await?;
     let deleted = normalization::delete_payroll_rule(&pool, &id, &rfc.to_uppercase())
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -1058,7 +1062,7 @@ pub async fn refresh_nomina_normalizada(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
 
     match nomina_refresh::refresh_guarded(&pool, &state)
         .await
@@ -1098,7 +1102,7 @@ pub async fn list_excluded_cfdis(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let cfdis = normalization::list_excluded_cfdis(&pool, &rfc)
         .await
         .map_err(|e| AppError::internal(e.to_string()))?;
@@ -1117,7 +1121,7 @@ pub async fn list_norm_counterparties(
     cfg: web::Data<Config>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let dl_type = query.dl_type();
     let from = query.from();
     let to = query.to();
@@ -1144,7 +1148,7 @@ pub async fn list_norm_counterparty_cfdis(
 ) -> Result<HttpResponse, AppError> {
     let (rfc, cp_rfc) = path.into_inner();
     let rfc = rfc.to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let dl_type = query.dl_type();
     let from = query.from();
     let to = query.to();
@@ -1196,7 +1200,7 @@ pub async fn list_normalization_individual_rule_ids(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
 
     let source_rfc = query
         .source_rfc
@@ -1238,7 +1242,7 @@ pub async fn get_normalization_payroll_employees(
     cfg: web::Data<Config>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     // L5-02: this catalog is no longer windowed by a date range -- it always returns each
     // employee's real full history, which is the whole point (see normalization.rs).
     let rows = normalization::list_payroll_employees(&pool, &rfc)
@@ -1259,7 +1263,7 @@ pub async fn get_normalization_payroll_employee_receipts(
 ) -> Result<HttpResponse, AppError> {
     let (rfc, employee_rfc) = path.into_inner();
     let rfc = rfc.to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let rows =
         normalization::list_nomina_receipts_for_employee(&pool, &rfc, &employee_rfc.to_uppercase())
             .await
@@ -1279,7 +1283,7 @@ pub async fn get_normalization_ebitda_bridge(
     cfg: web::Data<Config>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let from = query.from();
     let to = query.to();
     let (from_y, from_m) = crate::services::analytics::summary::parse_ym(&from);
@@ -1303,7 +1307,7 @@ pub async fn get_counterparties_evolution(
     cfg: web::Data<Config>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
     let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
     let value =
@@ -1329,7 +1333,7 @@ pub async fn get_counterparties_selector(
     cfg: web::Data<Config>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
     let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
     let value =
@@ -1353,7 +1357,7 @@ pub async fn get_counterparties_ltm(
     cfg: web::Data<Config>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, to) = (query.dl_type(), query.to());
     let key = cache_key(&[("dl_type", &dl_type), ("to", &to)]);
     let value = response_cache::get_or_compute(&pool, &rfc, "counterparties-ltm", &key, || async {
@@ -1376,7 +1380,7 @@ pub async fn get_counterparties_payments_detail(
     cfg: web::Data<Config>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
     let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
     let value = response_cache::get_or_compute(
@@ -1403,7 +1407,7 @@ pub async fn get_counterparties_atypical(
     cfg: web::Data<Config>,
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
     let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
     let value =
@@ -1429,7 +1433,7 @@ pub async fn get_counterparty_individual(
     let (rfc, cp_rfc) = path.into_inner();
     let rfc = rfc.to_uppercase();
     let cp_rfc = cp_rfc.to_uppercase();
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
     let key = cache_key(&[
         ("cp_rfc", &cp_rfc),
@@ -1501,7 +1505,7 @@ pub async fn get_quarterly(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let (dl_type, from, to) = (query.dl_type(), query.from(), query.to());
     let key = cache_key(&[("dl_type", &dl_type), ("from", &from), ("to", &to)]);
     let value = response_cache::get_or_compute(&pool, &rfc, "quarterly", &key, || async {
@@ -1535,7 +1539,7 @@ pub async fn get_period_comparison(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let dl_type = query.dl_type.clone().unwrap_or_else(|| "emitidos".into());
     let from_month = query.from_month.unwrap_or(1).clamp(1, 12);
     let to_month = query.to_month.unwrap_or(12).clamp(1, 12);
@@ -1582,7 +1586,7 @@ pub async fn get_xml_count(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let dl_type = query
         .get("dl_type")
         .map(|s| s.as_str())
@@ -1604,7 +1608,7 @@ pub async fn get_xml_breakdown(
 ) -> Result<HttpResponse, AppError> {
     let rfc = path.into_inner().to_uppercase();
     tracing::Span::current().record("rfc", rfc.as_str());
-    check_rfc_access(&pool, &req, &cfg, &rfc).await?;
+    let pool = check_rfc_access(&pool, &req, &cfg, &rfc).await?;
     let value = response_cache::get_or_compute(&pool, &rfc, "xml-breakdown", "", || async {
         xml_breakdown::get(&pool, &rfc).await
     })

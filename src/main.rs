@@ -122,36 +122,48 @@ fn job_ciec_password(auth_payload: &serde_json::Value, job_rfc: &str) -> Option<
 }
 
 /// L19-01 point 1 / L19-03 point 1: called once the SAT accepted a job's CIEC login. Marks
-/// the RFC's active owner verified only if that CIEC is the owner's current one -- a job
-/// queued with a previous owner's CIEC proves nothing about whoever owns the RFC now.
+/// verified each active owner whose current CIEC is that one -- a job queued with a
+/// previous owner's CIEC proves nothing about whoever owns the RFC now, and with several
+/// owning accounts (migration 096) each is verified by its own CIEC only.
 async fn verify_owner_after_sat_login(pool: &DbPool, rfc: &str, job_ciec: &str) {
-    let (owner_row_id, clave_enc) = match db::users::get_unverified_owner(pool, rfc).await {
-        Ok(Some(owner)) => owner,
-        Ok(None) => return,
+    let owners = match db::users::get_unverified_owners(pool, rfc).await {
+        Ok(owners) => owners,
         Err(e) => {
             tracing::error!(rfc = %rfc, "Owner verification: DB error: {e}");
             return;
         }
     };
     let key = services::crypto::load_key();
-    let owner_ciec = match services::crypto::decrypt(&key, &clave_enc) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(rfc = %rfc, "Owner verification: decrypt failed: {e}");
-            return;
+    for (owner_row_id, clave_enc) in owners {
+        match services::crypto::decrypt(&key, &clave_enc) {
+            Ok(owner_ciec) if owner_ciec == job_ciec => {}
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::error!(rfc = %rfc, "Owner verification: decrypt failed: {e}");
+                continue;
+            }
         }
+        match db::users::set_owner_verified(pool, &owner_row_id).await {
+            Ok(true) => {
+                tracing::info!(rfc = %rfc, "RFC owner verified: SAT login passed with their CIEC")
+            }
+            Ok(false) => {}
+            Err(e) => tracing::error!(rfc = %rfc, "Owner verification: update failed: {e}"),
+        }
+    }
+}
+
+/// Whether this CIEC belongs to an owner of the RFC still waiting on verification. Such a
+/// job must log in with that CIEC even if the RFC has a FIEL: a co-owner (migration 096)
+/// is only verified by their own CIEC passing the SAT login.
+async fn ciec_awaits_verification(pool: &DbPool, rfc: &str, ciec: &str) -> bool {
+    let Ok(owners) = db::users::get_unverified_owners(pool, rfc).await else {
+        return false;
     };
-    if owner_ciec != job_ciec {
-        tracing::warn!(rfc = %rfc, "SAT login passed with a CIEC that isn't the current owner's -- owner stays unverified");
-        return;
-    }
-    match db::users::set_owner_verified(pool, &owner_row_id).await {
-        Ok(true) => {
-            tracing::info!(rfc = %rfc, "RFC owner verified: SAT login passed with their CIEC")
-        }
-        Ok(false) => {}
-        Err(e) => tracing::error!(rfc = %rfc, "Owner verification: update failed: {e}"),
-    }
+    let key = services::crypto::load_key();
+    owners
+        .iter()
+        .any(|(_, enc)| services::crypto::decrypt(&key, enc).is_ok_and(|c| c == ciec))
 }
 
 /// L19-04 point 2: the scraper's stderr is logged as-is. Reviewed: it never prints the CIEC,
@@ -287,17 +299,23 @@ async fn resume_worker(
             // `own_ciec` is set only when the job logs in with its own CIEC -- the one
             // credential a successful login can verify the owner with.
             let bucket = cfg.s3_bucket.clone().unwrap_or_default();
-            let (auth_payload, _fiel_tmp, own_ciec) =
-                match try_fiel_auth(&pool, &s3_client, &bucket, &job.rfc).await {
-                    Some((fiel_auth, tmp)) => {
-                        tracing::info!(rfc = %job.rfc, "Worker: using FIEL auth");
-                        (fiel_auth, Some(tmp), None)
-                    }
-                    None => {
-                        let own_ciec = job_ciec_password(&auth_payload, &job.rfc);
-                        (auth_payload, None::<tempfile::TempDir>, own_ciec)
-                    }
-                };
+            let job_ciec = job_ciec_password(&auth_payload, &job.rfc);
+            let verifies_an_owner = match &job_ciec {
+                Some(ciec) => ciec_awaits_verification(&pool, &job.rfc, ciec).await,
+                None => false,
+            };
+            let fiel = if verifies_an_owner {
+                None
+            } else {
+                try_fiel_auth(&pool, &s3_client, &bucket, &job.rfc).await
+            };
+            let (auth_payload, _fiel_tmp, own_ciec) = match fiel {
+                Some((fiel_auth, tmp)) => {
+                    tracing::info!(rfc = %job.rfc, "Worker: using FIEL auth");
+                    (fiel_auth, Some(tmp), None)
+                }
+                None => (auth_payload, None::<tempfile::TempDir>, job_ciec),
+            };
 
             // Queued jobs start from period_from; paused jobs resume from day after cursor
             let resume_from = match &job.cursor_date {
@@ -728,7 +746,8 @@ async fn notify_sync_failed(
     let Some(ref api_key) = cfg.sendgrid_api_key else {
         return;
     };
-    let Ok(Some((user_id, email))) = crate::db::users::get_owner_contact_by_rfc(pool, rfc).await
+    let Ok(Some((user_id, email))) =
+        crate::db::users::get_owner_contact_for_job(pool, rfc, job_id).await
     else {
         return;
     };
@@ -1140,7 +1159,7 @@ async fn run_worker_chunk(
         // Email 2: monthly complete (job_type == "auto_daily" and period_to falls on the last day of its month)
         if let Some(ref api_key) = cfg.sendgrid_api_key
             && let Ok(Some((user_id, email))) =
-                crate::db::users::get_owner_contact_by_rfc(&pool, &job_rfc).await
+                crate::db::users::get_owner_contact_for_job(&pool, &job_rfc, &job_id).await
         {
             let send_result = if job_type == "list" {
                 match crate::db::users::is_initial_sync_job(&pool, &job_rfc, &job_id).await {

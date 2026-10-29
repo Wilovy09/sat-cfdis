@@ -4,10 +4,8 @@
 //! and the SAT validates it live; the RFC lands in the requester's account.
 //!
 //! Privacy between accounts (rule 6): if another account already has the RFC, nothing in
-//! these responses differs -- same link, same messages, same validation. Pulso doesn't yet
-//! let two accounts own one RFC, so the validated credential is kept encrypted on the link
-//! (`pending_clave_enc`) until it does, and the requester sees the RFC as still being
-//! prepared.
+//! these responses differs -- same link, same messages, same validation -- and the RFC
+//! joins the requester's account with its own analysis (migration 096).
 
 use actix_multipart::Multipart;
 use actix_web::{HttpRequest, HttpResponse, http::StatusCode, web};
@@ -137,12 +135,12 @@ pub async fn create_link(
         );
     }
 
-    // An RFC this account already has is a credentials update; another account's RFC is
-    // treated exactly like a new one (rule 6). Only a brand-new RFC for this account counts
-    // against the per-account limit.
+    // An RFC this account already has is a credentials update; any other is a new RFC for
+    // it, whether or not another account has it (rule 6), and counts against the
+    // per-account limit.
     let owned_by_self = match crate::db::users::check_rfc_ownership(&pool, &user_id, &rfc).await {
         Err(CreateUserError::AlreadyOwnedBySelf) => true,
-        Ok(()) | Err(CreateUserError::AlreadyOwnedByOther) => false,
+        Ok(()) => false,
         Err(CreateUserError::Db(e)) => {
             tracing::error!(user_id = %user_id, "credential link: ownership check failed: {e}");
             return internal_error();
@@ -387,15 +385,10 @@ pub async fn public_submit(
 
     let bucket = cfg.s3_bucket.clone().unwrap_or_default();
     match attach(&pool, &s3, &bucket, &link, &submission).await {
-        Ok(pending) => {
-            if let Err(e) = links::mark_validated(
-                &pool,
-                link.id,
-                &submission.kind,
-                &submission.role,
-                pending.as_deref(),
-            )
-            .await
+        Ok(()) => {
+            if let Err(e) =
+                links::mark_validated(&pool, link.id, &submission.kind, &submission.role, None)
+                    .await
             {
                 tracing::error!(rfc = %link.rfc, "credential link: closing the link failed: {e}");
             }
@@ -426,15 +419,16 @@ enum AttachError {
     Ownership(String),
 }
 
-/// Puts SAT-validated credentials where they belong. Returns the encrypted credential only
-/// when it has to wait on the link (another account owns the RFC).
+/// Puts SAT-validated credentials where they belong: the requester's own row for an RFC
+/// they already have (rules 4 and 5), else a new one -- with its own analysis when another
+/// account has the RFC too.
 async fn attach(
     pool: &DbPool,
     s3: &S3Client,
     bucket: &str,
     link: &links::PublicLink,
     submission: &Submission,
-) -> Result<Option<String>, AttachError> {
+) -> Result<(), AttachError> {
     let requester = link.requester_user_id.to_string();
     let rfc = link.rfc.as_str();
     let key = crypto::load_key();
@@ -461,24 +455,7 @@ async fn attach(
                 crate::db::users::update_rfc_clave(pool, &requester, rfc, &clave_enc).await?;
             }
             crate::db::users::mark_verified_now(pool, &requester, rfc).await?;
-            Ok(None)
-        }
-        Err(CreateUserError::AlreadyOwnedByOther) => {
-            use base64::Engine as _;
-            let b64 = base64::engine::general_purpose::STANDARD;
-            let held = if is_fiel {
-                serde_json::json!({
-                    "type": "fiel",
-                    "cert": b64.encode(&submission.cert),
-                    "key": b64.encode(&submission.key),
-                    "password": submission.password,
-                })
-            } else {
-                serde_json::json!({ "type": "ciec", "password": submission.password })
-            };
-            let held_enc =
-                crypto::encrypt(&key, &held.to_string()).map_err(AttachError::Encrypt)?;
-            Ok(Some(held_enc))
+            Ok(())
         }
         Ok(()) => {
             if is_fiel {
@@ -502,7 +479,7 @@ async fn attach(
                 )
                 .await?;
             }
-            Ok(None)
+            Ok(())
         }
         Err(CreateUserError::Db(e)) => Err(AttachError::Ownership(e.to_string())),
     }

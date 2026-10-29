@@ -70,6 +70,45 @@ fn download_order(priority_analysis: Option<&str>) -> Option<(&'static str, &'st
 /// main.rs enforces the order) and returns the second job's id, since that's
 /// the one that finishes last. Otherwise queues a single combined "ambos"
 /// job, exactly like before this feature existed.
+/// The first sync for an account that just registered `rfc`. When another account already
+/// downloaded the RFC's history (migration 096: one RFC, several accounts), the CFDIs are
+/// there: a one-day job is enough to log in with this account's CIEC and verify it,
+/// without spending the company's daily SAT quota downloading everything again.
+async fn queue_first_sync(
+    pool: &DbPool,
+    rfc: &str,
+    auth_enc: &str,
+    priority_analysis: Option<&str>,
+) -> Result<String, sqlx::Error> {
+    if crate::db::jobs::latest_historical_period_to(pool, rfc)
+        .await?
+        .is_some()
+    {
+        let day = crate::services::gap_detector::yesterday_ymd();
+        return crate::db::jobs::insert_queued(
+            pool,
+            "list",
+            rfc,
+            "ciec",
+            auth_enc,
+            "ambos",
+            &format!("{day} 00:00:00"),
+            &format!("{day} 23:59:59"),
+        )
+        .await;
+    }
+    let (period_from, period_to) = initial_sync_period();
+    queue_initial_sync(
+        pool,
+        rfc,
+        auth_enc,
+        &period_from,
+        &period_to,
+        priority_analysis,
+    )
+    .await
+}
+
 async fn queue_initial_sync(
     pool: &DbPool,
     rfc: &str,
@@ -397,16 +436,6 @@ async fn register_rfc(
                 error: "Este RFC ya está registrado para este usuario".to_string(),
             }));
         }
-        Err(crate::db::users::CreateUserError::AlreadyOwnedByOther) => {
-            // L18-06 point 4: generic on purpose -- doesn't confirm the RFC is someone
-            // else's specifically, which is exactly the fact an attacker probing RFCs
-            // would want confirmed.
-            return Err(HttpResponse::Conflict().json(ErrorBody {
-                error:
-                    "No pudimos registrar este RFC. Si crees que es un error, contacta a soporte."
-                        .to_string(),
-            }));
-        }
         Err(crate::db::users::CreateUserError::Db(e)) => {
             tracing::error!(user_id = %user_id, "Error checking RFC ownership: {e}");
             return Err(HttpResponse::InternalServerError().json(ErrorBody {
@@ -442,17 +471,7 @@ async fn register_rfc(
         }
     };
 
-    let (period_from, period_to) = initial_sync_period();
-    let sync_job_id = match queue_initial_sync(
-        pool,
-        rfc,
-        &auth_enc,
-        &period_from,
-        &period_to,
-        priority_analysis,
-    )
-    .await
-    {
+    let queued = match queue_first_sync(pool, rfc, &auth_enc, priority_analysis).await {
         Ok(id) => {
             tracing::info!(user_id = %user_id, job_id = %id, "Initial sync job(s) queued");
             Some(id)
@@ -462,6 +481,7 @@ async fn register_rfc(
             None
         }
     };
+    let sync_job_id = queued;
 
     if let Err(e) = crate::db::users::create_pulso_user(
         pool,
@@ -478,6 +498,9 @@ async fn register_rfc(
             error: "Error al guardar el RFC".to_string(),
         }));
     }
+    // A co-owner's analysis (migration 096) has no rows in the normalized payroll until it
+    // is refreshed; the ETL's next round does it instead of the 23 h cycle.
+    crate::services::nomina_refresh::mark_touched();
 
     if let Err(e) = crate::db::users::set_profile_complete(pool, user_id).await {
         tracing::error!(user_id = %user_id, "Error setting profile complete: {e}");
@@ -532,9 +555,9 @@ pub(crate) async fn register_validated_rfc(
         .await
         .map_err(|e| RegisterValidatedError::Create(e.to_string()))?;
     crate::db::users::mark_verified_now(pool, user_id, rfc).await?;
+    crate::services::nomina_refresh::mark_touched();
 
-    let (period_from, period_to) = initial_sync_period();
-    let job_id = queue_initial_sync(pool, rfc, &auth_enc, &period_from, &period_to, None).await?;
+    let job_id = queue_first_sync(pool, rfc, &auth_enc, None).await?;
     crate::db::users::set_initial_sync_job_for_rfc(pool, user_id, rfc, &job_id).await?;
     if let Err(e) = crate::db::users::set_profile_complete(pool, user_id).await {
         tracing::error!(user_id = %user_id, "Error setting profile complete: {e}");
@@ -712,7 +735,7 @@ pub async fn trigger_sync(
     };
 
     let (period_from, period_to) = initial_sync_period();
-    let priority_analysis = crate::db::users::get_priority_analysis_for_rfc(&pool, &rfc)
+    let priority_analysis = crate::db::users::get_priority_analysis_for_rfc(&pool, &rfc, &user_id)
         .await
         .unwrap_or(None);
     let job_id = match queue_initial_sync(
@@ -1366,7 +1389,7 @@ pub async fn delete_rfc_handler(
     }
 
     // Revoke all active shares before soft-deleting
-    if let Err(e) = crate::db::users::revoke_all_shares_for_rfc(&pool, &rfc).await {
+    if let Err(e) = crate::db::users::revoke_all_shares_for_rfc(&pool, &rfc, &user_id).await {
         tracing::error!(user_id = %user_id, rfc = %rfc, "delete_rfc: revoke shares error: {e}");
     }
 

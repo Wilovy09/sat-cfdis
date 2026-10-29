@@ -854,7 +854,7 @@ pub async fn get_payments_detail(
                    -- counterparty as a whole.
                    BOOL_OR(EXISTS (
                        SELECT 1 FROM pulso.normalization_rules nr
-                       WHERE nr.owner_rfc = $1
+                       WHERE nr.owner_rfc = pulso.analysis_key($1)
                          AND nr.action = 'exclude'
                          AND nr.cfdi_uuid IS NULL
                          AND nr.source_rfc = {cp_col}

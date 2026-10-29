@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod cfdis;
 pub mod credential_links;
 pub mod fiel;

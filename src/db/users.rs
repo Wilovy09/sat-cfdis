@@ -10,7 +10,6 @@ fn parse_uuid(user_id: &str) -> Result<Uuid, sqlx::Error> {
 #[derive(Debug)]
 pub enum CreateUserError {
     AlreadyOwnedBySelf,
-    AlreadyOwnedByOther,
     Db(sqlx::Error),
 }
 
@@ -24,7 +23,6 @@ impl std::fmt::Display for CreateUserError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AlreadyOwnedBySelf => write!(f, "RFC already registered for this user"),
-            Self::AlreadyOwnedByOther => write!(f, "RFC already registered by another user"),
             Self::Db(e) => write!(f, "DB error: {e}"),
         }
     }
@@ -54,11 +52,9 @@ pub async fn get_profile_complete(pool: &PgPool, user_id: &str) -> Result<bool, 
 }
 
 /// L18-06 point 2: the ownership check on its own, callable *before* a sync job is queued.
-/// Previously this lived inside `create_pulso_user` (called after `queue_initial_sync`),
-/// so a registration attempt rejected as `AlreadyOwnedByOther` had already left a real job
-/// in the queue -- against someone else's RFC, authenticating with whatever credentials
-/// the rejected caller supplied. Callers must run this first and only queue a job if it
-/// returns `Ok(())`.
+/// Only this account counts: another account owning the same RFC is fine -- each has its
+/// own analysis (migration 096) -- and must never change the answer, so nothing here
+/// hints that it exists.
 pub async fn check_rfc_ownership(
     pool: &PgPool,
     user_id: &str,
@@ -67,23 +63,15 @@ pub async fn check_rfc_ownership(
     let uid = parse_uuid(user_id)?;
     let rfc_upper = rfc.to_uppercase();
 
-    // One query: count rows owned by this user and rows owned by a different user.
-    let (owned_by_self, owned_by_other): (i64, i64) = sqlx::query_as(
-        r#"SELECT
-               COUNT(*) FILTER (WHERE user_id = $1) AS owned_by_self,
-               COUNT(*) FILTER (WHERE user_id <> $1) AS owned_by_other
-           FROM pulso.users
-           WHERE rfc = $2 AND deleted_at IS NULL"#,
+    let owned_by_self: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pulso.users WHERE user_id = $1 AND rfc = $2 AND deleted_at IS NULL)",
     )
     .bind(uid)
     .bind(&rfc_upper)
     .fetch_one(pool)
     .await?;
-    if owned_by_self > 0 {
+    if owned_by_self {
         return Err(CreateUserError::AlreadyOwnedBySelf);
-    }
-    if owned_by_other > 0 {
-        return Err(CreateUserError::AlreadyOwnedByOther);
     }
     Ok(())
 }
@@ -107,10 +95,14 @@ pub async fn create_pulso_user(
     // L19-01: verified_at is cleared -- the restored row carries a new, unproven CIEC, and
     // keeping the old mark would hand back data access without passing the SAT login again.
     let restored = sqlx::query(
-        r#"UPDATE pulso.users
+        r#"UPDATE pulso.users u
            SET deleted_at = NULL, verified_at = NULL, clave = $1, initial_sync_job_id = $2,
-               priority_analysis = $3
-           WHERE user_id = $4 AND rfc = $5 AND deleted_at IS NOT NULL"#,
+               priority_analysis = $3,
+               analysis_key = CASE WHEN EXISTS (
+                                  SELECT 1 FROM pulso.users a
+                                  WHERE a.analysis_key = u.analysis_key AND a.deleted_at IS NULL)
+                              THEN u.rfc || '#' || left(u.id, 8) ELSE u.analysis_key END
+           WHERE u.user_id = $4 AND u.rfc = $5 AND u.deleted_at IS NOT NULL"#,
     )
     .bind(clave_enc)
     .bind(initial_sync_job_id)
@@ -131,9 +123,14 @@ pub async fn create_pulso_user(
     // genuinely new row gets one assigned.
     let anio_piso = time::OffsetDateTime::now_utc().year() - 3;
     let id = Uuid::new_v4().to_string();
+    // Migration 096: the RFC itself is the analysis key only for the first account ever to
+    // have it; any other (now or before) gets its own, so it never inherits someone else's
+    // adjustments.
     sqlx::query(
-        r#"INSERT INTO pulso.users (id, user_id, rfc, clave, initial_sync_job_id, priority_analysis, anio_piso, deleted_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)"#,
+        r#"INSERT INTO pulso.users (id, user_id, rfc, clave, initial_sync_job_id, priority_analysis, anio_piso, deleted_at, analysis_key)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NULL,
+                   CASE WHEN EXISTS (SELECT 1 FROM pulso.users o WHERE o.rfc = $3 AND o.user_id <> $2)
+                        THEN $3 || '#' || left($1, 8) ELSE $3 END)"#,
     )
     .bind(id)
     .bind(uid)
@@ -175,16 +172,21 @@ pub async fn get_user_credentials(
 /// Returns (rfc, clave_enc) for every active user — used by the monthly sync worker.
 pub async fn get_all_with_credentials(pool: &PgPool) -> Result<Vec<(String, String)>, sqlx::Error> {
     let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT rfc, clave FROM pulso.users WHERE deleted_at IS NULL")
-            .fetch_all(pool)
-            .await?;
+        // One row per RFC even with several owning accounts: the one most likely to log in.
+        sqlx::query_as(
+            "SELECT DISTINCT ON (rfc) rfc, clave FROM pulso.users WHERE deleted_at IS NULL \
+             ORDER BY rfc, (verified_at IS NOT NULL) DESC, (clave <> '') DESC, created_at",
+        )
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 
 /// Returns encrypted clave for a given RFC regardless of owner — admin use only.
 pub async fn get_clave_for_rfc(pool: &PgPool, rfc: &str) -> Result<Option<String>, sqlx::Error> {
     let row: Option<(String,)> = sqlx::query_as(
-        "SELECT clave FROM pulso.users WHERE rfc = $1 AND deleted_at IS NULL LIMIT 1",
+        "SELECT clave FROM pulso.users WHERE rfc = $1 AND deleted_at IS NULL \
+         ORDER BY (verified_at IS NOT NULL) DESC, (clave <> '') DESC, created_at LIMIT 1",
     )
     .bind(rfc)
     .fetch_optional(pool)
@@ -319,34 +321,35 @@ pub async fn is_user_admin(pool: &PgPool, user_id: &str) -> Result<bool, sqlx::E
     Ok(row.is_some())
 }
 
-/// L19-01 point 2: whether `user_id` may read this RFC's invoice data -- admin, or a
-/// member (owner or active share) of an RFC whose active owner has passed the SAT login
-/// with their own CIEC. Membership alone is `user_has_rfc_or_admin`, which only the
-/// sync-status route uses, since an unverified RFC must still show its sync progress.
-pub async fn user_can_read_rfc_data(
+/// Migration 096: which analysis of `rfc` this user works on -- their own when they own
+/// it, else that of the account that shared it with them. L19-01 point 2: only through a
+/// verified owner (membership alone is `user_has_rfc_or_admin`, which only the sync-status
+/// route uses). An admin with neither gets the RFC's own analysis. `None`: no access to
+/// the RFC's data.
+pub async fn analysis_for(
     pool: &PgPool,
     user_id: &str,
     rfc: &str,
     is_admin: bool,
-) -> Result<bool, sqlx::Error> {
-    if is_admin {
-        return Ok(true);
-    }
+) -> Result<Option<String>, sqlx::Error> {
     let uid = parse_uuid(user_id)?;
-    sqlx::query_scalar(
-        r#"SELECT EXISTS (
-               SELECT 1 FROM pulso.users o
-               WHERE o.rfc = $2 AND o.deleted_at IS NULL AND o.verified_at IS NOT NULL
-                 AND (o.user_id = $1 OR EXISTS (
-                     SELECT 1 FROM pulso.rfc_shares s
-                     WHERE s.rfc = o.rfc AND s.shared_with = $1 AND s.revoked_at IS NULL
-                 ))
-           )"#,
+    let rfc = rfc.to_uppercase();
+    let key: Option<String> = sqlx::query_scalar(
+        r#"SELECT o.analysis_key FROM pulso.users o
+           WHERE o.rfc = $2 AND o.deleted_at IS NULL AND o.verified_at IS NOT NULL
+             AND (o.user_id = $1 OR EXISTS (
+                 SELECT 1 FROM pulso.rfc_shares s
+                 WHERE s.rfc = o.rfc AND s.owner_id = o.user_id
+                   AND s.shared_with = $1 AND s.revoked_at IS NULL
+             ))
+           ORDER BY (o.user_id = $1) DESC, o.created_at
+           LIMIT 1"#,
     )
     .bind(uid)
-    .bind(rfc.to_uppercase())
-    .fetch_one(pool)
-    .await
+    .bind(&rfc)
+    .fetch_optional(pool)
+    .await?;
+    Ok(key.or(is_admin.then_some(rfc)))
 }
 
 /// Whether the RFC's active owner has been verified (L19-01). `false` when it has no
@@ -361,18 +364,18 @@ pub async fn is_owner_verified(pool: &PgPool, rfc: &str) -> Result<bool, sqlx::E
     .await
 }
 
-/// The active owner row of an RFC that still awaits verification: (row id, clave_enc).
-/// `None` if the RFC has no active owner or it is already verified.
-pub async fn get_unverified_owner(
+/// The RFC's active owner rows still awaiting verification: (row id, clave_enc). Several
+/// accounts can own one RFC, each verified by its own CIEC.
+pub async fn get_unverified_owners(
     pool: &PgPool,
     rfc: &str,
-) -> Result<Option<(String, String)>, sqlx::Error> {
+) -> Result<Vec<(String, String)>, sqlx::Error> {
     sqlx::query_as(
         "SELECT id::text, clave FROM pulso.users \
-         WHERE rfc = $1 AND deleted_at IS NULL AND verified_at IS NULL LIMIT 1",
+         WHERE rfc = $1 AND deleted_at IS NULL AND verified_at IS NULL",
     )
     .bind(rfc.to_uppercase())
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
 }
 
@@ -593,11 +596,19 @@ pub async fn revoke_rfc_share(
 }
 
 /// Revoke all active shares for an RFC (called when owner deletes the RFC).
-pub async fn revoke_all_shares_for_rfc(pool: &PgPool, rfc: &str) -> Result<(), sqlx::Error> {
+/// Revokes what `owner_id` shared of this RFC; other accounts owning it keep theirs.
+pub async fn revoke_all_shares_for_rfc(
+    pool: &PgPool,
+    rfc: &str,
+    owner_id: &str,
+) -> Result<(), sqlx::Error> {
+    let uid = parse_uuid(owner_id)?;
     sqlx::query(
-        "UPDATE pulso.rfc_shares SET revoked_at = NOW() WHERE rfc = $1 AND revoked_at IS NULL",
+        "UPDATE pulso.rfc_shares SET revoked_at = NOW() \
+         WHERE rfc = $1 AND owner_id = $2 AND revoked_at IS NULL",
     )
     .bind(rfc.to_uppercase())
+    .bind(uid)
     .execute(pool)
     .await?;
     Ok(())
@@ -693,11 +704,15 @@ pub async fn get_anio_piso_for_rfc(pool: &PgPool, rfc: &str) -> Result<Option<i3
 pub async fn get_priority_analysis_for_rfc(
     pool: &PgPool,
     rfc: &str,
+    user_id: &str,
 ) -> Result<Option<String>, sqlx::Error> {
+    let uid = parse_uuid(user_id)?;
     let row: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT priority_analysis FROM pulso.users WHERE rfc = $1 AND deleted_at IS NULL LIMIT 1",
+        "SELECT priority_analysis FROM pulso.users WHERE rfc = $1 AND deleted_at IS NULL \
+         ORDER BY (user_id = $2) DESC LIMIT 1",
     )
     .bind(rfc.to_uppercase())
+    .bind(uid)
     .fetch_optional(pool)
     .await?;
     Ok(row.and_then(|(v,)| v))
@@ -726,18 +741,24 @@ pub async fn set_priority_analysis(
 
 /// The (user id, email) of the user who owns the given RFC (active rows only). The id is
 /// what logs may carry; the email is only for sending (L19-04).
-pub async fn get_owner_contact_by_rfc(
+/// Who hears about a job of this RFC: the account that started it (its initial sync), else
+/// the account that first had the RFC. Never a co-owner about someone else's job.
+pub async fn get_owner_contact_for_job(
     pool: &PgPool,
     rfc: &str,
+    job_id: &str,
 ) -> Result<Option<(String, String)>, sqlx::Error> {
     sqlx::query_as(
         "SELECT u.id::text, u.email
          FROM pulso.users pu
          JOIN public.users u ON u.id = pu.user_id
          WHERE pu.rfc = $1 AND pu.deleted_at IS NULL
+         ORDER BY (pu.initial_sync_job_id = $2) DESC NULLS LAST,
+                  (pu.analysis_key = pu.rfc) DESC, pu.created_at
          LIMIT 1",
     )
     .bind(rfc.to_uppercase())
+    .bind(job_id)
     .fetch_optional(pool)
     .await
 }

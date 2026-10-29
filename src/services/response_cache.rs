@@ -123,9 +123,12 @@ where
 {
     let version = current_version(pool, rfc).await?;
 
+    // Migration 096: cached under the session's analysis of the RFC (`pulso.analysis_key`),
+    // so co-owners of one RFC never read each other's results; the data version stays the
+    // RFC's own.
     let cached: Option<serde_json::Value> = sqlx::query_scalar(
         r#"SELECT payload FROM pulso.endpoint_response_cache
-           WHERE rfc = $1 AND endpoint = $2 AND params_key = $3 AND data_version = $4
+           WHERE rfc = pulso.analysis_key($1) AND endpoint = $2 AND params_key = $3 AND data_version = $4
              AND computed_at > $5"#,
     )
     .bind(rfc)
@@ -146,7 +149,7 @@ where
     if let Err(e) = sqlx::query(
         r#"INSERT INTO pulso.endpoint_response_cache
                (rfc, endpoint, params_key, data_version, payload)
-           VALUES ($1, $2, $3, $4, $5)
+           VALUES (pulso.analysis_key($1), $2, $3, $4, $5)
            ON CONFLICT (rfc, endpoint, params_key) DO UPDATE
                SET data_version = EXCLUDED.data_version,
                    payload = EXCLUDED.payload,
@@ -260,7 +263,7 @@ async fn delete_stale_by_data_version(pool: &DbPool) -> Result<u64, sqlx::Error>
                WHERE (rfc, endpoint, params_key) IN (
                    SELECT c.rfc, c.endpoint, c.params_key
                    FROM pulso.endpoint_response_cache c
-                   JOIN pulso.rfc_data_version v ON v.rfc = c.rfc
+                   JOIN pulso.rfc_data_version v ON v.rfc = split_part(c.rfc, '#', 1)
                    WHERE v.version <> c.data_version
                    LIMIT $1
                )"#,

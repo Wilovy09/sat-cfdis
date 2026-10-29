@@ -114,7 +114,7 @@ async fn refresh(pool: &DbPool) -> Result<Duration, sqlx::Error> {
     let start = std::time::Instant::now();
     // CONCURRENTLY needs nomina_normalizada_uuid_idx (migration 086) -- without it this
     // statement fails outright rather than silently locking readers.
-    sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY pulso.nomina_normalizada")
+    sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY pulso.nomina_normalizada_mv")
         .execute(pool)
         .await?;
     // L18-26 point 1: without this, a fresher view sits behind a cache that only

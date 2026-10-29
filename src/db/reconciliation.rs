@@ -33,14 +33,16 @@ pub struct WatchedRfc {
 
 pub async fn watched_rfcs(pool: &PgPool) -> Result<Vec<WatchedRfc>, sqlx::Error> {
     sqlx::query_as(
-        r#"SELECT pu.rfc, pu.clave AS clave_enc, pu.anio_piso
+        // One row per RFC even with several owning accounts (migration 096): the CFDIs and
+        // their reconciliation are the RFC's, not an account's.
+        r#"SELECT DISTINCT ON (pu.rfc) pu.rfc, pu.clave AS clave_enc, pu.anio_piso
            FROM pulso.users pu
            JOIN public.users u ON u.id = pu.user_id
            WHERE pu.deleted_at IS NULL AND u.deleted_at IS NULL
              AND pu.verified_at IS NOT NULL
              AND (pu.clave <> ''
                   OR EXISTS (SELECT 1 FROM pulso.rfc_fiel f WHERE f.rfc = pu.rfc))
-           ORDER BY pu.rfc"#,
+           ORDER BY pu.rfc, (pu.clave <> '') DESC, pu.anio_piso, pu.created_at"#,
     )
     .fetch_all(pool)
     .await
