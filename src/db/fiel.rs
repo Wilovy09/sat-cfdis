@@ -61,6 +61,13 @@ pub async fn delete(pool: &PgPool, rfc: &str) -> Result<bool, sqlx::Error> {
     Ok(result.rows_affected() > 0)
 }
 
+/// Where every stored FIEL's files live (rfc, cert key, key key).
+pub async fn list_file_keys(pool: &PgPool) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+    sqlx::query_as("SELECT rfc, cert_s3_key, key_s3_key FROM pulso.rfc_fiel")
+        .fetch_all(pool)
+        .await
+}
+
 /// L19-03: every stored FIEL whose RFC has no active owner -- no live `pulso.users` row
 /// whose Adquiere account (`public.users`) is itself still live.
 pub async fn list_orphaned(pool: &PgPool) -> Result<Vec<FielRow>, sqlx::Error> {

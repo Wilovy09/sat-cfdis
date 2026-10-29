@@ -32,9 +32,11 @@ async fn check_rfc_access(
     // argument). Six permission queries become four; the three identical ones become one.
     // Order unchanged: RFC access is still checked before subscription, so a user with no
     // access gets "denegado", not "paga tu suscripción".
+    // A failed lookup is a server error: read as "not admin" it ended in a 402 for admins
+    // whenever the database was slow.
     let is_admin = crate::db::users::is_user_admin(pool, &user_id)
         .await
-        .unwrap_or(false);
+        .map_err(|e| AppError::internal(e.to_string()))?;
 
     // L19-01 point 2: membership is not enough -- the RFC's owner must have passed the SAT
     // login with their own CIEC. Until then the RFC only shows its sync progress.
@@ -47,7 +49,9 @@ async fn check_rfc_access(
 
     // Non-admins must have an active pulso subscription.
     if !is_admin {
-        let subscribed = crate::routes::billing::has_access(pool, &user_id, is_admin).await;
+        let subscribed = crate::routes::billing::has_access(pool, &user_id, is_admin)
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
         if !subscribed {
             return Err(AppError::payment_required("Suscripción requerida"));
         }

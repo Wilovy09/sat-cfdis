@@ -406,11 +406,41 @@ const MEXICO_UTC_OFFSET_SECS: u64 = 6 * 3600;
 /// already requested.
 const DAILY_LOOKBACK_DAYS: u64 = 2;
 
+/// Tells the team, once per RFC per process, that an RFC's stored CIEC can't log in and it
+/// has no FIEL to fall back on -- otherwise it just stops syncing without anyone noticing.
+async fn report_unusable_ciec(
+    pool: &DbPool,
+    cfg: &Config,
+    rfc: &str,
+    problem: &str,
+    reported: &mut std::collections::HashSet<String>,
+) {
+    if reported.contains(rfc) || matches!(db::fiel::get(pool, rfc).await, Ok(Some(_))) {
+        return;
+    }
+    reported.insert(rfc.to_string());
+    services::email::alert_team(
+        cfg,
+        &format!("Pulso: la CIEC guardada de {rfc} {problem}"),
+        &format!(
+            "La CIEC guardada del RFC {rfc} {problem}, y el RFC no tiene FIEL: no se puede \
+             sincronizar. Hay que pedirle al dueño que actualice su CIEC (o que use la liga \
+             para que su contador la capture)."
+        ),
+    )
+    .await;
+}
+
 /// Every day, queue a one-day sync job for yesterday for every registered user
 /// whose credentials are stored and whose yesterday period hasn't been synced yet.
-async fn daily_sync_worker(pool: DbPool) {
+async fn daily_sync_worker(pool: DbPool, cfg: Arc<Config>) {
     // Short initial delay so the main worker gets a head start on startup.
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+    // RFCs whose stored CIEC is unusable, already reported this process lifetime -- the
+    // team hears about each once, not every hour.
+    let mut unusable_ciec_reported: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     loop {
         // Pulso_Propuestas_Integridad_Descarga_RFC.md 3.5: "yesterday" in Mexico time, not
@@ -485,32 +515,56 @@ async fn daily_sync_worker(pool: DbPool) {
                 _ => period_from.clone(),
             };
 
-            // An RFC whose credentials came in as a FIEL only has no CIEC: its job carries a
-            // FIEL placeholder the worker swaps for the stored FIEL (try_fiel_auth). With
-            // neither (a demo RFC), there is nothing to sync with.
-            let auth_json = if clave_enc.is_empty() {
-                match db::fiel::get(&pool, &rfc).await {
+            // A stored CIEC that doesn't decrypt, or decrypts to nothing, can't log in --
+            // the RFC silently stops syncing unless a FIEL covers it.
+            let ciec = if clave_enc.is_empty() {
+                None
+            } else {
+                match services::crypto::decrypt(&key, &clave_enc) {
+                    Ok(p) if !p.is_empty() => Some(p),
+                    Ok(_) => {
+                        report_unusable_ciec(
+                            &pool,
+                            &cfg,
+                            &rfc,
+                            "está vacía",
+                            &mut unusable_ciec_reported,
+                        )
+                        .await;
+                        None
+                    }
+                    Err(e) => {
+                        tracing::error!(rfc = %rfc, "Daily worker: decrypt failed: {e}");
+                        report_unusable_ciec(
+                            &pool,
+                            &cfg,
+                            &rfc,
+                            "no se puede descifrar",
+                            &mut unusable_ciec_reported,
+                        )
+                        .await;
+                        None
+                    }
+                }
+            };
+            let auth_json = match ciec {
+                Some(clave) => serde_json::json!({
+                    "type": "ciec",
+                    "rfc":  rfc,
+                    "password": clave,
+                })
+                .to_string(),
+                // An RFC whose credentials came in as a FIEL only has no CIEC: its job
+                // carries a FIEL placeholder the worker swaps for the stored FIEL
+                // (try_fiel_auth). With neither (a demo RFC), there is nothing to sync with.
+                None => match db::fiel::get(&pool, &rfc).await {
                     Ok(Some(_)) => serde_json::json!({ "type": "fiel", "rfc": rfc }).to_string(),
                     Ok(None) => continue,
                     Err(e) => {
                         tracing::error!(rfc = %rfc, "Daily worker: FIEL lookup failed: {e}");
                         continue;
                     }
-                }
-            } else {
-                let clave = match services::crypto::decrypt(&key, &clave_enc) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!(rfc = %rfc, "Daily worker: decrypt failed: {e}");
-                        continue;
-                    }
-                };
-                serde_json::json!({
-                    "type": "ciec",
-                    "rfc":  rfc,
-                    "password": clave,
-                })
-                .to_string()
+                },
             };
 
             let auth_enc = match services::crypto::encrypt(&key, &auth_json) {
@@ -1233,7 +1287,7 @@ async fn main() -> std::io::Result<()> {
         tokio::spawn(etl::etl_worker(etl_pool, etl_cfg, etl_s3, etl_nomina_state));
     }
     {
-        tokio::spawn(daily_sync_worker(bg_pool.clone()));
+        tokio::spawn(daily_sync_worker(bg_pool.clone(), Arc::new(cfg.clone())));
     }
     {
         let recheck_pool = bg_pool.clone();

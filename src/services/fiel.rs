@@ -114,6 +114,45 @@ pub async fn store(
     Ok(())
 }
 
+/// One pass at startup: re-uploads, encrypted, every FIEL file stored before files were
+/// encrypted (`crypto::encrypt_file`). Already-encrypted files are left alone, so after the
+/// first pass this only reads.
+async fn encrypt_legacy_files(pool: &crate::db::DbPool, s3: &aws_sdk_s3::Client, bucket: &str) {
+    if bucket.is_empty() {
+        return;
+    }
+    let rows = match crate::db::fiel::list_file_keys(pool).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("FIEL encryption pass: DB error: {e}");
+            return;
+        }
+    };
+    let enc_key = crate::services::crypto::load_key();
+    for (rfc, cert_s3_key, key_s3_key) in rows {
+        for s3_key in [&cert_s3_key, &key_s3_key] {
+            let Some(stored) = crate::services::s3::get_fiel(s3, bucket, s3_key).await else {
+                tracing::warn!(rfc = %rfc, "FIEL encryption pass: file not readable, skipped");
+                continue;
+            };
+            if crate::services::crypto::is_encrypted_file(&stored) {
+                continue;
+            }
+            let encrypted = match crate::services::crypto::encrypt_file(&enc_key, &stored) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!(rfc = %rfc, "FIEL encryption pass: encrypt failed: {e}");
+                    continue;
+                }
+            };
+            match crate::services::s3::upload_fiel(s3, bucket, s3_key, encrypted).await {
+                Ok(()) => tracing::info!(rfc = %rfc, "FIEL file re-stored encrypted"),
+                Err(e) => tracing::error!(rfc = %rfc, "FIEL encryption pass: upload failed: {e}"),
+            }
+        }
+    }
+}
+
 /// How often the orphaned-FIEL sweep runs after its first pass at startup.
 const ORPHAN_SWEEP_INTERVAL_SECS: u64 = 3600;
 
@@ -151,6 +190,7 @@ pub async fn orphan_sweep_worker(
     s3: std::sync::Arc<aws_sdk_s3::Client>,
 ) {
     let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+    encrypt_legacy_files(&pool, &s3, &bucket).await;
     loop {
         match crate::db::fiel::list_orphaned(&pool).await {
             Ok(rows) => {

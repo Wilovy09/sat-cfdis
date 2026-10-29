@@ -33,17 +33,17 @@ pub async fn get_status(
 // ── Subscription access guard ─────────────────────────────────────────────────
 
 /// Returns `true` if user has an active pulso subscription or is an admin.
+/// A database failure is an error, not "no subscription": under load it used to answer
+/// 402 "Suscripción requerida" to paying users.
 // P-03 / AUD-077: `is_admin` is resolved once by the caller (check_rfc_access) and passed
 // in, instead of this function running the same is_user_admin query a third time per
 // request.
-pub async fn has_access(pool: &DbPool, user_id: &str, is_admin: bool) -> bool {
+pub async fn has_access(pool: &DbPool, user_id: &str, is_admin: bool) -> Result<bool, sqlx::Error> {
     if is_admin {
-        return true;
+        return Ok(true);
     }
     let Ok(uid) = Uuid::parse_str(user_id) else {
-        return false;
+        return Ok(false);
     };
-    crate::db::subscriptions::is_pulso_active(pool, uid)
-        .await
-        .unwrap_or(false)
+    crate::db::subscriptions::is_pulso_active(pool, uid).await
 }

@@ -103,6 +103,12 @@ pub fn encrypt_file(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Whether a stored file already went through [`encrypt_file`].
+#[must_use]
+pub fn is_encrypted_file(stored: &[u8]) -> bool {
+    stored.starts_with(FILE_MARKER)
+}
+
 /// Reverses [`encrypt_file`]; legacy unencrypted files pass through unchanged.
 pub fn decrypt_file(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, String> {
     let Some(blob) = stored.strip_prefix(FILE_MARKER) else {
@@ -140,7 +146,8 @@ mod tests {
     fn files_round_trip_and_are_not_stored_in_clear() {
         let der = b"\x30\x82\x05\x00 fake der bytes";
         let stored = encrypt_file(&KEY, der).unwrap();
-        assert!(stored.starts_with(FILE_MARKER));
+        assert!(is_encrypted_file(&stored));
+        assert!(!is_encrypted_file(der));
         assert!(!stored.windows(der.len()).any(|w| w == der));
         assert_eq!(decrypt_file(&KEY, &stored).unwrap(), der);
     }
