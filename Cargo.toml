@@ -14,7 +14,7 @@ zip = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-actix-web = "0.7"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 bytes = "1"
 actix-files = "0.6"
 actix-multipart = "0.7"
@@ -35,6 +35,7 @@ time = { version = "0.3", features = ["serde-human-readable"] }
 aes-gcm = "0.10"
 rand = "0.8"
 hex = "0.4"
+sha2 = "0.10"
 quick-xml = { version = "0.37", features = ["async-tokio"] }
 actix-cors = "0.7"
 reqwest = { version = "0.12", features = [
@@ -48,3 +49,4 @@ utoipa = { version = "5" }
 utoipa-scalar = { version = "0.3", features = ["actix-web"] }
 jsonwebtoken = "9"
 thiserror = "1"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }

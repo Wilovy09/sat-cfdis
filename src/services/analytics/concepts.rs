@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, parse_ym, rfc_column};
+use super::summary::{dl_type_filter, get_f64, parse_ym, rfc_column};
 /// Concepts: top products/services by clave_prod_serv and descripcion.
 use crate::db::DbPool;
 use serde::Serialize;
@@ -41,23 +41,42 @@ pub async fn get(
     let owner_col = rfc_column(dl_type);
 
     // By description (top 50 by amount)
+    // L18-15 point 4: same rule as counterparties::get_individual's top-concepts query --
+    // monto = importe menos descuento, en pesos, y una nota de crédito resta (0 en vez de
+    // negativo cuando su tipo_relacion es '02'/'07', igual que cfdis_ajustado's own
+    // total_neto_mxn_ajustado, migration 051).
     let desc_rows = sqlx::query(&format!(
         r#"
         SELECT
             UPPER(TRIM(COALESCE(cc.descripcion, '')))   AS desc,
             COALESCE(cc.clave_prod_serv, '')             AS clave,
-            SUM(COALESCE(cc.importe, 0))                 AS total,
+            SUM(
+                (CASE
+                    WHEN c.tipo_comprobante = 'E' AND EXISTS (
+                        SELECT 1 FROM pulso.cfdi_relacionados r
+                        WHERE r.source_uuid = c.uuid AND r.tipo_relacion IN ('02', '07')
+                    ) THEN 0
+                    WHEN c.tipo_comprobante = 'E' THEN -1
+                    ELSE 1
+                END)
+                * (COALESCE(cc.importe::float8, 0) - COALESCE(cc.descuento::float8, 0))
+                * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)
+            ) AS total,
             COUNT(DISTINCT c.uuid)                       AS cnt,
-            AVG(COALESCE(cc.valor_unitario, 0))          AS avg_precio
+            AVG(COALESCE(cc.valor_unitario::float8, 0)
+                * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)) AS avg_precio
         FROM pulso.cfdi_concepts cc
         JOIN pulso.cfdis c ON c.uuid = cc.uuid
         WHERE c.{owner_col} = $1
           AND {dl_filter}
-          AND c.tipo_comprobante NOT IN ('P','N')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
           AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
           AND cc.descripcion IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         GROUP BY desc, clave
         ORDER BY total DESC
         LIMIT 50
@@ -74,21 +93,21 @@ pub async fn get(
     let top_by_amount: Vec<ConceptRow> = desc_rows
         .iter()
         .map(|r| {
-            let total: f64 = r.try_get("total").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "total");
             let cnt: i64 = r.try_get("cnt").unwrap_or(0);
             ConceptRow {
                 descripcion: r.try_get("desc").unwrap_or_default(),
                 clave_prod_serv: r.try_get("clave").unwrap_or_default(),
                 total_importe: total,
                 invoice_count: cnt,
-                avg_precio: r.try_get("avg_precio").unwrap_or(0.0),
+                avg_precio: get_f64(r, "avg_precio"),
             }
         })
         .collect();
 
     // Top by count
     let mut top_by_count = top_by_amount.clone();
-    top_by_count.sort_by(|a, b| b.invoice_count.cmp(&a.invoice_count));
+    top_by_count.sort_by_key(|x| std::cmp::Reverse(x.invoice_count));
     top_by_count.truncate(20);
 
     // By clave_prod_serv
@@ -96,16 +115,30 @@ pub async fn get(
         r#"
         SELECT
             COALESCE(cc.clave_prod_serv, 'SIN_CLAVE') AS clave,
-            SUM(COALESCE(cc.importe, 0))               AS total,
+            SUM(
+                (CASE
+                    WHEN c.tipo_comprobante = 'E' AND EXISTS (
+                        SELECT 1 FROM pulso.cfdi_relacionados r
+                        WHERE r.source_uuid = c.uuid AND r.tipo_relacion IN ('02', '07')
+                    ) THEN 0
+                    WHEN c.tipo_comprobante = 'E' THEN -1
+                    ELSE 1
+                END)
+                * (COALESCE(cc.importe::float8, 0) - COALESCE(cc.descuento::float8, 0))
+                * COALESCE(NULLIF(c.tipo_cambio::float8, 0), 1)
+            ) AS total,
             COUNT(DISTINCT c.uuid)                     AS cnt
         FROM pulso.cfdi_concepts cc
         JOIN pulso.cfdis c ON c.uuid = cc.uuid
         WHERE c.{owner_col} = $1
           AND {dl_filter}
-          AND c.tipo_comprobante NOT IN ('P','N')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
           AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         GROUP BY clave
         ORDER BY total DESC
         LIMIT 30
@@ -119,15 +152,12 @@ pub async fn get(
     .fetch_all(pool)
     .await?;
 
-    let grand_total: f64 = clave_rows
-        .iter()
-        .map(|r| r.try_get::<f64, _>("total").unwrap_or(0.0))
-        .sum();
+    let grand_total: f64 = clave_rows.iter().map(|r| get_f64(r, "total")).sum();
 
     let by_clave: Vec<ClaveRow> = clave_rows
         .iter()
         .map(|r| {
-            let total: f64 = r.try_get("total").unwrap_or(0.0);
+            let total: f64 = get_f64(r, "total");
             ClaveRow {
                 clave_prod_serv: r.try_get("clave").unwrap_or_default(),
                 total_importe: total,

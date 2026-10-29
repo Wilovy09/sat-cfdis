@@ -6,11 +6,11 @@ use crate::{
     services::{php_cli::PhpCli, storage, xml_parser},
 };
 use aws_sdk_s3::Client as S3Client;
-use tempfile::TempDir;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tempfile::TempDir;
 
-const ETL_POLL_SECS: u64 = 120;
+const ETL_POLL_SECS: u64 = 30;
 const BATCH_SIZE: usize = 100;
 const ENRICH_BATCH: i64 = 50;
 /// Max skip cycles before a job is considered permanently unresolvable this session (~24h).
@@ -18,7 +18,12 @@ const ENRICH_MAX_SKIP: u32 = 720;
 /// Rounds of failed SAT downloads before marking CFDIs as permanently unavailable.
 const ENRICH_MAX_SAT_FAIL: u32 = 5;
 
-pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
+pub async fn etl_worker(
+    pool: DbPool,
+    cfg: Arc<Config>,
+    s3: Arc<S3Client>,
+    nomina_state: Arc<crate::services::nomina_refresh::NominaRefreshState>,
+) {
     // Tracks remaining skip cycles per job_id. Doubles on each failed round, capped at ENRICH_MAX_SKIP.
     let mut enrich_skip: HashMap<String, u32> = HashMap::new();
     let mut enrich_fail_rounds: HashMap<String, u32> = HashMap::new();
@@ -28,12 +33,34 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(ETL_POLL_SECS)).await;
 
+        // C14-02/DEC-084: cache invalidation belongs at the moment data actually lands
+        // (insert or enrichment), not at jobs::complete (which fires before the ETL has
+        // even looked at the job). One bump per RFC at the close of THIS round, not one
+        // per job -- a round can carry hundreds of jobs for the same RFC (391 in one day,
+        // seen live), and a bump per job would be hundreds of writes to the same
+        // rfc_data_version row every 30s.
+        let mut touched_rfcs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // C14-05: which RFCs are tracked at all, so a mark-unavailable write below can
+        // tell "the invoice's other side is also a Pulso RFC" apart from "it's an
+        // ordinary external counterparty" -- only the former needs its own bump.
+        let creds: HashMap<String, String> = db::users::get_all_with_credentials(&pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
         // Normal ETL: insert new invoices not yet in cfdis
+        //
+        // V14-03: a bare `continue` on either query below would skip the round-closing bump
+        // loop at the bottom, along with it every RFC already touched earlier in this same
+        // round (a job's invoices land, then the enrichment-jobs query happens to fail --
+        // those insertions never get a bump, and the next round finds nothing pending, so
+        // the cache never self-heals). An empty Vec falls through to that bump loop instead.
         let job_ids = match db::cfdis::jobs_needing_etl(&pool).await {
             Ok(ids) => ids,
             Err(e) => {
                 tracing::error!("ETL: DB error finding jobs: {e}");
-                continue;
+                Vec::new()
             }
         };
         for job_id in job_ids {
@@ -41,8 +68,17 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
             enrich_skip.remove(&job_id);
             enrich_fail_rounds.remove(&job_id);
             enrich_sat_fail_rounds.remove(&job_id);
-            if let Err(e) = process_job(&pool, &cfg, &s3, &job_id).await {
-                tracing::error!(job_id = %job_id, "ETL: error processing job: {e}");
+            match process_job(&pool, &cfg, &s3, &job_id, &creds).await {
+                Ok((rfc, processed, other_side_touched)) if processed > 0 => {
+                    touched_rfcs.insert(rfc);
+                    // L16-11/AUD-170: the gemela of enrich_job's own dual-side check below --
+                    // normal insertion is the path that puts a brand-new invoice's figures in
+                    // front of BOTH sides for the first time, and it's the busiest of the six
+                    // write paths that move a factura's numbers.
+                    touched_rfcs.extend(other_side_touched);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(job_id = %job_id, "ETL: error processing job: {e}"),
             }
         }
 
@@ -51,31 +87,39 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
             Ok(ids) => ids,
             Err(e) => {
                 tracing::error!("ETL: DB error finding enrichment jobs: {e}");
-                continue;
+                Vec::new()
             }
         };
         for job_id in enrich_ids {
             // Decrement and skip if in backoff
-            if let Some(remaining) = enrich_skip.get_mut(&job_id) {
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    continue;
-                }
+            if let Some(remaining) = enrich_skip.get_mut(&job_id)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                continue;
             }
 
-            let (enriched, sat_failed) = match enrich_job(&pool, &cfg, &s3, &job_id).await {
-                Ok(result) => result,
-                Err(e) => {
-                    tracing::error!(job_id = %job_id, "ETL: error enriching job: {e}");
-                    (0, 0)
-                }
-            };
+            let (enriched, sat_failed, owner_rfc, other_side_touched) =
+                match enrich_job(&pool, &cfg, &s3, &job_id, &creds).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        tracing::error!(job_id = %job_id, "ETL: error enriching job: {e}");
+                        (0, 0, None, std::collections::HashSet::new())
+                    }
+                };
 
             if enriched > 0 {
                 // Progress made — reset all counters
                 enrich_skip.remove(&job_id);
                 enrich_fail_rounds.remove(&job_id);
                 enrich_sat_fail_rounds.remove(&job_id);
+                if let Some(rfc) = owner_rfc {
+                    touched_rfcs.insert(rfc);
+                }
+                // V14-01: this is enrich_job's own gemela of the SAT-give-up branch below --
+                // enrichment rewrites subtotal/currency/nomina for real, the same figure
+                // change that branch already invalidates on both sides.
+                touched_rfcs.extend(other_side_touched);
             } else {
                 // No enrichment this round — apply backoff
                 let rounds = enrich_fail_rounds.entry(job_id.clone()).or_insert(0);
@@ -98,15 +142,38 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
                     if *sat_rounds >= ENRICH_MAX_SAT_FAIL {
                         // Give up — mark remaining as permanently unavailable
                         match db::cfdis::mark_xml_unavailable_for_job(&pool, &job_id).await {
-                            Ok(n) if n > 0 => {
+                            Ok(pairs) if !pairs.is_empty() => {
                                 tracing::warn!(
                                     job_id = %job_id,
-                                    marked = n,
+                                    marked = pairs.len(),
                                     "ETL: marked CFDIs as xml_available=-1 (SAT unreachable after retries)"
                                 );
+                                // C14-04 trap 2: this branch is reached only when
+                                // `enriched == 0` (the outer if/else above), so it's outside
+                                // C14-02's "enriched something" bump. It still rewrites
+                                // subtotal to a 16%-of-total estimate -- a real figure
+                                // change that needs its own invalidation.
+                                if let Some(rfc) = owner_rfc.clone() {
+                                    touched_rfcs.insert(rfc);
+                                }
+                                // C14-05: the other side of each marked invoice, when it's
+                                // also a tracked Pulso RFC -- this job is scoped to its own
+                                // owner_rfc, but the counterparty is an independent RFC's
+                                // own egresos/ingresos.
+                                for (rfc_emisor, rfc_receptor) in &pairs {
+                                    for side in [rfc_emisor, rfc_receptor] {
+                                        if owner_rfc.as_deref() != Some(side.as_str())
+                                            && creds.contains_key(side)
+                                        {
+                                            touched_rfcs.insert(side.clone());
+                                        }
+                                    }
+                                }
                             }
                             Ok(_) => {}
-                            Err(e) => tracing::error!(job_id = %job_id, "ETL: mark_xml_unavailable failed: {e}"),
+                            Err(e) => {
+                                tracing::error!(job_id = %job_id, "ETL: mark_xml_unavailable failed: {e}")
+                            }
                         }
                         enrich_skip.remove(&job_id);
                         enrich_fail_rounds.remove(&job_id);
@@ -115,24 +182,68 @@ pub async fn etl_worker(pool: DbPool, cfg: Arc<Config>, s3: Arc<S3Client>) {
                 }
             }
         }
+
+        for rfc in touched_rfcs {
+            if let Err(e) = crate::services::response_cache::bump_version(&pool, &rfc).await {
+                tracing::warn!(rfc = %rfc, "ETL: failed to bump cache version: {e}");
+            }
+        }
+
+        // L18-26 point 2: a round that landed nomina rows (normal load, enrichment, or a
+        // redownload applying real XML -- all three flow through the two `mark_touched`
+        // call sites) refreshes the view now instead of waiting up to 23h. Grouped at
+        // round-end rather than per-invoice: a round can carry hundreds of jobs (see this
+        // loop's own C14-02 comment above), and REFRESH MATERIALIZED VIEW CONCURRENTLY
+        // isn't cheap enough to run per invoice. `refresh_guarded` already serializes
+        // against the scheduled tick and the manual route, so this can't stack a second
+        // refresh on top of one already running.
+        if crate::services::nomina_refresh::take_touched() {
+            match crate::services::nomina_refresh::refresh_guarded(&pool, &nomina_state).await {
+                Ok(crate::services::nomina_refresh::RefreshOutcome::Refreshed(elapsed)) => {
+                    tracing::info!(
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "ETL: nomina_normalizada refreshed after this round's nomina writes"
+                    );
+                }
+                // Didn't actually refresh (someone else's cycle owns it, or it errored) --
+                // re-mark so the next round retries even if it lands no nomina writes of
+                // its own. Otherwise this round's writes could wait for the NEXT round to
+                // coincidentally touch nomina again before anything re-triggers a refresh.
+                Ok(crate::services::nomina_refresh::RefreshOutcome::AlreadyInProgress) => {
+                    crate::services::nomina_refresh::mark_touched();
+                    tracing::info!("ETL: nomina refresh already in progress, retrying next round");
+                }
+                Err(e) => {
+                    crate::services::nomina_refresh::mark_touched();
+                    tracing::error!("ETL: nomina_normalizada refresh failed: {e}");
+                }
+            }
+        }
     }
 }
 
+/// Returns the job's owner RFC, how many of its pending invoices actually got a header row
+/// written (C14-02: the caller uses this, not the candidate count, to decide whether this
+/// RFC's cached analytics need invalidating this round), and (L16-11/AUD-170/C14-05) the set
+/// of counterparty RFCs also tracked by Pulso whose own figures this round's inserts moved --
+/// insertion is a factura appearing for the first time, so unlike enrichment (a correction)
+/// it puts real numbers in front of the other side for the very first time.
 async fn process_job(
     pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
     job_id: &str,
-) -> anyhow::Result<()> {
+    creds: &HashMap<String, String>,
+) -> anyhow::Result<(String, usize, std::collections::HashSet<String>)> {
     // Get job metadata (dl_type, rfc)
     let job = match db::jobs::get_by_id(pool, job_id).await? {
         Some(j) => j,
-        None => return Ok(()),
+        None => return Ok((String::new(), 0, std::collections::HashSet::new())),
     };
 
     let pending = db::cfdis::find_pending_etl(pool, job_id).await?;
     if pending.is_empty() {
-        return Ok(());
+        return Ok((job.rfc, 0, std::collections::HashSet::new()));
     }
 
     tracing::info!(
@@ -142,15 +253,31 @@ async fn process_job(
         "ETL: processing invoices"
     );
 
+    let mut processed = 0usize;
+    let mut other_side_touched = std::collections::HashSet::new();
     for chunk in pending.chunks(BATCH_SIZE) {
         for (uuid, metadata) in chunk {
-            process_invoice(pool, cfg, s3, job_id, uuid, metadata, &job.dl_type).await;
+            if process_invoice(pool, cfg, s3, job_id, uuid, metadata, &job.dl_type).await {
+                processed += 1;
+                let (rfc_e, rfc_r, ..) = extract_path_from_meta(metadata);
+                for side in [&rfc_e, &rfc_r] {
+                    if job.rfc != *side && creds.contains_key(side) {
+                        other_side_touched.insert(side.clone());
+                    }
+                }
+            }
         }
     }
 
-    Ok(())
+    Ok((job.rfc, processed, other_side_touched))
 }
 
+/// Returns `true` once the header row is written -- the point at which this invoice
+/// becomes visible to every analytics query that reads `pulso.cfdis`. The child-table
+/// inserts below (taxes, concepts, payments, relacionados, nomina) stay best-effort
+/// (warn and continue) same as before; they don't gate this signal. A CFDI already stored
+/// with its XML takes the fast path instead and returns `true` only if its SAT status
+/// changed -- the only case where the caller has a cache to invalidate.
 async fn process_invoice(
     pool: &DbPool,
     cfg: &Config,
@@ -159,7 +286,18 @@ async fn process_invoice(
     uuid: &str,
     metadata: &str,
     dl_type: &str,
-) {
+) -> bool {
+    // Re-listings of already-loaded CFDIs used to go through the full S3 read + parse +
+    // upsert below, ~200 rows/min, and buried the genuinely new CFDIs behind them (TEST,
+    // 27-oct: 139,034 of 141,980 pending rows were CFDIs Pulso already held).
+    match db::cfdis::settle_known_cfdi(pool, job_id, uuid, &extract_estado_from_meta(metadata))
+        .await
+    {
+        Ok(Some(status_changed)) => return status_changed,
+        Ok(None) => {}
+        Err(e) => tracing::warn!(uuid = %uuid, "ETL: fast path failed, using the full path: {e}"),
+    }
+
     // Try to find the XML in storage first
     let xml_bytes = try_load_xml(cfg, s3, uuid, metadata).await;
 
@@ -169,14 +307,17 @@ async fn process_invoice(
         xml_parser::parse(bytes, job_id, dl_type, &estado)
     } else {
         // Fallback: build from metadata JSON (no XML)
-        let preview_end = metadata.char_indices().nth(120).map(|(i,_)| i).unwrap_or(metadata.len());
-        tracing::warn!(uuid = %uuid, meta_preview = %&metadata[..preview_end], "ETL: no XML in storage, trying from_metadata");
+        // L18-05: used to log a metadata preview alongside the uuid -- that preview
+        // carries the SAT's rfc_emisor/rfc_receptor, most of what the (now-removed)
+        // xml-content route needed to hand out a stored CFDI's full XML to anyone. The
+        // uuid alone is enough to trace this in logs; the metadata isn't needed here.
+        tracing::warn!(uuid = %uuid, "ETL: no XML in storage, trying from_metadata");
         xml_parser::from_metadata(metadata, job_id, dl_type)
     };
 
     let Some(mut cfdi) = cfdi else {
         tracing::warn!(uuid = %uuid, "ETL: could not parse invoice, skipping");
-        return;
+        return false;
     };
 
     // Always normalize UUID to uppercase to match job_invoices
@@ -186,94 +327,123 @@ async fn process_invoice(
         cfdi.uuid = cfdi.uuid.to_uppercase();
     }
 
-    // For nómina CFDIs the relevant period is the payment period, NOT fecha_emision.
-    // Override year/month from fecha_final_pago (fallback: fecha_inicial_pago).
-    if cfdi.tipo_comprobante == "N" {
-        if let Some(ref nom) = cfdi.nomina {
-            let fecha_periodo = nom.fecha_final_pago.as_deref()
-                .or(nom.fecha_inicial_pago.as_deref())
-                .unwrap_or("");
-            if !fecha_periodo.is_empty() {
-                let parts: Vec<&str> = fecha_periodo.splitn(3, '-').collect();
-                if parts.len() >= 2 {
-                    if let (Ok(y), Ok(m)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
-                        if y > 2000 && m >= 1 && m <= 12 {
-                            cfdi.year = y;
-                            cfdi.month = m;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Nómina year/month-to-devengo override lives in xml_parser::parse now (a single place
+    // every caller that produces a populated `.nomina` shares, not just this one path) --
+    // see its own comment. Nothing to do here anymore.
 
     // Insert header
     if let Err(e) = db::cfdis::upsert_cfdi(pool, &cfdi).await {
         tracing::error!(uuid = %uuid, "ETL: upsert_cfdi failed: {e}");
-        return;
+        return false;
+    }
+
+    // migration 080: this is the "now visible to analytics" moment this fn's own doc
+    // comment already names -- also the moment jobs_needing_etl/find_pending_etl should
+    // stop counting this row as pending. Best-effort like the child-table inserts below:
+    // if this write is lost, the row just gets picked up again next round (same outcome
+    // as before this migration, just for one row instead of a full-table rescan).
+    if let Err(e) = db::cfdis::mark_etl_processed(pool, job_id, uuid).await {
+        tracing::warn!(uuid = %uuid, "ETL: mark_etl_processed: {e}");
     }
 
     // Insert taxes
-    if !cfdi.taxes.is_empty() {
-        if let Err(e) = db::cfdis::insert_taxes(pool, &cfdi.uuid, &cfdi.taxes).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_taxes: {e}");
-        }
+    if !cfdi.taxes.is_empty()
+        && let Err(e) = db::cfdis::insert_taxes(pool, &cfdi.uuid, &cfdi.taxes).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_taxes: {e}");
     }
 
-    // Insert concepts (only if XML was available to avoid duplicates)
-    if xml_bytes.is_some() && !cfdi.concepts.is_empty() {
-        if let Err(e) = db::cfdis::insert_concepts(pool, &cfdi.uuid, &cfdi.concepts).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_concepts: {e}");
-        }
+    // L18-12: this path used to insert concepts with no existence check at all -- the
+    // ON CONFLICT DO NOTHING below in insert_concepts has never had a unique index to
+    // conflict against, so it silently did nothing. Since migration 080, a CFDI is
+    // reprocessed every time it reappears in a new listing, so every extra pass through
+    // here without this check doubled its concepts again. concepts_exist matches the
+    // enrichment path's own guard (below) -- same check, both write paths now agree.
+    if xml_bytes.is_some()
+        && !cfdi.concepts.is_empty()
+        && !db::cfdis::concepts_exist(pool, &cfdi.uuid).await
+        && let Err(e) = db::cfdis::insert_concepts(pool, &cfdi.uuid, &cfdi.concepts).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_concepts: {e}");
     }
 
     // Insert payment complement data
-    if !cfdi.payments.is_empty() {
-        if let Err(e) = db::cfdis::insert_payments(pool, &cfdi.uuid, &cfdi.payments).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_payments: {e}");
-        }
+    if !cfdi.payments.is_empty()
+        && let Err(e) = db::cfdis::insert_payments(
+            pool,
+            Some(job_id),
+            &cfdi.rfc_emisor,
+            &cfdi.rfc_receptor,
+            &cfdi.uuid,
+            &cfdi.payments,
+        )
+        .await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_payments: {e}");
     }
 
     // Insert cfdi_relacionados (credit notes, etc.)
-    if !cfdi.relacionados.is_empty() {
-        if let Err(e) = db::cfdis::insert_relacionados(pool, &cfdi.uuid, &cfdi.relacionados).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_relacionados: {e}");
-        }
+    if !cfdi.relacionados.is_empty()
+        && let Err(e) = db::cfdis::insert_relacionados(pool, &cfdi.uuid, &cfdi.relacionados).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_relacionados: {e}");
     }
 
     // Insert nomina data
     if let Some(nomina) = &cfdi.nomina {
-        if let Err(e) = db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await {
-            tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}");
+        match db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await {
+            Ok(()) => crate::services::nomina_refresh::mark_touched(),
+            Err(e) => tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}"),
         }
     }
+
+    true
 }
 
 /// Re-processes invoices that were parsed from metadata only.
 /// First tries storage, then downloads from SAT.
-/// Returns (enriched, sat_failed).
+/// Returns (enriched, sat_failed, owner_rfc, other_side_touched). `owner_rfc` is `None` on
+/// the rare race where the job itself no longer exists -- C14-02's round-end bump has
+/// nothing to attribute an enrichment to in that case and skips it. `other_side_touched`
+/// (V14-01) is the gemela of the SAT-give-up branch's own pairs check in `etl_worker`: an
+/// enriched invoice rewrites subtotal/currency/nomina for real, and its counterparty is an
+/// independent RFC's own egresos/ingresos whenever that counterparty is also tracked.
 async fn enrich_job(
     pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
     job_id: &str,
-) -> anyhow::Result<(usize, usize)> {
+    creds: &HashMap<String, String>,
+) -> anyhow::Result<(
+    usize,
+    usize,
+    Option<String>,
+    std::collections::HashSet<String>,
+)> {
     let pending = db::cfdis::find_needs_enrichment(pool, job_id, ENRICH_BATCH).await?;
     if pending.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, 0, None, std::collections::HashSet::new()));
     }
 
     // Load job for auth credentials (needed for SAT download fallback)
     let job = db::jobs::get_by_id(pool, job_id).await?;
+    let owner_rfc = job.as_ref().map(|j| j.rfc.clone());
 
     tracing::info!(job_id = %job_id, count = pending.len(), "ETL: enriching invoices");
 
     let mut enriched = 0usize;
     let mut sat_failed = 0usize;
+    let mut other_side_touched = std::collections::HashSet::new();
     for (uuid, metadata) in &pending {
         let (ok, tried_sat) = enrich_invoice(pool, cfg, s3, job.as_ref(), uuid, metadata).await;
         if ok {
             enriched += 1;
+            let (rfc_e, rfc_r, ..) = extract_path_from_meta(metadata);
+            for side in [&rfc_e, &rfc_r] {
+                if owner_rfc.as_deref() != Some(side.as_str()) && creds.contains_key(side) {
+                    other_side_touched.insert(side.clone());
+                }
+            }
         } else if tried_sat {
             sat_failed += 1;
         }
@@ -283,7 +453,7 @@ async fn enrich_job(
         tracing::info!(job_id = %job_id, enriched, "ETL: enrichment batch done");
     }
 
-    Ok((enriched, sat_failed))
+    Ok((enriched, sat_failed, owner_rfc, other_side_touched))
 }
 
 /// Returns (enriched, tried_sat). Tries storage first, then SAT download.
@@ -301,7 +471,7 @@ async fn enrich_invoice(
     // 2. If not in storage, try to download from SAT using the job's credentials
     let (xml_bytes, tried_sat) = if xml_bytes.is_none() {
         if let Some(j) = job {
-            let sat_bytes = try_download_from_sat(cfg, s3, j, uuid, metadata).await;
+            let sat_bytes = try_download_from_sat(pool, cfg, s3, j, uuid, metadata).await;
             let tried = sat_bytes.is_none(); // only "tried and failed" if still None
             (sat_bytes, tried)
         } else {
@@ -316,54 +486,87 @@ async fn enrich_invoice(
         return (false, tried_sat);
     };
 
+    let ok = apply_xml_bytes(pool, uuid, metadata, &bytes).await;
+    (ok, tried_sat && !ok)
+}
+
+/// Parses real XML bytes for `uuid` and writes the header row plus every
+/// child table (taxes, concepts, payments, relacionados, nomina) — the
+/// "we now have the real XML, make everything correct" step shared by:
+/// - `enrich_invoice` above (single UUID, found via storage or a one-off SAT
+///   download during normal ETL)
+/// - `xml_redownload.rs`'s bulk worker (batched SAT downloads targeting rows
+///   already marked `xml_available = -1`)
+///
+/// Both callers already have `bytes` in hand by the time they call this —
+/// this fn only owns the parse-and-persist step, not acquisition.
+pub(crate) async fn apply_xml_bytes(
+    pool: &DbPool,
+    uuid: &str,
+    metadata: &str,
+    bytes: &[u8],
+) -> bool {
     let estado = extract_estado_from_meta(metadata);
 
     // job_id and dl_type don't affect enrichment (upsert ON CONFLICT preserves originals)
-    let Some(mut cfdi) = xml_parser::parse(&bytes, "", "ambos", &estado) else {
-        tracing::warn!(uuid = %uuid, "ETL enrich: could not parse XML");
-        return (false, tried_sat);
+    let Some(mut cfdi) = xml_parser::parse(bytes, "", "ambos", &estado) else {
+        tracing::warn!(uuid = %uuid, "ETL: could not parse XML");
+        return false;
     };
 
     cfdi.uuid = uuid.to_uppercase();
 
     // Update header row so xml_available flips to true
     if let Err(e) = db::cfdis::upsert_cfdi(pool, &cfdi).await {
-        tracing::warn!(uuid = %uuid, "ETL enrich: upsert_cfdi failed: {e}");
-        return (false, tried_sat);
+        tracing::warn!(uuid = %uuid, "ETL: upsert_cfdi failed: {e}");
+        return false;
     }
 
-    if !cfdi.taxes.is_empty() {
-        if let Err(e) = db::cfdis::insert_taxes(pool, &cfdi.uuid, &cfdi.taxes).await {
-            tracing::warn!(uuid = %uuid, "ETL enrich: insert_taxes: {e}");
-        }
+    if !cfdi.taxes.is_empty()
+        && let Err(e) = db::cfdis::insert_taxes(pool, &cfdi.uuid, &cfdi.taxes).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_taxes: {e}");
     }
 
     if !cfdi.payments.is_empty() {
-        if let Err(e) = db::cfdis::insert_payments(pool, &cfdi.uuid, &cfdi.payments).await {
-            tracing::warn!(uuid = %uuid, "ETL enrich: insert_payments: {e}");
+        // L4-06: enrichment isn't driven by a sync job, so this is a genuine "no job" --
+        // pass None rather than an empty string that would misleadingly look like data.
+        if let Err(e) = db::cfdis::insert_payments(
+            pool,
+            None,
+            &cfdi.rfc_emisor,
+            &cfdi.rfc_receptor,
+            &cfdi.uuid,
+            &cfdi.payments,
+        )
+        .await
+        {
+            tracing::warn!(uuid = %uuid, "ETL: insert_payments: {e}");
         }
     }
 
-    if !cfdi.relacionados.is_empty() {
-        if let Err(e) = db::cfdis::insert_relacionados(pool, &cfdi.uuid, &cfdi.relacionados).await {
-            tracing::warn!(uuid = %uuid, "ETL enrich: insert_relacionados: {e}");
-        }
+    if !cfdi.relacionados.is_empty()
+        && let Err(e) = db::cfdis::insert_relacionados(pool, &cfdi.uuid, &cfdi.relacionados).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_relacionados: {e}");
     }
 
-    if !cfdi.concepts.is_empty() && !db::cfdis::concepts_exist(pool, &cfdi.uuid).await {
-        if let Err(e) = db::cfdis::insert_concepts(pool, &cfdi.uuid, &cfdi.concepts).await {
-            tracing::warn!(uuid = %uuid, "ETL enrich: insert_concepts: {e}");
-        }
+    if !cfdi.concepts.is_empty()
+        && !db::cfdis::concepts_exist(pool, &cfdi.uuid).await
+        && let Err(e) = db::cfdis::insert_concepts(pool, &cfdi.uuid, &cfdi.concepts).await
+    {
+        tracing::warn!(uuid = %uuid, "ETL: insert_concepts: {e}");
     }
 
     if let Some(nomina) = &cfdi.nomina {
-        if let Err(e) = db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await {
-            tracing::warn!(uuid = %uuid, "ETL enrich: insert_nomina: {e}");
+        match db::cfdis::insert_nomina(pool, &cfdi.uuid, nomina).await {
+            Ok(()) => crate::services::nomina_refresh::mark_touched(),
+            Err(e) => tracing::warn!(uuid = %uuid, "ETL: insert_nomina: {e}"),
         }
     }
 
-    tracing::debug!(uuid = %uuid, "ETL enrich: enriched from XML");
-    (true, false)
+    tracing::debug!(uuid = %uuid, "ETL: applied real XML");
+    true
 }
 
 /// Attempt to load XML bytes from local storage or S3.
@@ -392,17 +595,35 @@ async fn try_load_xml(cfg: &Config, s3: &S3Client, uuid: &str, metadata: &str) -
 
 /// Try to download a single XML from SAT using the job's stored credentials.
 /// On success, uploads the XML to storage and returns the bytes.
+///
+/// `job.auth_enc` reflects whatever auth the job was *created* with, which is
+/// always the CIEC-shaped payload — RFCs that actually use FIEL never have a
+/// real CIEC password stored, so using it verbatim fails with "Missing CIEC
+/// field: password". `resume_worker`/`run_worker_chunk` already override this
+/// at scrape time via `try_fiel_auth`; this fallback path needs the same
+/// override, since it runs independently, potentially long after the job.
 async fn try_download_from_sat(
+    pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
     job: &db::jobs::SyncJob,
     uuid: &str,
     metadata: &str,
 ) -> Option<Vec<u8>> {
-    // Decrypt auth payload
-    let key = crate::services::crypto::load_key();
-    let auth_json = crate::services::crypto::decrypt(&key, &job.auth_enc).ok()?;
-    let auth: serde_json::Value = serde_json::from_str(&auth_json).ok()?;
+    let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+
+    // If the RFC has FIEL configured, that takes priority over the CIEC
+    // payload the job was created with (same rule as resume_worker).
+    let fiel_override = crate::try_fiel_auth(pool, s3, &bucket, &job.rfc).await;
+    let (auth, _fiel_tmp) = match fiel_override {
+        Some((fiel_auth, tmp)) => (fiel_auth, Some(tmp)),
+        None => {
+            // Decrypt the job's own auth payload (CIEC).
+            let key = crate::services::crypto::load_key();
+            let auth_json = crate::services::crypto::decrypt(&key, &job.auth_enc).ok()?;
+            (serde_json::from_str(&auth_json).ok()?, None)
+        }
+    };
 
     // Determine download_type from RFC ownership
     let (rfc_e, rfc_r, year, month, day) = extract_path_from_meta(metadata);
@@ -428,7 +649,7 @@ async fn try_download_from_sat(
         }
     });
 
-    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path);
+    let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path).with_proxy(cfg.https_proxy.clone());
     let result = match cli.run(&payload).await {
         Ok(r) => r,
         Err(e) => {
@@ -447,14 +668,24 @@ async fn try_download_from_sat(
 
     // Upload to S3 so future enrichment rounds find it in storage
     let uuid_lower = uuid.to_lowercase();
-    let bucket = cfg.s3_bucket.clone().unwrap_or_default();
-    let _ = storage::upload(s3, &bucket, &rfc_e, &rfc_r, year, month, day, &uuid_lower, bytes.clone()).await;
+    let _ = storage::upload(
+        s3,
+        &bucket,
+        &rfc_e,
+        &rfc_r,
+        year,
+        month,
+        day,
+        &uuid_lower,
+        bytes.clone(),
+    )
+    .await;
 
     tracing::info!(uuid = %uuid, download_type, "ETL: downloaded XML from SAT");
     Some(bytes)
 }
 
-fn extract_path_from_meta(metadata: &str) -> (String, String, u32, u32, u32) {
+pub(crate) fn extract_path_from_meta(metadata: &str) -> (String, String, u32, u32, u32) {
     let v: serde_json::Value = serde_json::from_str(metadata).unwrap_or_default();
 
     let rfc_e = v["rfcEmisor"]
@@ -477,7 +708,7 @@ fn extract_path_from_meta(metadata: &str) -> (String, String, u32, u32, u32) {
         .or_else(|| v["fechaEmision"].as_str())
         .unwrap_or("2000-01-01");
 
-    let parts: Vec<&str> = fecha.splitn(4, |c| c == '-' || c == 'T').collect();
+    let parts: Vec<&str> = fecha.splitn(4, ['-', 'T']).collect();
     let year = parts.first().and_then(|s| s.parse().ok()).unwrap_or(2000);
     let month = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
     let day = parts

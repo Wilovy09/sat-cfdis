@@ -41,12 +41,17 @@ pub const SCALAR_HTML: &str = r#"<!doctype html>
         crate::routes::queue::get_job,
         crate::routes::queue::get_job_results,
         crate::routes::queue::cancel_job,
+        // Admin
+        crate::routes::logs::get_logs,
+        crate::routes::system::get_system,
         // Analytics
         crate::routes::analytics::get_summary,
+        crate::routes::analytics::get_month_contributor,
         crate::routes::analytics::get_counterparties,
         crate::routes::analytics::get_recurrence,
         crate::routes::analytics::get_retention,
         crate::routes::analytics::get_geography,
+        crate::routes::analytics::get_hallazgos_egresos,
         crate::routes::analytics::get_concepts,
         crate::routes::analytics::get_fiscal,
         crate::routes::analytics::get_payments,
@@ -55,14 +60,12 @@ pub const SCALAR_HTML: &str = r#"<!doctype html>
         // Normalization
         crate::routes::analytics::list_normalization,
         crate::routes::analytics::create_normalization,
+        crate::routes::analytics::update_normalization,
         crate::routes::analytics::delete_normalization,
         crate::routes::analytics::list_payroll_normalization,
         crate::routes::analytics::create_payroll_normalization,
+        crate::routes::analytics::update_payroll_normalization,
         crate::routes::analytics::delete_payroll_normalization,
-        // Invoices
-        crate::routes::invoices::list_invoices,
-        crate::routes::invoices::download_invoices,
-        crate::routes::invoices::xml_content,
     ),
     components(schemas(
         crate::routes::auth::RegisterDto,
@@ -76,7 +79,6 @@ pub const SCALAR_HTML: &str = r#"<!doctype html>
         (name = "Queue",         description = "Jobs de descarga SAT"),
         (name = "Analytics",     description = "Analítica de CFDIs"),
         (name = "Normalization", description = "Reglas de normalización de contrapartes y nómina"),
-        (name = "Invoices",      description = "Descarga y consulta de CFDIs del SAT"),
     )
 )]
 pub struct ApiDoc;

@@ -1,0 +1,34 @@
+name: Test DB
+
+# L6C-02: migration_guard + number_contract + perf_budget + consistency_invariants (L6C-10
+# moved the last one here, once its invariants became live relational comparisons), against
+# the real shared database -- scheduled once daily, not on every push (perf_budget
+# seeds/deletes 60 rows each run, several of these read live data; writing to the shared DB
+# several times a day is the cost this schedule avoids). Needs
+# POSTGRES_HOST/PORT/USER/PASSWORD/DATABASE as repo secrets -- no cert: `cargo test`
+# compiles in debug profile, and db/mod.rs only requires POSTGRES_CERT_PATH in a release
+# build (PgSslMode::Prefer in debug, no cert needed).
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  test-db:
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+      POSTGRES_PORT: ${{ secrets.POSTGRES_PORT }}
+      POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      POSTGRES_DATABASE: ${{ secrets.POSTGRES_DATABASE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: extractions/setup-just@v2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: just test-db

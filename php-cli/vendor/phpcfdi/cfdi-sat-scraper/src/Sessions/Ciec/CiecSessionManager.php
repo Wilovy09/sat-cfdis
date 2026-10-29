@@ -31,6 +31,7 @@ final class CiecSessionManager extends AbstractSessionManager implements Session
      */
     public function requestCaptchaImage(): CaptchaImage
     {
+        $this->getHttpGateway()->clearCookieJar();
         try {
             $html = $this->getHttpGateway()->getAuthLoginPage(URLS::AUTH_LOGIN);
         } catch (SatHttpGatewayException $exception) {

@@ -1,0 +1,14 @@
+-- PULSO_Plan_Mejoras_SQL.md, punto #2: normalization.rs's
+-- list_individual_rule_ids_for_counterparty joins pulso.cfdis on
+-- UPPER(nr.cfdi_uuid) = UPPER(c.uuid) -- a plain btree on cfdis.uuid can't serve
+-- that predicate, so cfdis (the fastest-growing table in the schema, ~73k rows
+-- and climbing daily) falls back to a full scan whenever this join runs.
+-- normalization_rules is tiny today (8 rows), so the cost is invisible now --
+-- same shape of bug already fixed this session in the ETL anti-join (migration
+-- 080): works until the driving side grows.
+--
+-- Fixing the plan, not the calculation: this only gives the planner an index to
+-- use for the existing UPPER()=UPPER() predicate. The join condition in
+-- normalization.rs is untouched, so the result set is byte-for-byte identical --
+-- only how Postgres finds matching rows changes.
+CREATE INDEX idx_cfdis_uuid_upper ON pulso.cfdis (UPPER(uuid));

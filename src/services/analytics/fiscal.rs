@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, parse_ym, rfc_column};
+use super::summary::{dl_type_filter, get_f64, get_f64_opt, parse_ym, rfc_column};
 /// Fiscal & Currency: IVA/ISR breakdown, multi-currency analysis.
 use crate::db::DbPool;
 use serde::Serialize;
@@ -77,7 +77,7 @@ pub async fn get(
         JOIN pulso.cfdis c ON c.uuid = t.uuid
         WHERE c.{owner_col} = $1
           AND {dl_filter}
-          AND c.tipo_comprobante NOT IN ('P','N')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
           AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
@@ -101,10 +101,10 @@ pub async fn get(
     for r in &tax_rows {
         let impuesto: String = r.try_get("impuesto").unwrap_or_default();
         let tipo_factor: String = r.try_get("tipo_factor").unwrap_or_default();
-        let tasa: f64 = r.try_get("tasa").unwrap_or(0.0);
+        let tasa: f64 = get_f64(r, "tasa");
         let is_ret: i64 = r.try_get("is_retenido").unwrap_or(0);
-        let base: f64 = r.try_get("base_sum").unwrap_or(0.0);
-        let importe: f64 = r.try_get("importe_sum").unwrap_or(0.0);
+        let base: f64 = get_f64(r, "base_sum");
+        let importe: f64 = get_f64(r, "importe_sum");
 
         match impuesto.as_str() {
             "002" => {
@@ -168,7 +168,7 @@ pub async fn get(
         FROM pulso.cfdis
         WHERE {owner_col} = $1
           AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P','N')
+          AND tipo_comprobante NOT IN ('P','N','T')
           AND NOT is_cancelled
           AND (year > $2 OR (year = $2 AND month >= $3))
           AND (year < $4 OR (year = $4 AND month <= $5))
@@ -186,24 +186,26 @@ pub async fn get(
 
     let grand_total_mxn: f64 = currency_rows
         .iter()
-        .map(|r| r.try_get::<f64, _>("total_mxn_sum").unwrap_or(0.0))
+        .map(|r| get_f64(r, "total_mxn_sum"))
         .sum();
 
     let by_currency: Vec<CurrencyRow> = currency_rows
         .iter()
         .map(|r| {
-            let total_mxn: f64 = r.try_get("total_mxn_sum").unwrap_or(0.0);
+            let total_mxn: f64 = get_f64(r, "total_mxn_sum");
             CurrencyRow {
                 moneda: r.try_get("moneda").unwrap_or_default(),
                 invoice_count: r.try_get("cnt").unwrap_or(0),
-                total_original: r.try_get("total_orig").unwrap_or(0.0),
+                total_original: get_f64(r, "total_orig"),
                 total_mxn,
                 pct_of_total: if grand_total_mxn > 0.0 {
                     total_mxn / grand_total_mxn * 100.0
                 } else {
                     0.0
                 },
-                avg_tipo_cambio: r.try_get("avg_tc").unwrap_or(1.0),
+                // Default 1.0 (identity rate), not 0.0 -- a decode failure here must not
+                // make an amount collapse to zero via multiplication by a bad exchange rate.
+                avg_tipo_cambio: get_f64_opt(r, "avg_tc").unwrap_or(1.0),
             }
         })
         .collect();
@@ -222,7 +224,7 @@ pub async fn get(
         LEFT JOIN pulso.cfdi_taxes t ON t.uuid = c.uuid
         WHERE c.{owner_col} = $1
           AND {dl_filter}
-          AND c.tipo_comprobante NOT IN ('P','N')
+          AND c.tipo_comprobante NOT IN ('P','N','T')
           AND NOT c.is_cancelled
           AND (c.year > $2 OR (c.year = $2 AND c.month >= $3))
           AND (c.year < $4 OR (c.year = $4 AND c.month <= $5))
@@ -241,11 +243,11 @@ pub async fn get(
             let month: i64 = r.try_get("month").unwrap_or(0);
             FiscalMonth {
                 period: format!("{year}-{month:02}"),
-                subtotal: r.try_get("subtotal").unwrap_or(0.0),
-                iva_traslado: r.try_get("iva_tras").unwrap_or(0.0),
-                iva_retenido: r.try_get("iva_ret").unwrap_or(0.0),
-                isr_retenido: r.try_get("isr_ret").unwrap_or(0.0),
-                total_mxn: r.try_get("total_mxn").unwrap_or(0.0),
+                subtotal: get_f64(r, "subtotal"),
+                iva_traslado: get_f64(r, "iva_tras"),
+                iva_retenido: get_f64(r, "iva_ret"),
+                isr_retenido: get_f64(r, "isr_ret"),
+                total_mxn: get_f64(r, "total_mxn"),
             }
         })
         .collect();

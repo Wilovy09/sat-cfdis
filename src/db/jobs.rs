@@ -1,7 +1,8 @@
 //! CRUD operations for `sync_jobs` and `job_invoices`.
 
+use crate::services::response_cache::bump_version;
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 // ---------------------------------------------------------------------------
 // Models
@@ -22,10 +23,33 @@ pub struct SyncJob {
     /// Last date (YYYY-MM-DD) fully processed; None = not started yet
     pub cursor_date: Option<String>,
     pub found: i64,
+    /// Total invoices expected (from list-count pre-pass); None until count completes
+    pub total_expected: Option<i64>,
+    /// Live running tally while list-count is still counting; None once
+    /// total_expected is set (final) or before counting has started.
+    pub count_progress: Option<i64>,
+    /// Date (YYYY-MM-DD) the list-count pre-pass is currently scanning —
+    /// mirrors `cursor_date` but for the counting phase, not the download phase.
+    pub count_cursor_date: Option<String>,
     pub status: String,
+    /// Machine-readable classification of error_msg, from classifySatError() in
+    /// cfdi-scraper: "invalid_credentials" | "captcha_failed" | "login_not_registered"
+    /// | "fiel_login_failed" | "sat_connection_error" | "rate_limited" | "unknown_error".
+    pub error_code: Option<String>,
     pub error_msg: Option<String>,
     /// ISO-8601 UTC — when the worker should resume this job
     pub resume_at: Option<String>,
+    /// Automatic retries used for transient (non-SAT) failures — see
+    /// `retry_transient_or_fail`. Index into RETRY_BACKOFF_SECS.
+    pub retry_count: i32,
+    /// Fresh restarts the gap detector has issued for this job's leftover
+    /// range after it landed on `status='failed'` — see gap_detector.rs.
+    /// Distinct from `retry_count`, which tracks in-place backoff retries of
+    /// the *same* job row before it ever reaches `failed`.
+    pub gap_retry_count: i32,
+    /// Set by the gap detector once it has spawned a continuation job for
+    /// this (failed) job's unfinished range, so it isn't requeued twice.
+    pub superseded_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -58,7 +82,8 @@ fn fmt_unix(secs: u64) -> String {
     // Days since 1970-01-01
     let mut year = 1970u64;
     loop {
-        let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let leap =
+            (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
         let days_in_year = if leap { 366 } else { 365 };
         if remaining < days_in_year {
             break;
@@ -66,7 +91,7 @@ fn fmt_unix(secs: u64) -> String {
         remaining -= days_in_year;
         year += 1;
     }
-    let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
     let mut month = 0usize;
     for (i, &dim) in DAYS_IN_MONTH.iter().enumerate() {
         let dim = if i == 1 && leap { 29 } else { dim };
@@ -83,6 +108,16 @@ fn fmt_unix(secs: u64) -> String {
     )
 }
 
+/// ISO-8601 UTC timestamp `ago_secs` seconds before now, same format as `now_utc`.
+pub fn utc_ago(ago_secs: u64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    fmt_unix(secs.saturating_sub(ago_secs))
+}
+
 /// Return ISO-8601 UTC timestamp `offset_secs` seconds from now.
 pub fn utc_offset(offset_secs: u64) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -97,58 +132,31 @@ pub fn utc_offset(offset_secs: u64) -> String {
 // Write operations
 // ---------------------------------------------------------------------------
 
-/// Insert a new job record. Returns the job id.
-pub async fn insert(
-    pool: &PgPool,
-    rfc: &str,
-    auth_type: &str,
-    auth_enc: &str,
-    dl_type: &str,
-    period_from: &str,
-    period_to: &str,
-) -> Result<String, sqlx::Error> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = now_utc();
-    sqlx::query(
-        r#"INSERT INTO pulso.sync_jobs
-           (id, job_type, rfc, auth_type, auth_enc, dl_type,
-            period_from, period_to, found, status, created_at, updated_at)
-           VALUES ($1, 'list', $2, $3, $4, $5, $6, $7, 0, 'running', $8, $9)"#,
-    )
-    .bind(&id)
-    .bind(rfc)
-    .bind(auth_type)
-    .bind(auth_enc)
-    .bind(dl_type)
-    .bind(period_from)
-    .bind(period_to)
-    .bind(&now)
-    .bind(&now)
-    .execute(pool)
-    .await?;
-    Ok(id)
-}
-
-/// Mark a job as paused due to SAT download limit.
+/// Mark a job as paused due to SAT download limit (or a transient SAT
+/// connection error — see classifySatError() in cfdi-scraper).
 /// `cursor_date` = last date successfully processed (YYYY-MM-DD).
-/// `resume_at`   = when the worker should retry (typically +24.5 h).
+/// `resume_at`   = when the worker should retry (24.5h for a real rate limit,
+///                 much shorter for a transient connection error).
+/// `error_code`  = machine-readable classification, e.g. "rate_limited" | "sat_connection_error".
 pub async fn pause_limit(
     pool: &PgPool,
     job_id: &str,
     cursor_date: &str,
     found: i64,
     resume_at: &str,
+    error_code: Option<&str>,
     error_msg: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"UPDATE pulso.sync_jobs
            SET status='paused_limit', cursor_date=$1, found=$2,
-               resume_at=$3, error_msg=$4, updated_at=$5
-           WHERE id=$6"#,
+               resume_at=$3, error_code=$4, error_msg=$5, updated_at=$6
+           WHERE id=$7"#,
     )
     .bind(cursor_date)
     .bind(found)
     .bind(resume_at)
+    .bind(error_code)
     .bind(error_msg)
     .bind(now_utc())
     .bind(job_id)
@@ -157,38 +165,186 @@ pub async fn pause_limit(
     Ok(())
 }
 
-/// Mark a job as completed.
+/// Mark a job as completed — unless the row still carries an `error_code`
+/// from an earlier degraded attempt in this job's history, in which case it's
+/// marked `failed` instead.
+///
+/// Before this guard, a job could hit a transient SAT error mid-run (setting
+/// `error_code` via `pause_limit`/`retry_transient_or_fail`), get resumed,
+/// and reach the end of its period cleanly on the resumed attempt — but
+/// nothing ever cleared the stale `error_code`, so it landed here and got
+/// stamped `completed` anyway. That's PULSO-001: confirmed as the root cause
+/// of the audited client RFC's historical sync silently building thousands
+/// of rows without their XML while reporting success the whole time — a
+/// `sat_connection_error` sat on the job from the point the session degraded
+/// onward, through a `completed` status, invisible to anything downstream.
+///
+/// This can't tell "the retry that ran after the error genuinely repaired
+/// everything" apart from "the error degraded the session in a way that kept
+/// producing incomplete data even after it 'succeeded'" — so it errs toward
+/// `failed`, which surfaces the job to a human and to
+/// `find_failed_retryable` (gap_detector.rs) instead of hiding it. The cost
+/// is the occasional truly-fine job needing a redundant (idempotent, cheap)
+/// re-verification; the alternative is silent data corruption.
 pub async fn complete(
     pool: &PgPool,
     job_id: &str,
+    rfc: &str,
     cursor_date: &str,
     found: i64,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let row = sqlx::query(
         r#"UPDATE pulso.sync_jobs
-           SET status='completed', cursor_date=$1, found=$2, error_msg=NULL, updated_at=$3
-           WHERE id=$4"#,
+           SET status = CASE WHEN error_code IS NULL THEN 'completed' ELSE 'failed' END,
+               cursor_date = $1,
+               found = $2,
+               error_msg = CASE
+                   WHEN error_code IS NULL THEN NULL
+                   ELSE COALESCE(error_msg, 'Reached end of period with an unresolved error_code from an earlier attempt (PULSO-001 guard)')
+               END,
+               updated_at = $3
+           WHERE id = $4
+           RETURNING status"#,
     )
     .bind(cursor_date)
     .bind(found)
     .bind(now_utc())
     .bind(job_id)
+    .fetch_one(pool)
+    .await?;
+
+    let final_status: String = row.try_get("status")?;
+    if final_status == "completed" {
+        heal_stale_credential_flag(pool, rfc, job_id).await?;
+    }
+    Ok(())
+}
+
+/// A routine job succeeding proves the stored credential works right now. If
+/// this RFC's "CIEC/e.firma inválida" badge is still anchored to an old failed
+/// job (`pulso.users.initial_sync_job_id`, read by `sync_status`), repoint it
+/// here instead of leaving the badge stuck until someone manually re-enters
+/// the credential through the "Actualizar CIEC" flow. Routine auto_daily/
+/// gap_resync runs never touched this column before — only the initial
+/// onboarding job and the CIEC-update validation flow did — so a credential
+/// that started failing and later recovered on its own (SAT hiccup, retry,
+/// etc.) could show "inválida" indefinitely despite days of clean syncs.
+/// Reported live (Slack, two client RFCs, 2026-08-24-25).
+async fn heal_stale_credential_flag(
+    pool: &PgPool,
+    rfc: &str,
+    healthy_job_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE pulso.users u
+           SET initial_sync_job_id = $1
+           WHERE u.rfc = $2 AND u.deleted_at IS NULL
+             AND EXISTS (
+                 SELECT 1 FROM pulso.sync_jobs j
+                 WHERE j.id = u.initial_sync_job_id AND j.status = 'failed'
+             )"#,
+    )
+    .bind(healthy_job_id)
+    .bind(rfc.to_uppercase())
     .execute(pool)
     .await?;
     Ok(())
 }
 
 /// Mark a job as failed.
-pub async fn fail(pool: &PgPool, job_id: &str, error_msg: &str) -> Result<(), sqlx::Error> {
+/// `error_code` = machine-readable classification (see classifySatError() in
+/// cfdi-scraper), e.g. "invalid_credentials" | "fiel_login_failed"; `None`
+/// for infra-level failures (crash, decrypt error) that aren't SAT-classified.
+pub async fn fail(
+    pool: &PgPool,
+    job_id: &str,
+    error_code: Option<&str>,
+    error_msg: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
-        r#"UPDATE pulso.sync_jobs SET status='failed', error_msg=$1, updated_at=$2 WHERE id=$3"#,
+        r#"UPDATE pulso.sync_jobs SET status='failed', error_code=$1, error_msg=$2, updated_at=$3 WHERE id=$4"#,
     )
+    .bind(error_code)
     .bind(error_msg)
     .bind(now_utc())
     .bind(job_id)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Backoff schedule for transient retries, approved by the partners:
+/// 5min → 15min → 1h → 6h → 24h, then 24h again for a few more days before
+/// giving up permanently. Index = current `retry_count`. Total span before
+/// the final give-up is ~4.3 days — long enough to ride out a SAT outage
+/// without hammering its login endpoint every few minutes forever (risk of
+/// looking like abuse and getting the whole scraping IP blocked).
+const RETRY_BACKOFF_SECS: [u64; 8] = [
+    5 * 60,
+    15 * 60,
+    60 * 60,
+    6 * 60 * 60,
+    24 * 60 * 60,
+    24 * 60 * 60,
+    24 * 60 * 60,
+    24 * 60 * 60,
+];
+
+/// Handle a transient failure — PHP worker idle timeout, crash before sending
+/// `__done__`, or a `captcha_failed` auth error (an OCR miss on one attempt,
+/// not a persistent credential problem — worth another try, unlike
+/// `invalid_credentials`/`login_not_registered`/`fiel_login_failed`, which
+/// call `fail()` directly and never reach here). Retries automatically
+/// through the same paused_limit/resume_worker path already used for real
+/// SAT rate limits — which re-logs in from scratch, giving the captcha a
+/// fresh attempt — following RETRY_BACKOFF_SECS; once that schedule is
+/// exhausted, fails permanently.
+///
+/// Returns `true` if the job was permanently failed (schedule exhausted) —
+/// callers use this to know when to notify the client — or `false` if a
+/// retry was scheduled instead.
+pub async fn retry_transient_or_fail(
+    pool: &PgPool,
+    job_id: &str,
+    cursor_date: &str,
+    found: i64,
+    error_code: Option<&str>,
+    error_msg: &str,
+) -> Result<bool, sqlx::Error> {
+    let (retry_count,): (i32,) =
+        sqlx::query_as(r#"SELECT retry_count FROM pulso.sync_jobs WHERE id = $1"#)
+            .bind(job_id)
+            .fetch_one(pool)
+            .await?;
+
+    let Some(&delay_secs) = RETRY_BACKOFF_SECS.get(retry_count as usize) else {
+        fail(
+            pool,
+            job_id,
+            error_code,
+            &format!("{error_msg} (tras {retry_count} reintentos automáticos)"),
+        )
+        .await?;
+        return Ok(true);
+    };
+
+    let resume_at = utc_offset(delay_secs);
+    sqlx::query(
+        r#"UPDATE pulso.sync_jobs
+           SET status='paused_limit', cursor_date=$1, found=$2, resume_at=$3,
+               error_code=$4, error_msg=$5, retry_count=retry_count+1, updated_at=$6
+           WHERE id=$7"#,
+    )
+    .bind(cursor_date)
+    .bind(found)
+    .bind(&resume_at)
+    .bind(error_code)
+    .bind(error_msg)
+    .bind(now_utc())
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(false)
 }
 
 /// Mark a running job as failed (used on server restart to clean up stale state).
@@ -200,6 +356,43 @@ pub async fn reset_stale_running(pool: &PgPool) -> Result<u64, sqlx::Error> {
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
+}
+
+/// Store the pre-count total from the list-count pass.
+pub async fn set_total_expected(
+    pool: &PgPool,
+    job_id: &str,
+    total: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE pulso.sync_jobs SET total_expected=$1, updated_at=$2 WHERE id=$3"#)
+        .bind(total)
+        .bind(now_utc())
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Live running tally while the list-count pre-pass is still in progress —
+/// lets the frontend show a growing count instead of a static spinner while
+/// waiting (a full multi-year range can take hours). Overwritten on every
+/// day the pre-pass processes; irrelevant once `set_total_expected` lands.
+pub async fn update_count_progress(
+    pool: &PgPool,
+    job_id: &str,
+    count_so_far: i64,
+    count_date: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE pulso.sync_jobs SET count_progress=$1, count_cursor_date=$2, updated_at=$3 WHERE id=$4"#,
+    )
+    .bind(count_so_far)
+    .bind(count_date)
+    .bind(now_utc())
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Update found count in place (called as invoices stream in).
@@ -242,10 +435,34 @@ pub async fn upsert_invoice(
 // Read operations
 // ---------------------------------------------------------------------------
 
-pub async fn list_all(pool: &PgPool) -> Result<Vec<SyncJob>, sqlx::Error> {
-    sqlx::query_as::<_, SyncJob>(
-        r#"SELECT * FROM pulso.sync_jobs ORDER BY created_at DESC LIMIT 200"#,
+/// Total jobs matching `search` (empty = no filter) — pair with `list_paginated`.
+pub async fn count_all(pool: &PgPool, search: &str) -> Result<i64, sqlx::Error> {
+    let (count,): (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*) FROM pulso.sync_jobs
+           WHERE ($1 = '' OR rfc ILIKE '%' || $1 || '%' OR COALESCE(error_code, '') ILIKE '%' || $1 || '%')"#,
     )
+    .bind(search)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+/// Paginated job list, newest first. `search` matches rfc or error_code (empty = no filter).
+pub async fn list_paginated(
+    pool: &PgPool,
+    search: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<SyncJob>, sqlx::Error> {
+    sqlx::query_as::<_, SyncJob>(
+        r#"SELECT * FROM pulso.sync_jobs
+           WHERE ($1 = '' OR rfc ILIKE '%' || $1 || '%' OR COALESCE(error_code, '') ILIKE '%' || $1 || '%')
+           ORDER BY created_at DESC
+           LIMIT $2 OFFSET $3"#,
+    )
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
 }
@@ -279,7 +496,63 @@ pub async fn find_queued(pool: &PgPool) -> Result<Vec<SyncJob>, sqlx::Error> {
     .await
 }
 
+/// True if an earlier-created `list` job for this RFC hasn't reached a
+/// terminal state yet. Used to enforce download order (e.g. emitidos fully
+/// before recibidos, per the user's onboarding priority): the worker must
+/// not start a later-priority job while an earlier one is still queued,
+/// running, or paused — only once it completes/fails does this return false.
+pub async fn has_earlier_active_list_job(
+    pool: &PgPool,
+    rfc: &str,
+    created_at: &str,
+) -> Result<bool, sqlx::Error> {
+    let (exists,): (bool,) = sqlx::query_as(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM pulso.sync_jobs
+               WHERE rfc = $1 AND job_type = 'list' AND created_at < $2
+                 AND status IN ('running', 'queued', 'paused_limit')
+           )"#,
+    )
+    .bind(rfc.to_uppercase())
+    .bind(created_at)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
 /// True if a non-cancelled/non-failed job already covers this exact period for the RFC.
+/// True once this RFC has had at least one `auto_daily` job — `daily_sync_worker`
+/// uses this to know whether it's about to run for the RFC for the very
+/// first time.
+pub async fn has_any_daily_job(pool: &PgPool, rfc: &str) -> Result<bool, sqlx::Error> {
+    let (n,): (i64,) = sqlx::query_as(
+        r#"SELECT count(*) FROM pulso.sync_jobs WHERE rfc = $1 AND job_type = 'auto_daily'"#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
+}
+
+/// Latest `period_to` among this RFC's completed historical jobs (`list` or
+/// `gap_resync`) — SYNC-2: the point daily mode should resume from the first
+/// time it runs. Without this, `daily_sync_worker` only ever asks for
+/// "yesterday", so whatever gap sits between "the historical load ended" and
+/// "the day someone actually enabled daily mode" (one client RFC: 2026-07-31 →
+/// 2026-08-16, 15 days) never gets requested by anyone.
+pub async fn latest_historical_period_to(
+    pool: &PgPool,
+    rfc: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT MAX(period_to) FROM pulso.sync_jobs
+           WHERE rfc = $1 AND job_type IN ('list', 'gap_resync') AND status = 'completed'"#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await
+}
+
 pub async fn has_job_for_period(
     pool: &PgPool,
     rfc: &str,
@@ -290,7 +563,7 @@ pub async fn has_job_for_period(
         r#"SELECT EXISTS(
                SELECT 1 FROM pulso.sync_jobs
                WHERE rfc = $1 AND period_from = $2 AND period_to = $3
-               AND status NOT IN ('cancelled', 'failed')
+               AND status NOT IN ('cancelled')
            )"#,
     )
     .bind(rfc)
@@ -311,9 +584,16 @@ pub async fn set_running(pool: &PgPool, job_id: &str) -> Result<(), sqlx::Error>
     Ok(())
 }
 
-/// Insert a new job with status 'queued' (will be picked up by the background worker).
-/// `job_type`: `"list"` for manual jobs, `"auto_daily"` for automatic daily sync.
-pub async fn insert_queued(
+/// V14-02/L16-12: the INSERT alone, no bump. `insert_queued` (below) is this plus an
+/// unconditional bump, for its six callers where every new job is real new coverage
+/// (alta de RFC, sync manual, validación de credencial, descarga de admin, el worker
+/// diario). `gap_detector.rs`'s own resync call is the seventh and the odd one out --
+/// it creates a job per day already inside a covered range far more often than not (a
+/// gap resync, almost by definition, resyncs a day Pulso already believes it has),
+/// so it calls this directly and bumps itself, only when the new job's period
+/// actually widens the RFC's known coverage (L16-12's own condition).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_queued_row(
     pool: &PgPool,
     job_type: &str,
     rfc: &str,
@@ -346,6 +626,38 @@ pub async fn insert_queued(
     Ok(id)
 }
 
+/// Insert a new job with status 'queued' (will be picked up by the background worker).
+/// `job_type`: `"list"` for manual jobs, `"auto_daily"` for automatic daily sync.
+///
+/// V14-02: see `insert`'s doc -- same reason to bump here.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_queued(
+    pool: &PgPool,
+    job_type: &str,
+    rfc: &str,
+    auth_type: &str,
+    auth_enc: &str,
+    dl_type: &str,
+    period_from: &str,
+    period_to: &str,
+) -> Result<String, sqlx::Error> {
+    let id = insert_queued_row(
+        pool,
+        job_type,
+        rfc,
+        auth_type,
+        auth_enc,
+        dl_type,
+        period_from,
+        period_to,
+    )
+    .await?;
+    if let Err(e) = bump_version(pool, rfc).await {
+        tracing::warn!(rfc = %rfc, "jobs::insert_queued: failed to bump cache version: {e}");
+    }
+    Ok(id)
+}
+
 /// Paginated invoice results for a job.
 /// Most relevant job for a given RFC: active jobs (running > queued > paused_limit) first,
 /// then most recent by created_at. Used by sync_status to surface newer admin-queued jobs
@@ -369,6 +681,82 @@ pub async fn get_active_for_rfc(pool: &PgPool, rfc: &str) -> Result<Option<SyncJ
     .await
 }
 
+/// Same as `get_active_for_rfc`, scoped to jobs that actually advance the given direction:
+/// `dl_type` equal to it, or `'ambos'` (an `'ambos'` job downloads both directions in
+/// lockstep day-by-day, so its cursor is valid progress for either one -- see
+/// php-cli/bin/cfdi-scraper's `list-stream`). Falls back to the most recently created job
+/// for that direction regardless of status (so a completed direction still reports
+/// `status: "completed"` instead of looking never-started) when none is currently active.
+/// Powers sync_status's per-direction month grid (emitidas vs recibidas).
+pub async fn get_latest_for_rfc_direction(
+    pool: &PgPool,
+    rfc: &str,
+    direction: &str,
+) -> Result<Option<SyncJob>, sqlx::Error> {
+    let rfc = rfc.to_uppercase();
+    if let Some(job) = sqlx::query_as::<_, SyncJob>(
+        r#"SELECT * FROM pulso.sync_jobs
+           WHERE rfc = $1
+             AND dl_type IN ($2, 'ambos')
+             AND status IN ('running', 'queued', 'paused_limit')
+           ORDER BY
+             CASE status
+               WHEN 'running'      THEN 0
+               WHEN 'queued'       THEN 1
+               WHEN 'paused_limit' THEN 2
+             END,
+             created_at DESC
+           LIMIT 1"#,
+    )
+    .bind(&rfc)
+    .bind(direction)
+    .fetch_optional(pool)
+    .await?
+    {
+        return Ok(Some(job));
+    }
+    sqlx::query_as::<_, SyncJob>(
+        r#"SELECT * FROM pulso.sync_jobs
+           WHERE rfc = $1 AND dl_type IN ($2, 'ambos')
+           ORDER BY created_at DESC
+           LIMIT 1"#,
+    )
+    .bind(&rfc)
+    .bind(direction)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Widest [period_from, period_to] across every job this RFC has ever had,
+/// any status. `sync_status`'s coverage widget used to show a single job's
+/// own period_from/period_to — fine while an RFC had one job at a time, but
+/// gap_detector now leaves many jobs per RFC (one big historical `list` plus
+/// scattered single-day `gap_resync`s), and `get_active_for_rfc` can surface
+/// a narrow one as "the" active job, making the widget's month range collapse
+/// to just that job's few months even though far more has actually synced.
+pub async fn rfc_job_range(
+    pool: &PgPool,
+    rfc: &str,
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    // L17-10: `period_from`/`period_to` mix "YYYY-MM-DD" (most jobs) and
+    // "YYYY-MM-DD HH:MM:SS" (gap-resync jobs, see gap_detector.rs) -- MIN/MAX on the raw
+    // TEXT column compares lexicographically, so an earlier day stored with a trailing
+    // timestamp could out-rank a later day stored as a bare date, picking the wrong end of
+    // the range. Aggregating over LEFT(..., 10) instead of the raw column fixes the
+    // aggregation itself, not just how its result gets compared afterward -- truncating
+    // only the *output* would leave a wrongly-picked MIN/MAX unfixed underneath.
+    let row: (Option<String>, Option<String>) = sqlx::query_as(
+        r#"SELECT MIN(LEFT(period_from, 10)), MAX(LEFT(period_to, 10)) FROM pulso.sync_jobs WHERE rfc = $1"#,
+    )
+    .bind(rfc.to_uppercase())
+    .fetch_one(pool)
+    .await?;
+    Ok(match row {
+        (Some(from), Some(to)) => Some((from, to)),
+        _ => None,
+    })
+}
+
 pub async fn get_invoices(
     pool: &PgPool,
     job_id: &str,
@@ -384,4 +772,386 @@ pub async fn get_invoices(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Gap detector — failed jobs that never got resumed, and days that ended up
+// empty even inside a job marked 'completed'. See gap_detector.rs.
+// ---------------------------------------------------------------------------
+
+/// Failed jobs whose failure is transient in nature (worth another attempt)
+/// and that haven't already been superseded by a continuation job, capped at
+/// `max_retries` fresh restarts so a permanently broken RFC (revoked
+/// credentials, deleted account) doesn't get requeued forever.
+///
+/// `login_not_registered` is included despite `retry_transient_or_fail`
+/// treating it as permanent — that call site can only see one job's outcome,
+/// not the fleet-wide pattern this query can see. On 2026-08-15, ~50
+/// same-minute single-day gap_resync jobs for one client RFC (fresh process,
+/// fresh cookie jar, fresh login each) hit this code and only ~5 failed —
+/// with the SAT credentials independently confirmed valid by a human login
+/// the same day. A real bad-credential state fails every attempt, not one in
+/// ten; this is `accessPortalMainPage()`'s exact-string check
+/// (`RFC Autenticado: <rfc>`) occasionally missing on an otherwise-successful
+/// login, not the account being unregistered. `fiel_login_failed` is still
+/// excluded -- a rejected certificate doesn't recover on its own.
+///
+/// `invalid_credentials` is retried too, but only for an RFC whose owner is verified (its
+/// CIEC has passed the SAT login before) and only once the failure is
+/// `CREDENTIAL_RETRY_SPACING_SECS` old, so the `max_retries` attempts land at different
+/// moments. The SAT rejects a valid CIEC sporadically mid-run (two client RFCs' historical
+/// recibidos died this way while the same CIEC worked the day before and after); an owner
+/// who has never passed the login gets no retries -- nothing suggests the CIEC ever worked.
+pub async fn find_failed_retryable(
+    pool: &PgPool,
+    max_retries: i32,
+    limit: i64,
+) -> Result<Vec<SyncJob>, sqlx::Error> {
+    let spaced_before = utc_ago(CREDENTIAL_RETRY_SPACING_SECS);
+    sqlx::query_as::<_, SyncJob>(
+        r#"SELECT * FROM pulso.sync_jobs j
+           WHERE j.status = 'failed'
+             AND j.superseded_by IS NULL
+             AND j.gap_retry_count < $1
+             AND (j.error_code IS NULL
+                  OR j.error_code IN ('captcha_failed', 'sat_connection_error', 'rate_limited', 'unknown_error', 'login_not_registered')
+                  OR (j.error_code = 'invalid_credentials'
+                      AND j.updated_at < $3
+                      AND EXISTS (SELECT 1 FROM pulso.users u
+                                  WHERE u.rfc = j.rfc AND u.deleted_at IS NULL
+                                    AND u.verified_at IS NOT NULL)))
+           ORDER BY j.created_at ASC
+           LIMIT $2"#,
+    )
+    .bind(max_retries)
+    .bind(limit)
+    .bind(spaced_before)
+    .fetch_all(pool)
+    .await
+}
+
+/// Fresh continuations a failed job gets from the gap detector (`gap_retry_count` cap) --
+/// a persistently broken RFC (revoked credentials, deleted FIEL) isn't restarted forever.
+/// Shared with the credential-rejection rules below so "retries exhausted" means the same
+/// thing everywhere.
+pub const MAX_FAILED_JOB_RETRIES: i32 = 3;
+
+/// Minimum age of an `invalid_credentials` failure before it is retried -- spreads the
+/// attempts over the day instead of three logins in a row (UX-4: confirm with several
+/// attempts that it isn't a sporadic rejection).
+const CREDENTIAL_RETRY_SPACING_SECS: u64 = 2 * 3600;
+
+/// Error codes that mean the SAT rejected the stored credential.
+pub const CREDENTIAL_ERROR_CODES: [&str; 3] = [
+    "invalid_credentials",
+    "login_not_registered",
+    "fiel_login_failed",
+];
+
+/// Whether a credential rejection on this job is final -- the owner must update it -- or
+/// will still be retried automatically: final once the owner has never passed the SAT
+/// login (nothing to retry against) or the job already used up its continuations.
+pub async fn credential_rejection_is_final(
+    pool: &PgPool,
+    job_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT j.error_code = 'fiel_login_failed'
+                  OR j.gap_retry_count >= $2
+                  OR NOT EXISTS (SELECT 1 FROM pulso.users u
+                                 WHERE u.rfc = j.rfc AND u.deleted_at IS NULL
+                                   AND u.verified_at IS NOT NULL)
+           FROM pulso.sync_jobs j WHERE j.id = $1"#,
+    )
+    .bind(job_id)
+    .bind(MAX_FAILED_JOB_RETRIES)
+    .fetch_one(pool)
+    .await
+}
+
+/// The last job of a chain of gap-detector continuations (`superseded_by`), starting at
+/// `job_id` -- the job that actually tells how that range ended. `n/a-fully-covered` is a
+/// marker, not a job id, so the chain stops before it.
+pub async fn resolve_continuation_chain(
+    pool: &PgPool,
+    job_id: &str,
+) -> Result<Option<SyncJob>, sqlx::Error> {
+    sqlx::query_as::<_, SyncJob>(
+        r#"WITH RECURSIVE chain AS (
+               SELECT j.*, 0 AS depth FROM pulso.sync_jobs j WHERE j.id = $1
+               UNION ALL
+               SELECT n.*, c.depth + 1 FROM pulso.sync_jobs n
+               JOIN chain c ON n.id = c.superseded_by
+               WHERE c.depth < 20
+           )
+           SELECT id, job_type, rfc, auth_type, auth_enc, dl_type, period_from, period_to,
+                  cursor_date, found, total_expected, count_progress, count_cursor_date,
+                  status, error_code, error_msg, resume_at, retry_count, gap_retry_count,
+                  superseded_by, created_at, updated_at
+           FROM chain ORDER BY depth DESC LIMIT 1"#,
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Queues a fresh job covering a failed job's unfinished range, inheriting
+/// `gap_retry_count + 1` so the cap in `find_failed_retryable` eventually
+/// stops it. Returns the new job's id.
+///
+/// L16-12/AUD-171: the INSERT alone, no bump -- see `insert_queued_row`'s doc for why
+/// `gap_detector.rs` (this function's only caller) calls this directly and bumps itself,
+/// conditionally, instead of going through a variant that always bumps.
+// Only caller (gap_detector.rs) lives in the bin-only module tree, not lib.rs's -- same
+// lib/bin split as `add_viewer_rfc` above.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) async fn insert_gap_continuation_row(
+    pool: &PgPool,
+    rfc: &str,
+    auth_type: &str,
+    auth_enc: &str,
+    dl_type: &str,
+    period_from: &str,
+    period_to: &str,
+    gap_retry_count: i32,
+) -> Result<String, sqlx::Error> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_utc();
+    sqlx::query(
+        r#"INSERT INTO pulso.sync_jobs
+           (id, job_type, rfc, auth_type, auth_enc, dl_type,
+            period_from, period_to, found, status, gap_retry_count, created_at, updated_at)
+           VALUES ($1, 'list', $2, $3, $4, $5, $6, $7, 0, 'queued', $8, $9, $10)"#,
+    )
+    .bind(&id)
+    .bind(rfc)
+    .bind(auth_type)
+    .bind(auth_enc)
+    .bind(dl_type)
+    .bind(period_from)
+    .bind(period_to)
+    .bind(gap_retry_count)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Marks a failed job as handled — either superseded by a real continuation
+/// job, or (rare) determined to need no continuation because its cursor had
+/// already reached period_to despite the failure. Either way, stops
+/// `find_failed_retryable` from picking it up again.
+pub async fn mark_superseded(
+    pool: &PgPool,
+    job_id: &str,
+    superseded_by: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE pulso.sync_jobs SET superseded_by = $1, updated_at = $2 WHERE id = $3"#)
+        .bind(superseded_by)
+        .bind(now_utc())
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// RFCs with at least one successful historical sync — the population where
+/// a "day inside a completed range but zero rows" gap can actually occur.
+pub async fn distinct_completed_rfcs(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT DISTINCT rfc FROM pulso.sync_jobs WHERE status = 'completed'"#)
+        .fetch_all(pool)
+        .await
+}
+
+/// Where the day-by-day zero-activity scan should resume for this RFC. `None`
+/// means it's never been scanned — the caller starts from that RFC's earliest
+/// completed job.
+pub async fn get_gap_scan_progress(
+    pool: &PgPool,
+    rfc: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT last_scanned_date FROM pulso.gap_scan_progress WHERE rfc = $1"#)
+        .bind(rfc)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn set_gap_scan_progress(
+    pool: &PgPool,
+    rfc: &str,
+    last_scanned_date: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO pulso.gap_scan_progress (rfc, last_scanned_date, updated_at)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (rfc) DO UPDATE SET last_scanned_date = excluded.last_scanned_date, updated_at = excluded.updated_at"#,
+    )
+    .bind(rfc)
+    .bind(last_scanned_date)
+    .bind(now_utc())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Pulso_Propuestas_Integridad_Descarga_RFC.md 3.2.3: where the gap scan must go back to
+/// because a job completed after the last scan covering days the cursor had already
+/// passed (a historical job finishing after the cursor moved on to recent dates left its
+/// whole range unscanned). `None` when nothing new sits behind the cursor.
+pub async fn gap_scan_rewind_from(pool: &PgPool, rfc: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT MIN(LEFT(j.period_from, 10))
+           FROM pulso.sync_jobs j
+           JOIN pulso.gap_scan_progress g ON g.rfc = j.rfc
+           WHERE j.rfc = $1 AND j.status = 'completed'
+             AND j.updated_at > g.updated_at
+             AND LEFT(j.period_from, 10) <= g.last_scanned_date"#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await
+}
+
+/// Earliest day this RFC has a completed sync for — where a never-before-scanned
+/// RFC's gap scan should start from.
+pub async fn earliest_completed_period_from(
+    pool: &PgPool,
+    rfc: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"SELECT MIN(period_from) FROM pulso.sync_jobs WHERE rfc = $1 AND status = 'completed'"#,
+    )
+    .bind(rfc)
+    .fetch_one(pool)
+    .await
+}
+
+/// Saturdays (or Sundays) with CFDIs on a side in the last year -- 75 % of them -- before
+/// the gap scan treats that side's empty Saturdays (Sundays) as possible gaps. Measured on
+/// the test base: the one RFC that really invoices on Saturdays did so on 42 of 52; every
+/// other RFC x side x day stayed at 37 or fewer, and a looser bar (12 weekend days) would
+/// have queued a resync for almost every empty Saturday of that RFC's history.
+const WEEKEND_ACTIVE_MIN_DAYS: i64 = 39;
+
+#[derive(Debug)]
+pub struct ActivityGapDay {
+    pub day: String,
+    pub emit_gap: bool,
+    pub recv_gap: bool,
+}
+
+/// Days in `[start_day, end_day]` where one side (emitidas or recibidas) has zero CFDIs
+/// although a `completed` job covered that side that day. `emit_gap`/`recv_gap` say which
+/// side(s) -- a day can be a gap on only one side, e.g. one client RFC on 2024-08-15/22 had
+/// 9 and 23 emitidas that day but zero recibidas. Returns dates as "YYYY-MM-DD".
+///
+/// Pulso_Propuestas_Integridad_Descarga_RFC.md 3.2.3:
+/// - Coverage is per direction: a completed emitidos job doesn't vouch for recibidos (a
+///   failed historical recibidos job sat under completed emitidos ones, unseen).
+/// - A Saturday (Sunday) counts for a side when the RFC routinely works that day on that
+///   side -- `WEEKEND_ACTIVE_MIN_DAYS` of them with CFDIs in the year before `end_day`.
+///   Weekdays-only (every confirmed gap until then fell on one) missed a Saturday emitido
+///   of an RFC that invoices on Saturdays; checking every weekend for every RFC would flood
+///   the queue with resyncs of days that are legitimately empty.
+pub async fn find_activity_gap_days(
+    pool: &PgPool,
+    rfc: &str,
+    start_day: &str,
+    end_day: &str,
+) -> Result<Vec<ActivityGapDay>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        WITH days AS (
+            SELECT d::date AS day, EXTRACT(ISODOW FROM d)::int AS dow
+            FROM generate_series($2::date, $3::date, interval '1 day') d
+        ),
+        -- Which weekend days (6 = Saturday, 7 = Sunday) each side routinely works.
+        weekend_active AS (
+            SELECT w.dow,
+                   COUNT(DISTINCT c.fecha_emision::date) FILTER (WHERE c.rfc_emisor = $1)
+                       >= $4 AS emit,
+                   COUNT(DISTINCT c.fecha_emision::date) FILTER (WHERE c.rfc_receptor = $1)
+                       >= $4 AS recv
+            FROM (VALUES (6), (7)) w(dow)
+            LEFT JOIN pulso.cfdis_raw c
+              ON (c.rfc_emisor = $1 OR c.rfc_receptor = $1)
+             AND EXTRACT(ISODOW FROM c.fecha_emision::date) = w.dow
+             AND c.fecha_emision::date BETWEEN $3::date - 365 AND $3::date
+            GROUP BY w.dow
+        ),
+        covered AS (
+            SELECT d.day, d.dow,
+                   bool_or(j.dl_type IN ('emitidos', 'ambos'))  AS emit_covered,
+                   bool_or(j.dl_type IN ('recibidos', 'ambos')) AS recv_covered
+            FROM days d
+            JOIN pulso.sync_jobs j
+              ON j.rfc = $1 AND j.status = 'completed'
+             AND d.day BETWEEN j.period_from::date AND j.period_to::date
+            GROUP BY d.day, d.dow
+        ),
+        emit_activity AS (
+            SELECT fecha_emision::date AS day, COUNT(*) AS cnt
+            FROM pulso.cfdis_raw
+            WHERE rfc_emisor = $1
+              AND fecha_emision::date BETWEEN $2::date AND $3::date
+            GROUP BY fecha_emision::date
+        ),
+        recv_activity AS (
+            SELECT fecha_emision::date AS day, COUNT(*) AS cnt
+            FROM pulso.cfdis_raw
+            WHERE rfc_receptor = $1
+              AND fecha_emision::date BETWEEN $2::date AND $3::date
+            GROUP BY fecha_emision::date
+        ),
+        flagged AS (
+            SELECT c.day,
+                   c.emit_covered AND (c.dow < 6 OR COALESCE(w.emit, false))
+                       AND COALESCE(e.cnt, 0) = 0 AS emit_gap,
+                   c.recv_covered AND (c.dow < 6 OR COALESCE(w.recv, false))
+                       AND COALESCE(r.cnt, 0) = 0 AS recv_gap
+            FROM covered c
+            LEFT JOIN weekend_active w ON w.dow = c.dow
+            LEFT JOIN emit_activity e ON e.day = c.day
+            LEFT JOIN recv_activity r ON r.day = c.day
+        )
+        SELECT to_char(day, 'YYYY-MM-DD') AS day, emit_gap, recv_gap
+        FROM flagged
+        WHERE emit_gap OR recv_gap
+        ORDER BY day
+        "#,
+    )
+    .bind(rfc)
+    .bind(start_day)
+    .bind(end_day)
+    .bind(WEEKEND_ACTIVE_MIN_DAYS)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ActivityGapDay {
+            day: r.try_get("day").unwrap_or_default(),
+            emit_gap: r.try_get("emit_gap").unwrap_or(false),
+            recv_gap: r.try_get("recv_gap").unwrap_or(false),
+        })
+        .collect())
+}
+
+/// How many single-day gap_resync jobs already ran for this RFC+day — caps
+/// re-checking a day that turns out to be a genuine holiday/no-activity day
+/// forever.
+pub async fn count_gap_resync_attempts(
+    pool: &PgPool,
+    rfc: &str,
+    day: &str,
+) -> Result<i64, sqlx::Error> {
+    let (n,): (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*) FROM pulso.sync_jobs WHERE rfc = $1 AND job_type = 'gap_resync' AND period_from = $2"#,
+    )
+    .bind(rfc)
+    .bind(format!("{day} 00:00:00"))
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
 }

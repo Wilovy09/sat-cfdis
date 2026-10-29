@@ -70,3 +70,136 @@ pub async fn der_to_pem(
 
     Ok((cert_pem_path, key_pem_path))
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreFielError {
+    #[error("encrypting the FIEL failed: {0}")]
+    Encrypt(String),
+    #[error("uploading the FIEL to S3 failed: {0}")]
+    Upload(String),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// Stores one RFC's FIEL: the `.cer` and `.key` encrypted with the app key before they reach
+/// S3 (`crypto::encrypt_file`), then the row with the encrypted password. Replaces any FIEL
+/// the RFC already had.
+pub async fn store(
+    pool: &crate::db::DbPool,
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    rfc: &str,
+    cert: &[u8],
+    key: &[u8],
+    password: &str,
+) -> Result<(), StoreFielError> {
+    let rfc = rfc.to_uppercase();
+    let enc_key = crate::services::crypto::load_key();
+    let cert_enc =
+        crate::services::crypto::encrypt_file(&enc_key, cert).map_err(StoreFielError::Encrypt)?;
+    let key_enc =
+        crate::services::crypto::encrypt_file(&enc_key, key).map_err(StoreFielError::Encrypt)?;
+    let password_enc =
+        crate::services::crypto::encrypt(&enc_key, password).map_err(StoreFielError::Encrypt)?;
+
+    let cert_s3_key = format!("fiel/{rfc}/cert.cer");
+    let key_s3_key = format!("fiel/{rfc}/key.key");
+    crate::services::s3::upload_fiel(s3, bucket, &cert_s3_key, cert_enc)
+        .await
+        .map_err(StoreFielError::Upload)?;
+    crate::services::s3::upload_fiel(s3, bucket, &key_s3_key, key_enc)
+        .await
+        .map_err(StoreFielError::Upload)?;
+    crate::db::fiel::upsert(pool, &rfc, &cert_s3_key, &key_s3_key, &password_enc).await?;
+    Ok(())
+}
+
+/// One pass at startup: re-uploads, encrypted, every FIEL file stored before files were
+/// encrypted (`crypto::encrypt_file`). Already-encrypted files are left alone, so after the
+/// first pass this only reads.
+async fn encrypt_legacy_files(pool: &crate::db::DbPool, s3: &aws_sdk_s3::Client, bucket: &str) {
+    if bucket.is_empty() {
+        return;
+    }
+    let rows = match crate::db::fiel::list_file_keys(pool).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("FIEL encryption pass: DB error: {e}");
+            return;
+        }
+    };
+    let enc_key = crate::services::crypto::load_key();
+    for (rfc, cert_s3_key, key_s3_key) in rows {
+        for s3_key in [&cert_s3_key, &key_s3_key] {
+            let Some(stored) = crate::services::s3::get_fiel(s3, bucket, s3_key).await else {
+                tracing::warn!(rfc = %rfc, "FIEL encryption pass: file not readable, skipped");
+                continue;
+            };
+            if crate::services::crypto::is_encrypted_file(&stored) {
+                continue;
+            }
+            let encrypted = match crate::services::crypto::encrypt_file(&enc_key, &stored) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!(rfc = %rfc, "FIEL encryption pass: encrypt failed: {e}");
+                    continue;
+                }
+            };
+            match crate::services::s3::upload_fiel(s3, bucket, s3_key, encrypted).await {
+                Ok(()) => tracing::info!(rfc = %rfc, "FIEL file re-stored encrypted"),
+                Err(e) => tracing::error!(rfc = %rfc, "FIEL encryption pass: upload failed: {e}"),
+            }
+        }
+    }
+}
+
+/// How often the orphaned-FIEL sweep runs after its first pass at startup.
+const ORPHAN_SWEEP_INTERVAL_SECS: u64 = 3600;
+
+/// L18-06 / L19-03: deletes one RFC's stored FIEL -- its S3 files, then the row holding the
+/// encrypted password. Best-effort on S3 (logged, never blocks): the row goes regardless,
+/// and without it the files can't be used, since the password lives only there.
+pub async fn delete_stored(
+    pool: &crate::db::DbPool,
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    row: &crate::db::fiel::FielRow,
+) {
+    if !bucket.is_empty() {
+        for s3_key in [&row.cert_s3_key, &row.key_s3_key] {
+            if let Err(e) = crate::services::s3::delete_fiel(s3, bucket, s3_key).await {
+                tracing::warn!(rfc = %row.rfc, "FIEL delete: S3 delete failed (continuing): {e}");
+            }
+        }
+    }
+    match crate::db::fiel::delete(pool, &row.rfc).await {
+        Ok(true) => {
+            tracing::info!(rfc = %row.rfc, "Orphaned FIEL removed (RFC has no active owner)")
+        }
+        Ok(false) => {}
+        Err(e) => tracing::error!(rfc = %row.rfc, "FIEL delete: DB error: {e}"),
+    }
+}
+
+/// L19-03 point 2: removes every FIEL whose RFC is left without an active owner, however
+/// that happened -- the owner removing the RFC, an admin, a migration, or the owner's
+/// Adquiere account being deleted outside Pulso. Runs at startup, then hourly.
+pub async fn orphan_sweep_worker(
+    pool: crate::db::DbPool,
+    cfg: std::sync::Arc<crate::config::Config>,
+    s3: std::sync::Arc<aws_sdk_s3::Client>,
+) {
+    let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+    encrypt_legacy_files(&pool, &s3, &bucket).await;
+    loop {
+        match crate::db::fiel::list_orphaned(&pool).await {
+            Ok(rows) => {
+                for row in &rows {
+                    delete_stored(&pool, &s3, &bucket, row).await;
+                }
+            }
+            Err(e) => tracing::error!("FIEL orphan sweep: DB error: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(ORPHAN_SWEEP_INTERVAL_SECS)).await;
+    }
+}

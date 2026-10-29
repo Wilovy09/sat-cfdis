@@ -1,4 +1,4 @@
-use super::summary::{dl_type_filter, rfc_column};
+use super::summary::{cp_key_expr, cp_nombre_expr, dl_type_filter, get_f64, rfc_column};
 use crate::db::DbPool;
 use serde::Serialize;
 use sqlx::Row;
@@ -14,6 +14,8 @@ pub struct PeriodComparisonResponse {
     pub monthly_matrix: Vec<MonthMatrixRow>,
     pub top_cp_by_year: Vec<CpPeriodRow>,
     pub bridges: Vec<BridgeEntry>,
+    pub effective_from_month: i32,
+    pub effective_to_month: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,6 +61,18 @@ pub struct BridgeEntry {
     pub top_contractions: Vec<BridgeRow>,
     pub new_relevant: Vec<BridgeRow>,
     pub lost_relevant: Vec<BridgeRow>,
+    // L11-16 / AUD-111: a real bridge -- periodo_anterior_mxn + expansion_mxn +
+    // contraction_mxn + new_mxn + lost_mxn + estable_mxn == periodo_actual_mxn, exactly
+    // (trap 1). `estable_mxn` isn't one of the four highlighted drivers but still has to be
+    // in the sum -- an "Estable" counterparty's delta is small (within the +-5% band) but
+    // not literally zero, and leaving it out would make the four components not close.
+    pub periodo_anterior_mxn: f64,
+    pub periodo_actual_mxn: f64,
+    pub expansion_mxn: f64,
+    pub contraction_mxn: f64,
+    pub new_mxn: f64,
+    pub lost_mxn: f64,
+    pub estable_mxn: f64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -70,6 +84,37 @@ pub struct BridgeRow {
     pub delta_mxn: f64,
     pub delta_pct: Option<f64>,
     pub status: String,
+}
+
+/// If -- and only if -- `years` includes the year of the last closed calendar month, the
+/// effective `to_month` drops to `min(to_month, that month)`, applied to ALL compared
+/// years so the comparison stays over the same period for every year.
+///
+/// C14-03/AUD-147: the caller (`routes::analytics::get_period_comparison`) must build its
+/// cache key from THIS value, not the raw `to_month` query param -- otherwise a response
+/// cached in September under `to_month=12` (clamped to 9 internally) keeps its key frozen
+/// at "12" and gets served unchanged in October, even though the clamp would by then
+/// resolve to 10. One definition, two callers (this function and the cache key), per
+/// DEC-084's "one definition per number".
+#[must_use]
+pub fn effective_to_month(to_month: i32, years: &[i32]) -> i32 {
+    clamp_to_month(
+        to_month,
+        years,
+        crate::routes::analytics::current_month_yyyymm(),
+    )
+}
+
+/// Pure clamp logic behind `effective_to_month`, with the wall-clock cutoff as a plain
+/// argument so it's testable without mocking the clock.
+fn clamp_to_month(to_month: i32, years: &[i32], last_closed_yyyymm: i64) -> i32 {
+    let last_closed_year = (last_closed_yyyymm / 100) as i32;
+    let last_closed_month = (last_closed_yyyymm % 100) as i32;
+    if years.contains(&last_closed_year) {
+        to_month.min(last_closed_month)
+    } else {
+        to_month
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -97,8 +142,16 @@ pub async fn get(
     } else {
         "nombre_receptor"
     };
+    let cp_key_expr = cp_key_expr(cp_col, cp_name_col);
+    let cp_nombre_expr = cp_nombre_expr(cp_col, cp_name_col);
 
-    let years_vec: Vec<i32> = years.iter().copied().collect();
+    let years_vec: Vec<i32> = years.to_vec();
+
+    // L7-01 / C14-03: must land before period_label is built below, or CMP02's "Periodo"
+    // column would keep saying the untopped range while the queries already use the
+    // topped one. See `effective_to_month`'s own doc for why the caller's cache key must
+    // apply this same clamp too.
+    let to_month = effective_to_month(to_month, &years_vec);
 
     // Month abbreviations in Spanish
     const MONTHS: [&str; 12] = [
@@ -114,16 +167,19 @@ pub async fn get(
     let q1 = format!(
         r#"
         SELECT year,
-               SUM(COALESCE(total_neto_mxn, 0)::float8)::float8 AS total,
-               COUNT(DISTINCT {cp_col}) AS cp_count,
+               SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS total,
+               COUNT(DISTINCT ({cp_key_expr})) AS cp_count,
                COUNT(*) AS invoice_count
-        FROM pulso.cfdis
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P', 'N')
+          AND tipo_comprobante NOT IN ('P', 'N', 'T')
           AND NOT is_cancelled
           AND year = ANY($2)
           AND month >= $3 AND month <= $4
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         GROUP BY year
         ORDER BY year
         "#
@@ -141,7 +197,7 @@ pub async fn get(
     let mut period_map: HashMap<i32, (f64, i64, i64)> = HashMap::new();
     for r in &period_rows {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total");
         let cp_count: i64 = r.try_get("cp_count").unwrap_or(0);
         let invoice_count: i64 = r.try_get("invoice_count").unwrap_or(0);
         period_map.insert(year, (total, cp_count, invoice_count));
@@ -153,13 +209,16 @@ pub async fn get(
     let q2 = format!(
         r#"
         SELECT year,
-               SUM(COALESCE(total_neto_mxn, 0)::float8)::float8 AS fy_total
-        FROM pulso.cfdis
+               SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS fy_total
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P', 'N')
+          AND tipo_comprobante NOT IN ('P', 'N', 'T')
           AND NOT is_cancelled
           AND year = ANY($2)
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         GROUP BY year
         "#
     );
@@ -173,7 +232,7 @@ pub async fn get(
     let mut fy_map: HashMap<i32, f64> = HashMap::new();
     for r in &fy_rows {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
-        let fy_total: f64 = r.try_get("fy_total").unwrap_or(0.0);
+        let fy_total: f64 = get_f64(r, "fy_total");
         fy_map.insert(year, fy_total);
     }
 
@@ -184,19 +243,22 @@ pub async fn get(
         r#"
         WITH ranked AS (
             SELECT year,
-                   {cp_col} AS cp_rfc,
-                   MAX({cp_name_col}) AS cp_nombre,
-                   SUM(COALESCE(total_neto_mxn, 0)::float8)::float8 AS total,
+                   ({cp_key_expr}) AS cp_rfc,
+                   {cp_nombre_expr} AS cp_nombre,
+                   SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS total,
                    COUNT(*) AS invoice_count,
-                   ROW_NUMBER() OVER (PARTITION BY year ORDER BY SUM(COALESCE(total_neto_mxn, 0)) DESC) AS rnk
-            FROM pulso.cfdis
+                   ROW_NUMBER() OVER (PARTITION BY year ORDER BY SUM(COALESCE(total_neto_mxn_ajustado, 0)) DESC) AS rnk
+            FROM pulso.cfdis_ajustado c
             WHERE {owner_col} = $1
               AND {dl_filter}
-              AND tipo_comprobante NOT IN ('P', 'N')
+              AND tipo_comprobante NOT IN ('P', 'N', 'T')
           AND NOT is_cancelled
               AND year = ANY($2)
               AND month >= $3 AND month <= $4
-            GROUP BY year, {cp_col}
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+              )
+            GROUP BY year, ({cp_key_expr})
         )
         SELECT year, cp_rfc, cp_nombre, total, invoice_count, rnk
         FROM ranked
@@ -214,13 +276,52 @@ pub async fn get(
         .fetch_all(pool)
         .await?;
 
-    // Build a map: year -> Vec<(rfc, total)> for top10_pct and CpPeriodRow status
-    let mut top_by_year: HashMap<i32, Vec<(String, f64)>> = HashMap::new();
-    for r in &top_rows {
+    // -----------------------------------------------------------------------
+    // Query 3b – Top 10 counterparties per year, for the "Concentración Top 10" KPI only.
+    // C13-02/AUD-134: `limit` (the caller's Top-N selector) binds Query 3 above, whose
+    // `top_rows` also feeds `top_cp_by_year` -- which must keep returning exactly `limit`
+    // rows, selector-driven, unrelated to this item. Reusing that same query and just
+    // raising its bind to 10 would inflate `top_cp_by_year` past what the selector asked
+    // for, so the concentration metric needs its own query, fixed at 10 regardless of
+    // `limit` (with the selector at 5, Query 3 alone can never have more than 5 rows to
+    // sum, so "Top 10" silently became "Top 5").
+    // -----------------------------------------------------------------------
+    let q3b = format!(
+        r#"
+        WITH ranked AS (
+            SELECT year,
+                   ({cp_key_expr}) AS cp_rfc,
+                   SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS total,
+                   ROW_NUMBER() OVER (PARTITION BY year ORDER BY SUM(COALESCE(total_neto_mxn_ajustado, 0)) DESC) AS rnk
+            FROM pulso.cfdis_ajustado c
+            WHERE {owner_col} = $1
+              AND {dl_filter}
+              AND tipo_comprobante NOT IN ('P', 'N', 'T')
+              AND NOT is_cancelled
+              AND year = ANY($2)
+              AND month >= $3 AND month <= $4
+              AND NOT EXISTS (
+                  SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+              )
+            GROUP BY year, ({cp_key_expr})
+        )
+        SELECT year, total FROM ranked WHERE rnk <= 10
+        "#
+    );
+
+    let top10_rows = sqlx::query(&q3b)
+        .bind(rfc)
+        .bind(&years_vec as &[i32])
+        .bind(from_month)
+        .bind(to_month)
+        .fetch_all(pool)
+        .await?;
+
+    let mut top10_sum_by_year: HashMap<i32, f64> = HashMap::new();
+    for r in &top10_rows {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
-        let cp_rfc: String = r.try_get("cp_rfc").unwrap_or_default();
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
-        top_by_year.entry(year).or_default().push((cp_rfc, total));
+        let total: f64 = get_f64(r, "total");
+        *top10_sum_by_year.entry(year).or_insert(0.0) += total;
     }
 
     // -----------------------------------------------------------------------
@@ -229,14 +330,17 @@ pub async fn get(
     let q4 = format!(
         r#"
         SELECT year, month,
-               SUM(COALESCE(total_neto_mxn, 0)::float8)::float8 AS total
-        FROM pulso.cfdis
+               SUM(COALESCE(total_neto_mxn_ajustado, 0)::float8)::float8 AS total
+        FROM pulso.cfdis_ajustado c
         WHERE {owner_col} = $1
           AND {dl_filter}
-          AND tipo_comprobante NOT IN ('P', 'N')
+          AND tipo_comprobante NOT IN ('P', 'N', 'T')
           AND NOT is_cancelled
           AND year = ANY($2)
           AND month >= $3 AND month <= $4
+          AND NOT EXISTS (
+              SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+          )
         GROUP BY year, month
         ORDER BY year, month
         "#
@@ -256,7 +360,7 @@ pub async fn get(
     for r in &matrix_raw {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
         let month: i32 = r.try_get::<i64, _>("month").unwrap_or(0) as i32;
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total");
         let cum = cumulative_by_year.entry(year).or_insert(0.0);
         *cum += total;
         monthly_matrix.push(MonthMatrixRow {
@@ -306,11 +410,10 @@ pub async fn get(
             0.0
         };
 
-        // top10_pct: sum of top min(10, limit) cp shares for this year
+        // top10_pct: sum of the top 10 cp shares for this year (C13-02/AUD-134 -- always
+        // 10, independent of the caller's `limit` selector; see Query 3b above).
         let top10_pct = if period_total > 0.0 {
-            let tops = top_by_year.get(&year).map(|v| v.as_slice()).unwrap_or(&[]);
-            let take = (10usize).min(tops.len());
-            let top_sum: f64 = tops[..take].iter().map(|(_, t)| t).sum();
+            let top_sum = top10_sum_by_year.get(&year).copied().unwrap_or(0.0);
             top_sum / period_total * 100.0
         } else {
             0.0
@@ -339,7 +442,7 @@ pub async fn get(
     for r in &top_rows {
         let year: i32 = r.try_get::<i64, _>("year").unwrap_or(0) as i32;
         let cp_rfc: String = r.try_get("cp_rfc").unwrap_or_default();
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total");
         year_cp_totals
             .entry(year)
             .or_default()
@@ -352,7 +455,7 @@ pub async fn get(
         let rank: i64 = r.try_get("rnk").unwrap_or(0);
         let cp_rfc: String = r.try_get("cp_rfc").unwrap_or_default();
         let cp_nombre: String = r.try_get("cp_nombre").unwrap_or_default();
-        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let total: f64 = get_f64(r, "total");
         let invoice_count: i64 = r.try_get("invoice_count").unwrap_or(0);
 
         let (period_total, _, _) = period_map.get(&year).copied().unwrap_or((0.0, 0, 0));
@@ -362,7 +465,16 @@ pub async fn get(
             0.0
         };
 
-        // Status: compare with previous year in sorted list
+        // L11-15 / AUD-110: this used to be its own classification (>1.05x / <0.95x of
+        // prev_total) -- a different formula than CMP04's bridge (delta > prev*0.05 /
+        // delta < -prev*0.05, plus an explicit "Perdido" case for curr_total==0), so the
+        // SAME counterparty in the SAME year could be "Expansión" here and "Nuevo" there.
+        // CMP04 is the one that wins (compares against the same adjacent year, same
+        // exclusions, same tipo_comprobante filter as year_cp_totals below -- verified the
+        // two totals match). Not a shared computation (this stays a separate query, Query 3
+        // vs CMP04's Query 5), but the exact same formula against the exact same numbers
+        // gives the exact same answer, which is the point -- CMP06 has no classification
+        // logic of its own left to disagree with.
         let status = {
             let prev_year_idx = sorted_years
                 .iter()
@@ -375,11 +487,14 @@ pub async fn get(
                     .and_then(|m| m.get(&cp_rfc))
                     .copied()
                     .unwrap_or(0.0);
+                let delta = total - prev_total;
                 if prev_total == 0.0 {
                     "Nuevo"
-                } else if total > prev_total * 1.05 {
+                } else if total == 0.0 {
+                    "Perdido"
+                } else if delta > prev_total * 0.05 {
                     "Expansión"
-                } else if total < prev_total * 0.95 {
+                } else if delta < -(prev_total * 0.05) {
                     "Contracción"
                 } else {
                     "Estable"
@@ -414,39 +529,47 @@ pub async fn get(
         let q5 = format!(
             r#"
             WITH curr AS (
-                SELECT {cp_col} AS cp_rfc, MAX({cp_name_col}) AS cp_nombre,
-                       SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total
-                FROM pulso.cfdis
-                WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
+                SELECT ({cp_key_expr}) AS cp_rfc, {cp_nombre_expr} AS cp_nombre,
+                       SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total
+                FROM pulso.cfdis_ajustado c
+                WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T') AND NOT is_cancelled
                   AND year = $2 AND month >= $3 AND month <= $4
-                GROUP BY {cp_col}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+                  )
+                GROUP BY ({cp_key_expr})
             ),
             prev AS (
-                SELECT {cp_col} AS cp_rfc, MAX({cp_name_col}) AS cp_nombre,
-                       SUM(COALESCE(total_neto_mxn,0)::float8)::float8 AS total
-                FROM pulso.cfdis
-                WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N') AND NOT is_cancelled
+                SELECT ({cp_key_expr}) AS cp_rfc, {cp_nombre_expr} AS cp_nombre,
+                       SUM(COALESCE(total_neto_mxn_ajustado,0)::float8)::float8 AS total
+                FROM pulso.cfdis_ajustado c
+                WHERE {owner_col} = $1 AND {dl_filter} AND tipo_comprobante NOT IN ('P','N','T') AND NOT is_cancelled
                   AND year = $5 AND month >= $3 AND month <= $4
-                GROUP BY {cp_col}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pulso.cfdi_exclusion ex WHERE ex.owner_rfc = $1 AND ex.uuid = c.uuid
+                  )
+                GROUP BY ({cp_key_expr})
             )
             SELECT COALESCE(c.cp_rfc, p.cp_rfc) AS cp_rfc,
                    COALESCE(c.cp_nombre, p.cp_nombre) AS cp_nombre,
                    COALESCE(c.total, 0.0) AS curr_total,
                    COALESCE(p.total, 0.0) AS prev_total
             FROM curr c FULL OUTER JOIN prev p ON c.cp_rfc = p.cp_rfc
-            ORDER BY ABS(COALESCE(c.total, 0.0) - COALESCE(p.total, 0.0)) DESC
-            LIMIT $6
             "#
         );
 
-        let bridge_limit = limit * 4;
+        // L11-16 trap 1: the four bridge components have to sum to the EXACT variación --
+        // the old `LIMIT $6` (top `limit*4` counterparties by |delta|) cut off small-delta
+        // ("Estable") counterparties before they ever reached the aggregate, so the four
+        // displayed buckets never actually summed to periodo_actual - periodo_anterior. No
+        // limit here now; `rows`/top_expansions/etc. below still truncate in Rust for
+        // display, but the aggregate totals are computed from this full universe first.
         let bridge_raw = sqlx::query(&q5)
             .bind(rfc)
             .bind(year_current)
             .bind(from_month)
             .bind(to_month)
             .bind(year_prev)
-            .bind(bridge_limit)
             .fetch_all(pool)
             .await?;
 
@@ -454,8 +577,8 @@ pub async fn get(
         for r in &bridge_raw {
             let cp_rfc: String = r.try_get("cp_rfc").unwrap_or_default();
             let cp_nombre: String = r.try_get("cp_nombre").unwrap_or_default();
-            let curr_total: f64 = r.try_get("curr_total").unwrap_or(0.0);
-            let prev_total: f64 = r.try_get("prev_total").unwrap_or(0.0);
+            let curr_total: f64 = get_f64(r, "curr_total");
+            let prev_total: f64 = get_f64(r, "prev_total");
             let delta_mxn = curr_total - prev_total;
 
             let status = if prev_total == 0.0 {
@@ -553,6 +676,25 @@ pub async fn get(
         });
         rows.truncate(limit as usize);
 
+        // L11-16 trap 2: a counterparty that drops to zero is "Perdido", not "Contracción" --
+        // already enforced by the status classification above (curr_total == 0.0 check
+        // comes before the delta-threshold checks), so these sums-by-status don't double
+        // up a departing counterparty into both buckets.
+        let periodo_anterior_mxn: f64 = all_rows.iter().map(|r| r.prev_mxn).sum();
+        let periodo_actual_mxn: f64 = all_rows.iter().map(|r| r.current_mxn).sum();
+        let sum_by = |status: &str| -> f64 {
+            all_rows
+                .iter()
+                .filter(|r| r.status == status)
+                .map(|r| r.delta_mxn)
+                .sum()
+        };
+        let expansion_mxn = sum_by("Expansión");
+        let contraction_mxn = sum_by("Contracción");
+        let new_mxn = sum_by("Nuevo");
+        let lost_mxn = sum_by("Perdido");
+        let estable_mxn = sum_by("Estable");
+
         bridges.push(BridgeEntry {
             year_current,
             year_prev,
@@ -561,6 +703,13 @@ pub async fn get(
             top_contractions,
             new_relevant,
             lost_relevant,
+            periodo_anterior_mxn,
+            periodo_actual_mxn,
+            expansion_mxn,
+            contraction_mxn,
+            new_mxn,
+            lost_mxn,
+            estable_mxn,
         });
     }
 
@@ -569,5 +718,31 @@ pub async fn get(
         monthly_matrix,
         top_cp_by_year,
         bridges,
+        effective_from_month: from_month,
+        effective_to_month: to_month,
     })
+}
+
+#[cfg(test)]
+mod effective_to_month_tests {
+    use super::*;
+
+    #[test]
+    fn clamps_when_compared_years_include_the_cutoff_year() {
+        // Cutoff 2026-09 (last closed month), years compared include 2026 -- to_month=12
+        // must drop to 9.
+        assert_eq!(clamp_to_month(12, &[2024, 2025, 2026], 202609), 9);
+    }
+
+    #[test]
+    fn leaves_to_month_untouched_when_cutoff_year_not_compared() {
+        // Comparing only 2023/2024/2025 -- the 2026 cutoff is irrelevant to this range.
+        assert_eq!(clamp_to_month(12, &[2023, 2024, 2025], 202609), 12);
+    }
+
+    #[test]
+    fn never_raises_to_month_past_what_was_asked() {
+        // to_month already below the cutoff month -- min() leaves it as-is.
+        assert_eq!(clamp_to_month(3, &[2026], 202609), 3);
+    }
 }

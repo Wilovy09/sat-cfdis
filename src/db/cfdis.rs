@@ -1,7 +1,6 @@
 use crate::services::xml_parser::{
     ParsedCfdi, ParsedConcept, ParsedNomina, ParsedNominaDeduccion, ParsedNominaOtroPago,
-    ParsedNominaPercepcion,
-    ParsedPayment, ParsedPaymentDoc, ParsedRelacionado, ParsedTax,
+    ParsedNominaPercepcion, ParsedPayment, ParsedPaymentDoc, ParsedRelacionado, ParsedTax,
 };
 use sqlx::PgPool;
 
@@ -12,7 +11,7 @@ use sqlx::PgPool;
 pub async fn upsert_cfdi(pool: &PgPool, c: &ParsedCfdi) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO pulso.cfdis (
+        INSERT INTO pulso.cfdis_raw (
             uuid, job_id, rfc_emisor, nombre_emisor, regimen_fiscal_emisor,
             rfc_receptor, nombre_receptor, uso_cfdi,
             domicilio_fiscal_receptor, regimen_fiscal_receptor,
@@ -32,17 +31,39 @@ pub async fn upsert_cfdi(pool: &PgPool, c: &ParsedCfdi) -> Result<(), sqlx::Erro
             domicilio_fiscal_receptor = excluded.domicilio_fiscal_receptor,
             regimen_fiscal_receptor   = excluded.regimen_fiscal_receptor,
             tipo_comprobante          = excluded.tipo_comprobante,
-            subtotal                  = excluded.subtotal,
-            descuento                 = excluded.descuento,
-            total                     = excluded.total,
-            moneda                    = excluded.moneda,
-            tipo_cambio               = excluded.tipo_cambio,
-            total_mxn                 = excluded.total_mxn,
+            -- L18-14: a reload that only has the SAT listing (no XML, excluded.xml_available
+            -- = 0) used to overwrite these unconditionally every time migration 080 made this
+            -- invoice reprocess on reappearing in a new listing. Two concrete harms: it put a
+            -- pending invoice that already had real XML back behind a listing-only pass (rare,
+            -- since a listing-only call only follows an XML one for a CFDI that stopped
+            -- offering XML -- see next point), and it erased the estimated subtotal a separate
+            -- process assigns to the ~1,197 CFDIs the SAT never delivers XML for, because the
+            -- listing itself carries no subtotal. Only a call that itself has real XML
+            -- (excluded.xml_available = 1) may set these now -- estado_sat is the one exception
+            -- the doc calls out, since a cancellation is real news even from a listing alone.
+            subtotal                  = CASE WHEN excluded.xml_available = 1 THEN excluded.subtotal      ELSE pulso.cfdis_raw.subtotal      END,
+            descuento                 = CASE WHEN excluded.xml_available = 1 THEN excluded.descuento     ELSE pulso.cfdis_raw.descuento     END,
+            total                     = CASE WHEN excluded.xml_available = 1 THEN excluded.total         ELSE pulso.cfdis_raw.total         END,
+            moneda                    = CASE WHEN excluded.xml_available = 1 THEN excluded.moneda        ELSE pulso.cfdis_raw.moneda        END,
+            tipo_cambio               = CASE WHEN excluded.xml_available = 1 THEN excluded.tipo_cambio   ELSE pulso.cfdis_raw.tipo_cambio   END,
+            total_mxn                 = CASE WHEN excluded.xml_available = 1 THEN excluded.total_mxn     ELSE pulso.cfdis_raw.total_mxn     END,
+            xml_available             = CASE WHEN excluded.xml_available = 1 THEN excluded.xml_available ELSE pulso.cfdis_raw.xml_available END,
             metodo_pago               = excluded.metodo_pago,
             forma_pago                = excluded.forma_pago,
             lugar_expedicion          = excluded.lugar_expedicion,
             estado_sat                = excluded.estado_sat,
-            xml_available             = excluded.xml_available
+            -- Per a later review: year/month were insert-only before this -- a nómina
+            -- receipt first upserted via from_metadata (xml_available=0, no Nomina complement,
+            -- year/month stuck at emisión) never got corrected once real XML arrived and
+            -- computed the true devengo period (xml_parser::parse always sets
+            -- xml_available=1). Guarded by xml_available so this can't run in reverse: a
+            -- later from_metadata hit on an already-XML-backed row (xml_available=1) has
+            -- excluded.xml_available=0, so `excluded.xml_available >= cfdis.xml_available`
+            -- is false and year/month keep their existing (better) value instead of being
+            -- degraded back to emisión. Same-or-better source quality is the only thing that
+            -- gets to move year/month.
+            year  = CASE WHEN excluded.xml_available >= pulso.cfdis_raw.xml_available THEN excluded.year  ELSE pulso.cfdis_raw.year  END,
+            month = CASE WHEN excluded.xml_available >= pulso.cfdis_raw.xml_available THEN excluded.month ELSE pulso.cfdis_raw.month END
         "#,
     )
     .bind(&c.uuid)
@@ -91,7 +112,11 @@ pub async fn insert_taxes(
     let mut is_retenidos: Vec<i64> = Vec::new();
 
     for t in taxes {
-        if t.tasa.is_none() {
+        // Una retención sin TasaOCuota es válida en el CFDI (frecuente en ISR
+        // y en retenciones exentas) — descartarla pierde el renglón completo.
+        // Solo se omite si tampoco trae importe ni base, es decir, no hay nada
+        // que guardar.
+        if t.importe.is_none() && t.base.is_none() {
             continue;
         }
         uuids.push(uuid);
@@ -144,8 +169,9 @@ pub async fn insert_concepts(
     let mut valor_unitarios: Vec<Option<f64>> = Vec::with_capacity(concepts.len());
     let mut importes: Vec<Option<f64>> = Vec::with_capacity(concepts.len());
     let mut descuentos: Vec<Option<f64>> = Vec::with_capacity(concepts.len());
+    let mut positions: Vec<i32> = Vec::with_capacity(concepts.len());
 
-    for c in concepts {
+    for (position, c) in (0_i32..).zip(concepts) {
         uuids.push(uuid);
         clave_prod_servs.push(c.clave_prod_serv.clone());
         clave_unidades.push(c.clave_unidad.clone());
@@ -154,12 +180,16 @@ pub async fn insert_concepts(
         valor_unitarios.push(c.valor_unitario);
         importes.push(c.importe);
         descuentos.push(c.descuento);
+        positions.push(position);
     }
 
+    // L19-06 point 1: `position` is the line's 0-based order in the XML's <Conceptos>, same
+    // as reconstruct_concepts. With the (uuid, position) unique index (migration 090), a
+    // second insert of the same list conflicts and DO NOTHING drops it.
     sqlx::query(r#"
         INSERT INTO pulso.cfdi_concepts
-            (uuid, clave_prod_serv, clave_unidad, descripcion, cantidad, valor_unitario, importe, descuento)
-        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::float8[], $7::float8[], $8::float8[])
+            (uuid, clave_prod_serv, clave_unidad, descripcion, cantidad, valor_unitario, importe, descuento, position)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::float8[], $7::float8[], $8::float8[], $9::int4[])
         ON CONFLICT DO NOTHING
         "#)
     .bind(&uuids)
@@ -170,6 +200,7 @@ pub async fn insert_concepts(
     .bind(&valor_unitarios)
     .bind(&importes)
     .bind(&descuentos)
+    .bind(&positions)
     .execute(pool)
     .await?;
     Ok(())
@@ -177,6 +208,9 @@ pub async fn insert_concepts(
 
 pub async fn insert_payments(
     pool: &PgPool,
+    job_id: Option<&str>,
+    rfc_emisor: &str,
+    rfc_receptor: &str,
     payment_uuid: &str,
     payments: &[ParsedPayment],
 ) -> Result<(), sqlx::Error> {
@@ -194,6 +228,39 @@ pub async fn insert_payments(
 
     for (i, p) in payments.iter().enumerate() {
         let idx = i as i64;
+        // TC-3/DEC-029: a payment in foreign currency with tipo_cambio_p missing or
+        // exactly 1 doesn't necessarily mean the payment is mispriced -- the related
+        // documents decide that (see pulso.cfdi_cobro_estado, migration 055). What must
+        // not happen is for this combination to pass through unrecorded: it's logged to
+        // pulso.data_quality_flags (no UI surface, DEC-022 defers that) so ingestion
+        // leaves a durable trail even though the row is stored as-is either way.
+        if let Some(moneda) = &p.moneda_p
+            && moneda != "MXN"
+            && p.tipo_cambio_p.unwrap_or(1.0) == 1.0
+        {
+            tracing::warn!(
+                payment_uuid = %payment_uuid, pago_num = idx, moneda_p = %moneda,
+                "TC-3: pago en divisa distinta de MXN con tipo_cambio_p ausente o en 1 — se guarda igual, revisar el XML"
+            );
+            // L4-06: unique on (flag_type, payment_uuid) -- a redownload/enrichment
+            // reprocess of the same complement must not inflate the count.
+            if let Err(e) = sqlx::query(
+                r#"INSERT INTO pulso.data_quality_flags
+                        (job_id, flag_type, payment_uuid, rfc_emisor, rfc_receptor, moneda)
+                       VALUES ($1, 'tc3_moneda_tipo_cambio_1', $2, $3, $4, $5)
+                       ON CONFLICT (flag_type, payment_uuid) DO NOTHING"#,
+            )
+            .bind(job_id)
+            .bind(payment_uuid)
+            .bind(rfc_emisor)
+            .bind(rfc_receptor)
+            .bind(moneda)
+            .execute(pool)
+            .await
+            {
+                tracing::warn!(payment_uuid = %payment_uuid, "TC-3: failed to write data_quality_flags row: {e}");
+            }
+        }
         payment_uuids.push(payment_uuid);
         pago_nums.push(idx);
         fecha_pagos.push(p.fecha_pago.clone());
@@ -373,7 +440,7 @@ async fn insert_nomina_percepcion(
         INSERT INTO pulso.cfdi_nomina_percepciones
             (uuid, tipo_percepcion, clave, concepto, importe_gravado, importe_exento)
         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[], $6::float8[])
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (uuid, tipo_percepcion, clave, concepto) DO NOTHING
         "#,
     )
     .bind(&uuids)
@@ -415,7 +482,7 @@ async fn insert_nomina_deduccion(
         INSERT INTO pulso.cfdi_nomina_deducciones
             (uuid, tipo_deduccion, clave, concepto, importe)
         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[])
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (uuid, tipo_deduccion, clave, concepto) DO NOTHING
         "#,
     )
     .bind(&uuids)
@@ -456,7 +523,7 @@ async fn insert_nomina_otro_pago(
         INSERT INTO pulso.cfdi_nomina_otros_pagos
             (uuid, tipo_otro_pago, clave, concepto, importe)
         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float8[])
-        ON CONFLICT DO NOTHING
+        ON CONFLICT (uuid, tipo_otro_pago, clave, concepto) DO NOTHING
         "#,
     )
     .bind(&uuids)
@@ -481,10 +548,9 @@ pub async fn find_pending_etl(
     use sqlx::Row;
     let rows = sqlx::query(
         r#"
-        SELECT ji.uuid, ji.metadata
-        FROM pulso.job_invoices ji
-        LEFT JOIN pulso.cfdis c ON c.uuid = ji.uuid
-        WHERE ji.job_id = $1 AND c.uuid IS NULL
+        SELECT uuid, metadata
+        FROM pulso.job_invoices
+        WHERE job_id = $1 AND NOT etl_processed
         "#,
     )
     .bind(job_id)
@@ -500,15 +566,78 @@ pub async fn find_pending_etl(
         .collect())
 }
 
+/// ETL fast path for a CFDI listed again by a later job (the 3-day daily window and the
+/// reconciliation's month jobs re-list mostly CFDIs Pulso already holds). When the CFDI is
+/// already stored with its XML, reprocessing it from that same XML would rewrite identical
+/// values; the only thing the new listing can change is the SAT status (a cancellation).
+/// So: update `estado_sat` if it differs, and mark this listing processed -- no S3 read,
+/// no parse. Returns `None` when the CFDI isn't stored with XML yet (full path needed),
+/// `Some(changed)` otherwise, `changed` telling whether its status moved.
+pub async fn settle_known_cfdi(
+    pool: &PgPool,
+    job_id: &str,
+    uuid: &str,
+    estado_sat: &str,
+) -> Result<Option<bool>, sqlx::Error> {
+    let (known, changed): (bool, bool) = sqlx::query_as(
+        r#"WITH known AS (
+               SELECT uuid FROM pulso.cfdis_raw WHERE uuid = upper($2) AND xml_available = 1
+           ),
+           upd AS (
+               UPDATE pulso.cfdis_raw c SET estado_sat = $3
+               FROM known k
+               WHERE c.uuid = k.uuid AND c.estado_sat IS DISTINCT FROM $3
+               RETURNING c.uuid
+           ),
+           done AS (
+               UPDATE pulso.job_invoices SET etl_processed = true
+               WHERE job_id = $1 AND uuid = $2 AND EXISTS (SELECT 1 FROM known)
+               RETURNING 1
+           )
+           SELECT EXISTS (SELECT 1 FROM known), EXISTS (SELECT 1 FROM upd)"#,
+    )
+    .bind(job_id)
+    .bind(uuid)
+    .bind(estado_sat)
+    .fetch_one(pool)
+    .await?;
+    Ok(known.then_some(changed))
+}
+
+/// Marks a job_invoices row as ETL'd, once its cfdis header row has been written --
+/// mirrors the point `process_invoice` (services/etl.rs) already treats as "this invoice
+/// is now visible to analytics." Keeps `jobs_needing_etl`/`find_pending_etl`'s
+/// `etl_processed` flag as the single source of truth, rather than re-deriving it from a
+/// join against cfdis every time.
+pub async fn mark_etl_processed(
+    pool: &PgPool,
+    job_id: &str,
+    uuid: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE pulso.job_invoices SET etl_processed = true WHERE job_id = $1 AND uuid = $2"#,
+    )
+    .bind(job_id)
+    .bind(uuid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Job IDs that have invoice rows not yet ETL'd into cfdis.
+///
+/// migration 080: filters on `etl_processed` (set by `mark_etl_processed` once a row's
+/// cfdis header is written) instead of a `LEFT JOIN cfdis ... WHERE c.uuid IS NULL`
+/// anti-join -- that join re-scanned every job_invoices row ever inserted, every 30s,
+/// forever (measured live at 2-11s per run); the partial index behind `NOT etl_processed`
+/// stays bounded by however much work is actually still pending, not by total history.
 pub async fn jobs_needing_etl(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     use sqlx::Row;
     let rows = sqlx::query(
         r#"
-        SELECT DISTINCT ji.job_id
-        FROM pulso.job_invoices ji
-        LEFT JOIN pulso.cfdis c ON c.uuid = ji.uuid
-        WHERE c.uuid IS NULL
+        SELECT DISTINCT job_id
+        FROM pulso.job_invoices
+        WHERE NOT etl_processed
         "#,
     )
     .fetch_all(pool)
@@ -527,7 +656,7 @@ pub async fn jobs_needing_enrichment(pool: &PgPool) -> Result<Vec<String>, sqlx:
         r#"
         SELECT DISTINCT ji.job_id
         FROM pulso.job_invoices ji
-        JOIN pulso.cfdis c ON c.uuid = ji.uuid
+        JOIN pulso.cfdis_raw c ON c.uuid = ji.uuid
         WHERE c.xml_available = 0
         "#,
     )
@@ -551,7 +680,7 @@ pub async fn find_needs_enrichment(
         r#"
         SELECT ji.uuid, ji.metadata
         FROM pulso.job_invoices ji
-        JOIN pulso.cfdis c ON c.uuid = ji.uuid
+        JOIN pulso.cfdis_raw c ON c.uuid = ji.uuid
         WHERE ji.job_id = $1 AND c.xml_available = 0
         ORDER BY ji.uuid
         LIMIT $2
@@ -585,15 +714,20 @@ pub async fn concepts_exist(pool: &PgPool, uuid: &str) -> bool {
 /// Clears all parsed data (taxes, concepts, payments, nomina, relacionados) and sets
 /// xml_available=0 so the enrichment worker picks them up again.
 /// Returns the number of CFDIs queued for reprocessing.
+/// Returns the `(rfc_emisor, rfc_receptor)` pair of every row reset -- C14-05: `rfc` is the
+/// scope this admin action was aimed at, but a reset invoice's OTHER side can
+/// independently be a different, also-tracked Pulso RFC whose own cached figures just
+/// changed too.
 pub async fn reset_for_reprocessing(
     pool: &PgPool,
     rfc: &str,
-    dl_type: &str,       // "emitidos" | "recibidos" | "ambos"
+    dl_type: &str, // "emitidos" | "recibidos" | "ambos"
     from_year: Option<i32>,
     from_month: Option<i32>,
     to_year: Option<i32>,
     to_month: Option<i32>,
-) -> Result<u64, sqlx::Error> {
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    use sqlx::Row;
     let emit = dl_type != "recibidos";
     let recv = dl_type != "emitidos";
 
@@ -601,8 +735,10 @@ pub async fn reset_for_reprocessing(
         (Some(fy), Some(ty)) => format!(
             "AND (c.year > {fy} OR (c.year = {fy} AND c.month >= {fm})) \
              AND (c.year < {ty} OR (c.year = {ty} AND c.month <= {tm}))",
-            fy = fy, fm = from_month.unwrap_or(1),
-            ty = ty, tm = to_month.unwrap_or(12)
+            fy = fy,
+            fm = from_month.unwrap_or(1),
+            ty = ty,
+            tm = to_month.unwrap_or(12)
         ),
         _ => String::new(),
     };
@@ -611,13 +747,13 @@ pub async fn reset_for_reprocessing(
         (true, true) => "(c.rfc_emisor = $1 OR c.rfc_receptor = $1)".to_string(),
         (true, false) => "c.rfc_emisor = $1".to_string(),
         (false, true) => "c.rfc_receptor = $1".to_string(),
-        _ => return Ok(0),
+        _ => return Ok(Vec::new()),
     };
 
     let sql = format!(
         r#"
         WITH targets AS (
-            SELECT c.uuid FROM pulso.cfdis c
+            SELECT c.uuid FROM pulso.cfdis_raw c
             WHERE {owner_clause}
               AND c.xml_available IN (1, -1)
               {period_clause}
@@ -631,29 +767,379 @@ pub async fn reset_for_reprocessing(
         del_nomded  AS (DELETE FROM pulso.cfdi_nomina_deducciones   WHERE uuid         IN (SELECT uuid FROM targets)),
         del_nomop   AS (DELETE FROM pulso.cfdi_nomina_otros_pagos   WHERE uuid         IN (SELECT uuid FROM targets)),
         del_nom     AS (DELETE FROM pulso.cfdi_nomina               WHERE uuid         IN (SELECT uuid FROM targets))
-        UPDATE pulso.cfdis SET xml_available = 0
+        UPDATE pulso.cfdis_raw SET xml_available = 0
         WHERE uuid IN (SELECT uuid FROM targets)
+        RETURNING rfc_emisor, rfc_receptor
         "#,
     );
 
-    let result = sqlx::query(&sql).bind(rfc).execute(pool).await?;
-    Ok(result.rows_affected())
+    let result = sqlx::query(&sql).bind(rfc).fetch_all(pool).await?;
+    Ok(result
+        .iter()
+        .map(|r| {
+            (
+                r.try_get("rfc_emisor").unwrap_or_default(),
+                r.try_get("rfc_receptor").unwrap_or_default(),
+            )
+        })
+        .collect())
 }
 
 /// Mark all xml_available=0 CFDIs in a job as permanently unavailable (xml_available=-1).
-/// Called after repeated failed attempts to fetch the XML from both storage and SAT.
+/// Also backfills subtotal from total when subtotal is NULL so that the STORED GENERATED
+/// column total_neto_mxn has a meaningful value instead of 0 for analytics.
+/// Returns the `(rfc_emisor, rfc_receptor)` pair of every row marked -- C14-05: the caller
+/// needs both sides, not just the count, to invalidate a counterparty that's also a
+/// tracked Pulso RFC (this UPDATE is scoped by job_id, i.e. one owner's own sync job, but
+/// the invoice's other side can independently be a different owner's own tracked RFC).
 pub async fn mark_xml_unavailable_for_job(
     pool: &PgPool,
     job_id: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    use sqlx::Row;
+    // subtotal has no real value to fall back on here — SAT's metadata listing
+    // (see Metadata.php) never exposes SubTotal, only the IVA-inclusive Total.
+    // Approximate with the standard 16% rate rather than using Total outright:
+    // that was migration 013's mistake, fixed once in migration 016, then
+    // silently reintroduced here for every invoice that's failed to download
+    // since (this function runs continuously, unlike the one-time migration —
+    // see migration 039 for the backfill of everything it broke in the
+    // meantime). Under-corrects 0%/8% invoices, but that's a smaller error
+    // than counting the 16% IVA itself as revenue.
     let result = sqlx::query(
-        r#"UPDATE pulso.cfdis c
-           SET xml_available = -1
+        r#"UPDATE pulso.cfdis_raw c
+           SET xml_available = -1,
+               subtotal  = CASE
+                   WHEN c.subtotal IS NULL AND c.total IS NOT NULL
+                        AND c.tipo_comprobante NOT IN ('P', 'N')
+                       THEN c.total / NULLIF(COALESCE(c.tipo_cambio, 1.0), 0) / 1.16
+                   ELSE c.subtotal
+               END,
+               descuento = CASE
+                   WHEN c.subtotal IS NULL AND c.descuento IS NULL
+                        AND c.tipo_comprobante NOT IN ('P', 'N')
+                       THEN 0.0
+                   ELSE c.descuento
+               END
            FROM pulso.job_invoices ji
-           WHERE c.uuid = ji.uuid AND ji.job_id = $1 AND c.xml_available = 0"#,
+           WHERE c.uuid = ji.uuid AND ji.job_id = $1 AND c.xml_available = 0
+           RETURNING c.rfc_emisor, c.rfc_receptor"#,
     )
     .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(result
+        .iter()
+        .map(|r| {
+            (
+                r.try_get("rfc_emisor").unwrap_or_default(),
+                r.try_get("rfc_receptor").unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation status re-verification
+// ---------------------------------------------------------------------------
+
+/// Calendar months (year, month) that already have at least one CFDI for
+/// this RFC (either side), regardless of which sync job fetched it. Powers
+/// the coverage widget's "done" months — `month_progress()`'s old logic
+/// derived that purely from one active job's own cursor_date, which only
+/// reflects that single job's range. Once gap_detector/H-1 started leaving
+/// several jobs (one big historical `list` plus many one-day `gap_resync`s)
+/// active or paused per RFC, `get_active_for_rfc` could surface a narrow
+/// gap_resync job as "the" job and make already-downloaded months (fetched
+/// by a *different*, already-completed job) look undone — e.g. one client RFC
+/// showing only Nov–Dec 2023 covered while its financial summary (queried
+/// straight from these same rows) already reflected the full year.
+pub async fn months_with_data(
+    pool: &PgPool,
+    rfc: &str,
+) -> Result<std::collections::HashSet<(i64, i64)>, sqlx::Error> {
+    use sqlx::Row;
+    let rfc = rfc.to_uppercase();
+    // L7-11: a month whose only comprobantes are cancelled (no XML, precisely the ones
+    // data_quality.rs's missing-XML check is meant to catch) used to count as "covered"
+    // here -- the opposite direction of that same check's bug, so fixing one without the
+    // other leaves the banner's two halves reading two different universes.
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT year, month FROM pulso.cfdis
+           WHERE (rfc_emisor = $1 OR rfc_receptor = $1) AND NOT is_cancelled"#,
+    )
+    .bind(&rfc)
+    .fetch_all(pool)
+    .await?;
+    // year/month are bigint in this table — fetching them as i32 doesn't
+    // truncate, it fails the type check and every row silently fell back to
+    // (0, 0) via unwrap_or, so this set was always effectively empty and
+    // every RFC read as "0 months covered" regardless of real data. That's
+    // the exact bug behind the coverage block firing at 100% for RFCs with
+    // plenty of CFDIs (two client RFCs) and not just the ones with a real
+    // gap (a third).
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.try_get::<i64, _>("year").unwrap_or(0),
+                r.try_get::<i64, _>("month").unwrap_or(0),
+            )
+        })
+        .collect())
+}
+
+/// Same as `months_with_data`, scoped to one direction -- `rfc_emisor = rfc` for "emitidos",
+/// `rfc_receptor = rfc` for "recibidos" (`rfc_column`'s own convention, reused from
+/// services/analytics/summary.rs). `months_with_data`'s OR of both columns is exactly what
+/// hides an asymmetric sync (all emitidos downloaded, recibidos barely started) behind a
+/// grid that looks fully done -- a month reads "done" there the instant *either* side has
+/// one row.
+pub async fn months_with_data_direction(
+    pool: &PgPool,
+    rfc: &str,
+    dl_type: &str,
+) -> Result<std::collections::HashSet<(i64, i64)>, sqlx::Error> {
+    use sqlx::Row;
+    let rfc = rfc.to_uppercase();
+    let col = crate::services::analytics::summary::rfc_column(dl_type);
+    // L7-11: same fix as months_with_data above.
+    let rows = sqlx::query(&format!(
+        "SELECT DISTINCT year, month FROM pulso.cfdis WHERE {col} = $1 AND NOT is_cancelled"
+    ))
+    .bind(&rfc)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.try_get::<i64, _>("year").unwrap_or(0),
+                r.try_get::<i64, _>("month").unwrap_or(0),
+            )
+        })
+        .collect())
+}
+
+/// Candidate invoices for `estado_sat` re-verification: currently flagged
+/// cancelled, and either never checked (one-time historical backlog) or
+/// emitted within `recent_days` and not checked within `min_recheck_hours` —
+/// SAT's cancellation-rejection window is ~72h, so a "Cancelado" status can
+/// revert to "Vigente" without anything else in the pipeline noticing.
+/// Returns `(uuid, rfc_emisor, rfc_receptor)`.
+pub async fn find_cancelled_recheck_candidates(
+    pool: &PgPool,
+    min_recheck_hours: i32,
+    recent_days: i32,
+    limit: i64,
+) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT uuid, rfc_emisor, rfc_receptor
+        FROM pulso.cfdis_raw
+        WHERE is_cancelled
+          AND (
+              estado_sat_checked_at IS NULL
+              OR (
+                  estado_sat_checked_at < NOW() - make_interval(hours => $1)
+                  AND fecha_emision::timestamp > NOW() - make_interval(days => $2)
+              )
+          )
+        ORDER BY estado_sat_checked_at IS NULL DESC, estado_sat_checked_at ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(min_recheck_hours)
+    .bind(recent_days)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let uuid: String = r.try_get("uuid").unwrap_or_default();
+            let rfc_emisor: String = r.try_get("rfc_emisor").unwrap_or_default();
+            let rfc_receptor: String = r.try_get("rfc_receptor").unwrap_or_default();
+            (uuid, rfc_emisor, rfc_receptor)
+        })
+        .collect())
+}
+
+/// Mirror of `find_cancelled_recheck_candidates` for the opposite direction:
+/// invoices Pulso still thinks are Vigente. Nothing else ever re-polls SAT
+/// for these, so a real cancellation that happens after ingestion (SAT allows
+/// it well past the 72h reversal window) stays invisible forever — inflating
+/// revenue for as long as the invoice keeps getting counted. Scoped to I/E
+/// only: those are the types cancellation actually changes anything for.
+pub async fn find_vigente_recheck_candidates(
+    pool: &PgPool,
+    min_recheck_hours: i32,
+    recent_days: i32,
+    limit: i64,
+) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT uuid, rfc_emisor, rfc_receptor
+        FROM pulso.cfdis_raw
+        WHERE NOT is_cancelled
+          AND tipo_comprobante IN ('I', 'E')
+          AND (
+              estado_sat_checked_at IS NULL
+              OR (
+                  estado_sat_checked_at < NOW() - make_interval(hours => $1)
+                  AND fecha_emision::timestamp > NOW() - make_interval(days => $2)
+              )
+          )
+        ORDER BY estado_sat_checked_at IS NULL DESC, estado_sat_checked_at ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(min_recheck_hours)
+    .bind(recent_days)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let uuid: String = r.try_get("uuid").unwrap_or_default();
+            let rfc_emisor: String = r.try_get("rfc_emisor").unwrap_or_default();
+            let rfc_receptor: String = r.try_get("rfc_receptor").unwrap_or_default();
+            (uuid, rfc_emisor, rfc_receptor)
+        })
+        .collect())
+}
+
+/// Records a confirmed fresh SAT status check. Narrower than `upsert_cfdi` on
+/// purpose — a recheck only ever fetches `estadoComprobante`, so it must not
+/// clobber fields (subtotal, receptor name, ...) it never re-fetched. Resets
+/// the miss counter — this is a real answer, not an inconclusive one.
+pub async fn update_estado_sat(
+    pool: &PgPool,
+    uuid: &str,
+    estado_sat: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE pulso.cfdis_raw SET estado_sat = $1, estado_sat_checked_at = NOW(), estado_sat_check_attempts = 0 WHERE uuid = $2",
+    )
+    .bind(estado_sat)
+    .bind(uuid)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected())
+    Ok(())
+}
+
+/// Bumps `estado_sat_checked_at` without changing `estado_sat` — used only
+/// when no tracked RFC can even look the UUID up (no credentials exist to try
+/// again with), so retrying every cycle would be pointless.
+pub async fn touch_estado_sat_checked(pool: &PgPool, uuids: &[String]) -> Result<(), sqlx::Error> {
+    if uuids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE pulso.cfdis_raw SET estado_sat_checked_at = NOW() WHERE uuid = ANY($1::text[])",
+    )
+    .bind(uuids)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Records an inconclusive check — SAT's response didn't include this UUID
+/// under the RFC/download_type it was queried with. Does NOT stamp
+/// `estado_sat_checked_at` (so the invoice stays a top-priority candidate and
+/// gets retried next cycle regardless of age) unless `max_attempts` is
+/// reached, at which point it's treated like a real check so it stops being
+/// retried forever. Returns the attempt count after this miss.
+pub async fn record_estado_sat_miss(
+    pool: &PgPool,
+    uuid: &str,
+    max_attempts: i32,
+) -> Result<i32, sqlx::Error> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        r#"
+        UPDATE pulso.cfdis_raw
+        SET estado_sat_check_attempts = estado_sat_check_attempts + 1,
+            estado_sat_checked_at = CASE
+                WHEN estado_sat_check_attempts + 1 >= $2 THEN NOW()
+                ELSE estado_sat_checked_at
+            END
+        WHERE uuid = $1
+        RETURNING estado_sat_check_attempts
+        "#,
+    )
+    .bind(uuid)
+    .bind(max_attempts)
+    .fetch_one(pool)
+    .await?;
+    Ok(row
+        .try_get::<i32, _>("estado_sat_check_attempts")
+        .unwrap_or(0))
+}
+
+// ---------------------------------------------------------------------------
+// Bulk XML re-download — rows permanently marked xml_available = -1 (see
+// xml_redownload.rs). Distinct from the estado_sat recheck above: this is
+// about recovering the real subtotal/currency/payroll detail that the
+// metadata-only fallback never had, not about a status that changed later.
+// ---------------------------------------------------------------------------
+
+/// Candidates for re-download: one row per UUID (a UUID can appear in
+/// `job_invoices` more than once if multiple jobs listed it — any one of
+/// those metadata blobs is equivalent for this purpose, since they all
+/// describe the same real CFDI), capped at `max_attempts` prior misses.
+pub async fn find_needing_redownload(
+    pool: &PgPool,
+    max_attempts: i32,
+    limit: i64,
+) -> Result<Vec<(String, String, String, String)>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT ON (c.uuid) c.uuid, c.rfc_emisor, c.rfc_receptor, ji.metadata
+        FROM pulso.cfdis_raw c
+        JOIN pulso.job_invoices ji ON ji.uuid = c.uuid
+        WHERE c.xml_available = -1
+          AND c.xml_redownload_attempts < $1
+        ORDER BY c.uuid, ji.job_id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(max_attempts)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.try_get("uuid").unwrap_or_default(),
+                r.try_get("rfc_emisor").unwrap_or_default(),
+                r.try_get("rfc_receptor").unwrap_or_default(),
+                r.try_get("metadata").unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+/// Records a failed re-download attempt (SAT didn't return this UUID in the
+/// batch — could be a transient miss, or the CFDI is genuinely gone from
+/// SAT's portal). Capped at `max_attempts` so a permanently-unrecoverable
+/// UUID doesn't get retried forever; logged by the caller when the cap hits.
+/// Returns the attempt count after this miss.
+pub async fn record_redownload_miss(pool: &PgPool, uuid: &str) -> Result<i32, sqlx::Error> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        r#"UPDATE pulso.cfdis_raw SET xml_redownload_attempts = xml_redownload_attempts + 1
+           WHERE uuid = $1 RETURNING xml_redownload_attempts"#,
+    )
+    .bind(uuid)
+    .fetch_one(pool)
+    .await?;
+    Ok(row
+        .try_get::<i32, _>("xml_redownload_attempts")
+        .unwrap_or(0))
 }
