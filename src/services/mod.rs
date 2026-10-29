@@ -10,6 +10,7 @@ pub mod recheck_cancelled;
 pub mod reconciliation;
 pub mod response_cache;
 pub mod s3;
+pub mod sat_login;
 pub mod session;
 pub mod storage;
 pub mod xml_parser;

@@ -90,3 +90,73 @@ pub fn decrypt(key: &[u8; 32], b64: &str) -> Result<String, String> {
 
     String::from_utf8(plaintext).map_err(|e| e.to_string())
 }
+
+/// Marks a stored file as encrypted by [`encrypt_file`]. FIEL files uploaded before files
+/// were encrypted have no marker and are returned as-is by [`decrypt_file`].
+const FILE_MARKER: &[u8] = b"pulso-enc-v1:";
+
+/// Encrypts a binary file (a FIEL `.cer`/`.key`) for storage.
+pub fn encrypt_file(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+    let mut out = FILE_MARKER.to_vec();
+    out.extend_from_slice(encrypt(key, &b64)?.as_bytes());
+    Ok(out)
+}
+
+/// Reverses [`encrypt_file`]; legacy unencrypted files pass through unchanged.
+pub fn decrypt_file(key: &[u8; 32], stored: &[u8]) -> Result<Vec<u8>, String> {
+    let Some(blob) = stored.strip_prefix(FILE_MARKER) else {
+        return Ok(stored.to_vec());
+    };
+    let blob = std::str::from_utf8(blob).map_err(|e| e.to_string())?;
+    base64::engine::general_purpose::STANDARD
+        .decode(decrypt(key, blob)?)
+        .map_err(|e| e.to_string())
+}
+
+/// Opaque, unguessable token for a public URL (32 random bytes, hex).
+#[must_use]
+pub fn random_token() -> String {
+    use rand::RngCore as _;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// What a public token is looked up by: the token itself is never stored in clear.
+#[must_use]
+pub fn token_hash(token: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: [u8; 32] = [7; 32];
+
+    #[test]
+    fn files_round_trip_and_are_not_stored_in_clear() {
+        let der = b"\x30\x82\x05\x00 fake der bytes";
+        let stored = encrypt_file(&KEY, der).unwrap();
+        assert!(stored.starts_with(FILE_MARKER));
+        assert!(!stored.windows(der.len()).any(|w| w == der));
+        assert_eq!(decrypt_file(&KEY, &stored).unwrap(), der);
+    }
+
+    #[test]
+    fn legacy_unencrypted_files_pass_through() {
+        let der = b"\x30\x82 legacy";
+        assert_eq!(decrypt_file(&KEY, der).unwrap(), der);
+    }
+
+    #[test]
+    fn tokens_are_random_and_hash_deterministically() {
+        let a = random_token();
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, random_token());
+        assert_eq!(token_hash(&a), token_hash(&a));
+        assert_ne!(token_hash(&a), a);
+    }
+}

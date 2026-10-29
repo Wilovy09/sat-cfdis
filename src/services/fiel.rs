@@ -71,6 +71,49 @@ pub async fn der_to_pem(
     Ok((cert_pem_path, key_pem_path))
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum StoreFielError {
+    #[error("encrypting the FIEL failed: {0}")]
+    Encrypt(String),
+    #[error("uploading the FIEL to S3 failed: {0}")]
+    Upload(String),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// Stores one RFC's FIEL: the `.cer` and `.key` encrypted with the app key before they reach
+/// S3 (`crypto::encrypt_file`), then the row with the encrypted password. Replaces any FIEL
+/// the RFC already had.
+pub async fn store(
+    pool: &crate::db::DbPool,
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    rfc: &str,
+    cert: &[u8],
+    key: &[u8],
+    password: &str,
+) -> Result<(), StoreFielError> {
+    let rfc = rfc.to_uppercase();
+    let enc_key = crate::services::crypto::load_key();
+    let cert_enc =
+        crate::services::crypto::encrypt_file(&enc_key, cert).map_err(StoreFielError::Encrypt)?;
+    let key_enc =
+        crate::services::crypto::encrypt_file(&enc_key, key).map_err(StoreFielError::Encrypt)?;
+    let password_enc =
+        crate::services::crypto::encrypt(&enc_key, password).map_err(StoreFielError::Encrypt)?;
+
+    let cert_s3_key = format!("fiel/{rfc}/cert.cer");
+    let key_s3_key = format!("fiel/{rfc}/key.key");
+    crate::services::s3::upload_fiel(s3, bucket, &cert_s3_key, cert_enc)
+        .await
+        .map_err(StoreFielError::Upload)?;
+    crate::services::s3::upload_fiel(s3, bucket, &key_s3_key, key_enc)
+        .await
+        .map_err(StoreFielError::Upload)?;
+    crate::db::fiel::upsert(pool, &rfc, &cert_s3_key, &key_s3_key, &password_enc).await?;
+    Ok(())
+}
+
 /// How often the orphaned-FIEL sweep runs after its first pass at startup.
 const ORPHAN_SWEEP_INTERVAL_SECS: u64 = 3600;
 

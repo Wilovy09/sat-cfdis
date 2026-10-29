@@ -290,6 +290,21 @@ function resolveResourceType(string $type): ResourceType
 switch ($command) {
 
     // ----------------------------------------------------------------------
+    // login: only opens a SAT session to check the credentials (CIEC or FIEL).
+    // Always answers on stdout: {"ok": true} or {"ok": false, "code": ...}
+    // with the ErrorClassifier code, so the caller can tell "rejected" from
+    // "the SAT didn't answer".
+    // ----------------------------------------------------------------------
+    case 'login':
+        try {
+            $scraper->confirmSessionIsAlive();
+            outputJson(['ok' => true]);
+        } catch (Throwable $loginError) {
+            $classified = ErrorClassifier::classify($loginError);
+            outputJson(['ok' => false, 'code' => $classified['code']]);
+        }
+
+    // ----------------------------------------------------------------------
     // list: query invoices by period or by UUID list
     // ----------------------------------------------------------------------
     case 'list':

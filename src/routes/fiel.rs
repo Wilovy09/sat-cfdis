@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::db::DbPool;
 use crate::errors::GENERIC_INTERNAL_ERROR;
-use crate::services::crypto;
+use crate::services::sat_login::{self, LoginOutcome, SatCredential};
 use crate::services::session;
 
 #[derive(Serialize)]
@@ -96,40 +96,40 @@ pub async fn upload(
         }
     };
 
-    let bucket = cfg.s3_bucket.clone().unwrap_or_default();
-    let cert_s3_key = format!("fiel/{rfc}/cert.cer");
-    let key_s3_key = format!("fiel/{rfc}/key.key");
-
-    if let Err(e) = crate::services::s3::upload_fiel(&s3, &bucket, &cert_s3_key, cert).await {
-        tracing::error!(rfc = %rfc, "FIEL upload: S3 cert upload failed: {e}");
-        return HttpResponse::InternalServerError()
-            .json(serde_json::json!({"error": "S3 upload failed"}));
-    }
-
-    if let Err(e) = crate::services::s3::upload_fiel(&s3, &bucket, &key_s3_key, key).await {
-        tracing::error!(rfc = %rfc, "FIEL upload: S3 key upload failed: {e}");
-        return HttpResponse::InternalServerError()
-            .json(serde_json::json!({"error": "S3 upload failed"}));
-    }
-
-    let enc_key = crypto::load_key();
-    let password_enc = match crypto::encrypt(&enc_key, &password) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!(rfc = %rfc, "FIEL upload: encrypt failed: {e}");
-            return HttpResponse::InternalServerError()
-                .json(serde_json::json!({"error": "Encryption failed"}));
-        }
+    // A FIEL is only stored once the SAT opens a session with it for this RFC; that same
+    // login verifies the owner (L19-01), which a FIEL-only RFC has no other way to do.
+    let fiel = SatCredential::Fiel {
+        cert_der: &cert,
+        key_der: &key,
+        password: &password,
     };
-
-    if let Err(e) =
-        crate::db::fiel::upsert(&pool, &rfc, &cert_s3_key, &key_s3_key, &password_enc).await
-    {
-        tracing::error!(rfc = %rfc, "FIEL upload: DB upsert failed: {e}");
-        return HttpResponse::InternalServerError().json(serde_json::json!({"error": "DB error"}));
+    match sat_login::check(&cfg, &rfc, &fiel).await {
+        LoginOutcome::Accepted => {}
+        LoginOutcome::Rejected => {
+            return HttpResponse::UnprocessableEntity().json(serde_json::json!({
+                "error": "El SAT rechazó la e.firma. Revisa que los archivos sean de este RFC y que la contraseña sea la correcta."
+            }));
+        }
+        LoginOutcome::Unavailable => {
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "No pudimos comunicarnos con el SAT. Inténtalo de nuevo en unos minutos."
+            }));
+        }
     }
 
-    tracing::info!(rfc = %rfc, "FIEL credentials stored");
+    let bucket = cfg.s3_bucket.clone().unwrap_or_default();
+    if let Err(e) =
+        crate::services::fiel::store(&pool, &s3, &bucket, &rfc, &cert, &key, &password).await
+    {
+        tracing::error!(rfc = %rfc, "FIEL upload: {e}");
+        return HttpResponse::InternalServerError()
+            .json(serde_json::json!({"error": GENERIC_INTERNAL_ERROR}));
+    }
+    if let Err(e) = crate::db::users::mark_verified_now(&pool, &user_id, &rfc).await {
+        tracing::error!(rfc = %rfc, "FIEL upload: marking the owner verified failed: {e}");
+    }
+
+    tracing::info!(rfc = %rfc, "FIEL credentials validated and stored");
     HttpResponse::Ok().json(serde_json::json!({"ok": true}))
 }
 

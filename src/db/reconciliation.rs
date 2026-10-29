@@ -21,8 +21,9 @@ pub struct MonthRow {
     pub count_due: bool,
 }
 
-/// An RFC the reconciliation worker looks after: active, verified owner (its CIEC has
-/// passed the SAT login), with the floor year of its analysis window.
+/// An RFC the reconciliation worker looks after: active, verified owner (its CIEC or FIEL
+/// has passed the SAT login) with a credential to log in with, and the floor year of its
+/// analysis window. `clave_enc` is empty when the RFC only has a FIEL.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct WatchedRfc {
     pub rfc: String,
@@ -36,7 +37,9 @@ pub async fn watched_rfcs(pool: &PgPool) -> Result<Vec<WatchedRfc>, sqlx::Error>
            FROM pulso.users pu
            JOIN public.users u ON u.id = pu.user_id
            WHERE pu.deleted_at IS NULL AND u.deleted_at IS NULL
-             AND pu.verified_at IS NOT NULL AND pu.clave <> ''
+             AND pu.verified_at IS NOT NULL
+             AND (pu.clave <> ''
+                  OR EXISTS (SELECT 1 FROM pulso.rfc_fiel f WHERE f.rfc = pu.rfc))
            ORDER BY pu.rfc"#,
     )
     .fetch_all(pool)

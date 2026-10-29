@@ -390,6 +390,21 @@ pub async fn set_owner_verified(pool: &PgPool, owner_row_id: &str) -> Result<boo
     Ok(result.rows_affected() > 0)
 }
 
+/// Marks `user_id`'s active row for `rfc` verified: the SAT just accepted credentials for
+/// it live (credential link), not through a job's login.
+pub async fn mark_verified_now(pool: &PgPool, user_id: &str, rfc: &str) -> Result<(), sqlx::Error> {
+    let uid = parse_uuid(user_id)?;
+    sqlx::query(
+        "UPDATE pulso.users SET verified_at = NOW() \
+         WHERE user_id = $1 AND rfc = $2 AND deleted_at IS NULL",
+    )
+    .bind(uid)
+    .bind(rfc.to_uppercase())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// True if user owns this active RFC, has a valid share grant, OR has the 'admin' role.
 /// Membership only -- says nothing about whether the RFC's data may be read yet; see
 /// `user_can_read_rfc_data`.

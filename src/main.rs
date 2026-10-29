@@ -77,6 +77,12 @@ pub(crate) async fn try_fiel_auth(
     let password = services::crypto::decrypt(&enc_key, &row.password_enc)
         .map_err(|e| tracing::error!(rfc = %rfc, "FIEL: decrypt password failed: {e}"))
         .ok()?;
+    let cert_bytes = services::crypto::decrypt_file(&enc_key, &cert_bytes)
+        .map_err(|e| tracing::error!(rfc = %rfc, "FIEL: decrypt cert failed: {e}"))
+        .ok()?;
+    let key_bytes = services::crypto::decrypt_file(&enc_key, &key_bytes)
+        .map_err(|e| tracing::error!(rfc = %rfc, "FIEL: decrypt key failed: {e}"))
+        .ok()?;
 
     use base64::Engine as _;
     let cert_b64 = base64::engine::general_purpose::STANDARD.encode(&cert_bytes);
@@ -479,20 +485,33 @@ async fn daily_sync_worker(pool: DbPool) {
                 _ => period_from.clone(),
             };
 
-            let clave = match services::crypto::decrypt(&key, &clave_enc) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(rfc = %rfc, "Daily worker: decrypt failed: {e}");
-                    continue;
+            // An RFC whose credentials came in as a FIEL only has no CIEC: its job carries a
+            // FIEL placeholder the worker swaps for the stored FIEL (try_fiel_auth). With
+            // neither (a demo RFC), there is nothing to sync with.
+            let auth_json = if clave_enc.is_empty() {
+                match db::fiel::get(&pool, &rfc).await {
+                    Ok(Some(_)) => serde_json::json!({ "type": "fiel", "rfc": rfc }).to_string(),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::error!(rfc = %rfc, "Daily worker: FIEL lookup failed: {e}");
+                        continue;
+                    }
                 }
+            } else {
+                let clave = match services::crypto::decrypt(&key, &clave_enc) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(rfc = %rfc, "Daily worker: decrypt failed: {e}");
+                        continue;
+                    }
+                };
+                serde_json::json!({
+                    "type": "ciec",
+                    "rfc":  rfc,
+                    "password": clave,
+                })
+                .to_string()
             };
-
-            let auth_json = serde_json::json!({
-                "type": "ciec",
-                "rfc":  rfc,
-                "password": clave,
-            })
-            .to_string();
 
             let auth_enc = match services::crypto::encrypt(&key, &auth_json) {
                 Ok(e) => e,
@@ -1420,6 +1439,18 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::resource("/api/v1/users/rfcs/{rfc}")
                     .route(web::delete().to(users_routes::delete_rfc_handler)),
+            )
+            // Credential links (docs/Pulso_Feature_Liga_Credenciales.md). The two public
+            // routes take no session: the unguessable token is the authorization.
+            .service(
+                web::resource("/api/v1/users/credential-links")
+                    .route(web::get().to(routes::credential_links::list_links))
+                    .route(web::post().to(routes::credential_links::create_link)),
+            )
+            .service(
+                web::resource("/api/v1/public/credential-links/{token}")
+                    .route(web::get().to(routes::credential_links::public_get))
+                    .route(web::post().to(routes::credential_links::public_submit)),
             )
             // FIEL API
             .service(

@@ -39,10 +39,12 @@ impl PhpCli {
         let input_json = serde_json::to_vec(payload).context("Could not serialize CLI payload")?;
 
         let mut cmd = Command::new(&self.php_bin);
+        // A caller that gives up on the run (a timeout) must not leave the process behind.
         cmd.arg(&self.php_cli_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         if let Some(ref proxy) = self.https_proxy {
             cmd.env("HTTPS_PROXY", proxy).env("https_proxy", proxy);
         }

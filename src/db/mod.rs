@@ -1,4 +1,5 @@
 pub mod cfdis;
+pub mod credential_links;
 pub mod fiel;
 pub mod jobs;
 pub mod migration_guard;

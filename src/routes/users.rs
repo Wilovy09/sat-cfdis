@@ -486,6 +486,62 @@ async fn register_rfc(
     Ok(sync_job_id)
 }
 
+/// Credentials the SAT just accepted live, through a credential link.
+pub(crate) enum LinkedCredential<'a> {
+    Ciec(&'a str),
+    /// Already stored by `services::fiel::store`; jobs log in with it via `try_fiel_auth`.
+    Fiel,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RegisterValidatedError {
+    #[error("encrypting the credentials failed: {0}")]
+    Encrypt(String),
+    #[error("registering the RFC failed: {0}")]
+    Create(String),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// Registers `rfc` for `user_id` with credentials validated live through a credential link.
+/// Unlike `register_rfc`, the owner row starts verified -- the SAT already accepted them --
+/// so the first sync can log in with a FIEL right away. A FIEL-only RFC keeps an empty
+/// `clave`; its jobs carry a FIEL placeholder that `try_fiel_auth` replaces. The caller has
+/// already ruled out another active owner and the per-account RFC limit.
+pub(crate) async fn register_validated_rfc(
+    pool: &DbPool,
+    user_id: &str,
+    rfc: &str,
+    credential: LinkedCredential<'_>,
+) -> Result<(), RegisterValidatedError> {
+    let key = crypto::load_key();
+    let (clave_enc, auth_json) = match credential {
+        LinkedCredential::Ciec(clave) => (
+            crypto::encrypt(&key, clave).map_err(RegisterValidatedError::Encrypt)?,
+            serde_json::json!({ "type": "ciec", "rfc": rfc, "password": clave }),
+        ),
+        LinkedCredential::Fiel => (
+            String::new(),
+            serde_json::json!({ "type": "fiel", "rfc": rfc }),
+        ),
+    };
+    let auth_enc =
+        crypto::encrypt(&key, &auth_json.to_string()).map_err(RegisterValidatedError::Encrypt)?;
+
+    crate::db::users::create_pulso_user(pool, user_id, rfc, &clave_enc, None, None)
+        .await
+        .map_err(|e| RegisterValidatedError::Create(e.to_string()))?;
+    crate::db::users::mark_verified_now(pool, user_id, rfc).await?;
+
+    let (period_from, period_to) = initial_sync_period();
+    let job_id = queue_initial_sync(pool, rfc, &auth_enc, &period_from, &period_to, None).await?;
+    crate::db::users::set_initial_sync_job_for_rfc(pool, user_id, rfc, &job_id).await?;
+    if let Err(e) = crate::db::users::set_profile_complete(pool, user_id).await {
+        tracing::error!(user_id = %user_id, "Error setting profile complete: {e}");
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/users/complete-profile",
