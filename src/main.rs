@@ -993,7 +993,7 @@ async fn run_worker_chunk(
                     if should_upload {
                         let (rfc_e, rfc_r, year, month, day) =
                             crate::routes::invoices::extract_cfdi_path_info(&bytes);
-                        let _ = crate::services::storage::upload(
+                        if let Err(e) = crate::services::storage::upload(
                             &s3_ref,
                             &bucket,
                             &rfc_e,
@@ -1004,7 +1004,10 @@ async fn run_worker_chunk(
                             &uuid_str.to_lowercase(),
                             bytes,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::error!(uuid = %uuid_str, "Worker: XML upload to storage failed: {e}");
+                        }
                     }
                 }
             });

@@ -221,7 +221,7 @@ async fn redownload_chunk(
         };
 
         let (rfc_e, rfc_r, year, month, day) = etl::extract_path_from_meta(metadata);
-        let _ = storage::upload(
+        if let Err(e) = storage::upload(
             s3,
             bucket,
             &rfc_e,
@@ -232,7 +232,10 @@ async fn redownload_chunk(
             &uuid.to_lowercase(),
             bytes.clone(),
         )
-        .await;
+        .await
+        {
+            tracing::error!(uuid = %uuid, "Xml-redownload: XML upload to storage failed: {e}");
+        }
 
         if etl::apply_xml_bytes(pool, uuid, metadata, &bytes).await {
             recovered += 1;

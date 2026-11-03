@@ -12,7 +12,13 @@ use tempfile::TempDir;
 
 const ETL_POLL_SECS: u64 = 30;
 const BATCH_SIZE: usize = 100;
-const ENRICH_BATCH: i64 = 50;
+/// Invoices looked up per job per enrichment round; the ones missing from storage go to the
+/// SAT together, in one `download` call (one login).
+const ENRICH_BATCH: i64 = 100;
+/// Minimum time between two SAT downloads from the enrichment path, across all jobs. One
+/// login per missing XML, nonstop, got the server's connections reset by the SAT; a few
+/// batched logins an hour drain a 10k backlog in hours without looking like abuse.
+const ENRICH_SAT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
 /// Max skip cycles before a job is considered permanently unresolvable this session (~24h).
 const ENRICH_MAX_SKIP: u32 = 720;
 /// Rounds of failed SAT downloads before marking CFDIs as permanently unavailable.
@@ -29,6 +35,7 @@ pub async fn etl_worker(
     let mut enrich_fail_rounds: HashMap<String, u32> = HashMap::new();
     // Counts consecutive rounds where SAT download was attempted but nothing enriched.
     let mut enrich_sat_fail_rounds: HashMap<String, u32> = HashMap::new();
+    let mut sat_pacer = SatPacer::default();
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(ETL_POLL_SECS)).await;
@@ -99,15 +106,24 @@ pub async fn etl_worker(
                 continue;
             }
 
-            let (enriched, sat_failed, owner_rfc, other_side_touched) =
-                match enrich_job(&pool, &cfg, &s3, &job_id, &creds).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        tracing::error!(job_id = %job_id, "ETL: error enriching job: {e}");
-                        (0, 0, None, std::collections::HashSet::new())
-                    }
-                };
+            let EnrichOutcome {
+                enriched,
+                sat_failed,
+                sat_deferred,
+                owner_rfc,
+                other_side_touched,
+            } = match enrich_job(&pool, &cfg, &s3, &job_id, &creds, &mut sat_pacer).await {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!(job_id = %job_id, "ETL: error enriching job: {e}");
+                    EnrichOutcome::default()
+                }
+            };
 
+            if enriched == 0 && sat_deferred {
+                // Waiting its turn for the SAT, not failing: no backoff.
+                continue;
+            }
             if enriched > 0 {
                 // Progress made — reset all counters
                 enrich_skip.remove(&job_id);
@@ -400,101 +416,128 @@ async fn process_invoice(
     true
 }
 
-/// Re-processes invoices that were parsed from metadata only.
-/// First tries storage, then downloads from SAT.
-/// Returns (enriched, sat_failed, owner_rfc, other_side_touched). `owner_rfc` is `None` on
-/// the rare race where the job itself no longer exists -- C14-02's round-end bump has
-/// nothing to attribute an enrichment to in that case and skips it. `other_side_touched`
-/// (V14-01) is the gemela of the SAT-give-up branch's own pairs check in `etl_worker`: an
-/// enriched invoice rewrites subtotal/currency/nomina for real, and its counterparty is an
-/// independent RFC's own egresos/ingresos whenever that counterparty is also tracked.
+/// Spaces out the enrichment path's SAT downloads (`ENRICH_SAT_MIN_INTERVAL`).
+#[derive(Default)]
+struct SatPacer {
+    last: Option<std::time::Instant>,
+}
+
+impl SatPacer {
+    /// Whether a SAT download may start now; if so, counts it as started.
+    fn try_acquire(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < ENRICH_SAT_MIN_INTERVAL)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+}
+
+/// What one enrichment round did for a job.
+#[derive(Default)]
+struct EnrichOutcome {
+    enriched: usize,
+    /// XMLs the SAT was asked for and didn't deliver.
+    sat_failed: usize,
+    /// XMLs missing from storage left for a later round: the SAT pacer said wait.
+    sat_deferred: bool,
+    /// `None` on the rare race where the job itself no longer exists -- C14-02's round-end
+    /// bump has nothing to attribute an enrichment to in that case and skips it.
+    owner_rfc: Option<String>,
+    /// V14-01: an enriched invoice rewrites subtotal/currency/nomina for real, and its
+    /// counterparty is an independent RFC's own egresos/ingresos whenever it is tracked too.
+    other_side_touched: std::collections::HashSet<String>,
+}
+
+/// Re-processes invoices that were parsed from metadata only: storage first, then the SAT
+/// for whatever storage lacks -- in one batched download per direction, paced by `pacer`.
 async fn enrich_job(
     pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
     job_id: &str,
     creds: &HashMap<String, String>,
-) -> anyhow::Result<(
-    usize,
-    usize,
-    Option<String>,
-    std::collections::HashSet<String>,
-)> {
+    pacer: &mut SatPacer,
+) -> anyhow::Result<EnrichOutcome> {
     let pending = db::cfdis::find_needs_enrichment(pool, job_id, ENRICH_BATCH).await?;
     if pending.is_empty() {
-        return Ok((0, 0, None, std::collections::HashSet::new()));
+        return Ok(EnrichOutcome::default());
     }
 
     // Load job for auth credentials (needed for SAT download fallback)
     let job = db::jobs::get_by_id(pool, job_id).await?;
-    let owner_rfc = job.as_ref().map(|j| j.rfc.clone());
+    let mut outcome = EnrichOutcome {
+        owner_rfc: job.as_ref().map(|j| j.rfc.clone()),
+        ..EnrichOutcome::default()
+    };
 
     tracing::info!(job_id = %job_id, count = pending.len(), "ETL: enriching invoices");
 
-    let mut enriched = 0usize;
-    let mut sat_failed = 0usize;
-    let mut other_side_touched = std::collections::HashSet::new();
-    for (uuid, metadata) in &pending {
-        let (ok, tried_sat) = enrich_invoice(pool, cfg, s3, job.as_ref(), uuid, metadata).await;
-        if ok {
-            enriched += 1;
-            let (rfc_e, rfc_r, ..) = extract_path_from_meta(metadata);
-            for side in [&rfc_e, &rfc_r] {
-                if owner_rfc.as_deref() != Some(side.as_str()) && creds.contains_key(side) {
-                    other_side_touched.insert(side.clone());
+    let mut missing: Vec<&(String, String)> = Vec::new();
+    for item in &pending {
+        let (uuid, metadata) = item;
+        match try_load_xml(cfg, s3, uuid, metadata).await {
+            Some(bytes) => {
+                if apply_xml_bytes(pool, uuid, metadata, &bytes).await {
+                    outcome.record_enriched(metadata, creds);
                 }
             }
-        } else if tried_sat {
-            sat_failed += 1;
+            None => missing.push(item),
         }
     }
 
-    if enriched > 0 {
-        tracing::info!(job_id = %job_id, enriched, "ETL: enrichment batch done");
+    match &job {
+        Some(job) if !missing.is_empty() => {
+            if pacer.try_acquire() {
+                let recovered = download_batch_from_sat(pool, cfg, s3, job, &missing).await;
+                for (uuid, metadata) in &missing {
+                    let applied = match recovered.get(&uuid.to_lowercase()) {
+                        Some(bytes) => apply_xml_bytes(pool, uuid, metadata, bytes).await,
+                        None => false,
+                    };
+                    if applied {
+                        outcome.record_enriched(metadata, creds);
+                    } else {
+                        outcome.sat_failed += 1;
+                    }
+                }
+            } else {
+                outcome.sat_deferred = true;
+            }
+        }
+        None if !missing.is_empty() => {
+            tracing::warn!(job_id = %job_id, missing = missing.len(), "ETL enrich: XMLs not in storage, no job credentials");
+        }
+        _ => {}
     }
 
-    Ok((enriched, sat_failed, owner_rfc, other_side_touched))
+    if outcome.enriched > 0 {
+        tracing::info!(job_id = %job_id, enriched = outcome.enriched, "ETL: enrichment batch done");
+    }
+    Ok(outcome)
 }
 
-/// Returns (enriched, tried_sat). Tries storage first, then SAT download.
-async fn enrich_invoice(
-    pool: &DbPool,
-    cfg: &Config,
-    s3: &S3Client,
-    job: Option<&db::jobs::SyncJob>,
-    uuid: &str,
-    metadata: &str,
-) -> (bool, bool) {
-    // 1. Try storage
-    let xml_bytes = try_load_xml(cfg, s3, uuid, metadata).await;
-
-    // 2. If not in storage, try to download from SAT using the job's credentials
-    let (xml_bytes, tried_sat) = if xml_bytes.is_none() {
-        if let Some(j) = job {
-            let sat_bytes = try_download_from_sat(pool, cfg, s3, j, uuid, metadata).await;
-            let tried = sat_bytes.is_none(); // only "tried and failed" if still None
-            (sat_bytes, tried)
-        } else {
-            tracing::warn!(uuid = %uuid, "ETL enrich: XML not found in storage, no job credentials");
-            (None, false)
+impl EnrichOutcome {
+    fn record_enriched(&mut self, metadata: &str, creds: &HashMap<String, String>) {
+        self.enriched += 1;
+        let (rfc_e, rfc_r, ..) = extract_path_from_meta(metadata);
+        for side in [rfc_e, rfc_r] {
+            if self.owner_rfc.as_deref() != Some(side.as_str()) && creds.contains_key(&side) {
+                self.other_side_touched.insert(side);
+            }
         }
-    } else {
-        (xml_bytes, false)
-    };
-
-    let Some(bytes) = xml_bytes else {
-        return (false, tried_sat);
-    };
-
-    let ok = apply_xml_bytes(pool, uuid, metadata, &bytes).await;
-    (ok, tried_sat && !ok)
+    }
 }
 
 /// Parses real XML bytes for `uuid` and writes the header row plus every
 /// child table (taxes, concepts, payments, relacionados, nomina) — the
 /// "we now have the real XML, make everything correct" step shared by:
-/// - `enrich_invoice` above (single UUID, found via storage or a one-off SAT
-///   download during normal ETL)
+/// - `enrich_job` above (found in storage, or in a batched SAT download
+///   during normal ETL)
 /// - `xml_redownload.rs`'s bulk worker (batched SAT downloads targeting rows
 ///   already marked `xml_available = -1`)
 ///
@@ -575,114 +618,117 @@ async fn try_load_xml(cfg: &Config, s3: &S3Client, uuid: &str, metadata: &str) -
     let (rfc_e, rfc_r, year, month, day) = extract_path_from_meta(metadata);
     let bucket = cfg.s3_bucket.clone().unwrap_or_default();
     let uuid_lower = uuid.to_lowercase();
-    tracing::debug!(
-        uuid = %uuid,
-        path = %format!("cfdis/{rfc_e}/{rfc_r}/{year}/{month:02}/{day:02}/{uuid_lower}.xml"),
-        "ETL: looking up XML in storage"
-    );
     let result = storage::get(s3, &bucket, &rfc_e, &rfc_r, year, month, day, &uuid_lower).await;
     if result.is_none() {
-        tracing::warn!(
-            uuid    = %uuid,
-            rfc_e   = %rfc_e,
-            rfc_r   = %rfc_r,
-            date    = %format!("{year}-{month:02}-{day:02}"),
+        tracing::debug!(
+            uuid = %uuid,
             "ETL: XML not in storage — path: cfdis/{rfc_e}/{rfc_r}/{year}/{month:02}/{day:02}/{uuid_lower}.xml"
         );
     }
     result
 }
 
-/// Try to download a single XML from SAT using the job's stored credentials.
-/// On success, uploads the XML to storage and returns the bytes.
+/// Downloads `items`' XMLs from the SAT with the job's credentials -- one PHP `download`
+/// call (one login) per direction -- and stores each in storage so later rounds find it.
+/// Returns the recovered XMLs by lowercase UUID; a failed call just recovers nothing.
 ///
-/// `job.auth_enc` reflects whatever auth the job was *created* with, which is
-/// always the CIEC-shaped payload — RFCs that actually use FIEL never have a
-/// real CIEC password stored, so using it verbatim fails with "Missing CIEC
-/// field: password". `resume_worker`/`run_worker_chunk` already override this
-/// at scrape time via `try_fiel_auth`; this fallback path needs the same
-/// override, since it runs independently, potentially long after the job.
-async fn try_download_from_sat(
+/// `job.auth_enc` reflects whatever auth the job was *created* with, which is always the
+/// CIEC-shaped payload -- RFCs that use FIEL never have a real CIEC password stored, so
+/// using it verbatim fails with "Missing CIEC field: password". Same FIEL override as
+/// `resume_worker`, since this runs independently, potentially long after the job.
+async fn download_batch_from_sat(
     pool: &DbPool,
     cfg: &Config,
     s3: &S3Client,
     job: &db::jobs::SyncJob,
-    uuid: &str,
-    metadata: &str,
-) -> Option<Vec<u8>> {
+    items: &[&(String, String)],
+) -> HashMap<String, Vec<u8>> {
+    let mut recovered = HashMap::new();
     let bucket = cfg.s3_bucket.clone().unwrap_or_default();
 
-    // If the RFC has FIEL configured, that takes priority over the CIEC
-    // payload the job was created with (same rule as resume_worker).
     let fiel_override = crate::try_fiel_auth(pool, s3, &bucket, &job.rfc).await;
     let (auth, _fiel_tmp) = match fiel_override {
         Some((fiel_auth, tmp)) => (fiel_auth, Some(tmp)),
         None => {
-            // Decrypt the job's own auth payload (CIEC).
             let key = crate::services::crypto::load_key();
-            let auth_json = crate::services::crypto::decrypt(&key, &job.auth_enc).ok()?;
-            (serde_json::from_str(&auth_json).ok()?, None)
+            let parsed = crate::services::crypto::decrypt(&key, &job.auth_enc)
+                .ok()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
+            let Some(auth) = parsed else {
+                tracing::warn!(job_id = %job.id, "ETL: job credentials unreadable, skipping SAT download");
+                return recovered;
+            };
+            (auth, None)
         }
     };
 
-    // Determine download_type from RFC ownership
-    let (rfc_e, rfc_r, year, month, day) = extract_path_from_meta(metadata);
-    let download_type = if job.rfc.eq_ignore_ascii_case(&rfc_r) {
-        "recibidos"
-    } else {
-        "emitidos"
-    };
-
-    // Temp dir for the PHP CLI output
-    let work_dir = TempDir::new().ok()?;
-    let output_dir = work_dir.path().join("xml");
-    tokio::fs::create_dir_all(&output_dir).await.ok()?;
-
-    let payload = serde_json::json!({
-        "command": "download",
-        "auth": auth,
-        "params": {
-            "uuids":         [uuid.to_lowercase()],
-            "download_type": download_type,
-            "resource_type": "xml",
-            "output_dir":    output_dir.to_string_lossy(),
-        }
-    });
+    // The job's own RFC is the receiver for "recibidos", the issuer otherwise.
+    let mut by_direction: HashMap<&'static str, Vec<&(String, String)>> = HashMap::new();
+    for item in items {
+        let (_, rfc_r, ..) = extract_path_from_meta(&item.1);
+        let direction = if job.rfc.eq_ignore_ascii_case(&rfc_r) {
+            "recibidos"
+        } else {
+            "emitidos"
+        };
+        by_direction.entry(direction).or_default().push(item);
+    }
 
     let cli = PhpCli::new(&cfg.php_bin, &cfg.php_cli_path).with_proxy(cfg.https_proxy.clone());
-    let result = match cli.run(&payload).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(uuid = %uuid, "ETL: SAT download failed: {e}");
-            return None;
+    for (download_type, group) in by_direction {
+        let Ok(work_dir) = TempDir::new() else {
+            continue;
+        };
+        let output_dir = work_dir.path().join("xml");
+        if tokio::fs::create_dir_all(&output_dir).await.is_err() {
+            continue;
         }
-    };
+        let uuids: Vec<String> = group.iter().map(|(uuid, _)| uuid.to_lowercase()).collect();
+        let payload = serde_json::json!({
+            "command": "download",
+            "auth": auth,
+            "params": {
+                "uuids":         uuids,
+                "download_type": download_type,
+                "resource_type": "xml",
+                "output_dir":    output_dir.to_string_lossy(),
+            }
+        });
+        if let Err(e) = cli.run(&payload).await {
+            tracing::warn!(job_id = %job.id, download_type, requested = group.len(), "ETL: SAT batch download failed: {e}");
+            continue;
+        }
 
-    let path = result["files"]
-        .as_array()
-        .and_then(|f| f.first())
-        .and_then(|f| f["path"].as_str())
-        .map(|s| s.to_string())?;
-
-    let bytes = tokio::fs::read(&path).await.ok()?;
-
-    // Upload to S3 so future enrichment rounds find it in storage
-    let uuid_lower = uuid.to_lowercase();
-    let _ = storage::upload(
-        s3,
-        &bucket,
-        &rfc_e,
-        &rfc_r,
-        year,
-        month,
-        day,
-        &uuid_lower,
-        bytes.clone(),
-    )
-    .await;
-
-    tracing::info!(uuid = %uuid, download_type, "ETL: downloaded XML from SAT");
-    Some(bytes)
+        let requested = group.len();
+        let mut got = 0usize;
+        for (uuid, metadata) in group {
+            let uuid_lower = uuid.to_lowercase();
+            let Ok(bytes) = tokio::fs::read(output_dir.join(format!("{uuid_lower}.xml"))).await
+            else {
+                continue;
+            };
+            let (rfc_e, rfc_r, year, month, day) = extract_path_from_meta(metadata);
+            if let Err(e) = storage::upload(
+                s3,
+                &bucket,
+                &rfc_e,
+                &rfc_r,
+                year,
+                month,
+                day,
+                &uuid_lower,
+                bytes.clone(),
+            )
+            .await
+            {
+                tracing::error!(uuid = %uuid, "ETL: XML upload to storage failed: {e}");
+            }
+            got += 1;
+            recovered.insert(uuid_lower, bytes);
+        }
+        tracing::info!(job_id = %job.id, download_type, requested, got, "ETL: SAT batch download done");
+    }
+    recovered
 }
 
 pub(crate) fn extract_path_from_meta(metadata: &str) -> (String, String, u32, u32, u32) {
@@ -728,4 +774,24 @@ fn extract_estado_from_meta(metadata: &str) -> String {
         .or_else(|| v["EstadoComprobante"].as_str())
         .unwrap_or("vigente")
         .to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sat_pacer_allows_one_download_per_interval() {
+        let mut pacer = SatPacer::default();
+        assert!(pacer.try_acquire(), "the first download goes right away");
+        assert!(!pacer.try_acquire(), "a second one waits its turn");
+
+        pacer.last = pacer
+            .last
+            .map(|t| t.checked_sub(ENRICH_SAT_MIN_INTERVAL).unwrap());
+        assert!(
+            pacer.try_acquire(),
+            "once the interval passed, the next one goes"
+        );
+    }
 }
