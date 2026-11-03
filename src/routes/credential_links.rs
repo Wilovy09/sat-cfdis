@@ -56,7 +56,7 @@ fn internal_error() -> HttpResponse {
 }
 
 /// SAT RFC shape: 3 (company) or 4 (person) letters, a YYMMDD date, a 3-character homoclave.
-fn is_valid_rfc(rfc: &str) -> bool {
+pub(crate) fn is_valid_rfc(rfc: &str) -> bool {
     let chars: Vec<char> = rfc.chars().collect();
     let letters = match chars.len() {
         12 => 3,
@@ -469,13 +469,14 @@ async fn attach(
                     &submission.password,
                 )
                 .await?;
-                register_validated_rfc(pool, &requester, rfc, LinkedCredential::Fiel).await?;
+                register_validated_rfc(pool, &requester, rfc, LinkedCredential::Fiel, None).await?;
             } else {
                 register_validated_rfc(
                     pool,
                     &requester,
                     rfc,
                     LinkedCredential::Ciec(&submission.password),
+                    None,
                 )
                 .await?;
             }

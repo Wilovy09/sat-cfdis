@@ -17,6 +17,9 @@ pub struct CompleteProfileDto {
     pub priority_analysis: Option<String>,
 }
 
+/// What a user reads when something on our side failed and retrying is all they can do.
+pub(crate) const TRY_AGAIN_LATER: &str = "No pudimos completar la operación. Inténtalo de nuevo en unos minutos; si el problema sigue, escríbenos a soporte.";
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
@@ -386,20 +389,15 @@ pub async fn get_profile(
     }
 }
 
-/// L18-06 point 7: shared by `complete_profile` (pantalla de bienvenida) and `add_rfc`
-/// (Perfil -> Agregar RFC) so the two entry points can't drift apart the way they had --
-/// welcome had no per-user RFC limit at all, and both queued a sync job before checking
-/// ownership. Returns the queued sync job id on success, or the exact `HttpResponse` the
-/// caller should return on failure (so both handlers keep their existing error-response
-/// shape without duplicating it).
-async fn register_rfc(
+/// The checks every way of adding an RFC runs before touching anything: not one of the
+/// SAT's generic RFCs, the per-account limit (admins exempt), and not already registered
+/// to this account. Returns the exact response the handler should send on failure.
+pub(crate) async fn check_can_register(
     pool: &DbPool,
     user_id: &str,
     rfc: &str,
-    clave: &str,
-    priority_analysis: Option<&str>,
     is_admin: bool,
-) -> Result<Option<String>, HttpResponse> {
+) -> Result<(), HttpResponse> {
     // L19-01 point 5: the SAT's generic RFCs aren't companies -- registering one would make
     // its holder the "owner" of every counterparty invoice billed to the public or abroad.
     // The whole XAXX/XEXX prefix is reserved for them, not just the two canonical values.
@@ -417,7 +415,7 @@ async fn register_rfc(
             Err(e) => {
                 tracing::error!(user_id = %user_id, "Error counting RFCs: {e}");
                 return Err(HttpResponse::InternalServerError().json(ErrorBody {
-                    error: "Error al verificar RFCs existentes".to_string(),
+                    error: TRY_AGAIN_LATER.to_string(),
                 }));
             }
         };
@@ -431,19 +429,43 @@ async fn register_rfc(
     // L18-06 point 2: ownership is checked *before* anything is queued -- a rejected
     // attempt used to still leave a real sync job in the queue against someone else's RFC.
     match crate::db::users::check_rfc_ownership(pool, user_id, rfc).await {
-        Err(crate::db::users::CreateUserError::AlreadyOwnedBySelf) => {
-            return Err(HttpResponse::Conflict().json(ErrorBody {
-                error: "Este RFC ya está registrado para este usuario".to_string(),
-            }));
-        }
+        Err(crate::db::users::CreateUserError::AlreadyOwnedBySelf) => Err(HttpResponse::Conflict()
+            .json(ErrorBody {
+                error: "Este RFC ya está en tu cuenta.".to_string(),
+            })),
         Err(crate::db::users::CreateUserError::Db(e)) => {
             tracing::error!(user_id = %user_id, "Error checking RFC ownership: {e}");
-            return Err(HttpResponse::InternalServerError().json(ErrorBody {
-                error: "Error al verificar el RFC".to_string(),
-            }));
+            Err(HttpResponse::InternalServerError().json(ErrorBody {
+                error: TRY_AGAIN_LATER.to_string(),
+            }))
         }
-        Ok(()) => {}
+        Ok(()) => Ok(()),
     }
+}
+
+/// L18-06 point 7: shared by `complete_profile` (pantalla de bienvenida) and `add_rfc`
+/// (Perfil -> Agregar RFC) so the two entry points can't drift apart the way they had --
+/// welcome had no per-user RFC limit at all, and both queued a sync job before checking
+/// ownership. Returns the queued sync job id on success, or the exact `HttpResponse` the
+/// caller should return on failure (so both handlers keep their existing error-response
+/// shape without duplicating it).
+async fn register_rfc(
+    pool: &DbPool,
+    user_id: &str,
+    rfc: &str,
+    clave: &str,
+    priority_analysis: Option<&str>,
+    is_admin: bool,
+) -> Result<Option<String>, HttpResponse> {
+    // An RFC registered without a CIEC has nothing to log in with: its jobs could only fail.
+    // FIEL-only RFCs come in through `routes::fiel::register_with_fiel` instead.
+    if clave.trim().is_empty() {
+        return Err(HttpResponse::UnprocessableEntity().json(ErrorBody {
+            error: "Escribe la contraseña del SAT (CIEC), o agrega el RFC con tu e.firma (FIEL)."
+                .to_string(),
+        }));
+    }
+    check_can_register(pool, user_id, rfc, is_admin).await?;
 
     let key = crypto::load_key();
     let clave_enc = match crypto::encrypt(&key, clave) {
@@ -495,7 +517,7 @@ async fn register_rfc(
     {
         tracing::error!(user_id = %user_id, "Error creating pulso user: {e}");
         return Err(HttpResponse::InternalServerError().json(ErrorBody {
-            error: "Error al guardar el RFC".to_string(),
+            error: TRY_AGAIN_LATER.to_string(),
         }));
     }
     // A co-owner's analysis (migration 096) has no rows in the normalized payroll until it
@@ -536,6 +558,7 @@ pub(crate) async fn register_validated_rfc(
     user_id: &str,
     rfc: &str,
     credential: LinkedCredential<'_>,
+    priority_analysis: Option<&str>,
 ) -> Result<(), RegisterValidatedError> {
     let key = crypto::load_key();
     let (clave_enc, auth_json) = match credential {
@@ -551,13 +574,13 @@ pub(crate) async fn register_validated_rfc(
     let auth_enc =
         crypto::encrypt(&key, &auth_json.to_string()).map_err(RegisterValidatedError::Encrypt)?;
 
-    crate::db::users::create_pulso_user(pool, user_id, rfc, &clave_enc, None, None)
+    crate::db::users::create_pulso_user(pool, user_id, rfc, &clave_enc, None, priority_analysis)
         .await
         .map_err(|e| RegisterValidatedError::Create(e.to_string()))?;
     crate::db::users::mark_verified_now(pool, user_id, rfc).await?;
     crate::services::nomina_refresh::mark_touched();
 
-    let job_id = queue_first_sync(pool, rfc, &auth_enc, None).await?;
+    let job_id = queue_first_sync(pool, rfc, &auth_enc, priority_analysis).await?;
     crate::db::users::set_initial_sync_job_for_rfc(pool, user_id, rfc, &job_id).await?;
     if let Err(e) = crate::db::users::set_profile_complete(pool, user_id).await {
         tracing::error!(user_id = %user_id, "Error setting profile complete: {e}");

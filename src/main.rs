@@ -176,6 +176,22 @@ fn redact_secret(line: &str, secret: Option<&str>) -> String {
     }
 }
 
+/// `sync_jobs.error_code` of a job whose RFC has no CIEC and no FIEL to log in with.
+const MISSING_CREDENTIALS: &str = "missing_credentials";
+
+/// Whether a job's auth payload can open a SAT session: a non-empty CIEC, or a FIEL whose
+/// files were fetched (`try_fiel_auth`). A bare `{"type":"fiel"}` placeholder whose FIEL
+/// is gone, or a CIEC with an empty password, cannot.
+fn has_login_credential(auth_payload: &serde_json::Value) -> bool {
+    match auth_payload["type"].as_str() {
+        Some("ciec") => auth_payload["password"]
+            .as_str()
+            .is_some_and(|p| !p.trim().is_empty()),
+        Some("fiel") => auth_payload["cert_pem_path"].as_str().is_some(),
+        _ => false,
+    }
+}
+
 /// Whether a scraper output line is the one-time `{"__auth_ok__":true}` login signal.
 fn is_sat_login_ok(line: &serde_json::Value) -> bool {
     line.get("__auth_ok__")
@@ -316,6 +332,26 @@ async fn resume_worker(
                 }
                 None => (auth_payload, None::<tempfile::TempDir>, job_ciec),
             };
+            // An RFC registered while its FIEL failed to save has neither credential: every
+            // retry would crash the scraper the same way. Fail now with a code the UI words.
+            // A FIEL that exists but couldn't be fetched (S3 hiccup) keeps the transient
+            // retry path instead.
+            if !has_login_credential(&auth_payload)
+                && matches!(db::fiel::get(&pool, &job.rfc).await, Ok(None))
+            {
+                tracing::warn!(job_id = %job.id, rfc = %job.rfc, "Worker: job has no usable SAT credential");
+                if let Err(e) = db::jobs::fail(
+                    &pool,
+                    &job.id,
+                    Some(MISSING_CREDENTIALS),
+                    "El RFC no tiene contraseña del SAT (CIEC) ni e.firma (FIEL) guardadas",
+                )
+                .await
+                {
+                    tracing::error!(job_id = %job.id, "Worker: failing a job without credentials failed: {e}");
+                }
+                continue;
+            }
 
             // Queued jobs start from period_from; paused jobs resume from day after cursor
             let resume_from = match &job.cursor_date {
@@ -1488,6 +1524,11 @@ async fn main() -> std::io::Result<()> {
                     .route(web::get().to(users_routes::get_rfcs))
                     .route(web::post().to(users_routes::add_rfc)),
             )
+            // Before /rfcs/{rfc}: "fiel" is not an RFC.
+            .service(
+                web::resource("/api/v1/users/rfcs/fiel")
+                    .route(web::post().to(fiel_routes::register_with_fiel)),
+            )
             .service(
                 web::resource("/api/v1/users/rfcs/{rfc}/clave")
                     .route(web::put().to(users_routes::update_rfc_clave_handler)),
@@ -1719,6 +1760,25 @@ mod owner_verification_tests {
         assert_eq!(job_ciec_password(&fiel, RFC), None);
         let other = serde_json::json!({"type": "ciec", "rfc": "BBB010101BBB", "password": "pw"});
         assert_eq!(job_ciec_password(&other, RFC), None);
+    }
+
+    #[test]
+    fn has_login_credential_needs_a_password_or_fiel_files() {
+        assert!(has_login_credential(
+            &serde_json::json!({"type": "ciec", "rfc": RFC, "password": "pw"})
+        ));
+        assert!(!has_login_credential(
+            &serde_json::json!({"type": "ciec", "rfc": RFC, "password": ""})
+        ));
+        assert!(!has_login_credential(
+            &serde_json::json!({"type": "ciec", "rfc": RFC})
+        ));
+        assert!(has_login_credential(&serde_json::json!({
+            "type": "fiel", "cert_pem_path": "/tmp/c", "key_pem_path": "/tmp/k", "password": "x"
+        })));
+        assert!(!has_login_credential(
+            &serde_json::json!({"type": "fiel", "rfc": RFC})
+        ));
     }
 
     #[test]
